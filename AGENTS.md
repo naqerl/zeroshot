@@ -224,10 +224,27 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   and tombstones execution activity atomically; no late work may surface after close returns.
 - Node deadlines are optional: omitted `timeoutMs` means completion or explicit cancellation.
   Built-in graphs have no node deadlines, and provider adapters impose no separate turn timeout.
-  The supervisor records node error codes and elapsed time in durable logs before settlement.
+  The supervisor records every node error in durable logs before settlement, including handled
+  failures and retries. Summaries preserve error code, typed refusal/malformed reason, elapsed time,
+  and returned error context; provider adapters redact credentials before returning details. Runtime failure,
+  runtime loss/restart reconciliation, and force-stop use the same completion/log transaction for
+  every active node. Failed runs also retain a run-wide error log, including before graph dispatch.
+  An actual node error remains logged if a parallel winner voids that execution; intentional
+  cancellation is not presented as a new crash. Unconfirmed cleanup preserves a bounded best-effort
+  error log without completing the still-active execution or masking the primary failure.
+  Detailed provider, validation, and delivery errors retain their useful explanation in ordinary
+  run logs. Adapters redact their known credentials before returning error details; the supervisor
+  preserves these through ordinary completion logs. Capsule transport retains details as an existing
+  output event before reducing the failure to its wire code; the existing bounded cancellation queue
+  retains errors during draining; capsule terminal metadata preserves bounded error records too. Retries, corrections, and typed delivery
+  outcomes log detail separately only when completion would lose it. Correction prompts stay out of
+  diagnostics. Public error formatting is bounded and control-safe without suppressing causes.
+  These public summaries stay separate from private operator diagnostics.
 - A failed durable-output bridge cancels and drains its provider immediately. Fatal supervisor
-  errors and task panics close owned work and attempt runtime cleanup before durable failure.
-  If persistence is unavailable, the controller retains a minimal `runtime_failed` status at the
+  errors and task panics publish their private primary diagnostic before recovery waits or stderr
+  writes, then close owned work and attempt runtime cleanup before durable failure. Recovery failures
+  publish a separate private diagnostic without replacing the primary cause. If persistence is
+  unavailable, the controller retains a minimal `runtime_failed` status at the
   last observed durable cursor and records private operator diagnostics, including SQLite error codes.
   This fallback creates no history events. Readable retained history drains normally; unavailable
   history closes with `SOURCE_UNAVAILABLE`, never `done`. Compiler/runtime failure reasons
@@ -449,7 +466,18 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 - Target HTTP failures use the shared bounded `{code,message,details?}` protocol problem; message-only
   bodies are invalid, and details contain only user-safe structured metadata.
 - Operator diagnostics are private-capability-only, run-scoped, bounded, sanitized, and excluded
-  from public run status and logs.
+  from public run status and logs. `ProductionHostingConfig::operator_diagnostic_output` accepts an
+  optional `OperatorDiagnosticOutput` created before target construction. Its nonblocking channel
+  exports the same normalized records from checkout, Git push, and fatal runtime producers; the
+  two-record private snapshot remains independent. The channel retains at most 128 records and
+  reports overwritten records through Tokio's `Lagged` error. Hosts own continuous collection,
+  durable storage/export, deployment identity, timestamps, retention, and shutdown draining; this
+  in-memory handoff cannot guarantee preservation across abrupt process termination. Treat lag as
+  incomplete diagnostics. Namespace IDs by target process/attempt and keep collected data private.
+  `OperatorDiagnosticJsonLines` optionally drains those records on a dedicated writer thread,
+  flushing each line and reporting overflow. `target serve --operator-diagnostics-json` enables
+  stdout output. Writer shutdown is bounded; it cannot guarantee delivery after abrupt termination.
+  Output has no deployment metadata or cloud-specific envelope.
 - Hosted merge plans are atomic, immutable, merge-only DAGs over one explicit repository, branch,
   and profile. The target resolves each node's exact revision only after its dependencies succeed;
   plans have static inputs, no cross-node dataflow, and no retry-in-place. Agent runtime bindings

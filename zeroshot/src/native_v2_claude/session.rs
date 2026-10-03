@@ -85,7 +85,11 @@ impl NodeDriver for ClaudeAdapter {
         )
         .await?;
         loop {
-            if let Some(outcome) = self.advance_run(&turn, &mut state, &control).await? {
+            if let Some(outcome) = self
+                .advance_run(&turn, &mut state, &control)
+                .await
+                .map_err(|error| state.retry.redact_error(error))?
+            {
                 retain_session(&invocation.node, session, state.resume_id.as_deref()).await?;
                 return Ok(outcome);
             }
@@ -125,10 +129,7 @@ impl ClaudeAdapter {
                     .await?;
                 Ok(None)
             }
-            Err(error) => {
-                state.emit_terminal_error(control, &error).await?;
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 }
@@ -181,14 +182,6 @@ impl ClaudeRunState {
         self.response.replace_prompt(prompt);
         Ok(())
     }
-
-    async fn emit_terminal_error(
-        &self,
-        control: &DriverControl,
-        error: &NodeRunnerError,
-    ) -> Result<(), NodeRunnerError> {
-        self.retry.report_terminal(control, error).await
-    }
 }
 
 async fn retain_session(
@@ -199,9 +192,11 @@ async fn retain_session(
     if !requires_session(invocation) {
         return Ok(());
     }
-    let observed = observed.ok_or(NodeRunnerError::Driver)?;
+    let observed = observed
+        .ok_or_else(|| NodeRunnerError::DriverDetail(MISSING_REUSABLE_SESSION.to_owned()))?;
     let mut retained = session.resume_id.lock().await;
-    observe_session(&mut retained, Some(observed)).map_err(|_| NodeRunnerError::Driver)
+    observe_session(&mut retained, Some(observed))
+        .map_err(|detail| NodeRunnerError::DriverDetail(detail.to_owned()))
 }
 
 fn requires_session(invocation: &NodeInvocation) -> bool {
