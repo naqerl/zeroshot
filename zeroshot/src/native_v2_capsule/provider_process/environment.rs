@@ -49,6 +49,7 @@ pub(crate) const PI_LOCAL_ENVIRONMENT: &[&str] = &[
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_API_BASE",
+    "OPENCODE_API_KEY",
     "OPENROUTER_API_KEY",
     "AWS_BEARER_TOKEN_BEDROCK",
     "AWS_REGION",

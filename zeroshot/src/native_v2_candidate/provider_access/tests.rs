@@ -35,6 +35,7 @@ fn native_local_lanes_do_not_invent_provider_connections() {
         ("copilot", "github"),
         ("pi", "anthropic"),
         ("pi", "openai"),
+        ("pi", "opencode_go"),
     ] {
         let mut runtime = runtime(harness, provider, json!({}));
         materialize_provider_access(&mut runtime, ProviderAccessPlacement::Local).assert_value();

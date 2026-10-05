@@ -61,6 +61,7 @@ fn wave6_cli_contract_uniform_runtime_and_template_bindings_preserve_authority()
         (UniformHarness::Pi, UniformProvider::OpenRouter, true),
         (UniformHarness::Pi, UniformProvider::Gateway, true),
         (UniformHarness::Pi, UniformProvider::Bedrock, true),
+        (UniformHarness::Pi, UniformProvider::OpenCodeGo, true),
         (UniformHarness::Pi, UniformProvider::Github, false),
     ] {
         assert_eq!(

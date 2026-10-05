@@ -445,6 +445,8 @@ enum UniformProvider {
     Gateway,
     Anthropic,
     Bedrock,
+    #[serde(rename = "opencode_go")]
+    OpenCodeGo,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -572,6 +574,7 @@ impl UniformProvider {
             Self::OpenRouter => Some(PiProvider::OpenRouter),
             Self::Gateway => Some(PiProvider::Gateway),
             Self::Bedrock => Some(PiProvider::Bedrock),
+            Self::OpenCodeGo => Some(PiProvider::OpenCodeGo),
             _ => None,
         }
     }

@@ -24,6 +24,7 @@ pub(super) const ANTHROPIC_KEY: &str = "ANTHROPIC_API_KEY";
 const ANTHROPIC_AUTH: &str = "ANTHROPIC_AUTH_TOKEN";
 const ANTHROPIC_OAUTH: &str = "ANTHROPIC_OAUTH_TOKEN";
 pub(super) const OPENAI_KEY: &str = "OPENAI_API_KEY";
+pub(super) const OPENCODE_KEY: &str = "OPENCODE_API_KEY";
 
 /// Pi's agent directory. Contained runs and every non-native-local lane point this at a private
 /// home so no ambient configuration, model catalog, or stored login can be inherited.
@@ -38,14 +39,16 @@ pub(super) const PI_TELEMETRY: &str = "PI_TELEMETRY";
 /// authentication. Pi treats these as distinct forms, so any one satisfies the lane.
 const ANTHROPIC_CREDENTIALS: [&str; 3] = [ANTHROPIC_KEY, ANTHROPIC_AUTH, ANTHROPIC_OAUTH];
 const OPENAI_CREDENTIALS: [&str; 1] = [OPENAI_KEY];
+const OPENCODE_CREDENTIALS: [&str; 1] = [OPENCODE_KEY];
 
 /// Credentials belonging to any other lane. A declared value from one of these must not stand in
 /// for the selected lane's credential.
-const FOREIGN_CREDENTIALS: [&str; 5] = [
+const FOREIGN_CREDENTIALS: [&str; 6] = [
     ANTHROPIC_KEY,
     ANTHROPIC_AUTH,
     ANTHROPIC_OAUTH,
     OPENAI_KEY,
+    OPENCODE_KEY,
     OPENROUTER_KEY,
 ];
 
@@ -82,6 +85,8 @@ const fn provider_name(provider: PiProvider) -> &'static str {
         PiProvider::OpenAi | PiProvider::Gateway => "openai",
         PiProvider::OpenRouter => "openrouter",
         PiProvider::Bedrock => "amazon-bedrock",
+        // Pi's own spelling, including its hyphen. The protocol wire name stays snake_case.
+        PiProvider::OpenCodeGo => "opencode-go",
     }
 }
 
@@ -274,6 +279,7 @@ pub(super) fn configure_provider(
         PiProvider::Anthropic => accept_lane(environment, &ANTHROPIC_CREDENTIALS, native_local)?,
         PiProvider::OpenAi => accept_lane(environment, &OPENAI_CREDENTIALS, native_local)?,
         PiProvider::OpenRouter => accept_lane(environment, &[OPENROUTER_KEY], native_local)?,
+        PiProvider::OpenCodeGo => accept_lane(environment, &OPENCODE_CREDENTIALS, native_local)?,
         PiProvider::Bedrock => accept_bedrock(environment)?,
         PiProvider::Gateway => accept_gateway(environment)?,
     }
