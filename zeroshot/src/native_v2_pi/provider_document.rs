@@ -1,15 +1,14 @@
 //! Synthesized `models.json` for Pi lanes that carry a caller-owned endpoint.
 //!
-//! Pi resolves a compatible endpoint by overriding only `baseUrl`, `apiKey`, and optionally the
-//! `api` discriminant of an existing provider, which leaves every built-in model of that provider
-//! registered. That is what keeps the caller-owned model identifiers resolvable without Zeroshot
-//! owning a model catalog: an unmatched identifier becomes a custom model id on that provider.
+//! Pi reads its provider catalog from this file. Two behaviors decide its shape, and both were
+//! confirmed against the CLI rather than inferred: Pi ignores `api`, `baseUrl`, and `apiKey`
+//! overrides on a *built-in* provider, and it honours all three on a provider this file
+//! registers. That is why the `gateway` lane registers its own provider instead of retargeting
+//! `openai`, which is what lets a caller choose the wire protocol instead of being pinned to one.
 //!
-//! This is Pi's equivalent of Claude Code's `ANTHROPIC_BASE_URL`. Pi does not read that variable
-//! for endpoint selection, so a caller-owned Anthropic Messages endpoint has to arrive through this
-//! file. The wire protocol is never chosen here: each lane keeps the built-in protocol of the Pi
-//! provider it overrides, and only the `gateway` lane pins a discriminant, because that lane exists
-//! to carry an OpenAI Responses endpoint the way `codex/gateway` does.
+//! The registered model entry carries only the caller's own identifier, the chosen protocol, and a
+//! display name. Capability metadata is deliberately absent so Zeroshot never becomes a model
+//! catalog: Pi fills in its own defaults for context window, output limit, and cost.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,17 +21,36 @@ use crate::native_v2_runner::{NodeRunnerError, ResolvedEnvironment};
 /// Pi's provider file inside the private agent directory.
 pub(super) const MODELS_FILE: &str = "models.json";
 
-/// One provider override: which Pi provider to retarget, which endpoint it speaks, and which
+/// One provider override: which Pi provider to register, which protocol it speaks, and which
 /// environment variable holds its key.
 #[derive(Clone, Copy)]
 pub(super) struct ProviderOverride {
-    /// Pi's own provider name, which is also the wire protocol it speaks.
+    /// Pi provider name this file registers.
     pub(super) provider: &'static str,
     /// Environment field the API key is read from, referenced by Pi's `$NAME` interpolation.
     pub(super) api_key_field: &'static str,
-    /// Discriminant to pin. Omitted lanes keep the built-in protocol of the overridden provider.
-    pub(super) pin_api: Option<&'static str>,
 }
+
+/// The gateway lane registers its own provider so the caller owns the wire protocol.
+pub(super) const GATEWAY: ProviderOverride = ProviderOverride {
+    provider: "zeroshot-gateway",
+    api_key_field: gateway::API_KEY,
+};
+
+/// The `anthropic` lane retargets Pi's built-in provider, because that lane's protocol is already
+/// the one Pi speaks. No discriminant is written: overriding one on a built-in provider is ignored.
+pub(super) const ANTHROPIC: ProviderOverride = ProviderOverride {
+    provider: "anthropic",
+    api_key_field: "ANTHROPIC_API_KEY",
+};
+
+/// Wire protocols Pi can be asked to speak. The caller names one; Zeroshot never guesses it from
+/// the model identifier, because an identifier is opaque and provider-owned.
+pub(super) const SUPPORTED_APIS: [&str; 3] = [
+    "openai-responses",
+    "openai-completions",
+    "anthropic-messages",
+];
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum PiProviderDocumentError {
@@ -40,20 +58,37 @@ pub(super) enum PiProviderDocumentError {
     Serialize(#[source] serde_json::Error),
     #[error("Pi provider configuration could not be created: {0}")]
     Write(#[source] std::io::Error),
+    #[error("Pi gateway requires a supported wire protocol in {field}")]
+    UnsupportedApi { field: &'static str },
+    #[error("Pi gateway requires a non-empty model identifier")]
+    EmptyModel,
 }
 
 /// Builds the provider document. The API key is read from the declared connection through Pi's
 /// own `$NAME` interpolation, so the secret never reaches this file.
-fn models_document(selection: ProviderOverride, base_url: &str) -> Value {
+fn models_document(
+    selection: ProviderOverride,
+    base_url: &str,
+    api: Option<&str>,
+    model: Option<&str>,
+) -> Value {
     let mut provider = serde_json::Map::new();
     provider.insert("baseUrl".to_owned(), json!(base_url));
-    if let Some(api) = selection.pin_api {
+    if let Some(api) = api {
         provider.insert("api".to_owned(), json!(api));
     }
     provider.insert(
         "apiKey".to_owned(),
         json!(format!("${}", selection.api_key_field)),
     );
+    // A registered provider needs one model entry before it resolves any identifier. The entry
+    // binds the caller's own identifier and nothing else.
+    if let Some(model) = model {
+        provider.insert(
+            "models".to_owned(),
+            json!([{ "id": model, "name": model, "api": api }]),
+        );
+    }
     json!({ "providers": { selection.provider: Value::Object(provider) } })
 }
 
@@ -61,13 +96,36 @@ fn models_document(selection: ProviderOverride, base_url: &str) -> Value {
 ///
 /// The file is rewritten every turn so a resumed session cannot read a stale endpoint. It holds the
 /// caller-owned base URL and an interpolation reference, never the secret itself.
-pub(super) fn write_models(
+pub(super) fn write_gateway(
     agent_dir: &Path,
-    selection: ProviderOverride,
+    base_url: &str,
+    api: &str,
+    model: &str,
+) -> Result<PathBuf, PiProviderDocumentError> {
+    if !SUPPORTED_APIS.contains(&api) {
+        return Err(PiProviderDocumentError::UnsupportedApi {
+            field: "GATEWAY_API",
+        });
+    }
+    if model.trim().is_empty() {
+        return Err(PiProviderDocumentError::EmptyModel);
+    }
+    write_document(
+        agent_dir,
+        models_document(GATEWAY, base_url, Some(api), Some(model)),
+    )
+}
+
+/// Writes the `anthropic` endpoint override, which keeps Pi's own Messages protocol.
+pub(super) fn write_anthropic(
+    agent_dir: &Path,
     base_url: &str,
 ) -> Result<PathBuf, PiProviderDocumentError> {
-    let bytes = serde_json::to_vec_pretty(&models_document(selection, base_url))
-        .map_err(PiProviderDocumentError::Serialize)?;
+    write_document(agent_dir, models_document(ANTHROPIC, base_url, None, None))
+}
+
+fn write_document(agent_dir: &Path, document: Value) -> Result<PathBuf, PiProviderDocumentError> {
+    let bytes = serde_json::to_vec_pretty(&document).map_err(PiProviderDocumentError::Serialize)?;
     let path = agent_dir.join(MODELS_FILE);
     std::fs::create_dir_all(agent_dir).map_err(PiProviderDocumentError::Write)?;
     // The agent directory is provider-private and mode 0700, so this caller-owned base URL is
@@ -75,22 +133,6 @@ pub(super) fn write_models(
     std::fs::write(&path, bytes).map_err(PiProviderDocumentError::Write)?;
     Ok(path)
 }
-
-/// The `gateway` lane retargets Pi's built-in OpenAI provider and pins the Responses discriminant,
-/// matching the lane `codex/gateway` already uses.
-pub(super) const GATEWAY: ProviderOverride = ProviderOverride {
-    provider: "openai",
-    api_key_field: gateway::API_KEY,
-    pin_api: Some("openai-responses"),
-};
-
-/// The `anthropic` lane keeps Pi's own Anthropic Messages protocol and only retargets the endpoint,
-/// which is what a caller-owned Messages-compatible gateway needs.
-pub(super) const ANTHROPIC: ProviderOverride = ProviderOverride {
-    provider: "anthropic",
-    api_key_field: "ANTHROPIC_API_KEY",
-    pin_api: None,
-};
 
 /// Resolves the gateway base URL from the declared connection, so a missing or invalid connection
 /// fails before any child process starts.
@@ -109,6 +151,27 @@ pub(super) fn declared_base_url(resolved: &ResolvedEnvironment, field: &str) -> 
     (!value.is_empty()).then(|| value.to_owned())
 }
 
+/// Reads the caller-owned wire protocol. A missing or unrecognized value is a usage failure rather
+/// than a guess, because Pi has no way to report which protocol an opaque identifier needs.
+pub(super) fn declared_api(
+    resolved: &ResolvedEnvironment,
+    field: &str,
+) -> Result<String, NodeRunnerError> {
+    let value = declared_base_url(resolved, field).ok_or_else(|| {
+        NodeRunnerError::DriverDetail(format!(
+            "Pi gateway requires {field} to name one of {}",
+            SUPPORTED_APIS.join(", ")
+        ))
+    })?;
+    if !SUPPORTED_APIS.contains(&value.as_str()) {
+        return Err(NodeRunnerError::DriverDetail(format!(
+            "Pi gateway does not support wire protocol {value}; expected one of {}",
+            SUPPORTED_APIS.join(", ")
+        )));
+    }
+    Ok(value)
+}
+
 fn declared(resolved: &ResolvedEnvironment) -> BTreeMap<String, String> {
     resolved
         .iter()
@@ -119,15 +182,14 @@ fn declared(resolved: &ResolvedEnvironment) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANTHROPIC, GATEWAY, MODELS_FILE, declared_base_url, gateway_base_url, models_document,
-        write_models,
+        ANTHROPIC, GATEWAY, MODELS_FILE, SUPPORTED_APIS, declared_api, declared_base_url,
+        gateway_base_url, models_document, write_anthropic, write_gateway,
     };
     use crate::native_v2_candidate::test_support::{TestDirectory, environment_name};
     use crate::native_v2_contract::{
         DeclaredConnections, DeclaredEnvironment, EnvironmentVariableName, NodeRuntimeBinding,
     };
     use crate::native_v2_runner::ResolvedEnvironment;
-    use serde_json::json;
     use std::collections::BTreeMap;
 
     /// A resolved environment carrying exactly the supplied values, through the declared-connection
@@ -158,24 +220,86 @@ mod tests {
         ResolvedEnvironment::exact(&binding, map).unwrap()
     }
 
+    fn gateway_connection(api: Option<&str>) -> ResolvedEnvironment {
+        let mut fields = vec!["GATEWAY_BASE_URL", "GATEWAY_API_KEY"];
+        let mut values = vec![
+            ("GATEWAY_BASE_URL", "https://gateway.example/api/v1"),
+            ("GATEWAY_API_KEY", "sk-gateway"),
+        ];
+        if let Some(api) = api {
+            fields.push("GATEWAY_API");
+            values.push(("GATEWAY_API", api));
+        }
+        resolved(&fields, &values)
+    }
+
     #[test]
-    fn the_gateway_document_pins_responses_and_interpolates_the_key() {
-        let document = models_document(GATEWAY, "https://gateway.example/api/v1");
-        let provider = &document["providers"]["openai"];
-        assert_eq!(provider["api"], "openai-responses");
+    fn the_gateway_registers_its_own_provider_with_the_caller_protocol() {
+        // Pi honors `api` on a registered provider and ignores it on a built-in one, so the lane
+        // registers `zeroshot-gateway` rather than retargeting `openai`.
+        let document = models_document(
+            GATEWAY,
+            "https://gateway.example/api/v1",
+            Some("openai-completions"),
+            Some("provider-model"),
+        );
+        let provider = &document["providers"][GATEWAY.provider];
+        assert_eq!(provider["api"], "openai-completions");
         assert_eq!(provider["baseUrl"], "https://gateway.example/api/v1");
         // The key stays in the declared connection, never in the synthesized file.
         assert_eq!(provider["apiKey"], "$GATEWAY_API_KEY");
-        // No model list is synthesized: Pi keeps the built-in openai catalog.
-        assert!(provider.get("models").is_none());
+        // The model entry binds the caller's identifier and nothing else, so Zeroshot owns no
+        // capability metadata and no catalog.
+        let models = provider["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["id"], "provider-model");
+        assert_eq!(models[0]["api"], "openai-completions");
+        assert!(models[0].get("contextWindow").is_none());
+        assert!(models[0].get("cost").is_none());
+    }
+
+    #[test]
+    fn every_supported_protocol_is_accepted_and_nothing_else_is() {
+        for api in SUPPORTED_APIS {
+            assert_eq!(
+                declared_api(&gateway_connection(Some(api)), "GATEWAY_API").unwrap(),
+                api
+            );
+        }
+        // A missing or unrecognized protocol is a usage failure, never a guess.
+        assert!(declared_api(&gateway_connection(None), "GATEWAY_API").is_err());
+        assert!(declared_api(&gateway_connection(Some("grpc")), "GATEWAY_API").is_err());
+        assert!(declared_api(&gateway_connection(Some("  ")), "GATEWAY_API").is_err());
+    }
+
+    #[test]
+    fn the_gateway_document_is_written_and_validated() {
+        let directory = TestDirectory::new("pi-gateway-doc");
+        let agent_dir = directory.child("agent");
+        let path = write_gateway(
+            &agent_dir,
+            "https://gateway.example/api/v1",
+            "anthropic-messages",
+            "provider-model",
+        )
+        .unwrap();
+        assert_eq!(path, agent_dir.join(MODELS_FILE));
+        assert!(
+            directory
+                .read("agent/models.json")
+                .contains("anthropic-messages")
+        );
+
+        // An unsupported protocol and an empty identifier fail before any child process starts.
+        assert!(write_gateway(&agent_dir, "https://x.invalid", "grpc", "m").is_err());
+        assert!(write_gateway(&agent_dir, "https://x.invalid", "openai-responses", "  ").is_err());
     }
 
     #[test]
     fn the_anthropic_document_keeps_pis_own_messages_protocol() {
         // This is the escape hatch Claude Code offers through `ANTHROPIC_BASE_URL`: retarget the
-        // endpoint without choosing a wire protocol, because Pi ignores an `api` override on a
-        // built-in provider anyway.
-        let document = models_document(ANTHROPIC, "https://messages.example");
+        // endpoint without choosing a wire protocol, because overriding one is ignored anyway.
+        let document = models_document(ANTHROPIC, "https://messages.example", None, None);
         let provider = &document["providers"]["anthropic"];
         assert_eq!(provider["baseUrl"], "https://messages.example");
         assert_eq!(provider["apiKey"], "$ANTHROPIC_API_KEY");
@@ -183,20 +307,16 @@ mod tests {
             provider.get("api").is_none(),
             "the Anthropic Messages protocol must stay the built-in one"
         );
+        assert!(provider.get("models").is_none());
     }
 
     #[test]
     fn the_provider_file_lands_in_the_agent_directory() {
         assert_eq!(MODELS_FILE, "models.json");
-        let directory = TestDirectory::new("pi-provider-file");
+        let directory = TestDirectory::new("pi-anthropic-file");
         let agent_dir = directory.child("agent");
-        let path = write_models(&agent_dir, GATEWAY, "https://gateway.example/api/v1").unwrap();
+        let path = write_anthropic(&agent_dir, "https://messages.example").unwrap();
         assert_eq!(path, agent_dir.join("models.json"));
-        assert!(
-            directory
-                .read("agent/models.json")
-                .contains("openai-responses")
-        );
     }
 
     #[test]
@@ -225,15 +345,8 @@ mod tests {
 
     #[test]
     fn a_complete_gateway_connection_resolves_its_base_url() {
-        let complete = resolved(
-            &["GATEWAY_BASE_URL", "GATEWAY_API_KEY"],
-            &[
-                ("GATEWAY_BASE_URL", "https://gateway.example/api/v1"),
-                ("GATEWAY_API_KEY", "sk-gateway"),
-            ],
-        );
         assert_eq!(
-            gateway_base_url(&complete).unwrap(),
+            gateway_base_url(&gateway_connection(Some("openai-responses"))).unwrap(),
             "https://gateway.example/api/v1"
         );
     }
@@ -260,18 +373,5 @@ mod tests {
                 "incomplete gateway connection must fail before launch"
             );
         }
-    }
-
-    #[test]
-    fn a_gateway_document_is_valid_json_for_pi() {
-        let document = models_document(GATEWAY, "https://gateway.example/api/v1");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&document.to_string()).unwrap(),
-            json!({"providers": {"openai": {
-                "baseUrl": "https://gateway.example/api/v1",
-                "api": "openai-responses",
-                "apiKey": "$GATEWAY_API_KEY"
-            }}})
-        );
     }
 }

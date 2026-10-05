@@ -31,13 +31,15 @@ use crate::native_v2_capsule::provider_process::{
     ProviderExecutionFiles, ProviderProcessRunners, provider_redactions, report_provider_error,
     with_driver_detail,
 };
-use crate::native_v2_contract::PiProvider;
+use crate::native_v2_contract::{NodeRuntimeBinding, PiProvider};
 use crate::native_v2_runner::{
     AgentResponse, DriverControl, DriverInvocation, LiveOutput, LiveOutputStream, NodeRunnerError,
     ResolvedEnvironment, render_agent_prompt, resolve_agent_response,
 };
 use command::{PiCommandRequest, command};
-use provider_document::{ANTHROPIC, GATEWAY, declared_base_url, gateway_base_url, write_models};
+use provider_document::{
+    declared_api, declared_base_url, gateway_base_url, write_anthropic, write_gateway,
+};
 use session::{PiRunState, PiSession, PiTurnAdvance};
 use session_id::{agent_directory, observe_session, session_directory};
 use transcript::{PiAttempt, PiEmission, PiResult, PiTranscript};
@@ -224,20 +226,35 @@ impl PiAdapter {
         // The `gateway` lane retargets the OpenAI provider and pins Responses; the `anthropic`
         // lane only retargets the endpoint and keeps Pi's Anthropic Messages protocol, which is
         // the same escape hatch Claude Code offers through `ANTHROPIC_BASE_URL`.
-        let (selection, base_url) = match self.provider {
-            PiProvider::Gateway => (GATEWAY, Some(gateway_base_url(&invocation.environment)?)),
-            PiProvider::Anthropic => (
-                ANTHROPIC,
-                declared_base_url(&invocation.environment, command::ANTHROPIC_BASE_URL),
-            ),
-            _ => (GATEWAY, None),
+        // The gateway lane registers its own provider, carrying the caller's endpoint, key, and
+        // wire protocol. The anthropic lane only retargets the endpoint and keeps Pi's Messages
+        // protocol, the same escape hatch Claude Code offers through `ANTHROPIC_BASE_URL`.
+        let model = match &invocation.node.binding {
+            NodeRuntimeBinding::Agent { model, .. } => model.as_str(),
+            _ => {
+                return Err(NodeRunnerError::DriverDetail(
+                    "Pi command requires an agent runtime binding".to_owned(),
+                ));
+            }
         };
-        // A declared endpoint ends native reuse: the credential and the endpoint then both come
-        // from the connection, so inheriting the user's own agent directory would send a stored
-        // login to a caller-owned host.
-        let native_local = self.native_local() && base_url.is_none();
-        if let Some(base_url) = base_url {
-            write_models(&agent_dir, selection, &base_url).map_err(|error| {
+        let document = match self.provider {
+            PiProvider::Gateway => {
+                let base_url = gateway_base_url(&invocation.environment)?;
+                let api = declared_api(&invocation.environment, command::GATEWAY_API)?;
+                Some(write_gateway(&agent_dir, &base_url, &api, model))
+            }
+            PiProvider::Anthropic => {
+                declared_base_url(&invocation.environment, command::ANTHROPIC_BASE_URL)
+                    .map(|base_url| write_anthropic(&agent_dir, &base_url))
+            }
+            _ => None,
+        };
+        // A caller-owned endpoint ends native reuse: the credential and the endpoint then both
+        // come from the connection, so inheriting the user's own agent directory would send a
+        // stored login to a caller-owned host.
+        let native_local = self.native_local() && document.is_none();
+        if let Some(document) = document {
+            document.map_err(|error| {
                 NodeRunnerError::DriverDetail(format!("Pi provider configuration failed: {error}"))
             })?;
         }

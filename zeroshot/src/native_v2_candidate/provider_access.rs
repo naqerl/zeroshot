@@ -92,8 +92,10 @@ fn pi_contract(provider: PiProvider) -> ProviderAccessContract {
         PiProvider::Gateway => ProviderAccessContract::new(
             false,
             "gateway",
-            &["GATEWAY_BASE_URL", "GATEWAY_API_KEY"],
-            &[&["GATEWAY_BASE_URL", "GATEWAY_API_KEY"]],
+            // The wire protocol is authored alongside the endpoint, never inferred from the
+            // caller-owned model identifier.
+            &["GATEWAY_BASE_URL", "GATEWAY_API_KEY", "GATEWAY_API"],
+            &[&["GATEWAY_BASE_URL", "GATEWAY_API_KEY", "GATEWAY_API"]],
         ),
         PiProvider::Bedrock => ProviderAccessContract::new(
             false,

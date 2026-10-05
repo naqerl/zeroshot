@@ -97,7 +97,7 @@ fn contained_and_non_native_lanes_receive_canonical_fallbacks() {
             "pi",
             "gateway",
             ProviderAccessPlacement::Contained,
-            json!({"gateway":["GATEWAY_BASE_URL","GATEWAY_API_KEY"]}),
+            json!({"gateway":["GATEWAY_BASE_URL","GATEWAY_API_KEY","GATEWAY_API"]}),
         ),
     ] {
         let mut runtime = runtime(harness, provider, json!({}));
