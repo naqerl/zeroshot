@@ -92,12 +92,6 @@ fn pi_contract(provider: PiProvider) -> ProviderAccessContract {
             &["GATEWAY_BASE_URL", "GATEWAY_API_KEY"],
             &[&["GATEWAY_BASE_URL", "GATEWAY_API_KEY"]],
         ),
-        PiProvider::OpenCodeGo => ProviderAccessContract::new(
-            true,
-            "opencode",
-            &["OPENCODE_API_KEY"],
-            &[&["OPENCODE_API_KEY"]],
-        ),
         PiProvider::Bedrock => ProviderAccessContract::new(
             false,
             "bedrock",

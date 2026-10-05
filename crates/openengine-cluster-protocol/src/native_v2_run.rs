@@ -412,10 +412,6 @@ pub enum PiProvider {
     OpenRouter,
     Gateway,
     Bedrock,
-    /// OpenCode Go. Pi owns this provider's endpoint and per-model wire protocol, so the adapter
-    /// only supplies its credential and never synthesizes a provider document.
-    #[serde(rename = "opencode_go")]
-    OpenCodeGo,
 }
 
 impl PiProvider {
@@ -424,7 +420,7 @@ impl PiProvider {
     /// environment, so native reuse means exactly that stored credential.
     #[must_use]
     pub const fn natively_authenticated(self) -> bool {
-        matches!(self, Self::Anthropic | Self::OpenAi | Self::OpenCodeGo)
+        matches!(self, Self::Anthropic | Self::OpenAi)
     }
 }
 

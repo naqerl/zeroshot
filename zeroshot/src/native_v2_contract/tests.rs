@@ -117,7 +117,6 @@ fn every_pi_lane_round_trips() {
         ("openrouter", "anthropic/claude-sonnet-5"),
         ("bedrock", "global.anthropic.claude-sonnet-5"),
         ("gateway", "provider-owned-model"),
-        ("opencode_go", "space-bunny-free"),
     ] {
         let mut expected = canonical_submission();
         *expected.pointer_mut("/runtime/harness").assert_value() = json!("pi");
