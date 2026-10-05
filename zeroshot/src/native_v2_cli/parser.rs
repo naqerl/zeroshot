@@ -51,6 +51,7 @@ enum CliCommand {
     ///
     /// The built-in `cloud` target points to https://api.cloud.zeroshot.sh.
     /// Run `zeroshot target login cloud` to sign in.
+    /// See https://cloud.zeroshot.sh/docs for Cloud setup.
     Target {
         #[command(subcommand)]
         command: TargetCommand,
