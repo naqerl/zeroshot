@@ -11,7 +11,7 @@ use openengine_cluster_testkit::assertions::AssertValue;
 use serde_json::Value;
 
 use super::command::{PiCommandInput, PiCommandRequest, pi_arguments};
-use super::provider_document::{MODELS_FILE, gateway_base_url, write_models};
+use super::provider_document::{MODELS_FILE, gateway_base_url};
 use super::session::{PiSession, identity};
 use super::session_id::{observe_session, pi_session_id};
 use super::{PiAdapter, PiAdapterConfigError, PiConfig, PiProcessEnvironment};
@@ -82,10 +82,6 @@ fn delivery_binding() -> NodeRuntimeBinding {
 }
 
 /// A resolved environment carrying exactly the supplied values, through the declared-connection path.
-fn declared_names(fields: &[&str]) -> Vec<crate::native_v2_contract::EnvironmentVariableName> {
-    fields.iter().map(|name| environment_name(name)).collect()
-}
-
 fn resolved(fields: &[&str], values: &[(&str, &str)]) -> ResolvedEnvironment {
     let binding = agent_binding("openai/gpt-5", None, SessionScope::Execution, fields);
     let mut map = BTreeMap::new();
@@ -182,7 +178,6 @@ fn coverage_contract_pi_argv_uses_pi_own_provider_names() {
         (PiProvider::OpenAi, "openai"),
         (PiProvider::OpenRouter, "openrouter"),
         (PiProvider::Bedrock, "amazon-bedrock"),
-        (PiProvider::Gateway, "openai"),
     ] {
         assert_eq!(
             value(&argv_for(provider, false), "--provider").as_deref(),
@@ -350,35 +345,13 @@ fn coverage_contract_pi_reports_a_provider_identity_mismatch_as_a_failure() {
 }
 
 #[test]
-fn coverage_contract_pi_gateway_models_json_pins_responses_and_holds_no_secret() {
-    let directory = TestDirectory::new("pi-gateway");
-    let agent_dir = directory.child("agent");
-    let fields = declared_names(&["GATEWAY_BASE_URL", "GATEWAY_API_KEY"]);
-    let resolved = resolved(
-        &["GATEWAY_BASE_URL", "GATEWAY_API_KEY"],
-        &[
-            ("GATEWAY_BASE_URL", "https://gateway.example/api/v1"),
-            ("GATEWAY_API_KEY", "sk-gateway-secret"),
-        ],
-    );
-    assert_eq!(fields.len(), 2);
-    let path = write_models(
-        &agent_dir,
-        super::provider_document::GATEWAY,
-        &gateway_base_url(&resolved).unwrap(),
-    )
-    .assert_value();
-    assert_eq!(path, agent_dir.join(MODELS_FILE));
-    let contents = directory.read("agent/models.json");
-    let document: serde_json::Value = serde_json::from_str(&contents).unwrap();
-    let provider = &document["providers"]["openai"];
-    assert_eq!(provider["api"], "openai-responses");
-    assert_eq!(provider["baseUrl"], "https://gateway.example/api/v1");
-    // The secret stays in the declared connection, referenced through Pi's own interpolation.
-    assert_eq!(provider["apiKey"], "$GATEWAY_API_KEY");
-    assert!(!contents.contains("sk-gateway-secret"));
-    // No model list is synthesized, so Pi keeps the built-in openai catalog.
-    assert!(provider.get("models").is_none());
+fn coverage_contract_pi_gateway_provider_is_registered_rather_than_a_built_in_override() {
+    // Pi honors a protocol on a registered provider and ignores it on a built-in one, so the lane
+    // registers its own name instead of retargeting `openai`.
+    let argv = argv_for(PiProvider::Gateway, false);
+    let provider = value(&argv, "--provider").expect("gateway selects a provider");
+    assert_eq!(provider, super::provider_document::GATEWAY.provider);
+    assert_ne!(provider, "openai");
 }
 
 #[test]

@@ -27,6 +27,9 @@ pub(super) const ANTHROPIC_BASE_URL: &str = "ANTHROPIC_BASE_URL";
 const ANTHROPIC_AUTH: &str = "ANTHROPIC_AUTH_TOKEN";
 const ANTHROPIC_OAUTH: &str = "ANTHROPIC_OAUTH_TOKEN";
 pub(super) const OPENAI_KEY: &str = "OPENAI_API_KEY";
+/// Caller-owned wire protocol for the gateway lane. Zeroshot never infers it from the opaque model
+/// identifier; the caller names one of the protocols Pi implements.
+pub(super) const GATEWAY_API: &str = "GATEWAY_API";
 
 /// Pi's agent directory. Contained runs and every non-native-local lane point this at a private
 /// home so no ambient configuration, model catalog, or stored login can be inherited.
@@ -82,7 +85,10 @@ pub(super) struct PiCommandInput<'a> {
 const fn provider_name(provider: PiProvider) -> &'static str {
     match provider {
         PiProvider::Anthropic => "anthropic",
-        PiProvider::OpenAi | PiProvider::Gateway => "openai",
+        PiProvider::OpenAi => "openai",
+        // The gateway lane registers its own provider so the caller's wire protocol is honored;
+        // Pi ignores a protocol override on a built-in provider.
+        PiProvider::Gateway => crate::native_v2_pi::provider_document::GATEWAY.provider,
         PiProvider::OpenRouter => "openrouter",
         PiProvider::Bedrock => "amazon-bedrock",
     }
@@ -334,11 +340,16 @@ fn accept_bedrock(environment: &BTreeMap<String, String>) -> Result<(), NodeRunn
     validate_absent(environment, &FOREIGN_CREDENTIALS[..4])
 }
 
-/// The gateway lane pins the OpenAI Responses implementation through Pi's own `models.json`, so
-/// the caller's base URL and key stay in the declared connection and the synthesized file holds no
-/// secret. Pinning the discriminant is an adapter-owned choice, never protocol detection.
+/// The gateway lane carries a caller-owned endpoint, key, and wire protocol through Pi's own
+/// `models.json`. The base URL and key stay in the declared connection and the synthesized file
+/// holds no secret. The protocol is authored, never detected.
 fn accept_gateway(environment: &BTreeMap<String, String>) -> Result<(), NodeRunnerError> {
     let _ = gateway::connection(environment)?;
+    environment
+        .get(GATEWAY_API)
+        .filter(|value| !value.trim().is_empty())
+        .map(|_| ())
+        .ok_or(NodeRunnerError::Driver)?;
     validate_absent(environment, &FOREIGN_CREDENTIALS[..4])
 }
 

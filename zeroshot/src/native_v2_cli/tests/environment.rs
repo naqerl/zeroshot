@@ -2,7 +2,7 @@ use std::ffi::OsString;
 
 use openengine_cluster_protocol::RuntimePlan;
 use openengine_cluster_testkit::assertions::{AssertError, AssertValue};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::*;
 use crate::native_v2_cli::execution::{CliExecutionContext, execute_native_v2_cli_with_context};
@@ -443,9 +443,18 @@ async fn uniform_gateway_and_bedrock_runtime_materializes_for_every_supporting_h
     ] {
         // Every harness that owns a gateway or bedrock lane must materialize it identically.
         for harness in ["codex", "claude", "pi"] {
+            // The Pi gateway lane also carries the caller-authored wire protocol, so it
+            // materializes a third field rather than the two the other harnesses share.
+            let mut values = vec![(first, first_value), (second, second_value)];
+            if provider == "gateway" && harness == "pi" {
+                values.push(("GATEWAY_API", "openai-responses"));
+            }
+            // Requirements are materialized as a sorted set, so the expectation sorts too.
+            let mut fields = values.iter().map(|(field, _)| *field).collect::<Vec<_>>();
+            fields.sort_unstable();
             let available = |name: &str| {
-                [(first, first_value), (second, second_value)]
-                    .into_iter()
+                values
+                    .iter()
                     .find(|(field, _)| *field == name)
                     .map(|(_, value)| OsString::from(value))
             };
@@ -463,13 +472,13 @@ async fn uniform_gateway_and_bedrock_runtime_materializes_for_every_supporting_h
             assert_eq!(runtime.pointer("/provider"), Some(&json!(provider)));
             assert_eq!(
                 runtime.pointer(&format!("/nodes/worker/connections/{provider}")),
-                Some(&json!([first, second]))
+                Some(&json!(fields))
             );
             assert_eq!(
                 connections,
-                json!({
-                    provider: { first: first_value, second: second_value }
-                })
+                json!({ provider: Value::Object(
+                values.into_iter().map(|(field, value)| (field.to_owned(), json!(value))).collect()
+            ) })
             );
         }
     }
