@@ -424,7 +424,7 @@ async fn uniform_runtime_is_materialized_by_rust_against_the_selected_graph() {
 }
 
 #[tokio::test]
-async fn uniform_gateway_and_bedrock_runtime_materializes_for_both_harnesses_with_exact_defaults() {
+async fn uniform_gateway_and_bedrock_runtime_materializes_for_every_supporting_harness() {
     for (provider, first, first_value, second, second_value) in [
         (
             "bedrock",
@@ -441,7 +441,8 @@ async fn uniform_gateway_and_bedrock_runtime_materializes_for_both_harnesses_wit
             "https://gateway.example/api/v1",
         ),
     ] {
-        for harness in ["codex", "claude"] {
+        // Every harness that owns a gateway or bedrock lane must materialize it identically.
+        for harness in ["codex", "claude", "pi"] {
             let available = |name: &str| {
                 [(first, first_value), (second, second_value)]
                     .into_iter()

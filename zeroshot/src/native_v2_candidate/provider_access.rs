@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use openengine_cluster_protocol::{
     ClaudeProvider, CodexProvider, ConnectionKey, DeclaredConnections, DeclaredEnvironment,
-    EnvironmentVariableName, NativeV2RunValueError, NodeRuntimeBinding, RuntimePlan,
+    EnvironmentVariableName, NativeV2RunValueError, NodeRuntimeBinding, PiProvider, RuntimePlan,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +58,46 @@ fn provider_access_contract(runtime: &RuntimePlan) -> ProviderAccessContract {
         ),
         RuntimePlan::Codex { provider, .. } => codex_contract(*provider),
         RuntimePlan::Claude { provider, .. } => claude_contract(*provider),
+        RuntimePlan::Pi { provider, .. } => pi_contract(*provider),
+    }
+}
+
+/// Pi resolves credentials from its own agent directory before the process environment, so a
+/// native-local lane reuses the user's stored login and every other lane must receive its
+/// canonical requirement without inheriting an ambient credential.
+fn pi_contract(provider: PiProvider) -> ProviderAccessContract {
+    match provider {
+        PiProvider::Anthropic => ProviderAccessContract::new(
+            true,
+            "anthropic",
+            &["ANTHROPIC_API_KEY"],
+            &[
+                &["ANTHROPIC_API_KEY"],
+                &["ANTHROPIC_AUTH_TOKEN"],
+                &["ANTHROPIC_OAUTH_TOKEN"],
+            ],
+        ),
+        PiProvider::OpenAi => {
+            ProviderAccessContract::new(true, "openai", &["OPENAI_API_KEY"], &[&["OPENAI_API_KEY"]])
+        }
+        PiProvider::OpenRouter => ProviderAccessContract::new(
+            false,
+            "openrouter",
+            &["OPENROUTER_API_KEY"],
+            &[&["OPENROUTER_API_KEY"]],
+        ),
+        PiProvider::Gateway => ProviderAccessContract::new(
+            false,
+            "gateway",
+            &["GATEWAY_BASE_URL", "GATEWAY_API_KEY"],
+            &[&["GATEWAY_BASE_URL", "GATEWAY_API_KEY"]],
+        ),
+        PiProvider::Bedrock => ProviderAccessContract::new(
+            false,
+            "bedrock",
+            &["AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION"],
+            &[&["AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION"]],
+        ),
     }
 }
 
@@ -130,7 +170,8 @@ fn runtime_nodes_mut(
     match runtime {
         RuntimePlan::Copilot { nodes, .. }
         | RuntimePlan::Codex { nodes, .. }
-        | RuntimePlan::Claude { nodes, .. } => nodes,
+        | RuntimePlan::Claude { nodes, .. }
+        | RuntimePlan::Pi { nodes, .. } => nodes,
     }
 }
 

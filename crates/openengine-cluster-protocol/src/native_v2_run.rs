@@ -397,6 +397,33 @@ pub enum ClaudeProvider {
     Bedrock,
 }
 
+/// Provider lanes owned by the Pi harness.
+///
+/// Each variant names one Pi provider whose credentials resolve through a named connection. Pi
+/// owns the wire behavior of every lane; this enum only selects which lane the adapter
+/// configures and which requirements admission materializes.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PiProvider {
+    Anthropic,
+    #[serde(rename = "openai")]
+    OpenAi,
+    #[serde(rename = "openrouter")]
+    OpenRouter,
+    Gateway,
+    Bedrock,
+}
+
+impl PiProvider {
+    /// True when a local run can reuse the user's stored Pi login for this lane, so the lane needs
+    /// no connection. Pi resolves credentials from its own agent directory before the process
+    /// environment, so native reuse means exactly that stored credential.
+    #[must_use]
+    pub const fn natively_authenticated(self) -> bool {
+        matches!(self, Self::Anthropic | Self::OpenAi)
+    }
+}
+
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]

@@ -98,7 +98,10 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   separate ten-second/4 MiB budget, never send a
   model prompt, suppress Claude hooks/auth helpers, and require confirmed process cleanup before the
   model turn. They do not rewrite settings files; normal native startup state may still be updated.
-  Verifier nodes use the same permission handling as workers across all harnesses. The shared prompt
+  Verifier nodes use the same permission handling as workers across all harnesses. Pi exposes no
+  permission control at all, so the Pi lane appends no bypass argument and runs no configuration
+  probe: its disposable capsule is the boundary, and a contained Pi run additionally pins the
+  default tool set and refuses project-local resources. The shared prompt
   renderer tells workers to use repository-declared setup, await terminal command status, and keep
   standalone executable tools in the run's `ZEROSHOT_TOOLS/bin` when provided. All workers and
   verifiers share the prepared workspace and can write files. Review instructions prohibit repairs
@@ -130,6 +133,19 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 - Provider continuation is bounded: Claude continues once after `system/api_retry`; Codex continues
   once after a terminal execution error. Both send literal `Continue` in the same session when one
   exists. Structured output receives at most two correction turns before `malformed`.
+- Pi drives one `pi --mode json` process per turn, with the node prompt on stdin so a large input
+  payload can never exceed the platform argument limit. Model identifiers stay caller-owned and Pi
+  owns their resolution. Its provider lanes are `anthropic`, `openai`, `openrouter`, `bedrock`, and
+  `gateway`; the gateway lane synthesizes a private `models.json` that pins the OpenAI Responses
+  implementation against the caller's base URL and references the declared key by interpolation, so
+  no secret enters the file and no Zeroshot-owned model catalog exists. A native-local lane reuses
+  the user's stored Pi login from its agent directory; every other lane receives a private agent
+  directory so no ambient configuration, catalog, or credential is inherited. Session identity is a
+  bounded SHA-256 of the node-instance or execution identity, because Pi requires an alphanumeric
+  charset and bounds only that charset. Pi reports a failed or aborted model response in its event
+  stream while still exiting successfully, so the terminal event's stop reason decides provider
+  success and exit status alone is insufficient. Pi has no response-schema flag, so the shared prompt
+  contract plus local validation remains authoritative and corrections stay bounded to two turns.
 - Copilot uses the pinned CLI's headless JSON-RPC protocol 3, with provider `github` and
   caller-owned model IDs. Structured output and corrections share one session; node-instance
   revisits resume from the current user's `COPILOT_HOME` locally and a private home when contained.

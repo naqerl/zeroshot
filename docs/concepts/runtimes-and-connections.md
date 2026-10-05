@@ -11,14 +11,14 @@ rule.
 
 Each agent binding names:
 
-1. a **harness**, `codex`, `claude`, or `copilot`;
+1. a **harness**, `codex`, `claude`, `copilot`, or `pi`;
 2. a **provider** supported by that harness;
 3. an opaque provider-owned **model** identifier;
 4. zero or more named **connections**, each declaring exact environment field names.
 
 The [RuntimePlan reference](../reference/runtime-plan.md#harness-and-provider) lists the accepted
-harness/provider pairs. Admission rejects known-incompatible pairs, such as `codex` with `anthropic` and `claude` with
-`openai`. Zeroshot does not check current provider availability, and model names remain
+harness/provider pairs. Admission rejects known-incompatible pairs, such as `codex` with `anthropic`,
+`claude` with `openai`, and `pi` with `github`. Zeroshot does not check current provider availability, and model names remain
 provider-owned.
 
 ## Uniform and exact plans
@@ -60,8 +60,9 @@ The submission environment or a target-owned connection store supplies the value
 them out of the graph, runtime JSON, run ledger, and observation records.
 
 When `connections` is omitted, Zeroshot materializes provider access for the selected execution
-placement. Local `codex`/`openai`, `claude`/`anthropic`, and `copilot`/`github` runs reuse the
-harness's native login and configuration without inventing a connection. A contained target, or
+placement. Local `codex`/`openai`, `claude`/`anthropic`, `copilot`/`github`, `pi`/`anthropic`, and
+`pi`/`openai` runs reuse the harness's native login and configuration without inventing a
+connection. A contained target, or
 any non-native provider lane, receives these canonical requirements:
 
 | Provider     | Connection key | Fields                                   |
@@ -107,7 +108,8 @@ zeroshot connection set gateway --field GATEWAY_BASE_URL --field GATEWAY_API_KEY
 
 Codex requires the OpenAI **Responses API**, including streaming and tool calls; Chat Completions
 alone is insufficient. It sends the key as a bearer token. Claude requires the Anthropic **Messages
-API** and sends the key in `x-api-key`. The selected gateway/model must support the harness's
+API** and sends the key in `x-api-key`. Pi also pins the OpenAI **Responses API** for its gateway
+endpoint, and reads the key from the same declared connection. The selected gateway/model must support the harness's
 requests, including structured output. Zeroshot does not probe capabilities or translate protocols.
 
 Supply the base URL expected by the selected harness, including any gateway path prefix. Zeroshot

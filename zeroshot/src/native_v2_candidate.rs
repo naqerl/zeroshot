@@ -16,6 +16,7 @@ use thiserror::Error;
 use crate::native_v2_claude::{ClaudeAdapter, ClaudeAdapterConfig, ClaudeAdapterConfigError};
 use crate::native_v2_codex::{NativeV2CodexAdapter, NativeV2CodexConfig};
 use crate::native_v2_copilot::{CopilotAdapter, CopilotConfig};
+use crate::native_v2_pi::{PiAdapter, PiAdapterConfigError, PiConfig};
 use crate::native_v2_contract::{AdmittedRun, NodeInvocation, NodeRuntimeBinding, RuntimePlan};
 use crate::native_v2_delivery::{
     GitHubDeliveryAuthority, NativeV2DeliveryAdapter, NativeV2DeliveryConfig,
@@ -37,6 +38,7 @@ pub enum NativeV2HarnessConfig {
     Copilot(CopilotConfig),
     Codex(NativeV2CodexConfig),
     Claude(ClaudeAdapterConfig),
+    Pi(PiConfig),
 }
 
 pub struct NativeV2CandidateConfig {
@@ -78,6 +80,8 @@ pub enum NativeV2CandidateError {
     WorkspaceMismatch,
     #[error(transparent)]
     Claude(#[from] ClaudeAdapterConfigError),
+    #[error(transparent)]
+    Pi(#[from] PiAdapterConfigError),
     #[error(transparent)]
     Runner(#[from] NodeRunnerError),
 }
@@ -175,6 +179,14 @@ fn build_candidate(
             });
             assemble_runner(admitted, CandidateAgents::new(agent), delivery, placement)
         }
+        NativeV2HarnessConfig::Pi(config) => {
+            let agent = Arc::new(if placement.is_local() {
+                PiAdapter::new_local(config)?
+            } else {
+                PiAdapter::new(config)?
+            });
+            assemble_runner(admitted, CandidateAgents::new(agent), delivery, placement)
+        }
     }
 }
 
@@ -192,6 +204,11 @@ fn validate_config(
             harness.workspace == config.delivery.workspace
         }
         (RuntimePlan::Claude { provider, .. }, NativeV2HarnessConfig::Claude(harness))
+            if provider == &harness.provider =>
+        {
+            harness.workspace == config.delivery.workspace
+        }
+        (RuntimePlan::Pi { provider, .. }, NativeV2HarnessConfig::Pi(harness))
             if provider == &harness.provider =>
         {
             harness.workspace == config.delivery.workspace

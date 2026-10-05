@@ -16,7 +16,7 @@ machine-readable contract.
 
 | Field      | Value                                                                              |
 | ---------- | ---------------------------------------------------------------------------------- |
-| `harness`  | `codex`, `claude`, or `copilot`                                                    |
+| `harness`  | `codex`, `claude`, `copilot`, or `pi`                                            |
 | `provider` | A provider supported by the selected harness                                       |
 | `size`     | `small`, `medium`, or `large`                                                      |
 | `nodes`    | Object mapping each executable graph node name to a [node binding](#node-bindings) |
@@ -54,8 +54,14 @@ This plan binds the four agent nodes of the built-in `software-change` template:
 | `codex`   | `openai`, `openrouter`, `bedrock`, `gateway`    |
 | `claude`  | `anthropic`, `openrouter`, `bedrock`, `gateway` |
 | `copilot` | `github`                                        |
+| `pi`      | `anthropic`, `openai`, `openrouter`, `bedrock`, `gateway` |
 
 Any other pair is rejected when the plan is read.
+
+`pi/anthropic` and `pi/openai` reuse a local Pi login from `~/.pi/agent`; the other `pi` lanes
+need a connection. Pi's `gateway` lane pins the OpenAI Responses implementation against the
+caller's `GATEWAY_BASE_URL`, and Pi has no permission control of its own, so a contained `pi` run
+relies on the disposable capsule rather than a bypass argument.
 
 ## Node bindings
 

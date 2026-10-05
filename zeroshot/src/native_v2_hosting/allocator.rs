@@ -34,6 +34,7 @@ use crate::native_v2_cloud::{
 };
 use crate::native_v2_codex::NativeV2CodexConfig;
 use crate::native_v2_contract::{AdmittedRun, RuntimePlan};
+use crate::native_v2_pi::{PiConfig, PiProcessEnvironment};
 use crate::native_v2_delivery::{
     DeliveryLineage, GhCliAuthorityConfig, GhCliDeliveryAuthority, NativeV2DeliveryConfig,
 };
@@ -61,6 +62,9 @@ pub(super) struct ProductionCapsuleConfig {
     pub claude_executable: String,
     pub claude_prefix_arguments: Vec<String>,
     pub claude_process_environment: ClaudeProcessEnvironment,
+    pub pi_executable: String,
+    pub pi_prefix_arguments: Vec<String>,
+    pub pi_process_environment: PiProcessEnvironment,
     pub executable_search_path: String,
     pub git_program: PathBuf,
     pub gh_program: PathBuf,
@@ -176,6 +180,7 @@ impl ProductionCapsuleAllocator {
         if config.copilot_executable.as_os_str().is_empty()
             || config.codex_executable.as_os_str().is_empty()
             || config.claude_executable.is_empty()
+            || config.pi_executable.is_empty()
             || config.git_program.as_os_str().is_empty()
             || config.gh_program.as_os_str().is_empty()
         {
@@ -693,6 +698,32 @@ impl ProductionCapsuleAllocator {
                     native_environment: Default::default(),
                     base_environment: base_environment.clone(),
                     search_path: search_path.clone(),
+                    process_pool,
+                }))
+            }
+            RuntimePlan::Pi { provider, .. } => {
+                let base_environment = self
+                    .config
+                    .pi_process_environment
+                    .for_capsule(&filesystem.runtime_home, &search_path)
+                    .map_err(|_| CapsuleAllocationUnavailable::Runtime)?;
+                let mut values = base_environment.clone_values();
+                values.insert(
+                    "ZEROSHOT_TOOLS".to_owned(),
+                    environment::tools_directory(run_root)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                Ok(NativeV2HarnessConfig::Pi(PiConfig {
+                    provider: *provider,
+                    executable: self.config.pi_executable.clone(),
+                    prefix_arguments: self.config.pi_prefix_arguments.clone(),
+                    workspace: filesystem.workspace.clone(),
+                    runtime_home: filesystem.runtime_home.clone(),
+                    local_user_home: None,
+                    native_environment: Default::default(),
+                    base_environment: PiProcessEnvironment::new(values)
+                        .map_err(|_| CapsuleAllocationUnavailable::Runtime)?,
                     process_pool,
                 }))
             }

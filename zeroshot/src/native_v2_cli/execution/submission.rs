@@ -10,7 +10,7 @@ use std::pin::Pin;
 use openengine_cluster_protocol::{
     ClaudeProvider, CodexProvider, DeclaredConnections, DeclaredEnvironment,
     EnvironmentVariableName, GraphProfile, GraphSpec, IdempotencyKey, ModelId, NodeName,
-    NodeRuntimeBinding, ReasoningEffort, RunConnectionValues, RunSize, RunSubmitResult,
+    NodeRuntimeBinding, PiProvider, ReasoningEffort, RunConnectionValues, RunSize, RunSubmitResult,
     RunConnectionRequirements, RuntimePlan, SessionScope, StaticConnectionValues,
 };
 use serde::Deserialize;
@@ -431,6 +431,7 @@ enum UniformHarness {
     Copilot,
     Codex,
     Claude,
+    Pi,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -533,6 +534,11 @@ impl UniformRuntimePlan {
                 size: self.size,
                 nodes,
             }),
+            UniformHarness::Pi => Ok(RuntimePlan::Pi {
+                provider: self.provider.pi().ok_or_else(incompatible)?,
+                size: self.size,
+                nodes,
+            }),
             UniformHarness::Copilot => Err(incompatible()),
         }
     }
@@ -555,6 +561,17 @@ impl UniformProvider {
             Self::OpenRouter => Some(ClaudeProvider::OpenRouter),
             Self::Gateway => Some(ClaudeProvider::Gateway),
             Self::Bedrock => Some(ClaudeProvider::Bedrock),
+            _ => None,
+        }
+    }
+
+    const fn pi(self) -> Option<PiProvider> {
+        match self {
+            Self::Anthropic => Some(PiProvider::Anthropic),
+            Self::OpenAi => Some(PiProvider::OpenAi),
+            Self::OpenRouter => Some(PiProvider::OpenRouter),
+            Self::Gateway => Some(PiProvider::Gateway),
+            Self::Bedrock => Some(PiProvider::Bedrock),
             _ => None,
         }
     }
@@ -594,7 +611,8 @@ fn insert_template_binding(
     let nodes = match runtime {
         RuntimePlan::Copilot { nodes, .. }
         | RuntimePlan::Codex { nodes, .. }
-        | RuntimePlan::Claude { nodes, .. } => nodes,
+        | RuntimePlan::Claude { nodes, .. }
+        | RuntimePlan::Pi { nodes, .. } => nodes,
     };
     if let Some(existing) = nodes.get_mut(&name) {
         let NodeRuntimeBinding::GitDelivery {

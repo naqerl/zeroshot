@@ -174,6 +174,30 @@ impl ProviderExecutionFiles {
         self.home.path()
     }
 
+    /// Files for tests that only read the home and workspace paths, without launching a process.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        root: &Path,
+        scope: crate::execution::process::HostedProcessScope,
+    ) -> Result<Self, ProcessRunnerError> {
+        let (runner, home) = ProviderProcessRunners::Local.turn_process(root, scope)?;
+        // The scratch and execution directories live beside the session home, which turn_process
+        // already created, so a test never has to invent a second naming scheme.
+        let scratch = home.join("scratch");
+        let execution = home.join("execution");
+        create_private_directory(&scratch)
+            .map_err(|error| ProcessRunnerError::Launch(error.to_string()))?;
+        create_private_directory(&execution)
+            .map_err(|error| ProcessRunnerError::Launch(error.to_string()))?;
+        Ok(Self {
+            runner,
+            workspace: root.to_path_buf(),
+            scratch,
+            home: Arc::new(PrivateDirectory::retained(home)),
+            root: PrivateDirectory::retained(execution),
+        })
+    }
+
     pub(crate) fn scratch_text(&self) -> Result<String, ProcessRunnerError> {
         self.scratch.to_str().map(str::to_owned).ok_or_else(|| {
             ProcessRunnerError::InvalidCommand(

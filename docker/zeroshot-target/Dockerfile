@@ -45,6 +45,7 @@ FROM node:24-trixie-slim AS tooling
 ARG COPILOT_VERSION=1.0.86
 ARG CODEX_VERSION=0.155.0
 ARG CLAUDE_CODE_VERSION=2.1.276
+ARG PI_VERSION=1.0.3
 ARG TARGETARCH
 ARG GH_VERSION=2.101.0
 ARG NPM_VERSION=11.19.1
@@ -109,8 +110,9 @@ RUN install -d /opt/zeroshot/bin /opt/zeroshot/harness/lib/node_modules \
         "@github/copilot@${COPILOT_VERSION}" \
         "@openai/codex@${CODEX_VERSION}" \
         "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+        "@earendil-works/pi-coding-agent@${PI_VERSION}" \
     && npm cache clean --force \
-    && for tool in codex claude copilot; do \
+    && for tool in codex claude copilot pi; do \
         ln -s /usr/local/libexec/zeroshot-harness "/usr/local/bin/$tool"; \
     done
 

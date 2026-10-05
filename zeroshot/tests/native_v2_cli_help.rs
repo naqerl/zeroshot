@@ -116,18 +116,30 @@ fn help_explains_runtime_configuration() {
         SessionScope::NodeInstance,
     ]));
     let contract_prose = [
+        // Every admitted harness/provider pair is enumerated in one place, so a new lane cannot be
+        // added to the protocol without appearing in the CLI contract.
         concat!(
             "provider choices are codex/openai, codex/openrouter, codex/bedrock, ",
-            "claude/anthropic, claude/openrouter, claude/bedrock, codex/gateway, claude/gateway, and copilot/github."
+            "claude/anthropic, claude/openrouter, claude/bedrock, codex/gateway, claude/gateway, ",
+            "copilot/github, pi/anthropic, pi/openai, pi/openrouter, pi/bedrock, and pi/gateway."
         )
         .to_owned(),
         concat!(
             "gateway connections require gateway_base_url and gateway_api_key; ",
-            "codex uses responses and claude uses messages."
+            "codex uses responses, claude uses messages, and pi pins openai responses ",
+            "for its gateway endpoint."
         )
         .to_owned(),
-        "known-incompatible harness/provider pairs include codex/anthropic and claude/openai."
-            .to_owned(),
+        concat!(
+            "known-incompatible harness/provider pairs include codex/anthropic, claude/openai, ",
+            "and pi/github."
+        )
+        .to_owned(),
+        concat!(
+            "pi has no permission control of its own, so its contained runs rely on the ",
+            "disposable capsule rather than a bypass argument."
+        )
+        .to_owned(),
         concat!(
             "model ids are passed unchanged to the selected harness and provider; ",
             "zeroshot does not maintain or validate provider model catalogs."

@@ -27,6 +27,7 @@ use crate::native_v2_cli::PreparedRunRequest;
 use crate::native_v2_codex::{NativeV2CodexConfig, NativeV2CodexUser};
 use crate::native_v2_contract::AdmittedRun;
 use crate::native_v2_copilot::{CopilotConfig, CopilotLocalUser};
+use crate::native_v2_pi::{PiAdapterConfigError, PiConfig, PiProcessEnvironment};
 use crate::native_v2_capsule::provider_process::{COPILOT_LOCAL_ENVIRONMENT, LocalHarnessEnvironment};
 use crate::native_v2_delivery::{
     DeliveryTarget, GhCliAuthorityConfig, GhCliDeliveryAuthority, NativeV2DeliveryConfig,
@@ -62,6 +63,8 @@ pub enum LocalCompositionError {
     NativeEnvironment,
     #[error(transparent)]
     Claude(#[from] ClaudeAdapterConfigError),
+    #[error(transparent)]
+    Pi(#[from] PiAdapterConfigError),
     #[error(transparent)]
     Candidate(#[from] NativeV2CandidateError),
 }
@@ -390,6 +393,20 @@ fn local_harness(
                 process_pool,
             })
         }
+        RuntimePlan::Pi { provider, .. } => NativeV2HarnessConfig::Pi(PiConfig {
+            provider: *provider,
+            executable: "pi".to_owned(),
+            prefix_arguments: Vec::new(),
+            workspace: workspace.to_owned(),
+            runtime_home: runtime_home.to_owned(),
+            local_user_home: current_user_home(&native_environment),
+            native_environment: native_environment.clone(),
+            base_environment: PiProcessEnvironment::new(BTreeMap::from([
+                ("PATH".to_owned(), search_path.clone()),
+                ("ZEROSHOT_TOOLS".to_owned(), String::new()),
+            ]))?,
+            process_pool,
+        }),
     };
     Ok(harness)
 }

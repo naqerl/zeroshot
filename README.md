@@ -57,7 +57,7 @@ The installer requires Node.js 18 or newer and installs a verified native binary
 x64/arm64, macOS x64/arm64, or Windows x64. It also installs one Zeroshot skill for Codex, GitHub
 Copilot, and Claude Code at user scope.
 
-For local execution, install and sign in to Codex, Claude Code, or GitHub Copilot. Local runs can
+For local execution, install and sign in to Codex, Claude Code, GitHub Copilot, or Pi. Local runs can
 reuse the harness's existing login, including subscription-backed sessions. See the
 [installation guide](docs/getting-started/install.md) for harness prerequisites.
 
@@ -224,7 +224,7 @@ are a Zeroshot Cloud feature.
 ### Self-hosted: run the Docker target
 
 Keep execution and durable state on infrastructure you control. The target image includes the native
-engine plus pinned Codex, Claude, and GitHub Copilot harness CLIs.
+engine plus pinned Codex, Claude, GitHub Copilot, and Pi harness CLIs.
 
 ```bash
 docker run --detach --restart unless-stopped --name zeroshot-target \

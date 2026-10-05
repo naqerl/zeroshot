@@ -10,7 +10,8 @@ use crate::{
 };
 
 use super::{
-    ClaudeProvider, CodexProvider, CopilotProvider, NodeRuntimeBinding, RunSize, ResolvedSource,
+    ClaudeProvider, CodexProvider, CopilotProvider, NodeRuntimeBinding, PiProvider, RunSize,
+    ResolvedSource,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -31,15 +32,21 @@ pub enum RuntimePlan {
         size: RunSize,
         nodes: BTreeMap<NodeName, NodeRuntimeBinding>,
     },
+    Pi {
+        provider: PiProvider,
+        size: RunSize,
+        nodes: BTreeMap<NodeName, NodeRuntimeBinding>,
+    },
 }
 
 impl RuntimePlan {
     #[must_use]
     pub const fn size(&self) -> RunSize {
         match self {
-            Self::Copilot { size, .. } | Self::Codex { size, .. } | Self::Claude { size, .. } => {
-                *size
-            }
+            Self::Copilot { size, .. }
+            | Self::Codex { size, .. }
+            | Self::Claude { size, .. }
+            | Self::Pi { size, .. } => *size,
         }
     }
 
@@ -48,7 +55,8 @@ impl RuntimePlan {
         match self {
             Self::Copilot { nodes, .. }
             | Self::Codex { nodes, .. }
-            | Self::Claude { nodes, .. } => nodes,
+            | Self::Claude { nodes, .. }
+            | Self::Pi { nodes, .. } => nodes,
         }
     }
 
