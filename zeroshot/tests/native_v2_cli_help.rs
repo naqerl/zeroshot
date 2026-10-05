@@ -127,7 +127,9 @@ fn help_explains_runtime_configuration() {
         concat!(
             "gateway connections require gateway_base_url and gateway_api_key; ",
             "codex uses responses, claude uses messages, and pi pins openai responses ",
-            "for its gateway endpoint, so that gateway must support the responses api."
+            "for its gateway endpoint, so that gateway must support the responses api. ",
+            "declaring anthropic_base_url with anthropic_api_key sends the pi/anthropic lane ",
+            "to a caller-owned anthropic messages endpoint."
         )
         .to_owned(),
         concat!(

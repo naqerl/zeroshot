@@ -59,7 +59,10 @@ This plan binds the four agent nodes of the built-in `software-change` template:
 Any other pair is rejected when the plan is read.
 
 `pi/anthropic` and `pi/openai` reuse a local Pi login from `~/.pi/agent`; the other `pi` lanes
-need a connection. Pi's `gateway` lane pins the OpenAI Responses implementation against the
+need a connection. To send the `anthropic` lane to a caller-owned Messages-compatible endpoint,
+declare `ANTHROPIC_BASE_URL` together with `ANTHROPIC_API_KEY`. Pi ignores that variable itself, so
+Zeroshot turns it into a provider override that keeps Pi's Anthropic Messages protocol. A declared
+endpoint ends native-login reuse, so the stored login is never sent to that host. Pi's `gateway` lane pins the OpenAI Responses implementation against the
 caller's `GATEWAY_BASE_URL`, so that gateway must support the Responses API: a
 Chat-Completions-only gateway is rejected by the provider. Pi has no permission control of its own,
 so a contained `pi` run relies on the disposable capsule rather than a bypass argument.

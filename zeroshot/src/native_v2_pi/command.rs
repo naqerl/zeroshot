@@ -21,6 +21,9 @@ pub(super) const AWS_BEARER_TOKEN_BEDROCK: &str = "AWS_BEARER_TOKEN_BEDROCK";
 pub(super) const AWS_REGION: &str = "AWS_REGION";
 pub(super) const OPENROUTER_KEY: &str = "OPENROUTER_API_KEY";
 pub(super) const ANTHROPIC_KEY: &str = "ANTHROPIC_API_KEY";
+/// Caller-owned Anthropic Messages endpoint. Pi ignores this variable for endpoint selection, so
+/// the adapter turns a declared value into a provider override.
+pub(super) const ANTHROPIC_BASE_URL: &str = "ANTHROPIC_BASE_URL";
 const ANTHROPIC_AUTH: &str = "ANTHROPIC_AUTH_TOKEN";
 const ANTHROPIC_OAUTH: &str = "ANTHROPIC_OAUTH_TOKEN";
 pub(super) const OPENAI_KEY: &str = "OPENAI_API_KEY";

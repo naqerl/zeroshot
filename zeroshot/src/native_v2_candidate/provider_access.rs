@@ -75,6 +75,9 @@ fn pi_contract(provider: PiProvider) -> ProviderAccessContract {
                 &["ANTHROPIC_API_KEY"],
                 &["ANTHROPIC_AUTH_TOKEN"],
                 &["ANTHROPIC_OAUTH_TOKEN"],
+                // A caller-owned Messages-compatible endpoint, the same escape hatch Claude Code
+                // offers through `ANTHROPIC_BASE_URL`.
+                &["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY"],
             ],
         ),
         PiProvider::OpenAi => {

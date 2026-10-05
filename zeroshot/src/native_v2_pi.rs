@@ -11,8 +11,8 @@
 
 #[path = "native_v2_pi/command.rs"]
 mod command;
-#[path = "native_v2_pi/gateway_config.rs"]
-mod gateway_config;
+#[path = "native_v2_pi/provider_document.rs"]
+mod provider_document;
 #[path = "native_v2_pi/session.rs"]
 mod session;
 #[path = "native_v2_pi/session_id.rs"]
@@ -37,7 +37,7 @@ use crate::native_v2_runner::{
     ResolvedEnvironment, render_agent_prompt, resolve_agent_response,
 };
 use command::{PiCommandRequest, command};
-use gateway_config::{base_url as gateway_base_url, write_models};
+use provider_document::{ANTHROPIC, GATEWAY, declared_base_url, gateway_base_url, write_models};
 use session::{PiRunState, PiSession, PiTurnAdvance};
 use session_id::{agent_directory, observe_session, session_directory};
 use transcript::{PiAttempt, PiEmission, PiResult, PiTranscript};
@@ -219,20 +219,31 @@ impl PiAdapter {
         session_id: &str,
     ) -> Result<ProcessSessionCommand, NodeRunnerError> {
         let (agent_dir, sessions) = self.homes(files);
-        // The gateway lane's endpoint is caller-owned, so it synthesizes its own provider file in
-        // the private agent directory. The base URL is read from the declared connection and the
-        // secret stays there too, referenced through Pi's own interpolation.
-        if self.provider == PiProvider::Gateway && !self.native_local() {
-            let base_url = gateway_base_url(&invocation.environment)?;
-            write_models(&agent_dir, &base_url).map_err(|error| {
-                NodeRunnerError::DriverDetail(format!(
-                    "Pi gateway provider configuration failed: {error}"
-                ))
+        // A caller-owned endpoint becomes Pi's own provider override in the private agent
+        // directory. The secret stays in the declared connection, referenced by interpolation.
+        // The `gateway` lane retargets the OpenAI provider and pins Responses; the `anthropic`
+        // lane only retargets the endpoint and keeps Pi's Anthropic Messages protocol, which is
+        // the same escape hatch Claude Code offers through `ANTHROPIC_BASE_URL`.
+        let (selection, base_url) = match self.provider {
+            PiProvider::Gateway => (GATEWAY, Some(gateway_base_url(&invocation.environment)?)),
+            PiProvider::Anthropic => (
+                ANTHROPIC,
+                declared_base_url(&invocation.environment, command::ANTHROPIC_BASE_URL),
+            ),
+            _ => (GATEWAY, None),
+        };
+        // A declared endpoint ends native reuse: the credential and the endpoint then both come
+        // from the connection, so inheriting the user's own agent directory would send a stored
+        // login to a caller-owned host.
+        let native_local = self.native_local() && base_url.is_none();
+        if let Some(base_url) = base_url {
+            write_models(&agent_dir, selection, &base_url).map_err(|error| {
+                NodeRunnerError::DriverDetail(format!("Pi provider configuration failed: {error}"))
             })?;
         }
         command(PiCommandRequest {
             provider: self.provider,
-            native_local: self.native_local(),
+            native_local,
             contained: self.contained,
             executable: &self.executable,
             prefix_arguments: &self.prefix_arguments,
@@ -243,6 +254,18 @@ impl PiAdapter {
             session_dir: &sessions,
             session_id,
         })
+    }
+
+    /// The launch command for one turn, exposed so tests can assert the endpoint and home
+    /// decisions without launching a process.
+    #[cfg(test)]
+    pub(crate) fn command_for_test(
+        &self,
+        invocation: &DriverInvocation,
+        files: &ProviderExecutionFiles,
+        session_id: &str,
+    ) -> Result<ProcessSessionCommand, NodeRunnerError> {
+        self.command(invocation, files, session_id)
     }
 
     fn redactions(&self, resolved: &ResolvedEnvironment) -> Vec<String> {
