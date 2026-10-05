@@ -242,11 +242,6 @@ zeroshot template show auto-research
 
 See [Execution](docs/concepts/execution.md) for the research workflow's decision and evidence rules.
 
-## Works with Opcore
-
-[Opcore](https://github.com/the-open-engine/opcore) works alongside Zeroshot: Opcore checks each edit while
-an agent writes code, and Zeroshot has independent agents review the whole change before it lands.
-
 ## Community
 
 - [Discord](https://discord.gg/fZyzf2Cut9): ask questions, share runs and graphs, and talk to the team.
@@ -261,6 +256,8 @@ an agent writes code, and Zeroshot has independent agents review the whole chang
 - [Python SDK](sdks/python/README.md)
 - [Cluster API reference](https://the-open-engine.github.io/zeroshot/current/reference/cluster/api/)
 - [Graph contract](docs/reference/cluster/graph.md)
+
+Also check out: [Opcore](https://github.com/the-open-engine/opcore).
 
 ## Development
 
