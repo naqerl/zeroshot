@@ -423,6 +423,7 @@ fn coverage_contract_pi_rejects_a_non_agent_binding() {
         prefix_arguments: &[],
         invocation: &invocation(delivery_binding(), NodeRole::Worker, resolved(&[], &[])),
         files: &files,
+        local_environment: &BTreeMap::new(),
         agent_dir: directory.path(),
         session_dir: &directory.child("sessions"),
         session_id: "zs-fixed",
@@ -456,6 +457,7 @@ fn coverage_contract_pi_declared_connections_may_not_shadow_reserved_configurati
                 resolved(&[reserved], &[(reserved, "authored")]),
             ),
             files: &files,
+            local_environment: &BTreeMap::new(),
             agent_dir: directory.path(),
             session_dir: &directory.child("sessions"),
             session_id: "zs-fixed",
@@ -465,6 +467,118 @@ fn coverage_contract_pi_declared_connections_may_not_shadow_reserved_configurati
             "reserved name {reserved} must be rejected"
         );
     }
+}
+
+#[test]
+fn coverage_contract_pi_local_shell_supplies_a_credential_when_none_is_declared() {
+    // A local run with no declared connection relies on the invoking shell, and that value must
+    // reach the Pi child: it is how a user who exports a key rather than storing one keeps it.
+    let directory = TestDirectory::new("pi-ambient");
+    let files = files(&directory);
+    let ambient = BTreeMap::from([(String::from("ANTHROPIC_API_KEY"), String::from("ambient"))]);
+    let command = super::command::command(PiCommandRequest {
+        provider: PiProvider::Anthropic,
+        native_local: false,
+        contained: false,
+        executable: "pi",
+        prefix_arguments: &[],
+        invocation: &invocation(
+            agent_binding(
+                "anthropic/claude-sonnet-4-5",
+                None,
+                SessionScope::Execution,
+                &[],
+            ),
+            NodeRole::Worker,
+            resolved(&[], &[]),
+        ),
+        files: &files,
+        local_environment: &ambient,
+        agent_dir: directory.path(),
+        session_dir: &directory.child("sessions"),
+        session_id: "zs-fixed",
+    })
+    .assert_value_with("ambient credential launch");
+    assert_eq!(
+        command
+            .environment
+            .get("ANTHROPIC_API_KEY")
+            .map(String::as_str),
+        Some("ambient")
+    );
+}
+
+#[test]
+fn coverage_contract_pi_declared_credential_beats_the_local_shell() {
+    let directory = TestDirectory::new("pi-ambient-declared");
+    let files = files(&directory);
+    let ambient = BTreeMap::from([(String::from("ANTHROPIC_API_KEY"), String::from("ambient"))]);
+    let command = super::command::command(PiCommandRequest {
+        provider: PiProvider::Anthropic,
+        native_local: false,
+        contained: false,
+        executable: "pi",
+        prefix_arguments: &[],
+        invocation: &invocation(
+            agent_binding(
+                "anthropic/claude-sonnet-4-5",
+                None,
+                SessionScope::Execution,
+                &["ANTHROPIC_API_KEY"],
+            ),
+            NodeRole::Worker,
+            resolved(&["ANTHROPIC_API_KEY"], &[("ANTHROPIC_API_KEY", "declared")]),
+        ),
+        files: &files,
+        local_environment: &ambient,
+        agent_dir: directory.path(),
+        session_dir: &directory.child("sessions"),
+        session_id: "zs-fixed",
+    })
+    .assert_value_with("declared credential wins");
+    assert_eq!(
+        command
+            .environment
+            .get("ANTHROPIC_API_KEY")
+            .map(String::as_str),
+        Some("declared")
+    );
+}
+
+#[test]
+fn coverage_contract_pi_gateway_refuses_a_foreign_ambient_credential() {
+    // The ambient merge happens before credential validation, so a key belonging to another lane
+    // is refused instead of riding along inside the gateway child.
+    let directory = TestDirectory::new("pi-ambient-gateway");
+    let files = files(&directory);
+    let ambient = BTreeMap::from([(String::from("ANTHROPIC_API_KEY"), String::from("ambient"))]);
+    let command = super::command::command(PiCommandRequest {
+        provider: PiProvider::Gateway,
+        native_local: false,
+        contained: false,
+        executable: "pi",
+        prefix_arguments: &[],
+        invocation: &invocation(
+            agent_binding("provider-model", None, SessionScope::Execution, &[]),
+            NodeRole::Worker,
+            resolved(
+                &["GATEWAY_BASE_URL", "GATEWAY_API_KEY"],
+                &[
+                    ("GATEWAY_BASE_URL", "https://gateway.example/api/v1"),
+                    ("GATEWAY_API_KEY", "declared"),
+                ],
+            ),
+        ),
+        files: &files,
+        local_environment: &ambient,
+        agent_dir: directory.path(),
+        session_dir: &directory.child("sessions"),
+        session_id: "zs-fixed",
+    });
+    assert!(
+        command.is_err(),
+        "a foreign ambient key must not reach the gateway lane"
+    );
 }
 
 #[test]
@@ -492,6 +606,7 @@ fn coverage_contract_pi_launches_with_the_resolved_lane_credentials() {
             ),
         ),
         files: &files,
+        local_environment: &BTreeMap::new(),
         agent_dir: directory.path(),
         session_dir: &sessions,
         session_id: "zs-fixed",
@@ -552,6 +667,7 @@ fn coverage_contract_pi_native_local_lane_leaves_the_agent_directory_unset() {
             resolved(&[], &[]),
         ),
         files: &files,
+        local_environment: &BTreeMap::new(),
         agent_dir: directory.path(),
         session_dir: &directory.child("sessions"),
         session_id: "zs-fixed",
@@ -590,6 +706,7 @@ fn coverage_contract_pi_foreign_lane_credentials_are_refused() {
                 resolved(&[foreign], &[(foreign, "smuggled")]),
             ),
             files: &files,
+            local_environment: &BTreeMap::new(),
             agent_dir: directory.path(),
             session_dir: &directory.child("sessions"),
             session_id: "zs-fixed",
@@ -619,6 +736,7 @@ fn coverage_contract_pi_present_but_empty_declared_credential_fails_closed() {
                 resolved(&[field], &[(field, "")]),
             ),
             files: &files,
+            local_environment: &BTreeMap::new(),
             agent_dir: directory.path(),
             session_dir: &directory.child("sessions"),
             session_id: "zs-fixed",
@@ -657,6 +775,7 @@ fn coverage_contract_pi_bedrock_lane_requires_its_own_pair() {
             ),
         ),
         files: &files,
+        local_environment: &BTreeMap::new(),
         agent_dir: directory.path(),
         session_dir: &directory.child("sessions"),
         session_id: "zs-fixed",
@@ -685,6 +804,7 @@ fn coverage_contract_pi_bedrock_lane_requires_its_own_pair() {
             resolved(&["AWS_REGION"], &[("AWS_REGION", "us-east-1")]),
         ),
         files: &files,
+        local_environment: &BTreeMap::new(),
         agent_dir: directory.path(),
         session_dir: &directory.child("sessions"),
         session_id: "zs-fixed",
