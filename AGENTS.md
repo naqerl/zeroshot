@@ -69,6 +69,12 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   OpenAI-compatible proxies. Preserve declared `OPENAI_API_KEY` for custom provider authentication
   while supplying the native `CODEX_API_KEY` alias. Hosted runs and explicit OpenRouter/Bedrock/gateway
   selections retain adapter-owned provider setup.
+- The Pi lane forwards its own ambient allowlist into the local child the way the Claude and Codex
+  lanes do, merging those values only into names the adapter and the declared connections left
+  unset, and merging them before credential validation so a key belonging to another lane is refused
+  rather than smuggled into the selected provider. Pi resolves credentials from its agent directory
+  before the process environment, so a stored login wins and a declared value suppresses an ambient
+  one.
 - Local runs preserve shell endpoint settings, Claude configuration directories and permission controls;
   declared connection values take precedence. Hosted adapters do not inherit ambient settings.
   Endpoint and Claude control variables in declared connections are passed to the harness; active

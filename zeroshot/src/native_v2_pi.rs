@@ -238,6 +238,7 @@ impl PiAdapter {
             prefix_arguments: &self.prefix_arguments,
             invocation,
             files,
+            local_environment: &self.local_environment,
             agent_dir: &agent_dir,
             session_dir: &sessions,
             session_id,

@@ -122,6 +122,9 @@ pub(super) struct PiCommandRequest<'a> {
     pub(super) prefix_arguments: &'a [String],
     pub(super) invocation: &'a DriverInvocation,
     pub(super) files: &'a ProviderExecutionFiles,
+    /// Invoking-shell snapshot for the local target. It fills only names the adapter and the
+    /// declared connections left unset, and credential validation sees it.
+    pub(super) local_environment: &'a BTreeMap<String, String>,
     /// Provider-private agent directory: configuration, model catalog, and `models.json`.
     pub(super) agent_dir: &'a Path,
     /// Provider-private session storage, always explicit so project settings cannot redirect it.
@@ -140,6 +143,7 @@ pub(super) fn command(
         prefix_arguments,
         invocation,
         files,
+        local_environment,
         agent_dir,
         session_dir,
         session_id,
@@ -174,6 +178,7 @@ pub(super) fn command(
         agent_dir,
         session_dir,
         resolved: &invocation.environment,
+        local_environment,
     }
     .build()
     .map_err(|error| with_driver_detail(error, "Pi provider environment is invalid"))?;
@@ -203,6 +208,7 @@ struct EnvironmentRequest<'a> {
     agent_dir: &'a Path,
     session_dir: &'a Path,
     resolved: &'a ResolvedEnvironment,
+    local_environment: &'a BTreeMap<String, String>,
 }
 
 impl EnvironmentRequest<'_> {
@@ -217,6 +223,7 @@ impl EnvironmentRequest<'_> {
             agent_dir,
             session_dir,
             resolved,
+            local_environment,
         } = self;
         validate_reserved(resolved)?;
         let mut environment = BTreeMap::from([
@@ -232,6 +239,15 @@ impl EnvironmentRequest<'_> {
             environment.insert(PI_OFFLINE.to_owned(), "1".to_owned());
         }
         extend_declared(&mut environment, resolved)?;
+        // Ambient shell values fill only what the adapter and the declared connections left
+        // unset, so an authored value always wins. They are merged before credential validation
+        // so a credential belonging to another lane is refused rather than smuggled into the
+        // selected provider's process.
+        for (name, value) in local_environment {
+            environment
+                .entry(name.clone())
+                .or_insert_with(|| value.clone());
+        }
         configure_provider(&mut environment, provider, native_local)?;
         Ok(environment)
     }
