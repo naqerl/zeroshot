@@ -11,7 +11,7 @@ use openengine_cluster_testkit::assertions::AssertValue;
 use serde_json::Value;
 
 use super::command::{PiCommandInput, PiCommandRequest, pi_arguments};
-use super::gateway_config::{MODELS_FILE, base_url, write_models};
+use super::provider_document::{MODELS_FILE, gateway_base_url, write_models};
 use super::session::{PiSession, identity};
 use super::session_id::{observe_session, pi_session_id};
 use super::{PiAdapter, PiAdapterConfigError, PiConfig, PiProcessEnvironment};
@@ -362,7 +362,12 @@ fn coverage_contract_pi_gateway_models_json_pins_responses_and_holds_no_secret()
         ],
     );
     assert_eq!(fields.len(), 2);
-    let path = write_models(&agent_dir, &base_url(&resolved).unwrap()).assert_value();
+    let path = write_models(
+        &agent_dir,
+        super::provider_document::GATEWAY,
+        &gateway_base_url(&resolved).unwrap(),
+    )
+    .assert_value();
     assert_eq!(path, agent_dir.join(MODELS_FILE));
     let contents = directory.read("agent/models.json");
     let document: serde_json::Value = serde_json::from_str(&contents).unwrap();
@@ -385,7 +390,7 @@ fn coverage_contract_pi_gateway_connection_must_be_complete_before_launch() {
             ("GATEWAY_API_KEY", "sk-gateway"),
         ],
     );
-    assert!(base_url(&complete).is_ok());
+    assert!(gateway_base_url(&complete).is_ok());
 
     // Only the base URL, only the key, an empty base URL, and nothing at all all fail closed.
     for (fields, values) in [
@@ -404,7 +409,7 @@ fn coverage_contract_pi_gateway_connection_must_be_complete_before_launch() {
         (vec![], vec![]),
     ] {
         assert!(
-            base_url(&resolved(&fields, &values)).is_err(),
+            gateway_base_url(&resolved(&fields, &values)).is_err(),
             "incomplete gateway connection must fail before launch"
         );
     }
@@ -579,6 +584,131 @@ fn coverage_contract_pi_gateway_refuses_a_foreign_ambient_credential() {
         command.is_err(),
         "a foreign ambient key must not reach the gateway lane"
     );
+}
+
+#[test]
+fn coverage_contract_pi_anthropic_lane_accepts_a_caller_owned_endpoint() {
+    // Claude Code honours `ANTHROPIC_BASE_URL`; Pi does not, so the adapter converts a declared
+    // value into a provider override that keeps Pi's Anthropic Messages protocol.
+    let directory = TestDirectory::new("pi-anthropic-endpoint");
+    let files = files(&directory);
+    let agent_dir = directory.child("agent");
+    let command = super::command::command(PiCommandRequest {
+        provider: PiProvider::Anthropic,
+        native_local: false,
+        contained: false,
+        executable: "pi",
+        prefix_arguments: &[],
+        invocation: &invocation(
+            agent_binding(
+                "provider-owned-model",
+                None,
+                SessionScope::Execution,
+                &["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"],
+            ),
+            NodeRole::Worker,
+            resolved(
+                &["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"],
+                &[
+                    ("ANTHROPIC_API_KEY", "declared"),
+                    ("ANTHROPIC_BASE_URL", "https://messages.example"),
+                ],
+            ),
+        ),
+        files: &files,
+        local_environment: &BTreeMap::new(),
+        agent_dir: &agent_dir,
+        session_dir: &directory.child("sessions"),
+        session_id: "zs-fixed",
+    })
+    .assert_value_with("caller-owned endpoint launch");
+    assert_eq!(
+        value(&command.argv, "--provider").as_deref(),
+        Some("anthropic")
+    );
+    // A non-native lane receives a private agent directory so no ambient configuration is inherited.
+    assert_eq!(
+        command
+            .environment
+            .get("PI_CODING_AGENT_DIR")
+            .map(String::as_str),
+        Some(agent_dir.to_string_lossy().as_ref())
+    );
+}
+
+#[test]
+fn coverage_contract_pi_a_declared_endpoint_ends_native_login_reuse() {
+    // The credential and the endpoint both come from the connection, so the run must not inherit
+    // the user's own agent directory and send a stored login to a caller-owned host.
+    let directory = TestDirectory::new("pi-endpoint-native");
+    let files = files(&directory);
+    // The agent directory is the provider session home itself.
+    let agent_dir = files.home().to_path_buf();
+    let adapter = PiAdapter::new_local(adapter_configuration(
+        PiProvider::Anthropic,
+        "pi",
+        BTreeMap::new(),
+    ))
+    .assert_value();
+    let invocation = invocation(
+        agent_binding(
+            "provider-owned-model",
+            None,
+            SessionScope::Execution,
+            &["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"],
+        ),
+        NodeRole::Worker,
+        resolved(
+            &["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"],
+            &[
+                ("ANTHROPIC_API_KEY", "declared"),
+                ("ANTHROPIC_BASE_URL", "https://messages.example"),
+            ],
+        ),
+    );
+    let command = adapter
+        .command_for_test(&invocation, &files, "zs-fixed")
+        .assert_value_with("declared endpoint launch");
+    assert_eq!(
+        command
+            .environment
+            .get("PI_CODING_AGENT_DIR")
+            .map(String::as_str),
+        Some(agent_dir.to_string_lossy().as_ref()),
+        "a declared endpoint requires a private agent directory"
+    );
+    assert!(
+        agent_dir.join(MODELS_FILE).is_file(),
+        "a declared endpoint writes the provider document Pi reads"
+    );
+}
+
+#[test]
+fn coverage_contract_pi_native_local_anthropic_leaves_the_endpoint_to_pi() {
+    // Without a declared endpoint and with a native-local lane, Pi keeps its own configuration and
+    // login, so no provider document may be synthesized.
+    let directory = TestDirectory::new("pi-anthropic-native");
+    let files = files(&directory);
+    let command = super::command::command(PiCommandRequest {
+        provider: PiProvider::Anthropic,
+        native_local: true,
+        contained: false,
+        executable: "pi",
+        prefix_arguments: &[],
+        invocation: &invocation(
+            agent_binding("claude-sonnet-4-5", None, SessionScope::Execution, &[]),
+            NodeRole::Worker,
+            resolved(&[], &[]),
+        ),
+        files: &files,
+        local_environment: &BTreeMap::new(),
+        agent_dir: directory.path(),
+        session_dir: &directory.child("sessions"),
+        session_id: "zs-fixed",
+    })
+    .assert_value_with("native anthropic launch");
+    assert!(!command.environment.contains_key("PI_CODING_AGENT_DIR"));
+    assert!(!directory.path().join(MODELS_FILE).exists());
 }
 
 #[test]
