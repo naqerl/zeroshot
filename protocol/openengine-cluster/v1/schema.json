@@ -3665,23 +3665,14 @@
     },
     "PiProvider": {
       "description": "Provider lanes owned by the Pi harness.\n\nEach variant names one Pi provider whose credentials resolve through a named connection. Pi\nowns the wire behavior of every lane; this enum only selects which lane the adapter\nconfigures and which requirements admission materializes.",
-      "oneOf": [
-        {
-          "enum": [
-            "anthropic",
-            "openai",
-            "openrouter",
-            "gateway",
-            "bedrock"
-          ],
-          "type": "string"
-        },
-        {
-          "const": "opencode_go",
-          "description": "OpenCode Go. Pi owns this provider's endpoint and per-model wire protocol, so the adapter\nonly supplies its credential and never synthesizes a provider document.",
-          "type": "string"
-        }
-      ]
+      "enum": [
+        "anthropic",
+        "openai",
+        "openrouter",
+        "gateway",
+        "bedrock"
+      ],
+      "type": "string"
     },
     "PlanParams": {
       "additionalProperties": false,

@@ -183,7 +183,6 @@ fn coverage_contract_pi_argv_uses_pi_own_provider_names() {
         (PiProvider::OpenRouter, "openrouter"),
         (PiProvider::Bedrock, "amazon-bedrock"),
         (PiProvider::Gateway, "openai"),
-        (PiProvider::OpenCodeGo, "opencode-go"),
     ] {
         assert_eq!(
             value(&argv_for(provider, false), "--provider").as_deref(),
@@ -466,46 +465,6 @@ fn coverage_contract_pi_declared_connections_may_not_shadow_reserved_configurati
             "reserved name {reserved} must be rejected"
         );
     }
-}
-
-#[test]
-fn coverage_contract_pi_opencode_go_lane_launches_on_pi_own_provider() {
-    let directory = TestDirectory::new("pi-opencode");
-    let files = files(&directory);
-    let command = super::command::command(PiCommandRequest {
-        provider: PiProvider::OpenCodeGo,
-        native_local: true,
-        contained: false,
-        executable: "pi",
-        prefix_arguments: &[],
-        invocation: &invocation(
-            agent_binding("space-bunny-free", None, SessionScope::Execution, &[]),
-            NodeRole::Worker,
-            resolved(&[], &[]),
-        ),
-        files: &files,
-        agent_dir: directory.path(),
-        session_dir: &directory.child("sessions"),
-        session_id: "zs-fixed",
-    })
-    .assert_value_with("opencode go launch");
-    // Pi owns this provider's endpoint and per-model protocol, so no document is synthesized and
-    // the user's own stored credential supplies the key.
-    assert_eq!(
-        value(&command.argv, "--provider").as_deref(),
-        Some("opencode-go")
-    );
-    assert_eq!(
-        value(&command.argv, "--model").as_deref(),
-        Some("space-bunny-free")
-    );
-    assert!(!command.environment.contains_key("PI_CODING_AGENT_DIR"));
-    assert!(!command.environment.contains_key("OPENCODE_API_KEY"));
-    // No models.json is written for this lane.
-    assert!(
-        !directory.child("agent/models.json").exists()
-            && !directory.path().join("models.json").exists()
-    );
 }
 
 #[test]

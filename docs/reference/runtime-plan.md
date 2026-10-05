@@ -54,17 +54,15 @@ This plan binds the four agent nodes of the built-in `software-change` template:
 | `codex`   | `openai`, `openrouter`, `bedrock`, `gateway`    |
 | `claude`  | `anthropic`, `openrouter`, `bedrock`, `gateway` |
 | `copilot` | `github`                                        |
-| `pi`      | `anthropic`, `openai`, `openrouter`, `bedrock`, `gateway`, `opencode_go` |
+| `pi`      | `anthropic`, `openai`, `openrouter`, `bedrock`, `gateway` |
 
 Any other pair is rejected when the plan is read.
 
-`pi/anthropic`, `pi/openai`, and `pi/opencode_go` reuse a local Pi login from `~/.pi/agent`; the
-other `pi` lanes need a connection. Pi's `gateway` lane pins the OpenAI Responses implementation
-against the caller's `GATEWAY_BASE_URL`, so that gateway must support the Responses API; a
-Chat-Completions-only gateway is rejected by the provider. `pi/opencode_go` requires an endpoint
-speaking OpenAI Chat Completions, which is what Pi's own `opencode-go` provider uses. Pi has no
-permission control of its own, so a contained `pi` run relies on the disposable capsule rather
-than a bypass argument.
+`pi/anthropic` and `pi/openai` reuse a local Pi login from `~/.pi/agent`; the other `pi` lanes
+need a connection. Pi's `gateway` lane pins the OpenAI Responses implementation against the
+caller's `GATEWAY_BASE_URL`, so that gateway must support the Responses API: a
+Chat-Completions-only gateway is rejected by the provider. Pi has no permission control of its own,
+so a contained `pi` run relies on the disposable capsule rather than a bypass argument.
 
 ## Node bindings
 

@@ -859,10 +859,9 @@ RUNTIME CONFIGURATION
 
     Provider choices are codex/openai, codex/openrouter, codex/bedrock, claude/anthropic,
     claude/openrouter, claude/bedrock, codex/gateway, claude/gateway, copilot/github,
-    pi/anthropic, pi/openai, pi/openrouter, pi/bedrock, pi/opencode_go, and pi/gateway. Gateway
-    connections require GATEWAY_BASE_URL and GATEWAY_API_KEY; Codex uses Responses, Claude uses
-    Messages, and Pi pins OpenAI Responses for its gateway endpoint, so that gateway must support
-    the Responses API. pi/opencode_go needs an endpoint speaking OpenAI Chat Completions.
+    pi/anthropic, pi/openai, pi/openrouter, pi/bedrock, and pi/gateway. Gateway connections
+    require GATEWAY_BASE_URL and GATEWAY_API_KEY; Codex uses Responses, Claude uses Messages, and
+    Pi pins OpenAI Responses for its gateway endpoint, so that gateway must support the Responses API.
     Known-incompatible harness/provider pairs include
     codex/anthropic, claude/openai, and pi/github. Local Copilot reuses its native user login;
     contained
@@ -886,8 +885,8 @@ RUNTIME CONFIGURATION
     effort, sessionScope, and connections fields without nodes. Zeroshot expands that agent binding
     across every executable graph node and supplies graph-visible Git delivery bindings itself.
     Omitted connections reuse native local login for codex/openai, claude/anthropic,
-    copilot/github, pi/anthropic, pi/openai, and pi/opencode_go; other local lanes and contained
-    targets derive their canonical connection requirements.
+    copilot/github, pi/anthropic, and pi/openai; other local lanes and contained targets derive
+    their canonical connection requirements.
 
 ENVIRONMENT PREPARATION
     For Docker or Cloud targets, pass --environment environment.json with a separate, flat JSON

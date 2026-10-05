@@ -121,15 +121,13 @@ fn help_explains_runtime_configuration() {
         concat!(
             "provider choices are codex/openai, codex/openrouter, codex/bedrock, ",
             "claude/anthropic, claude/openrouter, claude/bedrock, codex/gateway, claude/gateway, ",
-            "copilot/github, pi/anthropic, pi/openai, pi/openrouter, pi/bedrock, pi/opencode_go, ",
-            "and pi/gateway."
+            "copilot/github, pi/anthropic, pi/openai, pi/openrouter, pi/bedrock, and pi/gateway."
         )
         .to_owned(),
         concat!(
             "gateway connections require gateway_base_url and gateway_api_key; ",
             "codex uses responses, claude uses messages, and pi pins openai responses ",
-            "for its gateway endpoint, so that gateway must support the responses api. ",
-            "pi/opencode_go needs an endpoint speaking openai chat completions."
+            "for its gateway endpoint, so that gateway must support the responses api."
         )
         .to_owned(),
         concat!(

@@ -135,14 +135,12 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   exists. Structured output receives at most two correction turns before `malformed`.
 - Pi drives one `pi --mode json` process per turn, with the node prompt on stdin so a large input
   payload can never exceed the platform argument limit. Model identifiers stay caller-owned and Pi
-  owns their resolution. Its provider lanes are `anthropic`, `openai`, `openrouter`, `bedrock`, `opencode_go`, and
-  `gateway`. The gateway lane synthesizes a private `models.json` that pins the OpenAI Responses
+  owns their resolution. Its provider lanes are `anthropic`, `openai`, `openrouter`, `bedrock`, and
+  `gateway`; the gateway lane synthesizes a private `models.json` that pins the OpenAI Responses
   implementation against the caller's base URL and references the declared key by interpolation, so
-  no secret enters the file and no Zeroshot-owned model catalog exists; because Pi ignores an `api`
-  override on a built-in provider, that lane always speaks Responses and a Chat-Completions-only
-  gateway is rejected by the provider rather than probed. The `opencode_go` lane passes Pi's own
-  provider name and synthesizes no document at all, leaving the endpoint and per-model wire protocol
-  to Pi's own catalog. A native-local lane reuses
+  no secret enters the file and no Zeroshot-owned model catalog exists. Because Pi ignores an `api`
+  override on a built-in provider, that lane always speaks Responses: a Chat-Completions-only
+  gateway is rejected by the provider rather than probed. A native-local lane reuses
   the user's stored Pi login from its agent directory; every other lane receives a private agent
   directory so no ambient configuration, catalog, or credential is inherited. Session identity is a
   bounded SHA-256 of the node-instance or execution identity, because Pi requires an alphanumeric
