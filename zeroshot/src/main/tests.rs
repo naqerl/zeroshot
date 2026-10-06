@@ -459,20 +459,7 @@ async fn wave10_cli_contract_process_dispatch_and_routing_matrix_is_exact() {
 }
 
 #[tokio::test]
-async fn service_dispatch_preserves_public_listener_and_origin_refusals() {
-    #[cfg(feature = "ui")]
-    {
-        let error = dispatch(NativeV2CliCommand::Ui {
-            listen: "0.0.0.0:0".parse().assert_value(),
-            target: None,
-        })
-        .await
-        .err()
-        .assert_value();
-        assert!(matches!(error, ProcessError::Cli(_)));
-        assert!(error.to_string().contains("loopback"));
-    }
-
+async fn service_dispatch_preserves_public_origin_refusals() {
     let root = openengine_cluster_testkit::TemporaryDirectory::for_test(
         "main-target-serve-invalid-origin",
     );

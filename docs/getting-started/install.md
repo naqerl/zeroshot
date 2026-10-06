@@ -59,7 +59,8 @@ zeroshot ui
 ```
 
 Open `http://127.0.0.1:4173/ui/` to edit profiles and inspect live or completed local runs.
-Use `--listen 127.0.0.1:4185` to choose another loopback port. Ctrl-C stops the UI server;
+Use `--listen 127.0.0.1:4185` to choose another loopback port. The UI is unauthenticated, so bind a
+LAN or Tailscale address only on a trusted network. Ctrl-C stops the UI server;
 active runs continue. Restart the command to reconnect.
 
 To inspect runs on a configured target while keeping profiles in the local CLI store:

@@ -38,7 +38,8 @@ enum CliCommand {
     /// local controller unless --target selects a configured target. Ctrl-C stops the UI
     /// server; active runs continue.
     Ui {
-        /// Loopback address for the local UI.
+        /// Address for the local UI. The default is loopback; a LAN or Tailscale address
+        /// exposes the unauthenticated UI to that network.
         #[arg(long, default_value = "127.0.0.1:4173")]
         listen: SocketAddr,
 

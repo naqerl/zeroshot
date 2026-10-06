@@ -71,7 +71,7 @@ Usage: zeroshot ui [OPTIONS]
 
 Options:
       --listen <LISTEN>
-          Loopback address for the local UI
+          Address for the local UI. The default is loopback; a LAN or Tailscale address exposes the unauthenticated UI to that network
 
           [default: 127.0.0.1:4173]
 

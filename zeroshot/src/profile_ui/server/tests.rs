@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use axum::http::HeaderName;
-use openengine_cluster_testkit::assertions::AssertValue;
+use openengine_cluster_testkit::assertions::{AssertError, AssertValue};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
@@ -338,13 +338,123 @@ async fn target_connection_serves_one_http_lifetime_and_drains_on_shutdown() {
     drop(idle_client);
 }
 
-#[tokio::test]
-async fn standalone_ui_rejects_non_loopback_before_binding() {
-    let error = serve("0.0.0.0:0".parse().assert_value())
+fn non_loopback_ipv4() -> Option<std::net::Ipv4Addr> {
+    // A UDP connect performs a route lookup without sending traffic and reveals the source
+    // address this host would use for an external destination.
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(address) if !address.is_loopback() => Some(address),
+        _ => None,
+    }
+}
+
+async fn non_loopback_listen_address() -> SocketAddr {
+    // Prefer a concrete LAN or Tailscale address; fall back to the wildcard when this host has
+    // no usable non-loopback address.
+    if let Some(ip) = non_loopback_ipv4() {
+        if let Ok(listener) = TcpListener::bind((ip, 0)).await {
+            if let Ok(address) = listener.local_addr() {
+                return address;
+            }
+        }
+    }
+    let listener = TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
         .await
-        .err()
         .assert_value();
-    assert!(error.to_string().contains("loopback"));
+    listener.local_addr().assert_value()
+}
+
+async fn serve_non_loopback_ui_once() -> Result<(), String> {
+    // A reserved port can be claimed between release and the server's rebind.
+    let address = non_loopback_listen_address().await;
+
+    let server = tokio::spawn(serve_with_target(address, None));
+    let mut client = None;
+    for _ in 0..200 {
+        if server.is_finished() {
+            break;
+        }
+        match TcpStream::connect(address).await {
+            Ok(stream) => {
+                client = Some(stream);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    }
+    let mut client = match client {
+        Some(client) => client,
+        None => {
+            let error = if server.is_finished() {
+                match server.await {
+                    Ok(Err(error)) => error.to_string(),
+                    Ok(Ok(())) => "UI server exited before listening".to_owned(),
+                    Err(error) => error.to_string(),
+                }
+            } else {
+                server.abort();
+                "UI server did not start listening".to_owned()
+            };
+            return Err(error);
+        }
+    };
+
+    // The origin follows the bound address, and the exact Host header is required.
+    client
+        .write_all(
+            format!("GET /ui/ HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await
+        .assert_value();
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).await.assert_value();
+    let response = String::from_utf8(response).assert_value();
+    if !response.starts_with("HTTP/1.1 200") {
+        server.abort();
+        return Err(format!("non-loopback origin was not served: {response}"));
+    }
+
+    // A different Host is still refused on the non-loopback origin.
+    let mut client = TcpStream::connect(address).await.assert_value();
+    client
+        .write_all(
+            format!(
+                "GET /ui/ HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+                address.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .assert_value();
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).await.assert_value();
+    let response = String::from_utf8(response).assert_value();
+    if !response.starts_with("HTTP/1.1 403") {
+        server.abort();
+        return Err(format!(
+            "non-loopback origin accepted a foreign Host: {response}"
+        ));
+    }
+
+    server.abort();
+    assert!(server.await.assert_error().is_cancelled());
+    Ok(())
+}
+
+#[tokio::test]
+async fn standalone_ui_serves_non_loopback_addresses_behind_their_exact_origin() {
+    let mut failure = None;
+    for _ in 0..3 {
+        match serve_non_loopback_ui_once().await {
+            Ok(()) => return,
+            Err(error) => failure = Some(error),
+        }
+    }
+    panic!(
+        "UI server did not serve a non-loopback address: {}",
+        failure.expect("at least one attempt")
+    );
 }
 
 #[tokio::test]

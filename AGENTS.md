@@ -530,7 +530,8 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   Cargo's optional `ui` feature.
   Releases and target images embed it. Build, development, and feature checks: [ui/README.md](ui/README.md).
 - `zeroshot ui` serves local CLI profiles and ledgers at `http://127.0.0.1:4173/ui/` by default;
-  `--listen` accepts loopback only. `zeroshot ui --target NAME` keeps profiles and authoring local
+  `--listen` accepts any address: the default stays loopback, and a LAN or Tailscale address
+  exposes the unauthenticated UI to that network. `zeroshot ui --target NAME` keeps profiles and authoring local
   while its server discovers the target's `zeroshot.run-history/v1` bounded list/detail/page
   routes; target coordinates and hosted credentials never enter the browser. The browser continues
   to use only the local `/ui/api/runs` BFF. Hosted reads reuse the named target's OAuth authority

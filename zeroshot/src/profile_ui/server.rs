@@ -152,15 +152,14 @@ pub async fn serve(listen: SocketAddr) -> Result<(), NativeV2CliError> {
 }
 
 /// Runs the local workspace with profiles kept local and optional configured-target history.
+///
+/// The default binds loopback, but an operator may bind a LAN or Tailscale address. The UI is
+/// unauthenticated, so a non-loopback bind exposes it to that network; the browser origin, Host
+/// header, and Fetch-Site boundary still applies to every request.
 pub async fn serve_with_target(
     listen: SocketAddr,
     target: Option<RunHistoryTarget>,
 ) -> Result<(), NativeV2CliError> {
-    if !listen.ip().is_loopback() {
-        return Err(NativeV2CliError::Local(
-            "the local UI must listen on a loopback address".into(),
-        ));
-    }
     let listener = TcpListener::bind(listen).await.map_err(local_error)?;
     let (service, origin) = prepare_local_service(&listener, target)?;
     serve_listener_until(listener, service, origin, shutdown_signal()).await
