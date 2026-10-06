@@ -67,9 +67,12 @@ reaches any endpoint Pi implements and the model identifier stays opaque and cal
 never infers the protocol from the identifier, and an unrecognized value fails before launch.
 
 To send the `anthropic` lane to a caller-owned Messages-compatible endpoint,
-declare `ANTHROPIC_BASE_URL` together with `ANTHROPIC_API_KEY`. Pi ignores that variable itself, so
-Zeroshot turns it into a provider override that keeps Pi's Anthropic Messages protocol. A declared
-endpoint ends native-login reuse, so the stored login is never sent to that host.
+declare `ANTHROPIC_BASE_URL` together with `ANTHROPIC_API_KEY`; a local run also honors the
+invoking shell's `ANTHROPIC_BASE_URL`. The `openai` lane likewise honors `OPENAI_BASE_URL` or
+`OPENAI_API_BASE`. Pi ignores these variables itself, so Zeroshot turns each into a provider
+override that keeps that provider's own protocol; the `openai` lane therefore needs a
+Responses-compatible endpoint, and any other protocol uses `pi/gateway`. A declared endpoint ends
+native-login reuse, so the stored login is never sent to that host.
 
 Pi has no permission control of its own, so a contained `pi` run relies on the disposable capsule
 rather than a bypass argument.
@@ -153,7 +156,7 @@ Values come from the submission environment or a target connection store at run 
 ```json
 {
   "connections": {
-    "gateway": ["GATEWAY_BASE_URL", "GATEWAY_API_KEY"]
+    "gateway": ["GATEWAY_BASE_URL", "GATEWAY_API_KEY", "GATEWAY_API"]
   }
 }
 ```

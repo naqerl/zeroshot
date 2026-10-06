@@ -1,14 +1,17 @@
 //! Synthesized `models.json` for Pi lanes that carry a caller-owned endpoint.
 //!
 //! Pi reads its provider catalog from this file. Two behaviors decide its shape, and both were
-//! confirmed against the CLI rather than inferred: Pi ignores `api`, `baseUrl`, and `apiKey`
-//! overrides on a *built-in* provider, and it honours all three on a provider this file
-//! registers. That is why the `gateway` lane registers its own provider instead of retargeting
-//! `openai`, which is what lets a caller choose the wire protocol instead of being pinned to one.
+//! confirmed against the CLI rather than inferred: on a *built-in* provider Pi ignores an `api` or
+//! `apiKey` override while still honoring `baseUrl`, and on a provider this file registers it
+//! honors all three. That is why the `gateway` lane registers its own provider instead of
+//! retargeting `openai`, which is what lets a caller choose the wire protocol instead of being
+//! pinned to one, while the `anthropic` lane can retarget the endpoint and keep the built-in
+//! protocol because it needs no `api` override.
 //!
-//! The registered model entry carries only the caller's own identifier, the chosen protocol, and a
-//! display name. Capability metadata is deliberately absent so Zeroshot never becomes a model
-//! catalog: Pi fills in its own defaults for context window, output limit, and cost.
+//! The registered model entry carries the caller's own identifier, the chosen protocol, a display
+//! name, and whether the caller's binding asked for reasoning. Capability metadata is deliberately
+//! absent so Zeroshot never becomes a model catalog: Pi fills in its own defaults for context
+//! window, output limit, and cost.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -44,6 +47,14 @@ pub(super) const ANTHROPIC: ProviderOverride = ProviderOverride {
     api_key_field: "ANTHROPIC_API_KEY",
 };
 
+/// The `openai` lane retargets Pi's built-in OpenAI provider for the same reason. It keeps the
+/// built-in Responses protocol, so a caller-owned endpoint for this lane must speak Responses; a
+/// caller with another protocol uses the gateway lane, which can name it.
+pub(super) const OPENAI: ProviderOverride = ProviderOverride {
+    provider: "openai",
+    api_key_field: "OPENAI_API_KEY",
+};
+
 /// Wire protocols Pi can be asked to speak. The caller names one; Zeroshot never guesses it from
 /// the model identifier, because an identifier is opaque and provider-owned.
 pub(super) const SUPPORTED_APIS: [&str; 3] = [
@@ -64,17 +75,30 @@ pub(super) enum PiProviderDocumentError {
     EmptyModel,
 }
 
+/// The endpoint fields a synthesized provider document is built from. A registered provider needs
+/// a model entry; a built-in override does not.
+struct EndpointDocument<'a> {
+    base_url: &'a str,
+    api: Option<&'a str>,
+    model: Option<&'a str>,
+    reasoning: bool,
+}
+
+/// A caller-owned gateway endpoint: the base URL, the wire protocol the caller named, the model
+/// identifier the caller owns, and whether the binding asked for reasoning.
+pub(super) struct GatewayDocument<'a> {
+    pub(super) base_url: &'a str,
+    pub(super) api: &'a str,
+    pub(super) model: &'a str,
+    pub(super) reasoning: bool,
+}
+
 /// Builds the provider document. The API key is read from the declared connection through Pi's
 /// own `$NAME` interpolation, so the secret never reaches this file.
-fn models_document(
-    selection: ProviderOverride,
-    base_url: &str,
-    api: Option<&str>,
-    model: Option<&str>,
-) -> Value {
+fn models_document(selection: ProviderOverride, endpoint: EndpointDocument<'_>) -> Value {
     let mut provider = serde_json::Map::new();
-    provider.insert("baseUrl".to_owned(), json!(base_url));
-    if let Some(api) = api {
+    provider.insert("baseUrl".to_owned(), json!(endpoint.base_url));
+    if let Some(api) = endpoint.api {
         provider.insert("api".to_owned(), json!(api));
     }
     provider.insert(
@@ -82,11 +106,18 @@ fn models_document(
         json!(format!("${}", selection.api_key_field)),
     );
     // A registered provider needs one model entry before it resolves any identifier. The entry
-    // binds the caller's own identifier and nothing else.
-    if let Some(model) = model {
+    // binds the caller's own identifier, and `reasoning` mirrors the binding's authored effort so
+    // Pi does not silently discard it. Context window, output limit, and cost stay unset: Pi owns
+    // those defaults rather than Zeroshot maintaining a catalog.
+    if let Some(model) = endpoint.model {
         provider.insert(
             "models".to_owned(),
-            json!([{ "id": model, "name": model, "api": api }]),
+            json!([{
+                "id": model,
+                "name": model,
+                "api": endpoint.api,
+                "reasoning": endpoint.reasoning,
+            }]),
         );
     }
     json!({ "providers": { selection.provider: Value::Object(provider) } })
@@ -98,30 +129,57 @@ fn models_document(
 /// caller-owned base URL and an interpolation reference, never the secret itself.
 pub(super) fn write_gateway(
     agent_dir: &Path,
-    base_url: &str,
-    api: &str,
-    model: &str,
+    document: GatewayDocument<'_>,
 ) -> Result<PathBuf, PiProviderDocumentError> {
-    if !SUPPORTED_APIS.contains(&api) {
-        return Err(PiProviderDocumentError::UnsupportedApi {
-            field: "GATEWAY_API",
-        });
-    }
-    if model.trim().is_empty() {
+    validate_api(document.api)?;
+    if document.model.trim().is_empty() {
         return Err(PiProviderDocumentError::EmptyModel);
     }
     write_document(
         agent_dir,
-        models_document(GATEWAY, base_url, Some(api), Some(model)),
+        models_document(
+            GATEWAY,
+            EndpointDocument {
+                base_url: document.base_url,
+                api: Some(document.api),
+                model: Some(document.model),
+                reasoning: document.reasoning,
+            },
+        ),
     )
 }
 
-/// Writes the `anthropic` endpoint override, which keeps Pi's own Messages protocol.
-pub(super) fn write_anthropic(
+/// Rejects an unsupported wire protocol before any child process starts. The same allowlist gates
+/// the launch-time credential check, so the guarantee does not depend on which layer runs first.
+pub(super) fn validate_api(api: &str) -> Result<(), PiProviderDocumentError> {
+    if SUPPORTED_APIS.contains(&api) {
+        Ok(())
+    } else {
+        Err(PiProviderDocumentError::UnsupportedApi {
+            field: "GATEWAY_API",
+        })
+    }
+}
+
+/// Writes a built-in-provider endpoint override, which keeps that provider's own protocol and its
+/// built-in model catalog.
+pub(super) fn write_endpoint(
     agent_dir: &Path,
+    selection: ProviderOverride,
     base_url: &str,
 ) -> Result<PathBuf, PiProviderDocumentError> {
-    write_document(agent_dir, models_document(ANTHROPIC, base_url, None, None))
+    write_document(
+        agent_dir,
+        models_document(
+            selection,
+            EndpointDocument {
+                base_url,
+                api: None,
+                model: None,
+                reasoning: false,
+            },
+        ),
+    )
 }
 
 fn write_document(agent_dir: &Path, document: Value) -> Result<PathBuf, PiProviderDocumentError> {
@@ -129,9 +187,31 @@ fn write_document(agent_dir: &Path, document: Value) -> Result<PathBuf, PiProvid
     let path = agent_dir.join(MODELS_FILE);
     std::fs::create_dir_all(agent_dir).map_err(PiProviderDocumentError::Write)?;
     // The agent directory is provider-private and mode 0700, so this caller-owned base URL is
-    // visible only to that child.
-    std::fs::write(&path, bytes).map_err(PiProviderDocumentError::Write)?;
+    // visible only to that child. The file is created owner-only as well, matching the discipline
+    // for every other provider-owned artifact.
+    write_private(&path, &bytes).map_err(PiProviderDocumentError::Write)?;
     Ok(path)
+}
+
+/// Writes bytes with owner-only permissions on Unix. The agent directory already restricts access,
+/// but the file holds a caller-owned endpoint and gets the same mode as other provider state.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
 }
 
 /// Resolves the gateway base URL from the declared connection, so a missing or invalid connection
@@ -182,8 +262,9 @@ fn declared(resolved: &ResolvedEnvironment) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANTHROPIC, GATEWAY, MODELS_FILE, SUPPORTED_APIS, declared_api, declared_base_url,
-        gateway_base_url, models_document, write_anthropic, write_gateway,
+        ANTHROPIC, EndpointDocument, GATEWAY, GatewayDocument, MODELS_FILE, OPENAI, SUPPORTED_APIS,
+        declared_api, declared_base_url, gateway_base_url, models_document, write_endpoint,
+        write_gateway,
     };
     use crate::native_v2_candidate::test_support::{TestDirectory, environment_name};
     use crate::native_v2_contract::{
@@ -239,9 +320,12 @@ mod tests {
         // registers `zeroshot-gateway` rather than retargeting `openai`.
         let document = models_document(
             GATEWAY,
-            "https://gateway.example/api/v1",
-            Some("openai-completions"),
-            Some("provider-model"),
+            EndpointDocument {
+                base_url: "https://gateway.example/api/v1",
+                api: Some("openai-completions"),
+                model: Some("provider-model"),
+                reasoning: true,
+            },
         );
         let provider = &document["providers"][GATEWAY.provider];
         assert_eq!(provider["api"], "openai-completions");
@@ -256,6 +340,29 @@ mod tests {
         assert_eq!(models[0]["api"], "openai-completions");
         assert!(models[0].get("contextWindow").is_none());
         assert!(models[0].get("cost").is_none());
+        // Reasoning mirrors the binding's authored effort so Pi cannot silently discard it.
+        assert_eq!(models[0]["reasoning"], true);
+    }
+
+    #[test]
+    fn the_written_provider_file_holds_no_secret() {
+        // The only credential reference is an interpolation of a constant field name, so the
+        // caller's key never reaches disk even though the base URL does.
+        let directory = TestDirectory::new("pi-gateway-secret");
+        let agent_dir = directory.child("agent");
+        write_gateway(
+            &agent_dir,
+            GatewayDocument {
+                base_url: "https://gateway.example/api/v1",
+                api: "openai-responses",
+                model: "provider-model",
+                reasoning: false,
+            },
+        )
+        .unwrap();
+        let written = directory.read("agent/models.json");
+        assert!(written.contains("$GATEWAY_API_KEY"));
+        assert!(!written.contains("sk-gateway"));
     }
 
     #[test]
@@ -278,9 +385,12 @@ mod tests {
         let agent_dir = directory.child("agent");
         let path = write_gateway(
             &agent_dir,
-            "https://gateway.example/api/v1",
-            "anthropic-messages",
-            "provider-model",
+            GatewayDocument {
+                base_url: "https://gateway.example/api/v1",
+                api: "anthropic-messages",
+                model: "provider-model",
+                reasoning: true,
+            },
         )
         .unwrap();
         assert_eq!(path, agent_dir.join(MODELS_FILE));
@@ -291,15 +401,67 @@ mod tests {
         );
 
         // An unsupported protocol and an empty identifier fail before any child process starts.
-        assert!(write_gateway(&agent_dir, "https://x.invalid", "grpc", "m").is_err());
-        assert!(write_gateway(&agent_dir, "https://x.invalid", "openai-responses", "  ").is_err());
+        assert!(
+            write_gateway(
+                &agent_dir,
+                GatewayDocument {
+                    base_url: "https://x.invalid",
+                    api: "grpc",
+                    model: "m",
+                    reasoning: false,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            write_gateway(
+                &agent_dir,
+                GatewayDocument {
+                    base_url: "https://x.invalid",
+                    api: "openai-responses",
+                    model: "  ",
+                    reasoning: false,
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn the_written_provider_file_is_owner_only() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let directory = TestDirectory::new("pi-gateway-mode");
+            let agent_dir = directory.child("agent");
+            let path = write_gateway(
+                &agent_dir,
+                GatewayDocument {
+                    base_url: "https://gateway.example/api/v1",
+                    api: "openai-responses",
+                    model: "provider-model",
+                    reasoning: false,
+                },
+            )
+            .unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the provider file must be owner-only");
+        }
     }
 
     #[test]
     fn the_anthropic_document_keeps_pis_own_messages_protocol() {
         // This is the escape hatch Claude Code offers through `ANTHROPIC_BASE_URL`: retarget the
         // endpoint without choosing a wire protocol, because overriding one is ignored anyway.
-        let document = models_document(ANTHROPIC, "https://messages.example", None, None);
+        let document = models_document(
+            ANTHROPIC,
+            EndpointDocument {
+                base_url: "https://messages.example",
+                api: None,
+                model: None,
+                reasoning: false,
+            },
+        );
         let provider = &document["providers"]["anthropic"];
         assert_eq!(provider["baseUrl"], "https://messages.example");
         assert_eq!(provider["apiKey"], "$ANTHROPIC_API_KEY");
@@ -311,11 +473,31 @@ mod tests {
     }
 
     #[test]
+    fn the_openai_document_keeps_pis_own_responses_protocol() {
+        // The OpenAI lane retargets the endpoint and keeps the built-in protocol, so an endpoint
+        // for this lane must speak Responses. The gateway lane is the one that can name a protocol.
+        let document = models_document(
+            OPENAI,
+            EndpointDocument {
+                base_url: "https://openai-proxy.example/v1",
+                api: None,
+                model: None,
+                reasoning: false,
+            },
+        );
+        let provider = &document["providers"]["openai"];
+        assert_eq!(provider["baseUrl"], "https://openai-proxy.example/v1");
+        assert_eq!(provider["apiKey"], "$OPENAI_API_KEY");
+        assert!(provider.get("api").is_none());
+        assert!(provider.get("models").is_none());
+    }
+
+    #[test]
     fn the_provider_file_lands_in_the_agent_directory() {
         assert_eq!(MODELS_FILE, "models.json");
         let directory = TestDirectory::new("pi-anthropic-file");
         let agent_dir = directory.child("agent");
-        let path = write_anthropic(&agent_dir, "https://messages.example").unwrap();
+        let path = write_endpoint(&agent_dir, ANTHROPIC, "https://messages.example").unwrap();
         assert_eq!(path, agent_dir.join("models.json"));
     }
 

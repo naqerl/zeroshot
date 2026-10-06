@@ -657,6 +657,179 @@ fn coverage_contract_pi_a_declared_endpoint_ends_native_login_reuse() {
 }
 
 #[test]
+fn coverage_contract_pi_gateway_writes_the_provider_document_before_launch() {
+    // The adapter, not just the document builder, must produce the registered provider and the
+    // private agent directory the caller-owned endpoint requires.
+    let directory = TestDirectory::new("pi-gateway-adapter");
+    let files = files(&directory);
+    let agent_dir = files.home().to_path_buf();
+    let adapter = PiAdapter::new_local(adapter_configuration(
+        PiProvider::Gateway,
+        "pi",
+        BTreeMap::new(),
+    ))
+    .assert_value();
+    let fields = ["GATEWAY_BASE_URL", "GATEWAY_API_KEY", "GATEWAY_API"];
+    let invocation = invocation(
+        agent_binding(
+            "provider-owned-model",
+            Some(ReasoningEffort::High),
+            SessionScope::Execution,
+            &fields,
+        ),
+        NodeRole::Worker,
+        resolved(
+            &fields,
+            &[
+                ("GATEWAY_BASE_URL", "https://gateway.example/api/v1"),
+                ("GATEWAY_API_KEY", "declared"),
+                ("GATEWAY_API", "openai-completions"),
+            ],
+        ),
+    );
+    let command = adapter
+        .command_for_test(&invocation, &files, "zs-fixed")
+        .assert_value_with("gateway launch");
+    assert_eq!(
+        value(&command.argv, "--provider").as_deref(),
+        Some("zeroshot-gateway")
+    );
+    assert_eq!(
+        command
+            .environment
+            .get("PI_CODING_AGENT_DIR")
+            .map(String::as_str),
+        Some(agent_dir.to_string_lossy().as_ref())
+    );
+    let written = std::fs::read_to_string(agent_dir.join(MODELS_FILE)).assert_value();
+    assert!(written.contains("openai-completions"));
+    assert!(written.contains("\"reasoning\": true"));
+    assert!(written.contains("$GATEWAY_API_KEY"));
+    assert!(!written.contains("declared"));
+}
+
+#[test]
+fn coverage_contract_pi_gateway_rejects_an_unsupported_protocol_before_launch() {
+    let directory = TestDirectory::new("pi-gateway-bad-api");
+    let files = files(&directory);
+    let adapter = PiAdapter::new_local(adapter_configuration(
+        PiProvider::Gateway,
+        "pi",
+        BTreeMap::new(),
+    ))
+    .assert_value();
+    let fields = ["GATEWAY_BASE_URL", "GATEWAY_API_KEY", "GATEWAY_API"];
+    let invocation = invocation(
+        agent_binding(
+            "provider-owned-model",
+            None,
+            SessionScope::Execution,
+            &fields,
+        ),
+        NodeRole::Worker,
+        resolved(
+            &fields,
+            &[
+                ("GATEWAY_BASE_URL", "https://gateway.example/api/v1"),
+                ("GATEWAY_API_KEY", "declared"),
+                ("GATEWAY_API", "grpc"),
+            ],
+        ),
+    );
+    // No child may start and no provider document may be written for an unsupported protocol.
+    assert!(
+        adapter
+            .command_for_test(&invocation, &files, "zs-fixed")
+            .is_err()
+    );
+    assert!(!files.home().join(MODELS_FILE).exists());
+}
+
+#[test]
+fn coverage_contract_pi_ambient_endpoint_becomes_a_provider_override() {
+    // The Claude lane inherits the invoking shell's `ANTHROPIC_BASE_URL`; Pi ignores the variable
+    // for endpoint selection, so the adapter must turn an ambient value into a provider override
+    // rather than forward a value Pi drops.
+    let directory = TestDirectory::new("pi-ambient-endpoint");
+    let files = files(&directory);
+    let agent_dir = files.home().to_path_buf();
+    let adapter = PiAdapter::new_local(adapter_configuration(
+        PiProvider::Anthropic,
+        "pi",
+        BTreeMap::from([
+            (
+                "ANTHROPIC_BASE_URL".to_owned(),
+                "https://messages.example".to_owned(),
+            ),
+            ("ANTHROPIC_API_KEY".to_owned(), "ambient".to_owned()),
+        ]),
+    ))
+    .assert_value();
+    let invocation = invocation(
+        agent_binding("claude-sonnet-4-5", None, SessionScope::Execution, &[]),
+        NodeRole::Worker,
+        resolved(&[], &[]),
+    );
+    let command = adapter
+        .command_for_test(&invocation, &files, "zs-fixed")
+        .assert_value_with("ambient endpoint launch");
+    assert_eq!(
+        command
+            .environment
+            .get("PI_CODING_AGENT_DIR")
+            .map(String::as_str),
+        Some(agent_dir.to_string_lossy().as_ref())
+    );
+    let written = std::fs::read_to_string(agent_dir.join(MODELS_FILE)).assert_value();
+    assert!(written.contains("https://messages.example"));
+}
+
+#[test]
+fn coverage_contract_pi_a_declared_credential_ends_native_login_reuse() {
+    // Pi resolves its agent directory before the process environment, so without a private agent
+    // directory a declared scoped key would be silently outranked by the broader stored login.
+    let directory = TestDirectory::new("pi-declared-credential");
+    let files = files(&directory);
+    let agent_dir = files.home().to_path_buf();
+    let adapter = PiAdapter::new_local(adapter_configuration(
+        PiProvider::Anthropic,
+        "pi",
+        BTreeMap::new(),
+    ))
+    .assert_value();
+    let invocation = invocation(
+        agent_binding(
+            "claude-sonnet-4-5",
+            None,
+            SessionScope::Execution,
+            &["ANTHROPIC_API_KEY"],
+        ),
+        NodeRole::Worker,
+        resolved(&["ANTHROPIC_API_KEY"], &[("ANTHROPIC_API_KEY", "declared")]),
+    );
+    let command = adapter
+        .command_for_test(&invocation, &files, "zs-fixed")
+        .assert_value_with("declared credential launch");
+    assert_eq!(
+        command
+            .environment
+            .get("PI_CODING_AGENT_DIR")
+            .map(String::as_str),
+        Some(agent_dir.to_string_lossy().as_ref()),
+        "a declared credential requires a private agent directory"
+    );
+    // The declared key must reach the child, since a declared credential is not a caller-owned
+    // endpoint and therefore writes no provider document.
+    assert_eq!(
+        command
+            .environment
+            .get("ANTHROPIC_API_KEY")
+            .map(String::as_str),
+        Some("declared")
+    );
+}
+
+#[test]
 fn coverage_contract_pi_native_local_anthropic_leaves_the_endpoint_to_pi() {
     // Without a declared endpoint and with a native-local lane, Pi keeps its own configuration and
     // login, so no provider document may be synthesized.

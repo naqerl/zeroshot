@@ -80,9 +80,18 @@ fn pi_contract(provider: PiProvider) -> ProviderAccessContract {
                 &["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY"],
             ],
         ),
-        PiProvider::OpenAi => {
-            ProviderAccessContract::new(true, "openai", &["OPENAI_API_KEY"], &[&["OPENAI_API_KEY"]])
-        }
+        PiProvider::OpenAi => ProviderAccessContract::new(
+            true,
+            "openai",
+            &["OPENAI_API_KEY"],
+            &[
+                &["OPENAI_API_KEY"],
+                // A caller-owned OpenAI-compatible endpoint, mirroring what the Codex lane
+                // inherits. The lane keeps the built-in Responses protocol.
+                &["OPENAI_BASE_URL", "OPENAI_API_KEY"],
+                &["OPENAI_API_BASE", "OPENAI_API_KEY"],
+            ],
+        ),
         PiProvider::OpenRouter => ProviderAccessContract::new(
             false,
             "openrouter",
