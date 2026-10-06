@@ -52,8 +52,6 @@ pub(crate) struct PiTranscript {
     settled: bool,
     /// Latest cumulative usage reported by the provider.
     usage: Option<TokenUsageDelta>,
-    /// Assistant text already emitted live, so a terminal message is not emitted twice.
-    emitted: String,
     malformed: usize,
     redactions: Vec<String>,
 }
@@ -73,7 +71,6 @@ impl PiTranscript {
             final_message: None,
             settled: false,
             usage: None,
-            emitted: String::new(),
             malformed: 0,
             redactions,
         }
@@ -184,19 +181,13 @@ impl PiTranscript {
             "message_update" => {
                 self.record_usage(value);
                 if let Some(text) = self.record_delta(value) {
-                    push_text(
-                        emissions,
-                        &mut self.emitted,
-                        LiveOutputStream::Output,
-                        &text,
-                    );
+                    push_text(emissions, LiveOutputStream::Output, &text);
                 }
             }
             "message_end" => self.record_message_end(value),
             "compaction_start" => {
                 push_text(
                     emissions,
-                    &mut self.emitted,
                     LiveOutputStream::System,
                     "Pi compacted the session context",
                 );
@@ -205,7 +196,6 @@ impl PiTranscript {
                 let attempt = value.get("attempt").and_then(Value::as_i64).unwrap_or(0);
                 push_text(
                     emissions,
-                    &mut self.emitted,
                     LiveOutputStream::System,
                     &format!("Pi is retrying the model turn (attempt {attempt})"),
                 );
@@ -334,16 +324,13 @@ fn assistant_text(message: &Value) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-fn push_text(
-    emissions: &mut Vec<PiEmission>,
-    emitted: &mut String,
-    stream: LiveOutputStream,
-    text: &str,
-) {
-    if text.is_empty() || emitted.contains(text) {
+/// Emits one non-empty live fragment. Deltas are emitted verbatim: Pi, like Claude, streams a
+/// model response as many small `text_delta` events, and a fragment must never be dropped merely
+/// because its characters happen to appear earlier in the same response.
+fn push_text(emissions: &mut Vec<PiEmission>, stream: LiveOutputStream, text: &str) {
+    if text.is_empty() {
         return;
     }
-    emitted.push_str(text);
     emissions.push(PiEmission {
         stream,
         text: text.to_owned(),
@@ -409,6 +396,32 @@ mod tests {
             panic!("expected a complete attempt");
         };
         assert_eq!(result.message, "Hello world");
+    }
+
+    #[test]
+    fn a_delta_repeating_earlier_text_is_still_emitted() {
+        // A fragment must not be dropped just because its characters appeared earlier: a model
+        // repeats words constantly, and dropping them renders the live transcript as word salad.
+        let mut transcript = PiTranscript::new(Vec::new());
+        let emissions = transcript.push(
+            [
+                header("s1").as_str(),
+                &json!({"type": "message_update", "assistantMessageEvent": {"type": "text_start", "contentIndex": 0}}).to_string(),
+                &json!({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "Let"}}).to_string(),
+                &json!({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": " me check"}}).to_string(),
+                &json!({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "Let"}}).to_string(),
+                &json!({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": " me check"}}).to_string(),
+                "",
+            ]
+            .join("\n")
+            .as_bytes(),
+        );
+        let streamed: String = emissions
+            .iter()
+            .filter(|e| e.stream == LiveOutputStream::Output)
+            .map(|e| e.text.as_str())
+            .collect();
+        assert_eq!(streamed, "Let me checkLet me check");
     }
 
     #[test]
