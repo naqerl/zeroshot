@@ -117,27 +117,34 @@ impl PiTranscript {
         let _ = self.finish_stream();
         let terminal = self.terminal.take();
         let session_id = self.session_id.clone();
-        if let Some(detail) = process_failure {
-            return Ok(PiAttempt::Failed(PiFailure {
-                session_id,
-                retryable: false,
-                diagnostic: self.safe(detail),
-            }));
-        }
         match terminal {
+            // A provider-reported failure carries the real explanation, such as the upstream HTTP
+            // error that survived Pi's own retries. Prefer it over the process tail, which for a
+            // zero-exit Pi holds only startup noise.
             Some(Terminal::Failed(detail)) => Ok(PiAttempt::Failed(PiFailure {
                 session_id,
                 retryable: true,
                 diagnostic: self.safe(&detail),
             })),
-            Some(Terminal::Complete(message)) => Ok(PiAttempt::Complete(PiResult {
-                session_id,
-                message,
-            })),
+            Some(Terminal::Complete(message)) => {
+                // A process that failed after producing an answer must not be treated as usable.
+                if let Some(detail) = process_failure {
+                    return Ok(PiAttempt::Failed(PiFailure {
+                        session_id,
+                        retryable: false,
+                        diagnostic: self.safe(detail),
+                    }));
+                }
+                Ok(PiAttempt::Complete(PiResult {
+                    session_id,
+                    message,
+                }))
+            }
             None => Ok(PiAttempt::Failed(PiFailure {
                 session_id,
                 retryable: false,
-                diagnostic: self.safe("Pi ended without a settled answer"),
+                diagnostic: self
+                    .safe(process_failure.unwrap_or("Pi ended without a settled answer")),
             })),
         }
     }
@@ -504,6 +511,30 @@ mod tests {
         };
         assert!(failure.retryable);
         assert!(failure.diagnostic.contains("529"));
+    }
+
+    #[test]
+    fn a_zero_exit_provider_failure_reports_the_provider_detail() {
+        // Pi exits zero even when its retries are exhausted, so the process tail holds only startup
+        // noise. The provider's own error must be the diagnostic, not the harmless stderr warning.
+        let mut transcript = PiTranscript::new(Vec::new());
+        transcript.push(
+            json!({"type": "message_end", "message": {"role": "assistant", "content": [],
+                    "stopReason": "error",
+                    "errorMessage": "500 {\"type\":\"server_error\",\"message\":\"Endpoint is unavailable.\"}"}})
+            .to_string()
+            .as_bytes(),
+        );
+        let super::PiAttempt::Failed(failure) = transcript
+            .finish(Some(
+                "stderr: Warning: No project session found with id 'zs-x'",
+            ))
+            .unwrap()
+        else {
+            panic!("expected a failure");
+        };
+        assert!(failure.diagnostic.contains("Endpoint is unavailable"));
+        assert!(!failure.diagnostic.contains("No project session"));
     }
 
     #[test]
