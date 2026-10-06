@@ -155,15 +155,15 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   `ANTHROPIC_BASE_URL` on the `anthropic` lane and `OPENAI_BASE_URL`/`OPENAI_API_BASE` on the
   `openai` lane: those overrides retarget the endpoint and keep each built-in provider's own
   protocol, mirroring the `ANTHROPIC_BASE_URL` escape hatch Claude Code already offers and the
-  endpoint variables the Codex lane inherits. Pi
-  ignores `apiKey` on a built-in provider, so the declared key must still reach the child
-  through the environment, and a declared endpoint or a declared lane credential ends native-login
-  reuse so a stored credential is never sent to a caller-owned host and never outranks the declared
-  one. A native-local lane reuses
+  endpoint variables the Codex lane inherits. A
+  stored `auth.json` credential outranks a `models.json` `apiKey` on any provider, so the declared
+  key must still reach the child through the environment, and a declared endpoint or a declared lane
+  credential ends native-login reuse so a stored credential is never sent to a caller-owned host and
+  never outranks the declared one. A native-local lane reuses
   the user's stored Pi login from its agent directory; every other lane receives a private agent
   directory so no ambient configuration, catalog, or credential is inherited. Session identity is a
-  bounded SHA-256 of the node-instance or execution identity, because Pi requires an alphanumeric
-  charset and bounds only that charset. Pi reports a failed or aborted model response in its event
+  bounded SHA-256 of the node-instance or execution identity, because Pi accepts
+  `[A-Za-z0-9._-]` with an alphanumeric first and last character and imposes no other bound. Pi reports a failed or aborted model response in its event
   stream while still exiting successfully, so the terminal event's stop reason decides provider
   success and exit status alone is insufficient. Pi has no response-schema flag, so the shared prompt
   contract plus local validation remains authoritative and corrections stay bounded to two turns.

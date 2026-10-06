@@ -1,12 +1,14 @@
 //! Synthesized `models.json` for Pi lanes that carry a caller-owned endpoint.
 //!
 //! Pi reads its provider catalog from this file. Two behaviors decide its shape, and both were
-//! confirmed against the CLI rather than inferred: on a *built-in* provider Pi ignores an `api` or
-//! `apiKey` override while still honoring `baseUrl`, and on a provider this file registers it
-//! honors all three. That is why the `gateway` lane registers its own provider instead of
-//! retargeting `openai`, which is what lets a caller choose the wire protocol instead of being
-//! pinned to one, while the `anthropic` lane can retarget the endpoint and keep the built-in
-//! protocol because it needs no `api` override.
+//! confirmed against the CLI rather than inferred. A *provider-level* `api` override does not
+//! retag a built-in provider's existing models, though a model definition's own `api` always
+//! applies. And a `models.json` `apiKey` is honored unless the agent directory holds a stored
+//! credential for that provider, which outranks it on any provider, built-in or registered.
+//! `baseUrl` is honored on both. That is why the `gateway` lane registers its own provider
+//! instead of retargeting `openai` — it needs to choose the wire protocol — while the `anthropic`
+//! lane retargets the endpoint and keeps the built-in protocol because it needs no `api`
+//! override.
 //!
 //! The registered model entry carries the caller's own identifier, the chosen protocol, a display
 //! name, and whether the caller's binding asked for reasoning. Capability metadata is deliberately
@@ -41,7 +43,8 @@ pub(super) const GATEWAY: ProviderOverride = ProviderOverride {
 };
 
 /// The `anthropic` lane retargets Pi's built-in provider, because that lane's protocol is already
-/// the one Pi speaks. No discriminant is written: overriding one on a built-in provider is ignored.
+/// the one Pi speaks. No discriminant is written: a provider-level `api` override does not retag a
+/// built-in provider's existing models.
 pub(super) const ANTHROPIC: ProviderOverride = ProviderOverride {
     provider: "anthropic",
     api_key_field: "ANTHROPIC_API_KEY",
