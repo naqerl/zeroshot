@@ -142,17 +142,24 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 - Pi drives one `pi --mode json` process per turn, with the node prompt on stdin so a large input
   payload can never exceed the platform argument limit. Model identifiers stay caller-owned and Pi
   owns their resolution. Its provider lanes are `anthropic`, `openai`, `openrouter`, `bedrock`, and
-  `gateway`; the gateway lane synthesizes a private `models.json` that pins the OpenAI Responses
-  implementation against the caller's base URL and references the declared key by interpolation, so
-  no secret enters the file and no Zeroshot-owned model catalog exists. Because Pi ignores an `api`
-  override on a built-in provider, that lane always speaks Responses: a Chat-Completions-only
-  gateway is rejected by the provider rather than probed. The same file is Pi's only
-  caller-owned-endpoint mechanism, which is why it also backs a declared `ANTHROPIC_BASE_URL` on
-  the `anthropic` lane: that override retargets the endpoint and keeps Pi's Anthropic Messages
-  protocol, mirroring the `ANTHROPIC_BASE_URL` escape hatch Claude Code already offers. Pi
-  ignores `apiKey` on a built-in provider too, so the declared key must still reach the child
-  through the environment, and a declared endpoint ends native-login reuse so a stored credential
-  is never sent to a caller-owned host. A native-local lane reuses
+  `gateway`; the gateway lane synthesizes a private `models.json` that registers its own Pi provider
+  against the caller's base URL and references the declared key by interpolation, so no secret enters
+  the file and no Zeroshot-owned model catalog exists. It registers its own provider rather than
+  retargeting a built-in one because Pi honors `api`, `apiKey`, and `baseUrl` on a registered
+  provider while ignoring the first two on a built-in one; that is what lets a declared `GATEWAY_API`
+  name the wire protocol (`openai-responses`, `openai-completions`, or `anthropic-messages`) and
+  reach any endpoint Pi implements without probing it. The registered model entry carries the
+  caller's identifier, the chosen protocol, and a `reasoning` flag mirroring the binding's authored
+  effort; context window, output limit, and cost stay Pi-owned defaults. The same file is Pi's only
+  caller-owned-endpoint mechanism, which is why it also backs a declared or ambient
+  `ANTHROPIC_BASE_URL` on the `anthropic` lane and `OPENAI_BASE_URL`/`OPENAI_API_BASE` on the
+  `openai` lane: those overrides retarget the endpoint and keep each built-in provider's own
+  protocol, mirroring the `ANTHROPIC_BASE_URL` escape hatch Claude Code already offers and the
+  endpoint variables the Codex lane inherits. Pi
+  ignores `apiKey` on a built-in provider, so the declared key must still reach the child
+  through the environment, and a declared endpoint or a declared lane credential ends native-login
+  reuse so a stored credential is never sent to a caller-owned host and never outranks the declared
+  one. A native-local lane reuses
   the user's stored Pi login from its agent directory; every other lane receives a private agent
   directory so no ambient configuration, catalog, or credential is inherited. Session identity is a
   bounded SHA-256 of the node-instance or execution identity, because Pi requires an alphanumeric

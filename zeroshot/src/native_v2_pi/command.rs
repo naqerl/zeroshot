@@ -24,9 +24,13 @@ pub(super) const ANTHROPIC_KEY: &str = "ANTHROPIC_API_KEY";
 /// Caller-owned Anthropic Messages endpoint. Pi ignores this variable for endpoint selection, so
 /// the adapter turns a declared value into a provider override.
 pub(super) const ANTHROPIC_BASE_URL: &str = "ANTHROPIC_BASE_URL";
-const ANTHROPIC_AUTH: &str = "ANTHROPIC_AUTH_TOKEN";
-const ANTHROPIC_OAUTH: &str = "ANTHROPIC_OAUTH_TOKEN";
+pub(super) const ANTHROPIC_AUTH: &str = "ANTHROPIC_AUTH_TOKEN";
+pub(super) const ANTHROPIC_OAUTH: &str = "ANTHROPIC_OAUTH_TOKEN";
 pub(super) const OPENAI_KEY: &str = "OPENAI_API_KEY";
+/// Caller-owned OpenAI-compatible endpoint. Pi ignores these for endpoint selection, so the
+/// adapter turns a declared or ambient value into a provider override.
+pub(super) const OPENAI_BASE_URL: &str = "OPENAI_BASE_URL";
+pub(super) const OPENAI_API_BASE: &str = "OPENAI_API_BASE";
 /// Caller-owned wire protocol for the gateway lane. Zeroshot never infers it from the opaque model
 /// identifier; the caller names one of the protocols Pi implements.
 pub(super) const GATEWAY_API: &str = "GATEWAY_API";
@@ -79,9 +83,10 @@ pub(super) struct PiCommandInput<'a> {
     pub(super) contained: bool,
 }
 
-/// Pi's own provider identifier for one admitted lane. The gateway lane reuses the built-in
-/// `openai` provider with a base-URL override rather than registering a provider, which keeps the
-/// caller-owned model identifiers resolvable without a Zeroshot-owned model catalog.
+/// Pi's own provider identifier for one admitted lane. The gateway lane registers its own provider
+/// rather than reusing a built-in one, because Pi honors a wire-protocol override only on a
+/// registered provider. The registered model entry still binds the caller-owned identifier, so no
+/// Zeroshot-owned model catalog exists.
 const fn provider_name(provider: PiProvider) -> &'static str {
     match provider {
         PiProvider::Anthropic => "anthropic",
@@ -343,13 +348,36 @@ fn accept_bedrock(environment: &BTreeMap<String, String>) -> Result<(), NodeRunn
 /// The gateway lane carries a caller-owned endpoint, key, and wire protocol through Pi's own
 /// `models.json`. The base URL and key stay in the declared connection and the synthesized file
 /// holds no secret. The protocol is authored, never detected.
+/// The declared credential fields a native-local lane accepts. A declared value on such a lane must
+/// still end stored-login reuse: Pi resolves its agent directory ahead of the process environment,
+/// so without a private agent directory a declared credential would be silently outranked by the
+/// broader stored login. Every lane that authenticates from Pi's own credential lists them here.
+pub(super) fn native_local_credentials(provider: PiProvider) -> &'static [&'static str] {
+    match provider {
+        PiProvider::Anthropic => &ANTHROPIC_CREDENTIALS,
+        PiProvider::OpenAi => &OPENAI_CREDENTIALS,
+        _ => &[],
+    }
+}
+
+/// Whether the lane carries a declared credential for its own provider.
+pub(super) fn credential_declared(provider: PiProvider, environment: &ResolvedEnvironment) -> bool {
+    native_local_credentials(provider)
+        .iter()
+        .any(|field| environment.iter().any(|(name, _)| name.as_str() == *field))
+}
+
 fn accept_gateway(environment: &BTreeMap<String, String>) -> Result<(), NodeRunnerError> {
     let _ = gateway::connection(environment)?;
-    environment
+    let api = environment
         .get(GATEWAY_API)
-        .filter(|value| !value.trim().is_empty())
-        .map(|_| ())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
         .ok_or(NodeRunnerError::Driver)?;
+    // The same allowlist the document writer enforces, so an unsupported protocol fails at the
+    // credential boundary too rather than only once the provider document is built.
+    crate::native_v2_pi::provider_document::validate_api(api)
+        .map_err(|_| NodeRunnerError::Driver)?;
     validate_absent(environment, &FOREIGN_CREDENTIALS[..4])
 }
 
