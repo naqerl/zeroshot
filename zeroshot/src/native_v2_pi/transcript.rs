@@ -47,7 +47,6 @@ pub(crate) struct PiTranscript {
     /// Assistant text blocks of the message currently streaming, keyed by content index.
     blocks: Vec<Option<String>>,
     /// Assistant text of the last completed message, which becomes the node response.
-    final_message: Option<String>,
     /// `agent_end` may precede automatic retry or queued work, so it is not terminal.
     settled: bool,
     /// Latest cumulative usage reported by the provider.
@@ -68,7 +67,6 @@ impl PiTranscript {
             session_id: None,
             terminal: None,
             blocks: Vec::new(),
-            final_message: None,
             settled: false,
             usage: None,
             malformed: 0,
@@ -106,8 +104,9 @@ impl PiTranscript {
         matches!(self.terminal, Some(Terminal::Complete(_)))
     }
 
-    /// Settles the attempt. A failure wins over a complete result, because a turn that reported an
-    /// error after producing an answer must not be treated as a usable response.
+    /// Settles the attempt from the last assistant message. A recovered retry is a success, and a
+    /// failure reported after the final answer is a failure, because the last message is
+    /// authoritative.
     pub(super) fn finish(
         mut self,
         process_failure: Option<&str>,
@@ -222,16 +221,14 @@ impl PiTranscript {
                     .get("errorMessage")
                     .and_then(Value::as_str)
                     .unwrap_or("Pi reported a failed model response");
-                if self.terminal.is_none() {
-                    self.terminal = Some(Terminal::Failed(detail.to_owned()));
-                }
+                self.terminal = Some(Terminal::Failed(detail.to_owned()));
             }
+            // The final assistant message is authoritative. Pi emits one per tool-use step, so an
+            // earlier pre-tool message must not become the node's response, and a message that
+            // follows a recovered `error` clears that failure.
             _ => {
                 if let Some(text) = text {
-                    if self.terminal.is_none() {
-                        self.terminal = Some(Terminal::Complete(text.clone()));
-                    }
-                    self.final_message = Some(text);
+                    self.terminal = Some(Terminal::Complete(text));
                 }
             }
         }
@@ -422,6 +419,72 @@ mod tests {
             .map(|e| e.text.as_str())
             .collect();
         assert_eq!(streamed, "Let me checkLet me check");
+    }
+
+    #[test]
+    fn the_last_assistant_message_is_the_response_not_the_pre_tool_text() {
+        // Pi emits one assistant message per tool-use step. The node's response must be the final
+        // answer, never the narration that preceded a tool call.
+        let mut transcript = PiTranscript::new(Vec::new());
+        transcript.push(
+            [
+                &json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "toolUse",
+                        "content": [{"type": "text", "text": "Let me check the file."}]}}).to_string(),
+                &json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "stop",
+                        "content": [{"type": "text", "text": "The answer is hello."}]}}).to_string(),
+                "",
+            ]
+            .join("\n")
+            .as_bytes(),
+        );
+        let super::PiAttempt::Complete(result) = transcript.finish(None).unwrap() else {
+            panic!("expected a complete attempt");
+        };
+        assert_eq!(result.message, "The answer is hello.");
+    }
+
+    #[test]
+    fn a_recovered_retry_settles_as_success() {
+        // Pi auto-retries a failed model turn. A later successful message must clear the earlier
+        // error, since the recovered answer is the authoritative result.
+        let mut transcript = PiTranscript::new(Vec::new());
+        transcript.push(
+            [
+                &json!({"type": "message_end", "message": {"role": "assistant", "content": [],
+                        "stopReason": "error", "errorMessage": "529 overloaded"}}).to_string(),
+                &json!({"type": "auto_retry_start", "attempt": 1}).to_string(),
+                &json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "stop",
+                        "content": [{"type": "text", "text": "Recovered answer"}]}}).to_string(),
+                "",
+            ]
+            .join("\n")
+            .as_bytes(),
+        );
+        let super::PiAttempt::Complete(result) = transcript.finish(None).unwrap() else {
+            panic!("expected a recovered success");
+        };
+        assert_eq!(result.message, "Recovered answer");
+    }
+
+    #[test]
+    fn a_failure_after_the_final_answer_still_fails() {
+        // The converse: a failure reported after the answer is authoritative and must fail.
+        let mut transcript = PiTranscript::new(Vec::new());
+        transcript.push(
+            [
+                &json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "stop",
+                        "content": [{"type": "text", "text": "Partial answer"}]}}).to_string(),
+                &json!({"type": "message_end", "message": {"role": "assistant", "content": [],
+                        "stopReason": "aborted", "errorMessage": "aborted by user"}}).to_string(),
+                "",
+            ]
+            .join("\n")
+            .as_bytes(),
+        );
+        assert!(matches!(
+            transcript.finish(None).unwrap(),
+            super::PiAttempt::Failed(_)
+        ));
     }
 
     #[test]
