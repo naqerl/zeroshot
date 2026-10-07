@@ -10,7 +10,7 @@ runtime configuration, targets, and CLI reference. Zeroshot Cloud is documented 
 
 The product site is [zeroshot.sh](https://zeroshot.sh/?utm_source=npm&utm_medium=readme&utm_campaign=zeroshot).
 
-The same managed skill is installed for Codex and GitHub Copilot at
+The same managed skill is installed for Codex, GitHub Copilot, and Pi at
 `$HOME/.agents/skills/zeroshot/SKILL.md`, and for Claude Code at
 `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/zeroshot/SKILL.md`. Reinstalling updates an unchanged
 managed copy. A conflicting or edited skill is preserved; installation fails with the exact path so

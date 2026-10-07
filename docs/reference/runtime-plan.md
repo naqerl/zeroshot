@@ -16,7 +16,7 @@ machine-readable contract.
 
 | Field      | Value                                                                              |
 | ---------- | ---------------------------------------------------------------------------------- |
-| `harness`  | `codex`, `claude`, `copilot`, or `pi`                                            |
+| `harness`  | `codex`, `claude`, `copilot`, or `pi`                                              |
 | `provider` | A provider supported by the selected harness                                       |
 | `size`     | `small`, `medium`, or `large`                                                      |
 | `nodes`    | Object mapping each executable graph node name to a [node binding](#node-bindings) |
@@ -49,11 +49,11 @@ This plan binds the four agent nodes of the built-in `software-change` template:
 
 `harness` selects which `provider` values parse:
 
-| `harness` | `provider`                                      |
-| --------- | ----------------------------------------------- |
-| `codex`   | `openai`, `openrouter`, `bedrock`, `gateway`    |
-| `claude`  | `anthropic`, `openrouter`, `bedrock`, `gateway` |
-| `copilot` | `github`                                        |
+| `harness` | `provider`                                                |
+| --------- | --------------------------------------------------------- |
+| `codex`   | `openai`, `openrouter`, `bedrock`, `gateway`              |
+| `claude`  | `anthropic`, `openrouter`, `bedrock`, `gateway`           |
+| `copilot` | `github`                                                  |
 | `pi`      | `anthropic`, `openai`, `openrouter`, `bedrock`, `gateway` |
 
 Any other pair is rejected when the plan is read.
