@@ -115,7 +115,7 @@ fn local_preparation_snapshots_git_identity_and_rejects_ambiguous_sources() {
             "remote",
             "set-url",
             "origin",
-            "https://example.invalid/open-engine/zeroshot.git",
+            "https://example.invalid/only-owner",
         ],
     );
     assert!(matches!(
@@ -204,19 +204,67 @@ async fn local_harness_contract_materializes_each_native_lane_without_processes(
 }
 
 #[test]
-fn parses_canonical_github_remote_forms() {
+fn parses_canonical_remote_forms() {
     for remote in [
         "https://github.com/open-engine/zeroshot.git",
         "ssh://git@github.com/open-engine/zeroshot.git",
         "git@github.com:open-engine/zeroshot.git",
+        "https://gitea.example.com/open-engine/zeroshot.git",
+        "git@gitea.example.com:open-engine/zeroshot.git",
     ] {
         assert_eq!(
-            github_repository(remote).as_deref(),
+            DeliveryForge::repository(remote).as_deref(),
             Some("open-engine/zeroshot")
         );
     }
-    assert!(github_repository("https://example.com/open-engine/zeroshot.git").is_none());
-    assert!(github_repository("https://github.com/extra/open-engine/zeroshot").is_none());
+    assert!(DeliveryForge::repository("https://example.com/").is_none());
+    assert!(DeliveryForge::repository("https://github.com/extra/open-engine/zeroshot").is_none());
+}
+
+#[test]
+fn local_delivery_token_selects_the_forge_credential() {
+    let gitea = DeliveryForge::gitea("https://gitea.example.com").assert_value();
+
+    // Fresh local run: no GitHub token is forwarded, so the Gitea credential resolves.
+    let environment = BTreeMap::from([(GITEA_TOKEN_ENV.to_owned(), "gitea-fresh".to_owned())]);
+    assert_eq!(
+        local_delivery_token(&gitea, None, &environment).as_deref(),
+        Some("gitea-fresh")
+    );
+
+    // Resume: `github_token` carries the invoking shell's GH_TOKEN, but a Gitea forge must never
+    // forward it and must prefer GITEA_TOKEN.
+    let environment = BTreeMap::from([
+        (GITEA_TOKEN_ENV.to_owned(), "gitea-resume".to_owned()),
+        ("GH_TOKEN".to_owned(), "github-ambient".to_owned()),
+    ]);
+    assert_eq!(
+        local_delivery_token(&gitea, Some("github-resume".to_owned()), &environment).as_deref(),
+        Some("gitea-resume")
+    );
+    assert_eq!(
+        local_delivery_token(&gitea, Some("github-resume".to_owned()), &BTreeMap::new()),
+        None,
+        "a Gitea forge must not fall back to the GitHub credential"
+    );
+    assert_eq!(
+        local_delivery_token(
+            &gitea,
+            Some("github-resume".to_owned()),
+            &BTreeMap::from([(GITEA_TOKEN_ENV.to_owned(), "   ".to_owned())])
+        ),
+        None,
+        "a blank Gitea credential is not a credential"
+    );
+
+    // The GitHub forge keeps the caller-provided token and never reads GITEA_TOKEN.
+    let github = DeliveryForge::github();
+    let environment = BTreeMap::from([(GITEA_TOKEN_ENV.to_owned(), "gitea".to_owned())]);
+    assert_eq!(
+        local_delivery_token(&github, Some("github".to_owned()), &environment).as_deref(),
+        Some("github")
+    );
+    assert_eq!(local_delivery_token(&github, None, &environment), None);
 }
 
 #[test]

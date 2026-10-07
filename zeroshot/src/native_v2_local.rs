@@ -15,7 +15,6 @@ use openengine_cluster_protocol::{
     ResolvedSource,
 };
 use thiserror::Error;
-use url::Url;
 
 use crate::execution::process::HostedProcessPool;
 use crate::native_v2_candidate::{
@@ -29,7 +28,9 @@ use crate::native_v2_contract::AdmittedRun;
 use crate::native_v2_copilot::{CopilotConfig, CopilotLocalUser};
 use crate::native_v2_capsule::provider_process::{COPILOT_LOCAL_ENVIRONMENT, LocalHarnessEnvironment};
 use crate::native_v2_delivery::{
-    DeliveryTarget, GhCliAuthorityConfig, GhCliDeliveryAuthority, NativeV2DeliveryConfig,
+    DeliveryForge, DeliveryTarget, GhCliAuthorityConfig, GhCliDeliveryAuthority,
+    GitHubDeliveryAuthority, GiteaAuthorityConfig, GiteaDeliveryAuthority, NativeV2DeliveryConfig,
+    GITEA_TOKEN_ENV,
 };
 use crate::native_v2_runner::{NativeNodeRunner, NodeRunner};
 use crate::native_v2_supervisor::{RunEnvironment, RunEnvironmentError};
@@ -44,7 +45,7 @@ pub enum LocalCompositionError {
     Workspace,
     #[error("current Git workspace must have an attached branch")]
     DetachedHead,
-    #[error("current Git workspace must have a GitHub origin")]
+    #[error("current Git workspace must have a supported Git forge origin")]
     RepositoryIdentity,
     #[error("current Git resolved source is invalid")]
     ResolvedSource,
@@ -193,7 +194,8 @@ pub(crate) fn local_resolved_source(
         &["config", "--get", "remote.origin.url"],
     )
     .map_err(|_| LocalCompositionError::RepositoryIdentity)?;
-    let repository = github_repository(&origin).ok_or(LocalCompositionError::RepositoryIdentity)?;
+    let repository =
+        DeliveryForge::repository(&origin).ok_or(LocalCompositionError::RepositoryIdentity)?;
     let source = ResolvedSource {
         repository: SourceRepositoryId::new(repository)
             .map_err(|_| LocalCompositionError::ResolvedSource)?,
@@ -229,35 +231,27 @@ fn git_line(
     Ok(value.to_owned())
 }
 
-fn github_repository(origin: &str) -> Option<String> {
-    let path = github_remote_path(origin)?;
-    let path = path
-        .trim_matches('/')
-        .strip_suffix(".git")
-        .unwrap_or(path.trim_matches('/'));
-    let mut segments = path.split('/');
-    let owner = segments.next()?;
-    let repository = segments.next()?;
-    if owner.is_empty() || repository.is_empty() || segments.next().is_some() {
-        return None;
-    }
-    Some(format!("{owner}/{repository}"))
+fn local_delivery_forge(workspace: &Path) -> Option<DeliveryForge> {
+    let origin = git_line(
+        Path::new("git"),
+        workspace,
+        &["config", "--get", "remote.origin.url"],
+    )
+    .ok()?;
+    DeliveryForge::from_origin(&origin).ok()
 }
 
-fn github_remote_path(origin: &str) -> Option<String> {
-    match Url::parse(origin) {
-        Ok(url) => url
-            .host_str()
-            .filter(|host| host.eq_ignore_ascii_case("github.com"))
-            .map(|_| url.path().to_owned()),
-        Err(_) => {
-            let (authority, path) = origin.split_once(':')?;
-            let host = authority
-                .rsplit_once('@')
-                .map_or(authority, |(_, host)| host);
-            host.eq_ignore_ascii_case("github.com")
-                .then(|| path.to_owned())
-        }
+fn local_delivery_token(
+    forge: &DeliveryForge,
+    github_token: Option<String>,
+    native_environment: &BTreeMap<String, String>,
+) -> Option<String> {
+    match forge {
+        DeliveryForge::GitHub => github_token,
+        DeliveryForge::Gitea(_) => native_environment
+            .get(GITEA_TOKEN_ENV)
+            .filter(|token| !token.trim().is_empty())
+            .cloned(),
     }
 }
 
@@ -300,9 +294,19 @@ fn build_local_candidate_config(
         admitted.source.revision.as_str(),
     )
     .map_err(|_| LocalCompositionError::ResolvedSource)?;
-    let mut github_config = GhCliAuthorityConfig::hosted(runtime_home);
-    github_config.git_program = PathBuf::from("git");
-    github_config.gh_program = PathBuf::from("gh");
+    let forge = local_delivery_forge(workspace).unwrap_or(DeliveryForge::GitHub);
+    let delivery_token = local_delivery_token(&forge, github_token, native_environment);
+    let authority: Arc<dyn GitHubDeliveryAuthority> = match &forge {
+        DeliveryForge::GitHub => {
+            let mut github_config = GhCliAuthorityConfig::hosted(runtime_home);
+            github_config.git_program = PathBuf::from("git");
+            github_config.gh_program = PathBuf::from("gh");
+            Arc::new(GhCliDeliveryAuthority::new(github_config))
+        }
+        DeliveryForge::Gitea(forges) => Arc::new(GiteaDeliveryAuthority::new(
+            GiteaAuthorityConfig::new(forges.base_url.clone(), PathBuf::from("git")),
+        )),
+    };
     let config = NativeV2CandidateConfig {
         harness,
         delivery: NativeV2DeliveryConfig {
@@ -314,7 +318,7 @@ fn build_local_candidate_config(
             target,
             poll: Default::default(),
         },
-        github: Arc::new(GhCliDeliveryAuthority::new(github_config)),
+        github: authority,
     };
     if owner_scoped {
         build_local_owner_native_v2_candidate(admitted, config).map_err(Into::into)
@@ -322,7 +326,7 @@ fn build_local_candidate_config(
         build_local_native_v2_candidate_with_github_token(
             admitted,
             config,
-            github_token.map(Arc::<str>::from),
+            delivery_token.map(Arc::<str>::from),
         )
         .map_err(Into::into)
     }

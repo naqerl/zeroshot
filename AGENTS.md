@@ -264,6 +264,11 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   the unchanged candidate directly; other integrated remote changes return `repair_required` so the
   authored graph decides what work follows. Agents receive local refs and conflicts without the
   delivery credential. Closed PRs, identity changes and lost published ancestry stop delivery.
+- Git delivery selects its forge from the workspace origin: `github.com` keeps the pinned GitHub CLI
+  authority, and every other http(s) or ssh host selects the Gitea/Forgejo REST authority. The
+  authority owns its credential environment (`GH_TOKEN` for GitHub, `GITEA_TOKEN` for Gitea/Forgejo)
+  so the adapter resolves the same contract for both forges and the GitHub path is unchanged.
+  Self-hosted Gitea/Forgejo is a local composition; hosted placement remains GitHub-only.
 - Hosted delivery Git runs as the pinned workspace writer UID/GID, matching source checkout, so
   fetched objects, commits, merges, and partial failures remain writable by subsequent repairs.
   Admission excludes overlapping writers and requires their process cleanup before delivery;

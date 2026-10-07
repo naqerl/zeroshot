@@ -129,7 +129,11 @@ impl NativeV2DeliveryAdapter {
     ) -> String {
         let tokens = [
             self.trusted_github_token.as_deref(),
-            github_credential(&invocation.environment).map(GitHubCredential::expose),
+            delivery_credential(
+                &invocation.environment,
+                self.authority.credential_environment(),
+            )
+            .map(GitHubCredential::expose),
         ];
         for token in tokens.into_iter().flatten() {
             diagnostic = diagnostic

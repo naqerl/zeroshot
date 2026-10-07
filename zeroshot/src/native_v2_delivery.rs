@@ -9,9 +9,11 @@ mod adapter;
 mod authority_error;
 pub(crate) mod command;
 pub(crate) mod contract;
+mod forge;
 mod git;
 #[doc(hidden)]
 pub mod git_auth;
+mod gitea;
 mod github;
 mod review_head;
 #[cfg(test)]
@@ -19,6 +21,8 @@ mod tests;
 
 pub use command::GitCommandFailure;
 pub use authority_error::{GitHubApiFailure, GitHubAuthorityError};
+pub use forge::{DeliveryForge, DeliveryForgeError, GiteaForge};
+pub use gitea::{GiteaAuthorityConfig, GiteaDeliveryAuthority};
 pub use github::{GhCliAuthorityConfig, GhCliDeliveryAuthority};
 pub use review_head::{
     GitHubDeliveryRead, GitHubDeliverySnapshot, GitHubHeadReconciliation,
@@ -57,6 +61,7 @@ use self::git::SystemGit;
 use self::review_head::valid_head_update;
 
 pub const GITHUB_TOKEN_ENV: &str = "GH_TOKEN";
+pub const GITEA_TOKEN_ENV: &str = "GITEA_TOKEN";
 pub const DELIVERY_SIGNAL_FIELD: &str = "delivery";
 pub const DELIVERY_PUSHED_LABEL: &str = "pushed";
 pub const DELIVERY_OPENED_LABEL: &str = "opened";
@@ -410,6 +415,11 @@ pub enum GitHubConflictOutcome {
 /// Target-owned, bounded GitHub effects. Implementations must bound every network operation.
 #[async_trait]
 pub trait GitHubDeliveryAuthority: Send + Sync {
+    /// The environment variable that carries this authority's delivery credential.
+    fn credential_environment(&self) -> &'static str {
+        GITHUB_TOKEN_ENV
+    }
+
     /// Observes the bound PR and branch without committing, pushing, or changing metadata.
     async fn observe_delivery(
         &self,
@@ -501,8 +511,11 @@ pub trait GitHubDeliveryAuthority: Send + Sync {
 
 pub use adapter::NativeV2DeliveryAdapter;
 
-fn github_credential(environment: &ResolvedEnvironment) -> Option<GitHubCredential<'_>> {
-    let name = EnvironmentVariableName::new(GITHUB_TOKEN_ENV).ok()?;
+fn delivery_credential<'a>(
+    environment: &'a ResolvedEnvironment,
+    environment_name: &str,
+) -> Option<GitHubCredential<'a>> {
+    let name = EnvironmentVariableName::new(environment_name).ok()?;
     let token = environment.get(&name)?;
     (!token.trim().is_empty() && token.len() <= MAX_TOKEN_BYTES).then_some(GitHubCredential(token))
 }

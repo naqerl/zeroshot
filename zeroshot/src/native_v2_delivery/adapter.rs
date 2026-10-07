@@ -221,6 +221,7 @@ struct ReviewDrive<'a> {
 struct DeliveryCredentials<'a> {
     environment: Option<&'a ResolvedEnvironment>,
     token: String,
+    credential_environment: &'static str,
 }
 
 impl<'a> DeliveryCredentials<'a> {
@@ -240,7 +241,7 @@ impl<'a> DeliveryCredentials<'a> {
             return Ok(());
         };
         let refreshed = crate::native_v2_runner::refresh_environment(environment).await?;
-        let credential = github_credential(&refreshed)
+        let credential = delivery_credential(&refreshed, self.credential_environment)
             .ok_or(crate::native_v2_runner::EnvironmentRefreshError::Refused)?;
         self.token = credential.expose().to_owned();
         Ok(())
@@ -307,17 +308,22 @@ impl NativeV2DeliveryAdapter {
         &'a self,
         invocation: &'a DriverInvocation,
     ) -> Result<DeliveryCredentials<'a>, DeliveryStop> {
+        let credential_environment = self.authority.credential_environment();
         let (token, environment) = match self.trusted_github_token.as_deref() {
             Some(token) => (token.to_owned(), None),
             None => (
-                github_credential(&invocation.environment)
+                delivery_credential(&invocation.environment, credential_environment)
                     .ok_or_else(|| DeliveryStop::Outcome(WorkerOutcome::authentication_refusal()))?
                     .expose()
                     .to_owned(),
                 Some(&invocation.environment),
             ),
         };
-        Ok(DeliveryCredentials { environment, token })
+        Ok(DeliveryCredentials {
+            environment,
+            token,
+            credential_environment,
+        })
     }
 
     async fn prepare_review(

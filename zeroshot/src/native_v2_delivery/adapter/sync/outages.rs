@@ -146,6 +146,7 @@ impl NodeDriver for SyncProbe {
         let mut credentials = DeliveryCredentials {
             environment: Some(&self.environment),
             token: "test-token".to_owned(),
+            credential_environment: GITHUB_TOKEN_ENV,
         };
         match self
             .adapter
