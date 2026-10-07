@@ -28,7 +28,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   profile UI. The UI is served by Rust and never needs a production Node server.
 - Canonical releases are explicit `vX.Y.Z` tags with major version 8 or newer.
 - The npm package is `@the-open-engine-company/zeroshot`.
-- That package owns one canonical skill and installs managed copies for Codex, GitHub Copilot, and
+- That package owns one canonical skill and installs managed copies for Codex, GitHub Copilot, Pi, and
   Claude Code at their user scopes. Do not fork the skill by host.
 - The target image is `ghcr.io/the-open-engine/zeroshot-target`.
 - The Python distribution is `the-open-engine-zeroshot`; its import package remains `zeroshot`.

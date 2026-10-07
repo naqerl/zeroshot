@@ -74,6 +74,10 @@ any non-native provider lane, receives these canonical requirements:
 | `bedrock`    | `bedrock`      | `AWS_BEARER_TOKEN_BEDROCK`, `AWS_REGION` |
 | `github`     | `github`       | `COPILOT_GITHUB_TOKEN`                   |
 
+A `pi` gateway run additionally requires `GATEWAY_API`, which names the wire protocol
+(`openai-responses`, `openai-completions`, or `anthropic-messages`). The Codex and Claude gateway
+lanes do not use it.
+
 Compatible authored connections take precedence, including `CODEX_API_KEY` for contained OpenAI
 access and Claude's supported auth-token variables for contained Anthropic access. Local profiles
 keep the authored runtime unchanged; applying one to a target derives the contained requirements at
@@ -94,7 +98,7 @@ kinds depend on the target; Zeroshot consumes only the resolved fields declared 
 
 ## Gateways
 
-Use `provider: "gateway"` with `codex` or `claude` and the gateway's model identifier:
+Use `provider: "gateway"` with `codex`, `claude`, or `pi` and the gateway's model identifier:
 
 ```json
 { "harness": "codex", "provider": "gateway", "model": "PROVIDER_MODEL_ID" }
@@ -108,8 +112,9 @@ zeroshot connection set gateway --field GATEWAY_BASE_URL --field GATEWAY_API_KEY
 
 Codex requires the OpenAI **Responses API**, including streaming and tool calls; Chat Completions
 alone is insufficient. It sends the key as a bearer token. Claude requires the Anthropic **Messages
-API** and sends the key in `x-api-key`. Pi also pins the OpenAI **Responses API** for its gateway
-endpoint, and reads the key from the same declared connection. The selected gateway/model must support the harness's
+API** and sends the key in `x-api-key`. The `pi` gateway lane lets the caller name the wire protocol
+in `GATEWAY_API` and reaches any endpoint Pi implements without probing it; an unrecognized value
+fails before launch. The selected gateway/model must support the harness's
 requests, including structured output. Zeroshot does not probe capabilities or translate protocols.
 
 Supply the base URL expected by the selected harness, including any gateway path prefix. Zeroshot

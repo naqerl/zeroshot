@@ -55,7 +55,7 @@ npm install -g @the-open-engine-company/zeroshot
 
 The installer requires Node.js 18 or newer and installs a verified native binary for Linux
 x64/arm64, macOS x64/arm64, or Windows x64. It also installs one Zeroshot skill for Codex, GitHub
-Copilot, and Claude Code at user scope.
+Copilot, Pi, and Claude Code at user scope.
 
 For local execution, install and sign in to Codex, Claude Code, GitHub Copilot, or Pi. Local runs can
 reuse the harness's existing login, including subscription-backed sessions. See the
