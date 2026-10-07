@@ -135,6 +135,18 @@ and environment you provide.
   <a href="docs/assets/zeroshot-workflow.svg">Static diagram</a>
 </div>
 
+## Auto-research
+
+The built-in `auto-research` template runs ten iterations by default; set a positive
+`options.iterations` value in the run input to choose another count. Three scouts propose
+directions, then a planner chooses an experiment and either the current candidate or a restorable
+archived candidate as its starting point. Independent judges check the evidence and method, while
+the progress judge decides whether the result should replace the current candidate under the task
+charter. A valid result can go into the archive without replacing it. An auditor checks the ledger,
+archive, and workspace before the next iteration.
+
+Inspect the graph with `zeroshot template show auto-research`.
+
 ## Bring your own graph topology
 
 Choose each agent's model and instructions, which steps run in parallel, and when to retry.
@@ -152,8 +164,8 @@ E2E tests
 Delivery
 ```
 
-Only the review loop and delivery are built in. You define the other stages, their tools, services
-and credentials, and where failures go for repair.
+The software-change review loop, auto-research graph, and delivery are built in. You define other
+stages, their tools, services and credentials, and where failures go for repair.
 
 Inspect the built-in graph as a starting point:
 
