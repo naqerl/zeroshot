@@ -50,11 +50,11 @@ struct ReviewRepositoryWire {
 
 pub(super) fn review_receipt(
     wire: PullRequestWire,
-    request: &GitHubReviewRequest,
-) -> Result<GitHubReviewReceipt, GitHubAuthorityError> {
+    request: &ForgeReviewRequest,
+) -> Result<ForgeReviewReceipt, ForgeAuthorityError> {
     let receipt = read_review_receipt(wire, &request.target, &request.head_branch)?;
     if receipt.head_revision != request.head_revision {
-        return Err(GitHubAuthorityError::review_head_not_visible());
+        return Err(ForgeAuthorityError::review_head_not_visible());
     }
     Ok(receipt)
 }
@@ -63,8 +63,8 @@ pub(super) fn read_review_receipt(
     wire: PullRequestWire,
     target: &super::super::DeliveryTarget,
     head_branch: &str,
-) -> Result<GitHubReviewReceipt, GitHubAuthorityError> {
-    let receipt = GitHubReviewReceipt {
+) -> Result<ForgeReviewReceipt, ForgeAuthorityError> {
+    let receipt = ForgeReviewReceipt {
         review_id: wire.number.to_string(),
         repository: wire.base.repo.full_name,
         target_branch: wire.base.branch,
@@ -78,7 +78,7 @@ pub(super) fn read_review_receipt(
         || wire.number == 0
         || !valid_revision(&receipt.head_revision)
     {
-        return Err(GitHubAuthorityError::identity(format!(
+        return Err(ForgeAuthorityError::identity(format!(
             "expected repository {} base {} head {}; observed review {receipt:?}",
             target.repository, target.target_branch, head_branch,
         )));
@@ -88,28 +88,28 @@ pub(super) fn read_review_receipt(
 
 pub(super) fn require_review_identity(
     wire: &PullRequestWire,
-    review: &GitHubReviewReceipt,
-) -> Result<(), GitHubAuthorityError> {
+    review: &ForgeReviewReceipt,
+) -> Result<(), ForgeAuthorityError> {
     let valid = wire.number.to_string() == review.review_id
         && wire.base.repo.full_name == review.repository
         && wire.base.branch == review.target_branch
         && wire.head.repo.full_name == review.repository
         && wire.head.branch == review.head_branch
         && wire.head.sha == review.head_revision;
-    valid.then_some(()).ok_or(GitHubAuthorityError::Rejected)
+    valid.then_some(()).ok_or(ForgeAuthorityError::Rejected)
 }
 
 pub(super) fn require_review_head(
     wire: GitReferenceWire,
-    request: &GitHubReviewRequest,
-) -> Result<(), GitHubAuthorityError> {
+    request: &ForgeReviewRequest,
+) -> Result<(), ForgeAuthorityError> {
     let valid_identity = wire.reference == format!("refs/heads/{}", request.head_branch)
         && wire.object.kind == "commit";
     if !valid_identity {
-        return Err(GitHubAuthorityError::Rejected);
+        return Err(ForgeAuthorityError::Rejected);
     }
     if wire.object.sha != request.head_revision {
-        return Err(GitHubAuthorityError::review_head_not_visible());
+        return Err(ForgeAuthorityError::review_head_not_visible());
     }
     Ok(())
 }
@@ -117,13 +117,13 @@ pub(super) fn require_review_head(
 pub(super) fn reference_revision(
     wire: GitReferenceWire,
     branch: &str,
-) -> Result<String, GitHubAuthorityError> {
+) -> Result<String, ForgeAuthorityError> {
     let valid_identity = wire.reference == format!("refs/heads/{branch}")
         && wire.object.kind == "commit"
         && valid_revision(&wire.object.sha);
     valid_identity
         .then_some(wire.object.sha)
-        .ok_or(GitHubAuthorityError::Rejected)
+        .ok_or(ForgeAuthorityError::Rejected)
 }
 
 #[cfg(test)]

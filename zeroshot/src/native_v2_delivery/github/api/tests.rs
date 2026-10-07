@@ -12,7 +12,7 @@ fn api_payload_budget_and_log_tail_are_bounded() {
     );
     assert_eq!(
         validate_api_output(vec![b'x'; MAX_API_OUTPUT_BYTES + 1]),
-        Err(GitHubAuthorityError::Rejected)
+        Err(ForgeAuthorityError::Rejected)
     );
 
     let mut output = b"discard".to_vec();
@@ -44,7 +44,7 @@ fn api_error_parser_preserves_bounded_provider_status_and_reason() {
     assert!(error.to_string().contains("Validation Failed (HTTP 422)"));
     assert!(error.retryable_review_sync());
 
-    let unauthorized = GitHubAuthorityError::api(Some(401), "HTTP 401: Bad credentials");
+    let unauthorized = ForgeAuthorityError::api(Some(401), "HTTP 401: Bad credentials");
     assert!(!unauthorized.retryable_review_sync());
     assert!(unauthorized.authentication_failed());
 }
@@ -58,10 +58,10 @@ fn only_typed_transient_api_failures_are_retryable_during_review_sync() {
     assert!(forbidden.to_string().contains("unusual remote refusal"));
     assert!(forbidden.to_string().contains("Please try again later."));
 
-    let statusless = GitHubAuthorityError::api(None, "GitHub returned an invalid response");
+    let statusless = ForgeAuthorityError::api(None, "GitHub returned an invalid response");
     assert!(!statusless.retryable_review_sync());
     assert!(statusless.clone().temporary().retryable_review_sync());
-    assert!(GitHubAuthorityError::api(Some(429), "rate limited").retryable_review_sync());
+    assert!(ForgeAuthorityError::api(Some(429), "rate limited").retryable_review_sync());
 }
 
 fn authority(program: PathBuf, deadline: Duration) -> GhCliDeliveryAuthority {
@@ -89,7 +89,7 @@ async fn missing_api_executable_preserves_os_error_and_redacts_command() {
     let error = authority(program, Duration::from_secs(1))
         .api_output(
             &["repos/acme/project/pulls".to_owned()],
-            GitHubCredential("test-token"),
+            ForgeCredential("test-token"),
         )
         .await
         .err()
@@ -123,11 +123,11 @@ async fn empty_api_output_remains_an_error() {
     let root = TemporaryDirectory::for_test("github-empty-api");
     let program = script(root.as_path(), "exit 0\n");
     let error = authority(program, Duration::from_secs(1))
-        .api_output(&["graphql".to_owned()], GitHubCredential("test-token"))
+        .api_output(&["graphql".to_owned()], ForgeCredential("test-token"))
         .await
         .err()
         .assert_value();
-    assert!(matches!(error, GitHubAuthorityError::Api(_)));
+    assert!(matches!(error, ForgeAuthorityError::Api(_)));
     assert!(!error.retryable_operation());
 }
 
@@ -141,7 +141,7 @@ async fn nonexecutable_api_program_preserves_permission_error() {
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o644)).assert_value();
     let expected = spawn_error(&program);
     let error = authority(program, Duration::from_secs(1))
-        .api_output(&[], GitHubCredential("test-token"))
+        .api_output(&[], ForgeCredential("test-token"))
         .await
         .err()
         .assert_value();
@@ -170,7 +170,7 @@ fn explicit_rate_limit_403s_are_temporary_but_permission_403_is_terminal() {
         .failure(
             Some(std::process::ExitStatus::from_raw(1 << 8)),
             "fixture failure",
-            GitHubCredential("test-token"),
+            ForgeCredential("test-token"),
         );
 
         assert_eq!(error.api_status(), Some(403));
@@ -191,7 +191,7 @@ exec /bin/sleep 30
 "#,
     );
     let error = authority(program, Duration::from_secs(1))
-        .api_output(&[], GitHubCredential("test-token"))
+        .api_output(&[], ForgeCredential("test-token"))
         .await
         .err()
         .assert_value();
@@ -232,7 +232,7 @@ async fn failed_api_reserves_diagnostic_space_for_both_streams_and_retains_http_
     // Emitting and draining both bounded multi-megabyte streams is intentionally heavier under
     // coverage instrumentation; the assertion is about capture bounds, not scheduler latency.
     let error = authority(program, Duration::from_secs(30))
-        .api_output(&[], GitHubCredential("test-token"))
+        .api_output(&[], ForgeCredential("test-token"))
         .await
         .err()
         .assert_value();
@@ -259,7 +259,7 @@ async fn successful_api_retains_large_raw_response_without_redacting_or_truncati
     std::fs::write(root.as_path().join("payload"), &expected).assert_value();
     let program = script(root.as_path(), "exec /bin/cat \"$HOME/payload\"\n");
     let output = authority(program, Duration::from_secs(10))
-        .api_output(&[], GitHubCredential("test-token"))
+        .api_output(&[], ForgeCredential("test-token"))
         .await
         .assert_value();
     assert_eq!(output, expected);
@@ -303,7 +303,7 @@ async fn api_pipe_failure_preserves_stream_and_partial_output_with_redaction() {
         .await
         .err()
         .assert_value();
-        let failure = output.failure(None, &error, GitHubCredential("test-token"));
+        let failure = output.failure(None, &error, ForgeCredential("test-token"));
         let diagnostic = failure.to_string();
         assert!(diagnostic.contains(&format!(
             "could not read command {stream}: fixture read failure: [REDACTED]"
@@ -355,13 +355,13 @@ exec /bin/cat "$HOME/payload"
 "#,
     );
     let output = authority(program, Duration::from_secs(10))
-        .job_log_output("acme/project", 91, GitHubCredential("test-token"))
+        .job_log_output("acme/project", 91, ForgeCredential("test-token"))
         .await
         .assert_value();
     assert_eq!(output, expected);
     let mut snapshot = PolicySnapshot {
-        state: GitHubReviewState::Open {
-            checks: GitHubChecks::Failed {
+        state: ForgeReviewState::Open {
+            checks: ForgeChecks::Failed {
                 diagnostic: "Required CI checks failed".to_owned(),
             },
         },
@@ -371,8 +371,8 @@ exec /bin/cat "$HOME/payload"
         pull_request_ready: false,
     };
     include_check_logs(&mut snapshot, &[(91, check_log_tail(&output))]);
-    let GitHubReviewState::Open {
-        checks: GitHubChecks::Failed { diagnostic },
+    let ForgeReviewState::Open {
+        checks: ForgeChecks::Failed { diagnostic },
     } = snapshot.state
     else {
         panic!("expected failed required checks");
@@ -400,7 +400,7 @@ printf 'older CLI failure details\n'
 "#,
     );
     let output = authority(program, Duration::from_secs(10))
-        .job_log_output("acme/project", 91, GitHubCredential("test-token"))
+        .job_log_output("acme/project", 91, ForgeCredential("test-token"))
         .await
         .assert_value();
     assert_eq!(output, b"older CLI failure details\n");
@@ -422,7 +422,7 @@ exit 1
 "#,
     );
     let error = authority(program, Duration::from_secs(10))
-        .job_log_output("acme/project", 91, GitHubCredential("test-token"))
+        .job_log_output("acme/project", 91, ForgeCredential("test-token"))
         .await
         .err()
         .assert_value();
@@ -440,7 +440,7 @@ fn schema_failures_preserve_bounded_redacted_response_details() {
     let value = serde_json::json!({
         "unexpected": format!("{token} {} {}", encode_basic_credential(token), "λ🦀".repeat(20_000))
     });
-    let error = decode_response::<GitReferenceWire>(value, GitHubCredential(token))
+    let error = decode_response::<GitReferenceWire>(value, ForgeCredential(token))
         .err()
         .expect("wrong schema must fail");
     let diagnostic = error.to_string();

@@ -29,9 +29,9 @@ pub(crate) use zeroshot_engine::native_v2_cli::TargetRunIntent;
 pub(crate) use zeroshot_engine::native_v2_claude::ClaudeProcessEnvironment;
 pub(crate) use zeroshot_engine::native_v2_contract::{NodeInvocation, NodeRuntimeBinding, RuntimePlan};
 pub(crate) use zeroshot_engine::native_v2_delivery::{
-    DeliveryPollPolicy, DeliveryTarget, GitHubAuthorityError, GitHubChecks, GitHubCredential,
-    GitHubDeliveryAuthority, GitHubMergeRequestOutcome, GitHubPushRequest, GitHubReviewObservation,
-    GitHubReviewReceipt, GitHubReviewRequest, GitHubReviewState, NativeV2DeliveryAdapter,
+    DeliveryPollPolicy, DeliveryTarget, ForgeAuthorityError, ForgeChecks, ForgeCredential,
+    DeliveryForgeAuthority, ForgeMergeRequestOutcome, ForgePushRequest, ForgeReviewObservation,
+    ForgeReviewReceipt, ForgeReviewRequest, ForgeReviewState, NativeV2DeliveryAdapter,
     NativeV2DeliveryConfig, GITHUB_TOKEN_ENV,
 };
 pub(crate) use zeroshot_engine::native_v2_hosting::{

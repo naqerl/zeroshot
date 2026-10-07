@@ -272,19 +272,19 @@ async fn root_target_integration_preserves_contained_writer_ownership() {
     let result = fixture
         .authority
         .reconcile_delivery_target(
-            GitHubTargetReconciliation {
+            ForgeTargetReconciliation {
                 workspace: &fixture.workspace,
                 target: &target,
                 commit_message: "feat: candidate",
             },
-            GitHubCredential("test-token"),
+            ForgeCredential("test-token"),
         )
         .await
         .assert_value();
     assert_eq!(result.target_revision, fixture.target);
     assert!(matches!(
         result.outcome,
-        GitHubReconciliationOutcome::NeedsWork(_)
+        ForgeReconciliationOutcome::NeedsWork(_)
     ));
     fixture.repair_and_redeliver().await;
 }
@@ -301,9 +301,9 @@ async fn root_published_conflict_preserves_contained_writer_ownership() {
         .prepare_revision(&fixture.workspace, &fixture.source, "feat: candidate")
         .await
         .assert_value();
-    let request = GitHubConflictRequest {
+    let request = ForgeConflictRequest {
         workspace: fixture.workspace.clone(),
-        review: GitHubReviewReceipt {
+        review: ForgeReviewReceipt {
             review_id: "17".to_owned(),
             repository: "acme/project".to_owned(),
             target_branch: "main".to_owned(),
@@ -313,10 +313,10 @@ async fn root_published_conflict_preserves_contained_writer_ownership() {
     };
     let result = fixture
         .authority
-        .materialize_merge_conflict(&request, GitHubCredential("test-token"))
+        .materialize_merge_conflict(&request, ForgeCredential("test-token"))
         .await
         .assert_value();
-    assert!(matches!(result, GitHubConflictOutcome::Materialized(_)));
+    assert!(matches!(result, ForgeConflictOutcome::Materialized(_)));
     fixture.repair_and_redeliver().await;
 }
 

@@ -100,11 +100,11 @@ fn success_and_operator_diagnostics_preserve_bounded_command_context() {
     assert!(diagnostic.contains("trusted delivery"));
     assert!(succeeded.require_success().is_ok());
 
-    let contextual = super::super::GitHubAuthorityError::from(failure("repository refused"))
+    let contextual = super::super::ForgeAuthorityError::from(failure("repository refused"))
         .with_context("pushing managed branch");
     assert!(matches!(
         &contextual,
-        super::super::GitHubAuthorityError::Command(_)
+        super::super::ForgeAuthorityError::Command(_)
     ));
     assert!(contextual.to_string().contains("repository refused"));
     assert!(contextual.to_string().contains("pushing managed branch"));

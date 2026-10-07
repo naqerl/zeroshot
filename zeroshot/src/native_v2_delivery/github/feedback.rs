@@ -51,9 +51,9 @@ struct FeedbackItemDraft<'a> {
 
 pub(super) async fn inspect(
     authority: &GhCliDeliveryAuthority,
-    review: &GitHubReviewReceipt,
-    credential: GitHubCredential<'_>,
-) -> Result<GitHubReviewFeedback, GitHubAuthorityError> {
+    review: &ForgeReviewReceipt,
+    credential: ForgeCredential<'_>,
+) -> Result<ForgeReviewFeedback, ForgeAuthorityError> {
     let before = authority.pull_request(review, credential).await?;
     require_review_identity(&before, review)?;
 
@@ -87,7 +87,7 @@ pub(super) async fn inspect(
 
     let after = authority.pull_request(review, credential).await?;
     require_review_identity(&after, review).map_err(|_| {
-        GitHubAuthorityError::Unavailable
+        ForgeAuthorityError::Unavailable
             .with_context("GitHub PR identity changed while feedback was paginated")
     })?;
 
@@ -98,13 +98,13 @@ fn collect_items(
     issue_comments: Vec<IssueCommentWire>,
     reviews: Vec<ReviewWire>,
     review_comments: Vec<ReviewCommentWire>,
-) -> Result<GitHubReviewFeedback, GitHubAuthorityError> {
+) -> Result<ForgeReviewFeedback, ForgeAuthorityError> {
     let count = issue_comments
         .len()
         .saturating_add(reviews.len())
         .saturating_add(review_comments.len());
     if count > MAX_FEEDBACK_ITEMS {
-        return Err(GitHubAuthorityError::api(
+        return Err(ForgeAuthorityError::api(
             None,
             format!(
                 "GitHub PR feedback exceeded the absolute backstop of {MAX_FEEDBACK_ITEMS} items"
@@ -117,10 +117,10 @@ fn collect_items(
     items.extend(reviews.into_iter().filter_map(review_item));
     items.extend(review_comments.into_iter().filter_map(review_comment_item));
     items.sort_by(|left, right| left.key.cmp(&right.key));
-    Ok(GitHubReviewFeedback { items })
+    Ok(ForgeReviewFeedback { items })
 }
 
-fn issue_item(comment: IssueCommentWire) -> Option<GitHubReviewFeedbackItem> {
+fn issue_item(comment: IssueCommentWire) -> Option<ForgeReviewFeedbackItem> {
     Some(item(FeedbackItemDraft {
         key: format!("issue_comment:{}", comment.id),
         provider_version: &comment.updated_at,
@@ -130,7 +130,7 @@ fn issue_item(comment: IssueCommentWire) -> Option<GitHubReviewFeedbackItem> {
     }))
 }
 
-fn review_item(summary: ReviewWire) -> Option<GitHubReviewFeedbackItem> {
+fn review_item(summary: ReviewWire) -> Option<ForgeReviewFeedbackItem> {
     let body = nonempty_clean(summary.body.as_deref()).or_else(|| {
         (summary.state == "CHANGES_REQUESTED")
             .then(|| "Review requested changes without a written summary.".to_owned())
@@ -149,7 +149,7 @@ fn review_item(summary: ReviewWire) -> Option<GitHubReviewFeedbackItem> {
     }))
 }
 
-fn review_comment_item(comment: ReviewCommentWire) -> Option<GitHubReviewFeedbackItem> {
+fn review_comment_item(comment: ReviewCommentWire) -> Option<ForgeReviewFeedbackItem> {
     let line = comment.line.or(comment.original_line);
     let location = Some(format!(
         "path={} line={} commit={} replyTo={}",
@@ -173,8 +173,8 @@ fn review_comment_item(comment: ReviewCommentWire) -> Option<GitHubReviewFeedbac
 async fn pages<T: serde::de::DeserializeOwned>(
     authority: &GhCliDeliveryAuthority,
     endpoint: String,
-    credential: GitHubCredential<'_>,
-) -> Result<Vec<T>, GitHubAuthorityError> {
+    credential: ForgeCredential<'_>,
+) -> Result<Vec<T>, ForgeAuthorityError> {
     let value = authority
         .api(
             &[
@@ -194,7 +194,7 @@ async fn pages<T: serde::de::DeserializeOwned>(
         .try_fold(0usize, usize::checked_add)
         .filter(|count| *count <= MAX_FEEDBACK_ITEMS)
         .ok_or_else(|| {
-            GitHubAuthorityError::api(
+            ForgeAuthorityError::api(
                 None,
                 format!(
                     "GitHub PR feedback exceeded the absolute backstop of {MAX_FEEDBACK_ITEMS} items"
@@ -206,7 +206,7 @@ async fn pages<T: serde::de::DeserializeOwned>(
     Ok(values)
 }
 
-fn item(draft: FeedbackItemDraft<'_>) -> GitHubReviewFeedbackItem {
+fn item(draft: FeedbackItemDraft<'_>) -> ForgeReviewFeedbackItem {
     let FeedbackItemDraft {
         key,
         provider_version,
@@ -226,7 +226,7 @@ fn item(draft: FeedbackItemDraft<'_>) -> GitHubReviewFeedbackItem {
         digest.update(value.as_bytes());
         digest.update([0]);
     }
-    GitHubReviewFeedbackItem {
+    ForgeReviewFeedbackItem {
         key,
         version: format!("{:x}", digest.finalize()),
         author,

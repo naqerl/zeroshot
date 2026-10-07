@@ -7,7 +7,7 @@ impl NativeV2DeliveryAdapter {
         authority_diagnostic: &str,
     ) -> Result<ReviewStep, DeliveryStop> {
         emit(drive.control, "delivery: materializing merge conflict").await?;
-        let request = GitHubConflictRequest {
+        let request = ForgeConflictRequest {
             workspace: self.config.workspace.clone(),
             review: drive.review.clone(),
         };
@@ -17,7 +17,7 @@ impl NativeV2DeliveryAdapter {
         let outcome = self
             .materialize_conflict(&request, &mut drive.credentials, drive.control)
             .await?;
-        let GitHubConflictOutcome::Materialized(materialization) = outcome else {
+        let ForgeConflictOutcome::Materialized(materialization) = outcome else {
             // ObservationChanged confirms the original clean review head was restored.
             self.record_review_base(previous_base);
             emit(
@@ -35,10 +35,10 @@ impl NativeV2DeliveryAdapter {
 
     async fn materialize_conflict(
         &self,
-        request: &GitHubConflictRequest,
+        request: &ForgeConflictRequest,
         credentials: &mut DeliveryCredentials<'_>,
         control: &DriverControl,
-    ) -> Result<GitHubConflictOutcome, DeliveryStop> {
+    ) -> Result<ForgeConflictOutcome, DeliveryStop> {
         let mut retry = preflight::OperationRetry::default();
         loop {
             ensure_active(control)?;

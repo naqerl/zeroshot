@@ -14,7 +14,7 @@ async fn silent_status_success_requires_no_json_response() {
     command_status(
         shell("exit 0"),
         Duration::from_secs(2),
-        GitHubCredential("test-token"),
+        ForgeCredential("test-token"),
     )
     .await
     .expect("silent GitHub command succeeded");
@@ -65,11 +65,11 @@ async fn failed_status_commands_keep_native_http_and_transport_semantics() {
         let error = command_status(
             command,
             Duration::from_secs(2),
-            GitHubCredential("test-token"),
+            ForgeCredential("test-token"),
         )
         .await
         .expect_err("command failed");
-        assert!(matches!(error, GitHubAuthorityError::Api(_)));
+        assert!(matches!(error, ForgeAuthorityError::Api(_)));
         assert_eq!(error.api_status(), status, "{message}");
         assert_eq!(error.retryable_operation(), retryable, "{message}");
         assert_eq!(
@@ -89,11 +89,11 @@ async fn timed_out_status_does_not_claim_an_incomplete_authentication_response()
     let error = command_status(
         command,
         Duration::from_millis(100),
-        GitHubCredential("test-token"),
+        ForgeCredential("test-token"),
     )
     .await
     .expect_err("command timed out");
-    assert!(matches!(error, GitHubAuthorityError::Api(_)));
+    assert!(matches!(error, ForgeAuthorityError::Api(_)));
     assert_eq!(error.api_status(), None);
     assert!(error.retryable_operation());
     assert!(!error.authentication_failed());
@@ -106,11 +106,11 @@ async fn status_spawn_failure_stays_in_the_api_boundary() {
     let error = command_status(
         command,
         Duration::from_secs(2),
-        GitHubCredential("test-token"),
+        ForgeCredential("test-token"),
     )
     .await
     .expect_err("missing executable");
-    assert!(matches!(error, GitHubAuthorityError::Api(_)));
+    assert!(matches!(error, ForgeAuthorityError::Api(_)));
     assert!(
         error
             .to_string()
@@ -161,7 +161,7 @@ async fn status_completion_failure_and_timeout_stop_owned_helpers() {
         let result = command_status(
             helper_command(&marker, ending),
             Duration::from_millis(250),
-            GitHubCredential("test-token"),
+            ForgeCredential("test-token"),
         )
         .await;
         assert_eq!(result.is_ok(), ending == "exit 0");
@@ -182,7 +182,7 @@ async fn cancelling_status_capture_stops_owned_helpers() {
         command_status(
             command,
             Duration::from_secs(30),
-            GitHubCredential("test-token"),
+            ForgeCredential("test-token"),
         )
         .await
     });
@@ -211,7 +211,7 @@ async fn truncated_status_diagnostics_are_bounded_and_do_not_claim_http_authorit
     .expect("large stderr fixture");
     let mut command = shell("/bin/cat \"$1\" >&2; exit 1");
     command.arg("gh-fixture").arg(output);
-    let error = command_status(command, Duration::from_secs(2), GitHubCredential(token))
+    let error = command_status(command, Duration::from_secs(2), ForgeCredential(token))
         .await
         .expect_err("truncated failure");
     let diagnostic = error.to_string();

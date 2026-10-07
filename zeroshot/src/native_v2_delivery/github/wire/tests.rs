@@ -3,7 +3,7 @@ use serde_json::json;
 
 use super::*;
 
-fn request() -> GitHubReviewRequest {
+fn request() -> ForgeReviewRequest {
     super::super::test_review_request()
 }
 
@@ -25,14 +25,14 @@ fn stale_review_head_is_retryable_but_changed_identity_is_rejected() {
     });
     let stale = serde_json::from_value(value.clone()).assert_value();
     let error = review_receipt(stale, &request()).assert_error_with("stale head must defer");
-    assert_eq!(error, GitHubAuthorityError::review_head_not_visible());
+    assert_eq!(error, ForgeAuthorityError::review_head_not_visible());
     assert!(error.retryable_review_sync());
 
     *value.pointer_mut("/base/ref").assert_value() = json!("other");
     let changed = serde_json::from_value(value).assert_value();
     assert!(matches!(
         review_receipt(changed, &request()),
-        Err(GitHubAuthorityError::Identity(_))
+        Err(ForgeAuthorityError::Identity(_))
     ));
 }
 
@@ -47,14 +47,14 @@ fn stale_reference_head_is_retryable_but_changed_reference_is_rejected() {
     });
     let stale = serde_json::from_value(value.clone()).assert_value();
     let error = require_review_head(stale, &request()).assert_error_with("stale head must defer");
-    assert_eq!(error, GitHubAuthorityError::review_head_not_visible());
+    assert_eq!(error, ForgeAuthorityError::review_head_not_visible());
     assert!(error.retryable_review_sync());
 
     *value.get_mut("ref").assert_value() = json!("refs/heads/other");
     let changed = serde_json::from_value(value).assert_value();
     assert_eq!(
         require_review_head(changed, &request()),
-        Err(GitHubAuthorityError::Rejected)
+        Err(ForgeAuthorityError::Rejected)
     );
 }
 
@@ -78,7 +78,7 @@ fn target_reference_requires_the_exact_branch_and_commit_revision() {
         *changed.pointer_mut(pointer).assert_value() = json!("invalid");
         assert_eq!(
             reference_revision(serde_json::from_value(changed).assert_value(), "main"),
-            Err(GitHubAuthorityError::Rejected)
+            Err(ForgeAuthorityError::Rejected)
         );
     }
 }

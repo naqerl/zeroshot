@@ -404,7 +404,7 @@ impl ProductionCapsuleAllocator {
                     target,
                     git_identity,
                 ),
-                github: Arc::new(
+                authority: Arc::new(
                     GhCliDeliveryAuthority::new(github_config).with_operator_diagnostics(
                         request.run_id.clone(),
                         self.config.operator_diagnostics.clone(),

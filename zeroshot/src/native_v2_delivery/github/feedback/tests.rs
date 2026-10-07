@@ -175,7 +175,7 @@ async fn paginated_feedback_is_fenced_by_the_exact_review_identity() {
     let feedback = inspect(
         &authority(program, root.path()),
         &receipt(),
-        GitHubCredential("test-token"),
+        ForgeCredential("test-token"),
     )
     .await
     .assert_value();
@@ -213,7 +213,7 @@ async fn feedback_pagination_rejects_malformed_pages_and_identity_changes() {
     let changed = inspect(
         &authority(changed_program, changed_root.path()),
         &receipt(),
-        GitHubCredential("test-token"),
+        ForgeCredential("test-token"),
     )
     .await
     .assert_error();
@@ -232,11 +232,11 @@ async fn feedback_pagination_rejects_malformed_pages_and_identity_changes() {
     let malformed = inspect(
         &authority(malformed_program, malformed_root.path()),
         &receipt(),
-        GitHubCredential("test-token"),
+        ForgeCredential("test-token"),
     )
     .await
     .assert_error();
-    assert!(matches!(malformed, GitHubAuthorityError::Api(_)));
+    assert!(matches!(malformed, ForgeAuthorityError::Api(_)));
     assert!(!malformed.retryable_operation());
     assert!(malformed.to_string().contains("expected a sequence"));
 }

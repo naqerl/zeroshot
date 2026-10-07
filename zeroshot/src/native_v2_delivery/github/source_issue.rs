@@ -6,10 +6,10 @@ const LEGACY_UNMANAGED_BODY: &str = "Created by Zeroshot v2.";
 
 pub(super) async fn connect_source_issue(
     authority: &GhCliDeliveryAuthority,
-    request: &GitHubReviewRequest,
-    review: &GitHubReviewReceipt,
-    credential: GitHubCredential<'_>,
-) -> Result<(), GitHubAuthorityError> {
+    request: &ForgeReviewRequest,
+    review: &ForgeReviewReceipt,
+    credential: ForgeCredential<'_>,
+) -> Result<(), ForgeAuthorityError> {
     let Some(issue) = request.source_issue.as_ref() else {
         return Ok(());
     };
@@ -22,7 +22,7 @@ pub(super) async fn connect_source_issue(
             .patch_review(review, &[format!("body={body}")], credential)
             .await?;
         if updated.body.as_deref() != Some(body.as_str()) {
-            return Err(GitHubAuthorityError::Rejected);
+            return Err(ForgeAuthorityError::Rejected);
         }
     }
     comment_on_source_issue(authority, request, review, credential).await
@@ -30,14 +30,14 @@ pub(super) async fn connect_source_issue(
 
 async fn comment_on_source_issue(
     authority: &GhCliDeliveryAuthority,
-    request: &GitHubReviewRequest,
-    review: &GitHubReviewReceipt,
-    credential: GitHubCredential<'_>,
-) -> Result<(), GitHubAuthorityError> {
+    request: &ForgeReviewRequest,
+    review: &ForgeReviewReceipt,
+    credential: ForgeCredential<'_>,
+) -> Result<(), ForgeAuthorityError> {
     let issue = request
         .source_issue
         .as_ref()
-        .ok_or(GitHubAuthorityError::Rejected)?;
+        .ok_or(ForgeAuthorityError::Rejected)?;
     let marker = delivery_comment_marker(&request.head_branch);
     let value = authority
         .api(
@@ -50,7 +50,7 @@ async fn comment_on_source_issue(
         )
         .await?;
     let issue_wire: IssueWire =
-        serde_json::from_value(value).map_err(|_| GitHubAuthorityError::Rejected)?;
+        serde_json::from_value(value).map_err(|_| ForgeAuthorityError::Rejected)?;
     let last_comment_page = issue_wire.comments.saturating_sub(1) / 100 + 1;
     for page in 1..=last_comment_page {
         let value = authority
@@ -71,7 +71,7 @@ async fn comment_on_source_issue(
             )
             .await?;
         let comments: Vec<IssueCommentWire> =
-            serde_json::from_value(value).map_err(|_| GitHubAuthorityError::Rejected)?;
+            serde_json::from_value(value).map_err(|_| ForgeAuthorityError::Rejected)?;
         if comments_have_marker(&comments, &marker) {
             return Ok(());
         }
@@ -101,7 +101,7 @@ fn closing_reference(issue_number: u64) -> String {
     format!("Closes #{issue_number}")
 }
 
-fn generated_review_content(request: &GitHubReviewRequest) -> String {
+fn generated_review_content(request: &ForgeReviewRequest) -> String {
     request.source_issue.as_ref().map_or_else(
         || request.description.clone(),
         |issue| {
@@ -115,24 +115,24 @@ fn generated_review_content(request: &GitHubReviewRequest) -> String {
 }
 
 pub(super) fn pull_request_body(
-    request: &GitHubReviewRequest,
-) -> Result<String, GitHubAuthorityError> {
+    request: &ForgeReviewRequest,
+) -> Result<String, ForgeAuthorityError> {
     generated_body(&generated_review_content(request))
 }
 
 pub(super) fn refresh_pull_request_body(
     current: Option<&str>,
-    request: &GitHubReviewRequest,
-) -> Result<String, GitHubAuthorityError> {
+    request: &ForgeReviewRequest,
+) -> Result<String, ForgeAuthorityError> {
     if let Some(body) = current {
         if has_unowned_legacy_closing_reference(body)? {
-            return Err(GitHubAuthorityError::Rejected);
+            return Err(ForgeAuthorityError::Rejected);
         }
     }
     refresh_generated_body(current, &generated_review_content(request))
 }
 
-fn has_unowned_legacy_closing_reference(body: &str) -> Result<bool, GitHubAuthorityError> {
+fn has_unowned_legacy_closing_reference(body: &str) -> Result<bool, ForgeAuthorityError> {
     let suffix = match generated_body_range(body)? {
         Some(range) => &body[range.end..],
         None => body.strip_prefix(LEGACY_UNMANAGED_BODY).unwrap_or_default(),

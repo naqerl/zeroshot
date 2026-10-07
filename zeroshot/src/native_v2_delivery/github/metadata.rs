@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use super::GitHubAuthorityError;
+use super::ForgeAuthorityError;
 
 const GENERATED_BODY_START: &str = "<!-- zeroshot-delivery:generated:v1:start -->";
 const GENERATED_BODY_END: &str = "<!-- zeroshot-delivery:generated:v1:end -->";
@@ -9,16 +9,16 @@ pub(in crate::native_v2_delivery) fn valid_generated_description(description: &s
     !description.contains(GENERATED_BODY_START) && !description.contains(GENERATED_BODY_END)
 }
 
-pub(super) fn generated_body(description: &str) -> Result<String, GitHubAuthorityError> {
+pub(super) fn generated_body(description: &str) -> Result<String, ForgeAuthorityError> {
     valid_generated_description(description)
         .then(|| format!("{GENERATED_BODY_START}\n{description}\n{GENERATED_BODY_END}"))
-        .ok_or(GitHubAuthorityError::Rejected)
+        .ok_or(ForgeAuthorityError::Rejected)
 }
 
 pub(super) fn refresh_generated_body(
     current: Option<&str>,
     description: &str,
-) -> Result<String, GitHubAuthorityError> {
+) -> Result<String, ForgeAuthorityError> {
     let generated = generated_body(description)?;
     let Some(current) = current.filter(|body| !body.is_empty()) else {
         return Ok(generated);
@@ -35,7 +35,7 @@ pub(super) fn refresh_generated_body(
 
 pub(super) fn generated_body_range(
     body: &str,
-) -> Result<Option<Range<usize>>, GitHubAuthorityError> {
+) -> Result<Option<Range<usize>>, ForgeAuthorityError> {
     let starts = body.match_indices(GENERATED_BODY_START).collect::<Vec<_>>();
     let ends = body.match_indices(GENERATED_BODY_END).collect::<Vec<_>>();
     match (starts.as_slice(), ends.as_slice()) {
@@ -43,7 +43,7 @@ pub(super) fn generated_body_range(
         ([(start, _)], [(end, _)]) if start < end => {
             Ok(Some(*start..end + GENERATED_BODY_END.len()))
         }
-        _ => Err(GitHubAuthorityError::Rejected),
+        _ => Err(ForgeAuthorityError::Rejected),
     }
 }
 

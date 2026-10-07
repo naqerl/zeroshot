@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{GitHubAuthorityError, GitHubReviewReceipt};
+use super::{ForgeAuthorityError, ForgeReviewReceipt};
 
 const MERGE_POLICY_QUERY: &str = r#"
 query MergePolicy($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
@@ -138,15 +138,15 @@ struct PullRequestParameters {
 }
 
 pub(super) fn query_arguments(
-    review: &GitHubReviewReceipt,
-) -> Result<Vec<String>, GitHubAuthorityError> {
+    review: &ForgeReviewReceipt,
+) -> Result<Vec<String>, ForgeAuthorityError> {
     super::review_query_arguments(review, MERGE_POLICY_QUERY)
 }
 
 pub(super) fn classify(
     value: Value,
-    review: &GitHubReviewReceipt,
-) -> Result<MergeMethod, GitHubAuthorityError> {
+    review: &ForgeReviewReceipt,
+) -> Result<MergeMethod, ForgeAuthorityError> {
     let pages: Vec<QueryPage> = serde_json::from_value(value)
         .map_err(|error| invalid(format!("invalid response: {error}")))?;
     let first = validate_identity_and_policy(&pages, review)?;
@@ -177,7 +177,7 @@ pub(super) fn classify(
         .zip([MergeMethod::Merge, MergeMethod::Squash, MergeMethod::Rebase])
         .find_map(|(enabled, method)| enabled.then_some(method))
         .ok_or_else(|| {
-            GitHubAuthorityError::api(
+            ForgeAuthorityError::api(
                 None,
                 "No merge method is allowed by both repository settings and base-branch protection/rulesets. \
                  Enable a compatible merge method or use a merge queue before retrying delivery.",
@@ -187,8 +187,8 @@ pub(super) fn classify(
 
 fn validate_identity_and_policy<'a>(
     pages: &'a [QueryPage],
-    review: &GitHubReviewReceipt,
-) -> Result<&'a Repository, GitHubAuthorityError> {
+    review: &ForgeReviewReceipt,
+) -> Result<&'a Repository, ForgeAuthorityError> {
     let first = &pages
         .first()
         .ok_or_else(|| invalid("no response pages"))?
@@ -210,7 +210,7 @@ fn apply_rules(
     pages: &[QueryPage],
     expected_count: usize,
     allowed: &mut [bool; 3],
-) -> Result<(), GitHubAuthorityError> {
+) -> Result<(), ForgeAuthorityError> {
     let mut cursors = BTreeSet::new();
     let mut rule_ids = BTreeSet::new();
     for (index, page) in pages.iter().enumerate() {
@@ -240,7 +240,7 @@ fn validate_page<'a>(
     rules: &'a Rules,
     has_next_page: bool,
     cursors: &mut BTreeSet<&'a str>,
-) -> Result<(), GitHubAuthorityError> {
+) -> Result<(), ForgeAuthorityError> {
     if rules.page_info.has_next_page != has_next_page {
         return Err(invalid("incomplete branch-rule pagination"));
     }
@@ -275,7 +275,7 @@ fn apply_restriction(restriction: &Restriction, allowed: &mut [bool; 3]) {
     }
 }
 
-fn rules(repository: &Repository) -> Result<&Rules, GitHubAuthorityError> {
+fn rules(repository: &Repository) -> Result<&Rules, ForgeAuthorityError> {
     repository
         .pull_request
         .base_ref
@@ -286,8 +286,8 @@ fn rules(repository: &Repository) -> Result<&Rules, GitHubAuthorityError> {
 
 fn require_identity(
     repository: &Repository,
-    review: &GitHubReviewReceipt,
-) -> Result<(), GitHubAuthorityError> {
+    review: &ForgeReviewReceipt,
+) -> Result<(), ForgeAuthorityError> {
     let pull_request = &repository.pull_request;
     if repository.name_with_owner != review.repository
         || pull_request.number.to_string() != review.review_id
@@ -297,7 +297,7 @@ fn require_identity(
         || pull_request.head_ref_oid != review.head_revision
         || pull_request.id.is_empty()
     {
-        return Err(GitHubAuthorityError::identity(
+        return Err(ForgeAuthorityError::identity(
             "Merge policy no longer matches the admitted pull request, base branch, and exact head.",
         ));
     }
@@ -316,8 +316,8 @@ fn same_policy(first: &Repository, current: &Repository) -> bool {
         && left.base_ref.ref_update_rule == right.base_ref.ref_update_rule
 }
 
-fn invalid(detail: impl std::fmt::Display) -> GitHubAuthorityError {
-    GitHubAuthorityError::api(
+fn invalid(detail: impl std::fmt::Display) -> ForgeAuthorityError {
+    ForgeAuthorityError::api(
         None,
         format!("Cannot determine a permitted merge method: {detail}."),
     )

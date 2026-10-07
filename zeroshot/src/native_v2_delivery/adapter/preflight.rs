@@ -14,7 +14,7 @@ pub(super) struct OperationContext<'a, 'environment> {
 
 struct ObservedPreflight<'a, 'invocation, 'environment> {
     known: &'a DeliveryState,
-    observed: GitHubReviewReceipt,
+    observed: ForgeReviewReceipt,
     preparation: &'a mut DeliveryPreparation<'invocation, 'environment>,
     commit_message: &'a str,
 }
@@ -47,7 +47,7 @@ impl<'environment> ReviewDrive<'environment> {
 
 #[derive(Clone, Default)]
 pub(super) struct DeliveryState {
-    pub(super) published: Option<GitHubReviewReceipt>,
+    pub(super) published: Option<ForgeReviewReceipt>,
     pub(super) intended_push: Option<String>,
     pub(super) pending_head: Option<head::PendingHead>,
     pub(super) review_base_revision: Option<String>,
@@ -62,7 +62,7 @@ impl NativeV2DeliveryAdapter {
             .clone()
     }
 
-    pub(super) fn record_published(&self, review: GitHubReviewReceipt) {
+    pub(super) fn record_published(&self, review: ForgeReviewReceipt) {
         let mut state = self
             .state
             .lock()
@@ -74,8 +74,8 @@ impl NativeV2DeliveryAdapter {
 
     pub(super) fn checkpoint_feedback(
         &self,
-        feedback: GitHubReviewFeedback,
-    ) -> Vec<GitHubReviewFeedbackItem> {
+        feedback: ForgeReviewFeedback,
+    ) -> Vec<ForgeReviewFeedbackItem> {
         let mut state = self
             .state
             .lock()
@@ -105,7 +105,7 @@ impl NativeV2DeliveryAdapter {
         let known = self.delivery_state();
         let mode = DeliveryMode::from_worker(&preparation.invocation.node.worker)
             .ok_or(NodeRunnerError::InvalidRole)?;
-        let request = GitHubDeliveryRead {
+        let request = ForgeDeliveryRead {
             target: &self.config.target,
             head_branch: &branch,
             known_review: known.published.as_ref(),
@@ -170,7 +170,7 @@ impl NativeV2DeliveryAdapter {
                 .is_some_and(|updated| updated.head_revision == observed.head_revision)
         });
         let adopting_existing = self.is_adopting_existing_delivery(known);
-        let request = GitHubHeadReconciliation {
+        let request = ForgeHeadReconciliation {
             workspace: &self.config.workspace,
             published: &published,
             observed: &observed,
@@ -181,14 +181,14 @@ impl NativeV2DeliveryAdapter {
         self.forget_review_base_if_head_changed(&published.head_revision, &observed.head_revision);
         let outcome = self.reconcile_before_delivery(request, preparation).await?;
         match outcome {
-            GitHubReconciliationOutcome::Refused(diagnostic) => {
+            ForgeReconciliationOutcome::Refused(diagnostic) => {
                 self.refuse_delivery(preparation.control, &diagnostic).await
             }
-            GitHubReconciliationOutcome::NeedsWork(diagnostic) => {
+            ForgeReconciliationOutcome::NeedsWork(diagnostic) => {
                 self.record_published(observed.clone());
                 Err(recovery::repair(diagnostic).with_review(&observed))
             }
-            GitHubReconciliationOutcome::Unchanged | GitHubReconciliationOutcome::Adopted => {
+            ForgeReconciliationOutcome::Unchanged | ForgeReconciliationOutcome::Adopted => {
                 self.record_published(observed);
                 Ok(())
             }
@@ -204,9 +204,9 @@ impl NativeV2DeliveryAdapter {
     async fn require_reconciliation_anchor(
         &self,
         known: &DeliveryState,
-        observed: &GitHubReviewReceipt,
+        observed: &ForgeReviewReceipt,
         control: &DriverControl,
-    ) -> Result<GitHubReviewReceipt, DeliveryStop> {
+    ) -> Result<ForgeReviewReceipt, DeliveryStop> {
         match reconciliation_anchor(known, observed, self.config.adopt_existing_delivery) {
             Ok(published) => Ok(published),
             Err(error) => {
@@ -218,9 +218,9 @@ impl NativeV2DeliveryAdapter {
 
     async fn observe_before_delivery(
         &self,
-        request: GitHubDeliveryRead<'_>,
+        request: ForgeDeliveryRead<'_>,
         preparation: &mut DeliveryPreparation<'_, '_>,
-    ) -> Result<GitHubDeliverySnapshot, DeliveryStop> {
+    ) -> Result<ForgeDeliverySnapshot, DeliveryStop> {
         let mut refreshed = OperationRetry::default();
         loop {
             ensure_active(preparation.control)?;
@@ -240,9 +240,9 @@ impl NativeV2DeliveryAdapter {
 
     async fn reconcile_before_delivery(
         &self,
-        request: GitHubHeadReconciliation<'_>,
+        request: ForgeHeadReconciliation<'_>,
         preparation: &mut DeliveryPreparation<'_, '_>,
-    ) -> Result<GitHubReconciliationOutcome, DeliveryStop> {
+    ) -> Result<ForgeReconciliationOutcome, DeliveryStop> {
         let before = self
             .git
             .workspace_state(&self.config.workspace)
@@ -267,10 +267,10 @@ impl NativeV2DeliveryAdapter {
 
     pub(super) async fn reconciliation_result(
         &self,
-        outcome: GitHubReconciliationOutcome,
+        outcome: ForgeReconciliationOutcome,
         before: &(String, bool),
-    ) -> Result<GitHubReconciliationOutcome, DeliveryStop> {
-        if outcome != GitHubReconciliationOutcome::Unchanged {
+    ) -> Result<ForgeReconciliationOutcome, DeliveryStop> {
+        if outcome != ForgeReconciliationOutcome::Unchanged {
             return Ok(outcome);
         }
         let after = self
@@ -279,7 +279,7 @@ impl NativeV2DeliveryAdapter {
             .await
             .map_err(|error| recovery::repair(error.to_string()))?;
         if before != &after {
-            return Ok(GitHubReconciliationOutcome::NeedsWork(format!(
+            return Ok(ForgeReconciliationOutcome::NeedsWork(format!(
                 "the workspace changed during trusted reconciliation before a retry confirmed it: \
                  before head {} dirty {}; after head {} dirty {}; inspect the current workspace",
                 before.0, before.1, after.0, after.1,
@@ -290,21 +290,21 @@ impl NativeV2DeliveryAdapter {
 
     async fn check_terminal_review(
         &self,
-        snapshot: &GitHubDeliverySnapshot,
+        snapshot: &ForgeDeliverySnapshot,
         preparation: &DeliveryPreparation<'_, '_>,
     ) -> Result<(), DeliveryStop> {
         let Some(review) = &snapshot.review else {
             return Ok(());
         };
         match &review.state {
-            GitHubReviewState::Closed => {
+            ForgeReviewState::Closed => {
                 self.refuse_delivery(
                     preparation.control,
                     "the run PR was closed; no branch or PR mutation was attempted",
                 )
                 .await
             }
-            GitHubReviewState::Merged { .. } => {
+            ForgeReviewState::Merged { .. } => {
                 self.complete_existing_merge(review, preparation).await
             }
             _ => Ok(()),
@@ -313,10 +313,10 @@ impl NativeV2DeliveryAdapter {
 
     async fn complete_existing_merge(
         &self,
-        review: &GitHubReviewObservation,
+        review: &ForgeReviewObservation,
         preparation: &DeliveryPreparation<'_, '_>,
     ) -> Result<(), DeliveryStop> {
-        let GitHubReviewState::Merged { merge_revision } = &review.state else {
+        let ForgeReviewState::Merged { merge_revision } = &review.state else {
             return Err(DeliveryStop::Outcome(WorkerOutcome::malformed()));
         };
         let (head, dirty) = self
@@ -409,7 +409,7 @@ impl NativeV2DeliveryAdapter {
 
     pub(super) async fn operation_result<T>(
         &self,
-        result: Result<T, GitHubAuthorityError>,
+        result: Result<T, ForgeAuthorityError>,
         context: OperationContext<'_, '_>,
     ) -> Result<Option<T>, DeliveryStop> {
         match result {
@@ -423,7 +423,7 @@ impl NativeV2DeliveryAdapter {
 
     pub(super) async fn retry_operation(
         &self,
-        error: GitHubAuthorityError,
+        error: ForgeAuthorityError,
         context: OperationContext<'_, '_>,
     ) -> Result<(), DeliveryStop> {
         let OperationContext {
@@ -464,9 +464,9 @@ impl NativeV2DeliveryAdapter {
 
 fn reconciliation_anchor(
     known: &DeliveryState,
-    observed: &GitHubReviewReceipt,
+    observed: &ForgeReviewReceipt,
     adopt_existing_delivery: bool,
-) -> Result<GitHubReviewReceipt, GitHubAuthorityError> {
+) -> Result<ForgeReviewReceipt, ForgeAuthorityError> {
     if let Some(published) = &known.published {
         return Ok(published.clone());
     }
@@ -478,21 +478,21 @@ fn reconciliation_anchor(
     if adopt_existing_delivery {
         return Ok(observed.clone());
     }
-    Err(GitHubAuthorityError::identity(format!(
+    Err(ForgeAuthorityError::identity(format!(
         "unexpected existing run branch at {}; no published candidate or pending push proves ownership",
         observed.head_revision,
     )))
 }
 
 fn observed_receipt(
-    snapshot: GitHubDeliverySnapshot,
+    snapshot: ForgeDeliverySnapshot,
     target: &DeliveryTarget,
     branch: &str,
-) -> Option<GitHubReviewReceipt> {
+) -> Option<ForgeReviewReceipt> {
     let head_revision = snapshot.head_revision?;
     match snapshot.review {
         Some(review) => Some(receipt_from_observation(&review)),
-        None => Some(GitHubReviewReceipt {
+        None => Some(ForgeReviewReceipt {
             review_id: String::new(),
             repository: target.repository.clone(),
             target_branch: target.target_branch.clone(),
@@ -502,8 +502,8 @@ fn observed_receipt(
     }
 }
 
-pub(super) fn receipt_from_observation(review: &GitHubReviewObservation) -> GitHubReviewReceipt {
-    GitHubReviewReceipt {
+pub(super) fn receipt_from_observation(review: &ForgeReviewObservation) -> ForgeReviewReceipt {
+    ForgeReviewReceipt {
         review_id: review.review_id.clone(),
         repository: review.repository.clone(),
         target_branch: review.target_branch.clone(),

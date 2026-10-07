@@ -62,8 +62,8 @@ fn method_rule(methods: Value) -> Value {
     json!({"type": "PULL_REQUEST", "parameters": {"allowedMergeMethods": methods}})
 }
 
-fn assert_permanent(error: &GitHubAuthorityError) {
-    assert!(matches!(error, GitHubAuthorityError::Api(_)), "{error}");
+fn assert_permanent(error: &ForgeAuthorityError) {
+    assert!(matches!(error, ForgeAuthorityError::Api(_)), "{error}");
     assert!(!error.retryable_operation(), "{error}");
 }
 
@@ -257,7 +257,7 @@ fn every_page_must_match_the_admitted_identity() {
             *input[page].pointer_mut(path).assert_value() = value;
             let error = classify(input, &review()).assert_error();
             assert!(
-                matches!(error, GitHubAuthorityError::Identity(_)),
+                matches!(error, ForgeAuthorityError::Identity(_)),
                 "{path}: {error}"
             );
             assert!(!error.retryable_operation());

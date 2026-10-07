@@ -14,8 +14,8 @@ use super::*;
 const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
 const OTHER: &str = "1111111111111111111111111111111111111111";
 
-fn credential() -> GitHubCredential<'static> {
-    GitHubCredential("test-token")
+fn credential() -> ForgeCredential<'static> {
+    ForgeCredential("test-token")
 }
 
 fn authority(base_url: &str) -> GiteaDeliveryAuthority {
@@ -58,19 +58,19 @@ fn combined_commit_status_maps_to_checks() {
         state: "success".to_owned(),
         statuses: Vec::new(),
     };
-    assert_eq!(classify_checks(&empty), GitHubChecks::NotRequired);
+    assert_eq!(classify_checks(&empty), ForgeChecks::NotRequired);
 
     let passed = StatusWire {
         state: "success".to_owned(),
         statuses: vec![json!({"status": "success"})],
     };
-    assert_eq!(classify_checks(&passed), GitHubChecks::Passed);
+    assert_eq!(classify_checks(&passed), ForgeChecks::Passed);
 
     let pending = StatusWire {
         state: "pending".to_owned(),
         statuses: vec![json!({"status": "pending"})],
     };
-    assert_eq!(classify_checks(&pending), GitHubChecks::Pending);
+    assert_eq!(classify_checks(&pending), ForgeChecks::Pending);
 
     let failed = StatusWire {
         state: "failure".to_owned(),
@@ -78,7 +78,7 @@ fn combined_commit_status_maps_to_checks() {
     };
     assert!(matches!(
         classify_checks(&failed),
-        GitHubChecks::Failed { .. }
+        ForgeChecks::Failed { .. }
     ));
 }
 
@@ -86,21 +86,21 @@ fn combined_commit_status_maps_to_checks() {
 fn pull_state_classification_is_terminal_aware() {
     assert_eq!(
         classify_pull_state(&pull("open", false, None, Some(true))).expect("open"),
-        GitHubReviewState::Open {
-            checks: GitHubChecks::Pending
+        ForgeReviewState::Open {
+            checks: ForgeChecks::Pending
         }
     );
     assert_eq!(
         classify_pull_state(&pull("open", false, None, Some(false))).expect("conflict"),
-        GitHubReviewState::Conflict
+        ForgeReviewState::Conflict
     );
     assert_eq!(
         classify_pull_state(&pull("closed", false, None, Some(true))).expect("closed"),
-        GitHubReviewState::Closed
+        ForgeReviewState::Closed
     );
     assert_eq!(
         classify_pull_state(&pull("closed", true, Some(HEAD), None)).expect("merged"),
-        GitHubReviewState::Merged {
+        ForgeReviewState::Merged {
             merge_revision: HEAD.to_owned()
         }
     );
@@ -127,8 +127,8 @@ fn receipt_rejects_malformed_pull_identity() {
 fn observations_must_agree_on_head_identity() {
     let receipt =
         receipt_from_pull(&pull("open", false, None, Some(true)), "acme/project").expect("receipt");
-    let observation = receipt.observation(GitHubReviewState::Open {
-        checks: GitHubChecks::Passed,
+    let observation = receipt.observation(ForgeReviewState::Open {
+        checks: ForgeChecks::Passed,
     });
     assert!(require_consistent_head(Some(&observation), Some(HEAD)).is_ok());
     assert!(require_consistent_head(Some(&observation), Some(OTHER)).is_err());
@@ -151,7 +151,7 @@ fn published_and_observed_identities_must_match() {
 fn authority_selects_the_gitea_credential_environment() {
     let authority = authority("https://gitea.example.com");
     assert_eq!(
-        GitHubDeliveryAuthority::credential_environment(&authority),
+        DeliveryForgeAuthority::credential_environment(&authority),
         "GITEA_TOKEN"
     );
     assert_eq!(
@@ -225,7 +225,7 @@ async fn observe_delivery_reports_the_bound_pull_and_head() {
     let target = target();
     let snapshot = authority
         .observe_delivery(
-            GitHubDeliveryRead {
+            ForgeDeliveryRead {
                 target: &target,
                 head_branch: "zeroshot/run/42",
                 known_review: None,
@@ -239,7 +239,7 @@ async fn observe_delivery_reports_the_bound_pull_and_head() {
     let review = snapshot.review.expect("review");
     assert_eq!(review.review_id, "7");
     assert_eq!(review.head_branch, "zeroshot/run/42");
-    assert!(matches!(review.state, GitHubReviewState::Open { .. }));
+    assert!(matches!(review.state, ForgeReviewState::Open { .. }));
 
     let requests = server.requests();
     assert_eq!(requests.len(), 3, "{requests:?}");
@@ -278,7 +278,7 @@ async fn open_review_creates_the_run_pull_request() {
     let authority = authority(&server.base_url);
     let receipt = authority
         .open_or_update_review(
-            &GitHubReviewRequest {
+            &ForgeReviewRequest {
                 target: target(),
                 head_branch: "zeroshot/run/42".to_owned(),
                 head_revision: HEAD.to_owned(),
@@ -329,7 +329,7 @@ async fn open_review_updates_an_existing_pull_request() {
     let authority = authority(&server.base_url);
     let receipt = authority
         .open_or_update_review(
-            &GitHubReviewRequest {
+            &ForgeReviewRequest {
                 target: target(),
                 head_branch: "zeroshot/run/42".to_owned(),
                 head_revision: HEAD.to_owned(),
@@ -369,7 +369,7 @@ async fn inspect_review_reads_branch_checks() {
         ),
     ]);
     let authority = authority(&server.base_url);
-    let receipt = GitHubReviewReceipt {
+    let receipt = ForgeReviewReceipt {
         review_id: "7".to_owned(),
         repository: "acme/project".to_owned(),
         target_branch: "main".to_owned(),
@@ -384,8 +384,8 @@ async fn inspect_review_reads_branch_checks() {
     assert!(!observation.pull_request_ready);
     assert_eq!(
         observation.state,
-        GitHubReviewState::Open {
-            checks: GitHubChecks::Passed
+        ForgeReviewState::Open {
+            checks: ForgeChecks::Passed
         }
     );
     let requests = server.requests();
@@ -496,7 +496,7 @@ async fn inspect_review_feedback_reads_all_discussion_surfaces() {
         (200, pull),
     ]);
     let authority = authority(&server.base_url);
-    let receipt = GitHubReviewReceipt {
+    let receipt = ForgeReviewReceipt {
         review_id: "7".to_owned(),
         repository: "acme/project".to_owned(),
         target_branch: "main".to_owned(),
@@ -557,7 +557,7 @@ async fn request_merge_reports_a_conflict_without_merging() {
         .to_string(),
     )]);
     let authority = authority(&server.base_url);
-    let receipt = GitHubReviewReceipt {
+    let receipt = ForgeReviewReceipt {
         review_id: "7".to_owned(),
         repository: "acme/project".to_owned(),
         target_branch: "main".to_owned(),
@@ -569,7 +569,7 @@ async fn request_merge_reports_a_conflict_without_merging() {
             .request_merge(&receipt, credential())
             .await
             .expect("outcome"),
-        GitHubMergeRequestOutcome::Conflict
+        ForgeMergeRequestOutcome::Conflict
     );
     assert_eq!(server.requests().len(), 1);
 }
@@ -592,7 +592,7 @@ async fn request_merge_accepts_once_gitea_merges() {
         (200, "{}".to_owned()),
     ]);
     let authority = authority(&server.base_url);
-    let receipt = GitHubReviewReceipt {
+    let receipt = ForgeReviewReceipt {
         review_id: "7".to_owned(),
         repository: "acme/project".to_owned(),
         target_branch: "main".to_owned(),
@@ -604,7 +604,7 @@ async fn request_merge_accepts_once_gitea_merges() {
             .request_merge(&receipt, credential())
             .await
             .expect("outcome"),
-        GitHubMergeRequestOutcome::Accepted
+        ForgeMergeRequestOutcome::Accepted
     );
     let requests = server.requests();
     assert_eq!(requests[1].0, "POST");
@@ -742,7 +742,7 @@ mod conflict {
     struct ConflictFixture {
         repository: TestGitRepository,
         authority: GiteaDeliveryAuthority,
-        request: GitHubConflictRequest,
+        request: ForgeConflictRequest,
         target_revision: String,
         git_program: PathBuf,
         _server: TestGitea,
@@ -768,9 +768,9 @@ mod conflict {
             )]);
             let git_program = git_wrapper(&repository, &server.base_url);
             let authority = authority_with_program(&server.base_url, git_program.clone());
-            let request = GitHubConflictRequest {
+            let request = ForgeConflictRequest {
                 workspace: repository.workspace.clone(),
-                review: GitHubReviewReceipt {
+                review: ForgeReviewReceipt {
                     review_id: "7".to_owned(),
                     repository: "acme/project".to_owned(),
                     target_branch: "main".to_owned(),
@@ -830,7 +830,7 @@ exec /usr/bin/git "${{arguments[@]}}"
             .materialize_merge_conflict(&fixture.request, credential())
             .await
             .assert_value();
-        let GitHubConflictOutcome::Materialized(materialized) = outcome else {
+        let ForgeConflictOutcome::Materialized(materialized) = outcome else {
             panic!("expected a materialized merge conflict");
         };
 
@@ -872,7 +872,7 @@ exec /usr/bin/git "${{arguments[@]}}"
             .materialize_merge_conflict(&fixture.request, credential())
             .await
             .assert_value();
-        assert!(matches!(outcome, GitHubConflictOutcome::Materialized(_)));
+        assert!(matches!(outcome, ForgeConflictOutcome::Materialized(_)));
 
         fs::write(
             fixture.repository.workspace.join("result.txt"),
@@ -914,7 +914,7 @@ exec /usr/bin/git "${{arguments[@]}}"
             .await
             .assert_value();
 
-        assert_eq!(outcome, GitHubConflictOutcome::ObservationChanged);
+        assert_eq!(outcome, ForgeConflictOutcome::ObservationChanged);
         assert_eq!(
             git_output(&fixture.repository.workspace, &["rev-parse", "HEAD"]),
             fixture.request.review.head_revision

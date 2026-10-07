@@ -2,9 +2,9 @@ use super::*;
 
 pub(crate) async fn reconcile(
     authority: &GhCliDeliveryAuthority,
-    request: GitHubHeadReconciliation<'_>,
-    credential: GitHubCredential<'_>,
-) -> Result<GitHubReconciliationOutcome, GitHubAuthorityError> {
+    request: ForgeHeadReconciliation<'_>,
+    credential: ForgeCredential<'_>,
+) -> Result<ForgeReconciliationOutcome, ForgeAuthorityError> {
     require_identity(request.published, request.observed)?;
     let context = HeadUpdateContext {
         authority,
@@ -20,7 +20,7 @@ pub(crate) async fn reconcile(
         )
         .await?
     {
-        return Ok(GitHubReconciliationOutcome::Refused(format!(
+        return Ok(ForgeReconciliationOutcome::Refused(format!(
             "remote history was rewritten: published head {}; observed head {}; local work was preserved",
             request.published.head_revision, request.observed.head_revision,
         )));
@@ -30,11 +30,11 @@ pub(crate) async fn reconcile(
 
 async fn reconcile_adopted_delivery(
     context: HeadUpdateContext<'_>,
-    request: GitHubHeadReconciliation<'_>,
+    request: ForgeHeadReconciliation<'_>,
     local_head: String,
-) -> Result<GitHubReconciliationOutcome, GitHubAuthorityError> {
+) -> Result<ForgeReconciliationOutcome, ForgeAuthorityError> {
     if !is_ancestor(context, &local_head, &request.observed.head_revision).await? {
-        return Ok(GitHubReconciliationOutcome::Refused(format!(
+        return Ok(ForgeReconciliationOutcome::Refused(format!(
             "existing remote head {} does not descend from retained local head {}; local work was preserved",
             request.observed.head_revision, local_head,
         )));
@@ -43,7 +43,7 @@ async fn reconcile_adopted_delivery(
     anchor.head_revision = local_head;
     Box::pin(reconcile_workspace(
         context,
-        GitHubHeadReconciliation {
+        ForgeHeadReconciliation {
             published: &anchor,
             adopting_existing: false,
             ..request
@@ -53,9 +53,9 @@ async fn reconcile_adopted_delivery(
 }
 
 fn require_identity(
-    published: &GitHubReviewReceipt,
-    observed: &GitHubReviewReceipt,
-) -> Result<(), GitHubAuthorityError> {
+    published: &ForgeReviewReceipt,
+    observed: &ForgeReviewReceipt,
+) -> Result<(), ForgeAuthorityError> {
     let bound_review_changed =
         !published.review_id.is_empty() && published.review_id != observed.review_id;
     if bound_review_changed
@@ -63,38 +63,34 @@ fn require_identity(
         || published.target_branch != observed.target_branch
         || published.head_branch != observed.head_branch
     {
-        return Err(GitHubAuthorityError::identity(format!(
+        return Err(ForgeAuthorityError::identity(format!(
             "published identity {published:?}; observed identity {observed:?}",
         )));
     }
     Ok(())
 }
 
-fn authorizes_fast_forward(
-    request: &GitHubHeadReconciliation<'_>,
-    head: &str,
-    dirty: bool,
-) -> bool {
+fn authorizes_fast_forward(request: &ForgeHeadReconciliation<'_>, head: &str, dirty: bool) -> bool {
     request.authorized_update && !dirty && head == request.published.head_revision
 }
 
 async fn reconcile_workspace(
     context: HeadUpdateContext<'_>,
-    request: GitHubHeadReconciliation<'_>,
-) -> Result<GitHubReconciliationOutcome, GitHubAuthorityError> {
+    request: ForgeHeadReconciliation<'_>,
+) -> Result<ForgeReconciliationOutcome, ForgeAuthorityError> {
     let git = context.authority.workspace_git();
     let (head, dirty) = git
         .workspace_state(context.workspace)
         .await
         .map_err(git_error)?;
     if is_ancestor(context, &request.observed.head_revision, &head).await? {
-        return Ok(GitHubReconciliationOutcome::Unchanged);
+        return Ok(ForgeReconciliationOutcome::Unchanged);
     }
     if request.adopting_existing {
         return reconcile_adopted_delivery(context, request, head).await;
     }
     if !is_ancestor(context, &request.published.head_revision, &head).await? {
-        return Ok(GitHubReconciliationOutcome::Refused(format!(
+        return Ok(ForgeReconciliationOutcome::Refused(format!(
             "local history no longer contains published head {}; local head {head}; \
              observed head {}; work was preserved",
             request.published.head_revision, request.observed.head_revision,
@@ -115,9 +111,9 @@ async fn reconcile_workspace(
 
 async fn integrate(
     context: HeadUpdateContext<'_>,
-    request: GitHubHeadReconciliation<'_>,
+    request: ForgeHeadReconciliation<'_>,
     authorized: bool,
-) -> Result<GitHubReconciliationOutcome, GitHubAuthorityError> {
+) -> Result<ForgeReconciliationOutcome, ForgeAuthorityError> {
     let mut command = git_command(
         &context.authority.config,
         context.workspace,
@@ -143,18 +139,18 @@ async fn integrate(
     );
     if output.exit_status == Some(0) {
         return Ok(if authorized {
-            GitHubReconciliationOutcome::Adopted
+            ForgeReconciliationOutcome::Adopted
         } else {
-            GitHubReconciliationOutcome::NeedsWork(diagnostic)
+            ForgeReconciliationOutcome::NeedsWork(diagnostic)
         });
     }
     if has_conflicts(context).await? {
-        return Ok(GitHubReconciliationOutcome::NeedsWork(diagnostic));
+        return Ok(ForgeReconciliationOutcome::NeedsWork(diagnostic));
     }
     Err(output.into())
 }
 
-async fn has_conflicts(context: HeadUpdateContext<'_>) -> Result<bool, GitHubAuthorityError> {
+async fn has_conflicts(context: HeadUpdateContext<'_>) -> Result<bool, ForgeAuthorityError> {
     let output = git_output(
         git_command(
             &context.authority.config,
@@ -172,7 +168,7 @@ async fn is_ancestor(
     context: HeadUpdateContext<'_>,
     ancestor: &str,
     descendant: &str,
-) -> Result<bool, GitHubAuthorityError> {
+) -> Result<bool, ForgeAuthorityError> {
     let mut command = git_command(
         &context.authority.config,
         context.workspace,

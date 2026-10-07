@@ -25,8 +25,8 @@ fn method_rule(methods: Value) -> Value {
     json!({"type": "PULL_REQUEST", "parameters": {"allowedMergeMethods": methods}})
 }
 
-fn assert_policy_error(error: &GitHubAuthorityError) {
-    assert!(matches!(error, GitHubAuthorityError::Api(_)), "{error}");
+fn assert_policy_error(error: &ForgeAuthorityError) {
+    assert!(matches!(error, ForgeAuthorityError::Api(_)), "{error}");
     assert!(!error.retryable_operation(), "{error}");
     assert!(!error.authentication_failed(), "{error}");
 }
@@ -67,10 +67,10 @@ async fn merge_commands_use_the_selected_method_and_exact_head_without_bypass() 
         set_rules(&mut page, vec![method_rule(json!([method]))]);
         page["data"]["repository"]["pullRequest"]["isMergeQueueEnabled"] = json!(method == "QUEUE");
         let outcome = merge_authority(root.path(), &page, &page, "exit 0")
-            .request_merge(&review(), GitHubCredential("test-token"))
+            .request_merge(&review(), ForgeCredential("test-token"))
             .await
             .assert_value();
-        assert_eq!(outcome, GitHubMergeRequestOutcome::Accepted);
+        assert_eq!(outcome, ForgeMergeRequestOutcome::Accepted);
         let args = std::fs::read_to_string(root.path().join("merge-args")).assert_value();
         assert!(args.contains(&format!(
             "--match-head-commit\n{}\n",
@@ -96,7 +96,7 @@ async fn unavailable_method_or_changed_head_never_invokes_merge() {
     for page in [unavailable, changed] {
         let root = tempfile::tempdir().assert_value();
         merge_authority(root.path(), &page, &page, "exit 0")
-            .request_merge(&review(), GitHubCredential("test-token"))
+            .request_merge(&review(), ForgeCredential("test-token"))
             .await
             .assert_error();
         assert!(!root.path().join("merge-args").exists());
@@ -123,14 +123,14 @@ async fn merge_submission_rechecks_terminal_approval_queue_and_freshness_state()
     let mut behind = policy_page("MERGEABLE", "BEHIND", None, (false, None));
     base_ref(&mut behind)["rules"] = Value::Null;
     for (page, expected) in [
-        (queued, GitHubMergeRequestOutcome::Pending),
-        (merged, GitHubMergeRequestOutcome::Accepted),
-        (review_required, GitHubMergeRequestOutcome::Pending),
-        (behind, GitHubMergeRequestOutcome::HeadUpdateRequired),
+        (queued, ForgeMergeRequestOutcome::Pending),
+        (merged, ForgeMergeRequestOutcome::Accepted),
+        (review_required, ForgeMergeRequestOutcome::Pending),
+        (behind, ForgeMergeRequestOutcome::HeadUpdateRequired),
     ] {
         let root = tempfile::tempdir().assert_value();
         let actual = merge_authority(root.path(), &page, &page, "exit 19")
-            .request_merge(&review(), GitHubCredential("test-token"))
+            .request_merge(&review(), ForgeCredential("test-token"))
             .await
             .assert_value();
         assert_eq!(actual, expected);
@@ -159,7 +159,7 @@ async fn permanent_merge_rejection_preserves_diagnostics_and_cannot_become_pendi
                 shell_literal(rejection)
             );
             let error = merge_authority(root.path(), &ready, &after, &action)
-                .request_merge(&review(), GitHubCredential("test-token"))
+                .request_merge(&review(), ForgeCredential("test-token"))
                 .await
                 .assert_error();
             assert_policy_error(&error);
@@ -182,7 +182,7 @@ async fn merge_transport_errors_preserve_authentication_and_retry_classification
             "printf '%s\\n' 'HTTP {status}: request failed (https://api.github.com/graphql)' >&2; exit 1"
         );
         let error = merge_authority(root.path(), &page, &page, &action)
-            .request_merge(&review(), GitHubCredential("test-token"))
+            .request_merge(&review(), ForgeCredential("test-token"))
             .await
             .assert_error();
         assert_eq!(error.api_status(), Some(status));
@@ -205,10 +205,10 @@ async fn permanent_http_rejection_cannot_request_workspace_repair_or_head_update
                 "printf '%s\\n' 'HTTP {status}: request rejected (https://api.github.com/graphql)' >&2; exit 1"
             );
             let error = merge_authority(root.path(), &ready, &after, &action)
-                .request_merge(&review(), GitHubCredential("test-token"))
+                .request_merge(&review(), ForgeCredential("test-token"))
                 .await
                 .assert_error();
-            assert!(matches!(error, GitHubAuthorityError::Api(_)));
+            assert!(matches!(error, ForgeAuthorityError::Api(_)));
             assert_eq!(error.api_status(), Some(status));
             assert!(!error.retryable_operation());
             assert_eq!(error.authentication_failed(), status == 401);
@@ -228,24 +228,24 @@ async fn merge_failure_reconciles_authoritative_success_conflict_and_freshness()
     for (after, expected, action) in [
         (
             merged.clone(),
-            GitHubMergeRequestOutcome::Accepted,
+            ForgeMergeRequestOutcome::Accepted,
             "printf 'GraphQL: already merged (mergePullRequest)\\n' >&2; exit 1",
         ),
-        (merged, GitHubMergeRequestOutcome::Accepted, transient),
+        (merged, ForgeMergeRequestOutcome::Accepted, transient),
         (
             policy_page("CONFLICTING", "DIRTY", None, (false, None)),
-            GitHubMergeRequestOutcome::Conflict,
+            ForgeMergeRequestOutcome::Conflict,
             transient,
         ),
         (
             policy_page("MERGEABLE", "BEHIND", None, (false, None)),
-            GitHubMergeRequestOutcome::HeadUpdateRequired,
+            ForgeMergeRequestOutcome::HeadUpdateRequired,
             transient,
         ),
     ] {
         let root = tempfile::tempdir().assert_value();
         let outcome = merge_authority(root.path(), &ready, &after, action)
-            .request_merge(&review(), GitHubCredential("test-token"))
+            .request_merge(&review(), ForgeCredential("test-token"))
             .await
             .assert_value();
         assert_eq!(outcome, expected);
@@ -266,22 +266,22 @@ async fn review_observation_and_queue_submission_do_not_read_direct_merge_policy
         page["data"]["repository"]["pullRequest"]["isMergeQueueEnabled"] = json!(queued);
         let authority = merge_authority(root.path(), &page, &page, "exit 0");
         let observation = authority
-            .inspect_review(&review(), GitHubCredential("test-token"))
+            .inspect_review(&review(), ForgeCredential("test-token"))
             .await
             .assert_value();
         assert!(matches!(
             observation.state,
-            GitHubReviewState::Open {
-                checks: GitHubChecks::NotRequired
+            ForgeReviewState::Open {
+                checks: ForgeChecks::NotRequired
             }
         ));
         if queued {
             assert_eq!(
                 authority
-                    .request_merge(&review(), GitHubCredential("test-token"))
+                    .request_merge(&review(), ForgeCredential("test-token"))
                     .await
                     .assert_value(),
-                GitHubMergeRequestOutcome::Accepted
+                ForgeMergeRequestOutcome::Accepted
             );
         }
     }

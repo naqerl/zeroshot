@@ -72,8 +72,8 @@ fn authority(repo: &TempRepo, server: &HttpGit) -> GhCliDeliveryAuthority {
     })
 }
 
-fn push_request(repo: &TempRepo, revision: String) -> GitHubPushRequest {
-    GitHubPushRequest {
+fn push_request(repo: &TempRepo, revision: String) -> ForgePushRequest {
+    ForgePushRequest {
         workspace: repo.workspace.clone(),
         target: target(repo),
         head_branch: delivery_branch(RUN),
@@ -81,9 +81,9 @@ fn push_request(repo: &TempRepo, revision: String) -> GitHubPushRequest {
     }
 }
 
-async fn push_successfully(repo: &TempRepo, server: &HttpGit, request: &GitHubPushRequest) {
+async fn push_successfully(repo: &TempRepo, server: &HttpGit, request: &ForgePushRequest) {
     authority(repo, server)
-        .push_branch(request, GitHubCredential("test-token"))
+        .push_branch(request, ForgeCredential("test-token"))
         .await
         .assert_value();
     assert_eq!(
@@ -92,7 +92,7 @@ async fn push_successfully(repo: &TempRepo, server: &HttpGit, request: &GitHubPu
     );
 }
 
-fn publish_reviewed_candidate(repo: &TempRepo) -> GitHubReviewReceipt {
+fn publish_reviewed_candidate(repo: &TempRepo) -> ForgeReviewReceipt {
     let candidate = commit_file(&repo.workspace, "result.txt", "reviewed\n");
     let branch = delivery_branch(RUN);
     git(
@@ -103,7 +103,7 @@ fn publish_reviewed_candidate(repo: &TempRepo) -> GitHubReviewReceipt {
             &format!("{candidate}:refs/heads/{branch}"),
         ],
     );
-    GitHubReviewReceipt {
+    ForgeReviewReceipt {
         review_id: "17".to_owned(),
         repository: "acme/project".to_owned(),
         target_branch: "main".to_owned(),
@@ -160,7 +160,7 @@ async fn http_rejected_credential_is_an_authentication_error_and_cannot_create_a
         .store(true, Ordering::SeqCst);
 
     let failure = authority(&repo, &server)
-        .push_branch(&request, GitHubCredential("test-token"))
+        .push_branch(&request, ForgeCredential("test-token"))
         .await
         .expect_err("expired credential must fail");
 
@@ -181,7 +181,7 @@ struct TransportAuthority {
     concrete: GhCliDeliveryAuthority,
     remote: PathBuf,
     faults: Arc<transport_http::TransportFaults>,
-    review: Mutex<Option<GitHubReviewReceipt>>,
+    review: Mutex<Option<ForgeReviewReceipt>>,
     update: Update,
     updated: AtomicBool,
     expire_during_update: AtomicBool,
@@ -212,11 +212,7 @@ impl TransportAuthority {
         }
     }
 
-    fn advance_remote(
-        &self,
-        workspace: &Path,
-        review: &GitHubReviewReceipt,
-    ) -> GitHubReviewReceipt {
+    fn advance_remote(&self, workspace: &Path, review: &ForgeReviewReceipt) -> ForgeReviewReceipt {
         let writer = self.remote.parent().assert_value().join("remote-writer");
         git(
             self.remote.parent().assert_value(),
@@ -245,22 +241,22 @@ impl TransportAuthority {
 }
 
 #[async_trait]
-impl GitHubDeliveryAuthority for TransportAuthority {
+impl DeliveryForgeAuthority for TransportAuthority {
     async fn observe_delivery(
         &self,
-        request: GitHubDeliveryRead<'_>,
-        _credential: GitHubCredential<'_>,
-    ) -> Result<GitHubDeliverySnapshot, GitHubAuthorityError> {
+        request: ForgeDeliveryRead<'_>,
+        _credential: ForgeCredential<'_>,
+    ) -> Result<ForgeDeliverySnapshot, ForgeAuthorityError> {
         let head_revision = reference(&self.remote, request.head_branch);
         let review = self.review.lock().assert_value().clone().map(|mut review| {
             if let Some(head) = &head_revision {
                 review.head_revision.clone_from(head);
             }
-            review.observation(GitHubReviewState::Open {
-                checks: GitHubChecks::Passed,
+            review.observation(ForgeReviewState::Open {
+                checks: ForgeChecks::Passed,
             })
         });
-        Ok(GitHubDeliverySnapshot {
+        Ok(ForgeDeliverySnapshot {
             review,
             head_revision,
         })
@@ -268,9 +264,9 @@ impl GitHubDeliveryAuthority for TransportAuthority {
 
     async fn reconcile_delivery_target(
         &self,
-        request: GitHubTargetReconciliation<'_>,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubTargetIntegration, GitHubAuthorityError> {
+        request: ForgeTargetReconciliation<'_>,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeTargetIntegration, ForgeAuthorityError> {
         self.concrete
             .reconcile_delivery_target(request, credential)
             .await
@@ -278,9 +274,9 @@ impl GitHubDeliveryAuthority for TransportAuthority {
 
     async fn reconcile_delivery_head(
         &self,
-        request: GitHubHeadReconciliation<'_>,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubReconciliationOutcome, GitHubAuthorityError> {
+        request: ForgeHeadReconciliation<'_>,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeReconciliationOutcome, ForgeAuthorityError> {
         self.concrete
             .reconcile_delivery_head(request, credential)
             .await
@@ -288,9 +284,9 @@ impl GitHubDeliveryAuthority for TransportAuthority {
 
     async fn push_branch(
         &self,
-        request: &GitHubPushRequest,
-        credential: GitHubCredential<'_>,
-    ) -> Result<(), GitHubAuthorityError> {
+        request: &ForgePushRequest,
+        credential: ForgeCredential<'_>,
+    ) -> Result<(), ForgeAuthorityError> {
         self.pushes.fetch_add(1, Ordering::SeqCst);
         if self.expire_before_push.swap(false, Ordering::SeqCst) {
             self.faults.require_refreshed.store(true, Ordering::SeqCst);
@@ -304,14 +300,14 @@ impl GitHubDeliveryAuthority for TransportAuthority {
 
     async fn open_or_update_review(
         &self,
-        request: &GitHubReviewRequest,
-        _credential: GitHubCredential<'_>,
-    ) -> Result<GitHubReviewReceipt, GitHubAuthorityError> {
+        request: &ForgeReviewRequest,
+        _credential: ForgeCredential<'_>,
+    ) -> Result<ForgeReviewReceipt, ForgeAuthorityError> {
         assert_eq!(
             reference(&self.remote, &request.head_branch),
             Some(request.head_revision.clone())
         );
-        let review = GitHubReviewReceipt {
+        let review = ForgeReviewReceipt {
             review_id: "17".to_owned(),
             repository: request.target.repository.clone(),
             target_branch: request.target.target_branch.clone(),
@@ -324,16 +320,16 @@ impl GitHubDeliveryAuthority for TransportAuthority {
 
     async fn inspect_review(
         &self,
-        review: &GitHubReviewReceipt,
-        _credential: GitHubCredential<'_>,
-    ) -> Result<GitHubReviewObservation, GitHubAuthorityError> {
+        review: &ForgeReviewReceipt,
+        _credential: ForgeCredential<'_>,
+    ) -> Result<ForgeReviewObservation, ForgeAuthorityError> {
         let state = if self.merged.load(Ordering::SeqCst) {
-            GitHubReviewState::Merged {
+            ForgeReviewState::Merged {
                 merge_revision: review.head_revision.clone(),
             }
         } else {
-            GitHubReviewState::Open {
-                checks: GitHubChecks::Passed,
+            ForgeReviewState::Open {
+                checks: ForgeChecks::Passed,
             }
         };
         assert_eq!(
@@ -345,22 +341,22 @@ impl GitHubDeliveryAuthority for TransportAuthority {
 
     async fn request_merge(
         &self,
-        _review: &GitHubReviewReceipt,
-        _credential: GitHubCredential<'_>,
-    ) -> Result<GitHubMergeRequestOutcome, GitHubAuthorityError> {
+        _review: &ForgeReviewReceipt,
+        _credential: ForgeCredential<'_>,
+    ) -> Result<ForgeMergeRequestOutcome, ForgeAuthorityError> {
         if self.update != Update::None && !self.updated.load(Ordering::SeqCst) {
-            return Ok(GitHubMergeRequestOutcome::HeadUpdateRequired);
+            return Ok(ForgeMergeRequestOutcome::HeadUpdateRequired);
         }
         self.merged.store(true, Ordering::SeqCst);
-        Ok(GitHubMergeRequestOutcome::Accepted)
+        Ok(ForgeMergeRequestOutcome::Accepted)
     }
 
     async fn update_review_head(
         &self,
         workspace: &Path,
-        review: &GitHubReviewReceipt,
-        _credential: GitHubCredential<'_>,
-    ) -> Result<GitHubHeadUpdateOutcome, GitHubAuthorityError> {
+        review: &ForgeReviewReceipt,
+        _credential: ForgeCredential<'_>,
+    ) -> Result<ForgeHeadUpdateOutcome, ForgeAuthorityError> {
         assert_eq!(
             self.updates.fetch_add(1, Ordering::SeqCst),
             0,
@@ -373,19 +369,19 @@ impl GitHubDeliveryAuthority for TransportAuthority {
         }
         self.faults.fail_fetch_once.store(true, Ordering::SeqCst);
         if self.update == Update::LostResponse {
-            return Err(GitHubAuthorityError::api(
+            return Err(ForgeAuthorityError::api(
                 Some(502),
                 "update response lost after server commit",
             ));
         }
-        Ok(GitHubHeadUpdateOutcome::Updated(updated))
+        Ok(ForgeHeadUpdateOutcome::Updated(updated))
     }
 
     async fn synchronize_review_head(
         &self,
-        request: GitHubHeadSynchronization<'_>,
-        credential: GitHubCredential<'_>,
-    ) -> Result<(), GitHubAuthorityError> {
+        request: ForgeHeadSynchronization<'_>,
+        credential: ForgeCredential<'_>,
+    ) -> Result<(), ForgeAuthorityError> {
         self.synchronizations.fetch_add(1, Ordering::SeqCst);
         self.concrete
             .synchronize_review_head(request, credential)
@@ -569,7 +565,7 @@ async fn http_remote_update_preserves_dirty_repairs_without_reusing_old_approval
 
     let result = authority
         .reconcile_delivery_head(
-            GitHubHeadReconciliation {
+            ForgeHeadReconciliation {
                 workspace: &repo.workspace,
                 published: &published,
                 observed: &observed,
@@ -577,13 +573,13 @@ async fn http_remote_update_preserves_dirty_repairs_without_reusing_old_approval
                 authorized_update: true,
                 adopting_existing: false,
             },
-            GitHubCredential("test-token"),
+            ForgeCredential("test-token"),
         )
         .await
         .assert_value();
 
     assert!(
-        matches!(result, GitHubReconciliationOutcome::NeedsWork(_)),
+        matches!(result, ForgeReconciliationOutcome::NeedsWork(_)),
         "{result:?}"
     );
     git(

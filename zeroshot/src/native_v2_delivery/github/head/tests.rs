@@ -7,8 +7,8 @@ use crate::native_v2_candidate::test_support::{TestGitRepository, commit_all, gi
 const OLD_HEAD: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const NEW_HEAD: &str = "cccccccccccccccccccccccccccccccccccccccc";
 
-fn review() -> GitHubReviewReceipt {
-    GitHubReviewReceipt {
+fn review() -> ForgeReviewReceipt {
+    ForgeReviewReceipt {
         review_id: "17".to_owned(),
         repository: "acme/project".to_owned(),
         target_branch: "main".to_owned(),
@@ -135,7 +135,7 @@ async fn fetched_head_adoption_accepts_only_the_authorized_transition_and_its_re
     let context = HeadUpdateContext {
         authority: &authority,
         workspace,
-        credential: GitHubCredential("test-token"),
+        credential: ForgeCredential("test-token"),
     };
 
     git(workspace, &["reset", "--hard", &repository.base]);
@@ -169,7 +169,7 @@ async fn fetched_head_adoption_accepts_only_the_authorized_transition_and_its_re
 struct SeparateHistory {
     repository: TestGitRepository,
     external: PathBuf,
-    published: GitHubReviewReceipt,
+    published: ForgeReviewReceipt,
     authority: GhCliDeliveryAuthority,
 }
 
@@ -219,7 +219,7 @@ impl SeparateHistory {
         }
     }
 
-    fn advance_remote(&self, name: &str, contents: &str) -> GitHubReviewReceipt {
+    fn advance_remote(&self, name: &str, contents: &str) -> ForgeReviewReceipt {
         std::fs::write(self.external.join(name), contents).assert_value();
         commit_all(&self.external, "remote update");
         git(
@@ -231,7 +231,7 @@ impl SeparateHistory {
         observed
     }
 
-    fn rewrite_remote(&self) -> GitHubReviewReceipt {
+    fn rewrite_remote(&self) -> ForgeReviewReceipt {
         git(&self.external, &["reset", "--hard", &self.repository.base]);
         std::fs::write(self.external.join("rewritten.txt"), "rewritten\n").assert_value();
         commit_all(&self.external, "human rewrite");
@@ -251,21 +251,21 @@ impl SeparateHistory {
 
     async fn reconcile(
         &self,
-        observed: &GitHubReviewReceipt,
+        observed: &ForgeReviewReceipt,
         authorized: bool,
-    ) -> GitHubReconciliationOutcome {
+    ) -> ForgeReconciliationOutcome {
         self.reconcile_with_mode(observed, authorized, false).await
     }
 
     async fn reconcile_with_mode(
         &self,
-        observed: &GitHubReviewReceipt,
+        observed: &ForgeReviewReceipt,
         authorized: bool,
         adopting_existing: bool,
-    ) -> GitHubReconciliationOutcome {
+    ) -> ForgeReconciliationOutcome {
         super::reconcile(
             &self.authority,
-            GitHubHeadReconciliation {
+            ForgeHeadReconciliation {
                 workspace: &self.repository.workspace,
                 published: &self.published,
                 observed,
@@ -273,7 +273,7 @@ impl SeparateHistory {
                 authorized_update: authorized,
                 adopting_existing,
             },
-            GitHubCredential("test-token"),
+            ForgeCredential("test-token"),
         )
         .await
         .assert_value()
@@ -296,7 +296,7 @@ async fn real_reconciliation_fetches_remote_objects_before_needs_work() {
     );
     assert!(matches!(
         history.reconcile(&observed, false).await,
-        GitHubReconciliationOutcome::NeedsWork(_)
+        ForgeReconciliationOutcome::NeedsWork(_)
     ));
     assert_eq!(
         git_output(&history.repository.workspace, &["rev-parse", "HEAD"]),
@@ -324,7 +324,7 @@ async fn real_reconciliation_preserves_dirty_repairs_and_local_commits() {
         let before = git_output(&history.repository.workspace, &["rev-parse", "HEAD"]);
         assert!(matches!(
             history.reconcile(&observed, true).await,
-            GitHubReconciliationOutcome::NeedsWork(_)
+            ForgeReconciliationOutcome::NeedsWork(_)
         ));
         git(
             &history.repository.workspace,
@@ -356,7 +356,7 @@ async fn real_reconciliation_materializes_conflict_without_discarding_repairs() 
     )
     .assert_value();
     let outcome = history.reconcile(&observed, false).await;
-    let GitHubReconciliationOutcome::NeedsWork(diagnostic) = outcome else {
+    let ForgeReconciliationOutcome::NeedsWork(diagnostic) = outcome else {
         panic!("expected conflict");
     };
     assert!(diagnostic.contains("CONFLICT"));
@@ -397,11 +397,11 @@ async fn real_reconciliation_preserves_the_authorized_clean_fast_forward_path() 
     let observed = history.advance_remote("remote.txt", "base update\n");
     assert_eq!(
         history.reconcile(&observed, true).await,
-        GitHubReconciliationOutcome::Adopted
+        ForgeReconciliationOutcome::Adopted
     );
     assert_eq!(
         history.reconcile(&observed, true).await,
-        GitHubReconciliationOutcome::Unchanged
+        ForgeReconciliationOutcome::Unchanged
     );
 }
 
@@ -417,7 +417,7 @@ async fn real_reconciliation_refuses_lost_local_anchor_even_when_remote_is_uncha
 
 async fn assert_refusal_preserves_repairs(
     history: &SeparateHistory,
-    observed: &GitHubReviewReceipt,
+    observed: &ForgeReviewReceipt,
     adopting_existing: bool,
 ) {
     std::fs::write(
@@ -430,7 +430,7 @@ async fn assert_refusal_preserves_repairs(
         history
             .reconcile_with_mode(observed, false, adopting_existing)
             .await,
-        GitHubReconciliationOutcome::Refused(_)
+        ForgeReconciliationOutcome::Refused(_)
     ));
     assert_eq!(
         git_output(&history.repository.workspace, &["rev-parse", "HEAD"]),

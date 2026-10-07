@@ -76,7 +76,7 @@ const MAX_FAILURE_DIAGNOSTIC_CHARS: usize = 8 * 1_024;
 const MAX_FAILURE_FEEDBACK_CHARS: usize = 64 * 1_024;
 
 pub(super) struct PolicySnapshot {
-    pub(super) state: GitHubReviewState,
+    pub(super) state: ForgeReviewState,
     pub(super) failed_job_ids: Vec<u64>,
     pub(super) is_merge_queue_enabled: bool,
     pub(super) head_update: Option<HeadUpdate>,
@@ -208,27 +208,27 @@ struct RepositoryPolicyWire {
 }
 
 pub(super) fn query_arguments(
-    review: &GitHubReviewReceipt,
-) -> Result<Vec<String>, GitHubAuthorityError> {
+    review: &ForgeReviewReceipt,
+) -> Result<Vec<String>, ForgeAuthorityError> {
     review_query_arguments(review, POLICY_QUERY)
 }
 
 pub(super) fn classify_policy(
     value: Value,
-    review: &GitHubReviewReceipt,
-) -> Result<PolicySnapshot, GitHubAuthorityError> {
+    review: &ForgeReviewReceipt,
+) -> Result<PolicySnapshot, ForgeAuthorityError> {
     let pages: Vec<QueryPageWire> = serde_json::from_value(value).map_err(|error| {
-        GitHubAuthorityError::api(
+        ForgeAuthorityError::api(
             None,
             format!("GitHub returned invalid delivery policy: {error}"),
         )
     })?;
-    let first = pages.first().ok_or(GitHubAuthorityError::Rejected)?;
+    let first = pages.first().ok_or(ForgeAuthorityError::Rejected)?;
     let first_repository = first
         .data
         .repository
         .as_ref()
-        .ok_or(GitHubAuthorityError::Rejected)?;
+        .ok_or(ForgeAuthorityError::Rejected)?;
     let first_pull_request = require_identity(first_repository, review)?.clone();
     let (contexts, complete) = collect_contexts(&pages, review, first_repository)?;
     if !complete {
@@ -242,9 +242,9 @@ pub(super) fn classify_policy(
 
 fn collect_contexts(
     pages: &[QueryPageWire],
-    review: &GitHubReviewReceipt,
+    review: &ForgeReviewReceipt,
     first_repository: &RepositoryPolicyWire,
-) -> Result<(Vec<CheckContextWire>, bool), GitHubAuthorityError> {
+) -> Result<(Vec<CheckContextWire>, bool), ForgeAuthorityError> {
     let mut contexts = Vec::new();
     let mut complete = true;
     let mut cursors = BTreeSet::new();
@@ -254,7 +254,7 @@ fn collect_contexts(
             .data
             .repository
             .as_ref()
-            .ok_or(GitHubAuthorityError::Rejected)?;
+            .ok_or(ForgeAuthorityError::Rejected)?;
         let pull_request = require_identity(repository, review)?;
         complete &= page_policy_is_stable(first_repository, pull_request)?;
         let Some(page_contexts) = check_contexts(pull_request)? else {
@@ -270,11 +270,11 @@ fn collect_contexts(
 fn page_policy_is_stable(
     first_repository: &RepositoryPolicyWire,
     pull_request: &PullRequestPolicyWire,
-) -> Result<bool, GitHubAuthorityError> {
+) -> Result<bool, ForgeAuthorityError> {
     let first_pull_request = first_repository
         .pull_request
         .as_ref()
-        .ok_or(GitHubAuthorityError::Rejected)?;
+        .ok_or(ForgeAuthorityError::Rejected)?;
     Ok(same_policy(first_pull_request, pull_request))
 }
 
@@ -292,8 +292,8 @@ fn page_is_complete(
 }
 
 pub(super) fn include_check_logs(snapshot: &mut PolicySnapshot, logs: &[(u64, String)]) {
-    let GitHubReviewState::Open {
-        checks: GitHubChecks::Failed { diagnostic },
+    let ForgeReviewState::Open {
+        checks: ForgeChecks::Failed { diagnostic },
     } = &mut snapshot.state
     else {
         return;
@@ -312,12 +312,12 @@ pub(super) fn include_check_logs(snapshot: &mut PolicySnapshot, logs: &[(u64, St
 
 fn require_identity<'a>(
     repository: &'a RepositoryPolicyWire,
-    review: &GitHubReviewReceipt,
-) -> Result<&'a PullRequestPolicyWire, GitHubAuthorityError> {
+    review: &ForgeReviewReceipt,
+) -> Result<&'a PullRequestPolicyWire, ForgeAuthorityError> {
     let pull_request = repository
         .pull_request
         .as_ref()
-        .ok_or(GitHubAuthorityError::Rejected)?;
+        .ok_or(ForgeAuthorityError::Rejected)?;
     let valid = repository.name_with_owner == review.repository
         && pull_request.number.to_string() == review.review_id
         && pull_request.base_ref_name == review.target_branch
@@ -326,7 +326,7 @@ fn require_identity<'a>(
         && pull_request.head_ref_oid == review.head_revision;
     valid
         .then_some(pull_request)
-        .ok_or(GitHubAuthorityError::Rejected)
+        .ok_or(ForgeAuthorityError::Rejected)
 }
 
 fn same_policy(left: &PullRequestPolicyWire, right: &PullRequestPolicyWire) -> bool {
@@ -361,9 +361,9 @@ fn same_policy(left: &PullRequestPolicyWire, right: &PullRequestPolicyWire) -> b
 
 fn check_contexts(
     pull_request: &PullRequestPolicyWire,
-) -> Result<Option<&CheckContextConnectionWire>, GitHubAuthorityError> {
+) -> Result<Option<&CheckContextConnectionWire>, ForgeAuthorityError> {
     let [commit] = pull_request.commits.nodes.as_slice() else {
-        return Err(GitHubAuthorityError::Rejected);
+        return Err(ForgeAuthorityError::Rejected);
     };
     Ok(commit
         .commit
@@ -382,8 +382,8 @@ fn classify_snapshot(
     }
     if !evidence.failures.is_empty() {
         return PolicySnapshot {
-            state: GitHubReviewState::Open {
-                checks: GitHubChecks::Failed {
+            state: ForgeReviewState::Open {
+                checks: ForgeChecks::Failed {
                     diagnostic: failure_diagnostic(evidence.failures),
                 },
             },
@@ -395,14 +395,14 @@ fn classify_snapshot(
     }
     let policy_ready = merge_gate_ready(pull_request) || pull_request_ready(pull_request);
     let checks = match (policy_ready, evidence.checks) {
-        (true, RequiredChecks::Absent) => GitHubChecks::NotRequired,
-        (true, RequiredChecks::Passed) => GitHubChecks::Passed,
-        _ => GitHubChecks::Pending,
+        (true, RequiredChecks::Absent) => ForgeChecks::NotRequired,
+        (true, RequiredChecks::Passed) => ForgeChecks::Passed,
+        _ => ForgeChecks::Pending,
     };
     let pull_request_ready =
         !matches!(evidence.checks, RequiredChecks::Pending) && pull_request_ready(pull_request);
     PolicySnapshot {
-        state: GitHubReviewState::Open { checks },
+        state: ForgeReviewState::Open { checks },
         failed_job_ids: Vec::new(),
         is_merge_queue_enabled: pull_request.is_merge_queue_enabled,
         head_update: head_update(pull_request),
@@ -455,16 +455,16 @@ fn merge_gate_ready(pull_request: &PullRequestPolicyWire) -> bool {
 
 fn terminal_snapshot(
     pull_request: &PullRequestPolicyWire,
-) -> Result<Option<PolicySnapshot>, GitHubAuthorityError> {
+) -> Result<Option<PolicySnapshot>, ForgeAuthorityError> {
     if pull_request.merged {
         return merged_snapshot(pull_request).map(Some);
     }
     let state = match pull_request.state.as_str() {
-        "CLOSED" => Some(GitHubReviewState::Closed),
-        "OPEN" if pull_request.mergeable == "CONFLICTING" => Some(GitHubReviewState::Conflict),
-        "OPEN" if pull_request.merge_state_status == "DIRTY" => Some(GitHubReviewState::Conflict),
+        "CLOSED" => Some(ForgeReviewState::Closed),
+        "OPEN" if pull_request.mergeable == "CONFLICTING" => Some(ForgeReviewState::Conflict),
+        "OPEN" if pull_request.merge_state_status == "DIRTY" => Some(ForgeReviewState::Conflict),
         "OPEN" => None,
-        _ => return Err(GitHubAuthorityError::Rejected),
+        _ => return Err(ForgeAuthorityError::Rejected),
     };
     Ok(state.map(|state| PolicySnapshot {
         state,
@@ -477,22 +477,22 @@ fn terminal_snapshot(
 
 fn merged_snapshot(
     pull_request: &PullRequestPolicyWire,
-) -> Result<PolicySnapshot, GitHubAuthorityError> {
+) -> Result<PolicySnapshot, ForgeAuthorityError> {
     let merge_revision = pull_request
         .merge_commit
         .as_ref()
         .map(|commit| commit.oid.clone())
         .filter(|revision| valid_revision(revision))
-        .ok_or(GitHubAuthorityError::Rejected)?;
+        .ok_or(ForgeAuthorityError::Rejected)?;
     (pull_request.state == "MERGED")
         .then_some(PolicySnapshot {
-            state: GitHubReviewState::Merged { merge_revision },
+            state: ForgeReviewState::Merged { merge_revision },
             failed_job_ids: Vec::new(),
             is_merge_queue_enabled: false,
             head_update: None,
             pull_request_ready: false,
         })
-        .ok_or(GitHubAuthorityError::Rejected)
+        .ok_or(ForgeAuthorityError::Rejected)
 }
 
 fn pull_request_ready(pull_request: &PullRequestPolicyWire) -> bool {
@@ -519,8 +519,8 @@ fn approval_handoff_policy_ready(base_ref: &RefWire) -> bool {
 
 fn waiting_snapshot() -> PolicySnapshot {
     PolicySnapshot {
-        state: GitHubReviewState::Open {
-            checks: GitHubChecks::Pending,
+        state: ForgeReviewState::Open {
+            checks: ForgeChecks::Pending,
         },
         failed_job_ids: Vec::new(),
         is_merge_queue_enabled: false,

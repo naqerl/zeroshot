@@ -885,7 +885,7 @@ impl<'a> DeliveryLineage<'a> {
 
 fn retained_adapter(
     repo: &TempRepo,
-    authority: Arc<dyn GitHubDeliveryAuthority>,
+    authority: Arc<dyn DeliveryForgeAuthority>,
     poll: DeliveryPollPolicy,
     lineage: DeliveryLineage<'_>,
 ) -> Arc<NativeV2DeliveryAdapter> {

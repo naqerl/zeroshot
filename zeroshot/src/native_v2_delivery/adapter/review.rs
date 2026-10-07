@@ -18,32 +18,32 @@ pub(super) enum ReviewStep {
 
 impl ReviewProgress {
     pub(super) fn from_observation(
-        observation: GitHubReviewObservation,
+        observation: ForgeReviewObservation,
     ) -> Result<Self, DeliveryStop> {
         match observation.state {
-            GitHubReviewState::Merged { merge_revision } if valid_revision(&merge_revision) => {
+            ForgeReviewState::Merged { merge_revision } if valid_revision(&merge_revision) => {
                 Ok(Self::Merged(merge_revision))
             }
-            GitHubReviewState::Merged { .. } => {
+            ForgeReviewState::Merged { .. } => {
                 Err(DeliveryStop::Outcome(WorkerOutcome::malformed()))
             }
-            GitHubReviewState::Open { checks } => Ok(Self::from_open(
+            ForgeReviewState::Open { checks } => Ok(Self::from_open(
                 checks,
                 observation.pull_request_ready,
                 observation.head_update_required,
             )),
-            GitHubReviewState::Conflict => Ok(Self::Conflict),
-            GitHubReviewState::Closed => Ok(Self::Closed),
+            ForgeReviewState::Conflict => Ok(Self::Conflict),
+            ForgeReviewState::Closed => Ok(Self::Closed),
         }
     }
 
-    fn from_open(checks: GitHubChecks, ready: bool, behind: bool) -> Self {
+    fn from_open(checks: ForgeChecks, ready: bool, behind: bool) -> Self {
         match checks {
-            GitHubChecks::Failed { diagnostic } => Self::CiFailed(diagnostic),
-            GitHubChecks::Pending => Self::Pending,
-            GitHubChecks::NotRequired | GitHubChecks::Passed if behind => Self::Behind,
-            GitHubChecks::NotRequired | GitHubChecks::Passed if ready => Self::PullRequestReady,
-            GitHubChecks::NotRequired | GitHubChecks::Passed => Self::Mergeable,
+            ForgeChecks::Failed { diagnostic } => Self::CiFailed(diagnostic),
+            ForgeChecks::Pending => Self::Pending,
+            ForgeChecks::NotRequired | ForgeChecks::Passed if behind => Self::Behind,
+            ForgeChecks::NotRequired | ForgeChecks::Passed if ready => Self::PullRequestReady,
+            ForgeChecks::NotRequired | ForgeChecks::Passed => Self::Mergeable,
         }
     }
 }

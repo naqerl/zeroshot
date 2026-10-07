@@ -8,15 +8,15 @@ const MAX_CONFLICT_PATH_OUTPUT_BYTES: usize = 6 * 1_024;
 #[derive(Clone, Copy)]
 struct ConflictContext<'a> {
     authority: &'a GhCliDeliveryAuthority,
-    request: &'a GitHubConflictRequest,
-    credential: GitHubCredential<'a>,
+    request: &'a ForgeConflictRequest,
+    credential: ForgeCredential<'a>,
 }
 
 pub(super) async fn materialize(
     authority: &GhCliDeliveryAuthority,
-    request: &GitHubConflictRequest,
-    credential: GitHubCredential<'_>,
-) -> Result<GitHubConflictOutcome, GitHubAuthorityError> {
+    request: &ForgeConflictRequest,
+    credential: ForgeCredential<'_>,
+) -> Result<ForgeConflictOutcome, ForgeAuthorityError> {
     let context = ConflictContext {
         authority,
         request,
@@ -32,11 +32,11 @@ pub(super) async fn materialize(
     let conflicted_paths = conflicted_paths(context).await?;
     if observation_changed(merge_status, &conflicted_paths) {
         restore_clean_review_head(context).await?;
-        return Ok(GitHubConflictOutcome::ObservationChanged);
+        return Ok(ForgeConflictOutcome::ObservationChanged);
     }
     require_materialized_state(context, &target_revision, merge_status, &conflicted_paths).await?;
-    Ok(GitHubConflictOutcome::Materialized(
-        GitHubConflictMaterialization {
+    Ok(ForgeConflictOutcome::Materialized(
+        ForgeConflictMaterialization {
             target_revision,
             conflicted_paths,
         },
@@ -49,7 +49,7 @@ fn observation_changed(merge_status: i32, conflicted_paths: &[String]) -> bool {
 
 async fn require_clean_review_head(
     context: ConflictContext<'_>,
-) -> Result<(), GitHubAuthorityError> {
+) -> Result<(), ForgeAuthorityError> {
     let head = workspace_head(context).await?;
     let status = bounded_git_output(
         local_git_command(&context.authority.config, &context.request.workspace).args([
@@ -63,13 +63,13 @@ async fn require_clean_review_head(
     .await?;
     (head.trim() == context.request.review.head_revision && status.is_empty())
         .then_some(())
-        .ok_or(GitHubAuthorityError::Rejected)
+        .ok_or(ForgeAuthorityError::Rejected)
 }
 
 async fn fetch_target(
     context: ConflictContext<'_>,
     target_revision: &str,
-) -> Result<(), GitHubAuthorityError> {
+) -> Result<(), ForgeAuthorityError> {
     let mut command = authenticated_git_command(
         &context.authority.config,
         &context.request.workspace,
@@ -92,7 +92,7 @@ async fn fetch_target(
 async fn require_commit(
     context: ConflictContext<'_>,
     target_revision: &str,
-) -> Result<(), GitHubAuthorityError> {
+) -> Result<(), ForgeAuthorityError> {
     let mut command = local_git_command(&context.authority.config, &context.request.workspace);
     command.args(["cat-file", "-e", &format!("{target_revision}^{{commit}}")]);
     bounded_status(command, context.authority.config.api_deadline).await
@@ -101,7 +101,7 @@ async fn require_commit(
 async fn merge_target(
     context: ConflictContext<'_>,
     target_revision: &str,
-) -> Result<i32, GitHubAuthorityError> {
+) -> Result<i32, ForgeAuthorityError> {
     configure_delivery_identity(&context.authority.config, &context.request.workspace).await?;
     let mut command = local_git_command(&context.authority.config, &context.request.workspace);
     command.args([
@@ -122,7 +122,7 @@ async fn merge_target(
 
 async fn conflicted_paths(
     context: ConflictContext<'_>,
-) -> Result<Vec<String>, GitHubAuthorityError> {
+) -> Result<Vec<String>, ForgeAuthorityError> {
     let output = bounded_git_output(
         local_git_command(&context.authority.config, &context.request.workspace).args([
             "diff",
@@ -135,7 +135,7 @@ async fn conflicted_paths(
     )
     .await?;
     if !output.is_empty() && !output.ends_with('\0') {
-        return Err(GitHubAuthorityError::repairable(
+        return Err(ForgeAuthorityError::repairable(
             "Git conflict path inspection returned malformed output after merge materialization",
         ));
     }
@@ -150,7 +150,7 @@ async fn conflicted_paths(
             valid
                 .then(|| path.to_owned())
                 .ok_or_else(|| {
-                    GitHubAuthorityError::repairable(
+                    ForgeAuthorityError::repairable(
                         "Git conflict path inspection returned an unsafe path after merge materialization",
                     )
                 })
@@ -163,7 +163,7 @@ async fn require_materialized_state(
     target_revision: &str,
     merge_status: i32,
     conflicted_paths: &[String],
-) -> Result<(), GitHubAuthorityError> {
+) -> Result<(), ForgeAuthorityError> {
     require_merge_result(merge_status, conflicted_paths)?;
     require_unchanged_head(context).await?;
     require_merge_head(context, target_revision).await
@@ -172,19 +172,19 @@ async fn require_materialized_state(
 fn require_merge_result(
     merge_status: i32,
     conflicted_paths: &[String],
-) -> Result<(), GitHubAuthorityError> {
+) -> Result<(), ForgeAuthorityError> {
     if merge_status != 1 || conflicted_paths.is_empty() {
-        return Err(GitHubAuthorityError::repairable(
+        return Err(ForgeAuthorityError::repairable(
             "Git merge did not leave the exact expected conflict state",
         ));
     }
     Ok(())
 }
 
-async fn require_unchanged_head(context: ConflictContext<'_>) -> Result<(), GitHubAuthorityError> {
+async fn require_unchanged_head(context: ConflictContext<'_>) -> Result<(), ForgeAuthorityError> {
     let head = workspace_head(context).await?;
     if head.trim() != context.request.review.head_revision {
-        return Err(GitHubAuthorityError::repairable(
+        return Err(ForgeAuthorityError::repairable(
             "Git merge changed the reviewed HEAD while materializing a conflict",
         ));
     }
@@ -193,7 +193,7 @@ async fn require_unchanged_head(context: ConflictContext<'_>) -> Result<(), GitH
 
 async fn restore_clean_review_head(
     context: ConflictContext<'_>,
-) -> Result<(), GitHubAuthorityError> {
+) -> Result<(), ForgeAuthorityError> {
     if merge_in_progress(context).await? {
         let mut command = local_git_command(&context.authority.config, &context.request.workspace);
         command.args(["merge", "--abort"]);
@@ -202,20 +202,20 @@ async fn restore_clean_review_head(
     require_clean_review_head(context).await
 }
 
-async fn merge_in_progress(context: ConflictContext<'_>) -> Result<bool, GitHubAuthorityError> {
+async fn merge_in_progress(context: ConflictContext<'_>) -> Result<bool, ForgeAuthorityError> {
     let mut command = local_git_command(&context.authority.config, &context.request.workspace);
     command.args(["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
     match bounded_exit_code(command, context.authority.config.api_deadline).await? {
         0 => Ok(true),
         1 => Ok(false),
-        _ => Err(GitHubAuthorityError::Rejected),
+        _ => Err(ForgeAuthorityError::Rejected),
     }
 }
 
 async fn require_merge_head(
     context: ConflictContext<'_>,
     target_revision: &str,
-) -> Result<(), GitHubAuthorityError> {
+) -> Result<(), ForgeAuthorityError> {
     let merge_head = bounded_git_output(
         local_git_command(&context.authority.config, &context.request.workspace).args([
             "rev-parse",
@@ -232,13 +232,13 @@ async fn require_merge_head(
         .filter(|merge_head| merge_head.trim() == target_revision)
         .map(|_| ())
         .ok_or_else(|| {
-            GitHubAuthorityError::repairable(
+            ForgeAuthorityError::repairable(
                 "Git merge did not retain the expected target revision in MERGE_HEAD",
             )
         })
 }
 
-async fn workspace_head(context: ConflictContext<'_>) -> Result<String, GitHubAuthorityError> {
+async fn workspace_head(context: ConflictContext<'_>) -> Result<String, ForgeAuthorityError> {
     bounded_git_output(
         local_git_command(&context.authority.config, &context.request.workspace)
             .args(["rev-parse", "HEAD"]),
@@ -251,7 +251,7 @@ async fn workspace_head(context: ConflictContext<'_>) -> Result<String, GitHubAu
 async fn bounded_exit_code(
     mut command: Command,
     deadline: Duration,
-) -> Result<i32, GitHubAuthorityError> {
+) -> Result<i32, ForgeAuthorityError> {
     let output = capture(&mut command, deadline).await?;
     match output.exit_status {
         Some(code @ (0 | 1)) => Ok(code),

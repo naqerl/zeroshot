@@ -12,7 +12,7 @@ use crate::native_v2_candidate::test_support::{
 struct ConflictFixture {
     repository: TestGitRepository,
     authority: GhCliDeliveryAuthority,
-    request: GitHubConflictRequest,
+    request: ForgeConflictRequest,
     target_revision: String,
     git_program: PathBuf,
     gh_program: PathBuf,
@@ -63,9 +63,9 @@ impl ConflictFixture {
             api_deadline: Duration::from_secs(10),
             push_deadline: Duration::from_secs(10),
         });
-        let request = GitHubConflictRequest {
+        let request = ForgeConflictRequest {
             workspace: repository.workspace.clone(),
-            review: GitHubReviewReceipt {
+            review: ForgeReviewReceipt {
                 review_id: "17".to_owned(),
                 repository: "acme/project".to_owned(),
                 target_branch: "main".to_owned(),
@@ -90,10 +90,10 @@ async fn authenticated_target_fetch_leaves_exact_conflict_for_repair() {
 
     let outcome = fixture
         .authority
-        .materialize_merge_conflict(&fixture.request, GitHubCredential("test-token"))
+        .materialize_merge_conflict(&fixture.request, ForgeCredential("test-token"))
         .await
         .assert_value();
-    let GitHubConflictOutcome::Materialized(materialized) = outcome else {
+    let ForgeConflictOutcome::Materialized(materialized) = outcome else {
         panic!("expected a materialized merge conflict");
     };
 
@@ -129,10 +129,10 @@ async fn conflict_handoff_pins_repair_commit_to_delivery_identity() {
 
     let outcome = fixture
         .authority
-        .materialize_merge_conflict(&fixture.request, GitHubCredential("test-token"))
+        .materialize_merge_conflict(&fixture.request, ForgeCredential("test-token"))
         .await
         .assert_value();
-    assert!(matches!(outcome, GitHubConflictOutcome::Materialized(_)));
+    assert!(matches!(outcome, ForgeConflictOutcome::Materialized(_)));
 
     fs::write(
         fixture.repository.workspace.join("result.txt"),
@@ -177,7 +177,7 @@ async fn stale_conflict_observation_restores_the_review_head_for_reobservation()
 
     let outcome = fixture
         .authority
-        .materialize_merge_conflict(&fixture.request, GitHubCredential("test-token"))
+        .materialize_merge_conflict(&fixture.request, ForgeCredential("test-token"))
         .await
         .assert_value();
 
@@ -191,7 +191,7 @@ async fn stale_conflict_observation_accepts_an_already_integrated_target() {
 
     let outcome = fixture
         .authority
-        .materialize_merge_conflict(&fixture.request, GitHubCredential("test-token"))
+        .materialize_merge_conflict(&fixture.request, ForgeCredential("test-token"))
         .await
         .assert_value();
 
@@ -200,10 +200,10 @@ async fn stale_conflict_observation_accepts_an_already_integrated_target() {
 
 fn assert_reobservation_cleanup(
     fixture: &ConflictFixture,
-    outcome: GitHubConflictOutcome,
+    outcome: ForgeConflictOutcome,
     expected: ExpectedCleanup,
 ) {
-    assert_eq!(outcome, GitHubConflictOutcome::ObservationChanged);
+    assert_eq!(outcome, ForgeConflictOutcome::ObservationChanged);
     assert_eq!(
         git_output(&fixture.repository.workspace, &["rev-parse", "HEAD"]),
         fixture.request.review.head_revision

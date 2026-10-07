@@ -20,12 +20,12 @@ struct OutageAuthority {
 }
 
 #[async_trait]
-impl GitHubDeliveryAuthority for OutageAuthority {
+impl DeliveryForgeAuthority for OutageAuthority {
     async fn open_or_update_review(
         &self,
-        _request: &GitHubReviewRequest,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubReviewReceipt, GitHubAuthorityError> {
+        _request: &ForgeReviewRequest,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeReviewReceipt, ForgeAuthorityError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let failure = match self.outage {
             Outage::Refresh if credential.expose() != "refreshed-token" => Some(401),
@@ -34,12 +34,12 @@ impl GitHubDeliveryAuthority for OutageAuthority {
             _ => None,
         };
         if let Some(status) = failure {
-            return Err(GitHubAuthorityError::api(
+            return Err(ForgeAuthorityError::api(
                 Some(status),
                 format!("HTTP {status} scripted outage"),
             ));
         }
-        Ok(GitHubReviewReceipt {
+        Ok(ForgeReviewReceipt {
             review_id: "17".to_owned(),
             repository: "acme/project".to_owned(),
             target_branch: "main".to_owned(),
@@ -50,50 +50,50 @@ impl GitHubDeliveryAuthority for OutageAuthority {
 
     async fn observe_delivery(
         &self,
-        _: GitHubDeliveryRead<'_>,
-        _: GitHubCredential<'_>,
-    ) -> Result<GitHubDeliverySnapshot, GitHubAuthorityError> {
-        Err(GitHubAuthorityError::Rejected)
+        _: ForgeDeliveryRead<'_>,
+        _: ForgeCredential<'_>,
+    ) -> Result<ForgeDeliverySnapshot, ForgeAuthorityError> {
+        Err(ForgeAuthorityError::Rejected)
     }
 
     async fn reconcile_delivery_target(
         &self,
-        _: GitHubTargetReconciliation<'_>,
-        _: GitHubCredential<'_>,
-    ) -> Result<GitHubTargetIntegration, GitHubAuthorityError> {
-        Err(GitHubAuthorityError::Rejected)
+        _: ForgeTargetReconciliation<'_>,
+        _: ForgeCredential<'_>,
+    ) -> Result<ForgeTargetIntegration, ForgeAuthorityError> {
+        Err(ForgeAuthorityError::Rejected)
     }
 
     async fn reconcile_delivery_head(
         &self,
-        _: GitHubHeadReconciliation<'_>,
-        _: GitHubCredential<'_>,
-    ) -> Result<GitHubReconciliationOutcome, GitHubAuthorityError> {
-        Err(GitHubAuthorityError::Rejected)
+        _: ForgeHeadReconciliation<'_>,
+        _: ForgeCredential<'_>,
+    ) -> Result<ForgeReconciliationOutcome, ForgeAuthorityError> {
+        Err(ForgeAuthorityError::Rejected)
     }
 
     async fn push_branch(
         &self,
-        _: &GitHubPushRequest,
-        _: GitHubCredential<'_>,
-    ) -> Result<(), GitHubAuthorityError> {
-        Err(GitHubAuthorityError::Rejected)
+        _: &ForgePushRequest,
+        _: ForgeCredential<'_>,
+    ) -> Result<(), ForgeAuthorityError> {
+        Err(ForgeAuthorityError::Rejected)
     }
 
     async fn inspect_review(
         &self,
-        _: &GitHubReviewReceipt,
-        _: GitHubCredential<'_>,
-    ) -> Result<GitHubReviewObservation, GitHubAuthorityError> {
-        Err(GitHubAuthorityError::Rejected)
+        _: &ForgeReviewReceipt,
+        _: ForgeCredential<'_>,
+    ) -> Result<ForgeReviewObservation, ForgeAuthorityError> {
+        Err(ForgeAuthorityError::Rejected)
     }
 
     async fn request_merge(
         &self,
-        _: &GitHubReviewReceipt,
-        _: GitHubCredential<'_>,
-    ) -> Result<GitHubMergeRequestOutcome, GitHubAuthorityError> {
-        Err(GitHubAuthorityError::Rejected)
+        _: &ForgeReviewReceipt,
+        _: ForgeCredential<'_>,
+    ) -> Result<ForgeMergeRequestOutcome, ForgeAuthorityError> {
+        Err(ForgeAuthorityError::Rejected)
     }
 }
 
@@ -116,7 +116,7 @@ impl RuntimeEnvironmentRefresh for TimedRefresh {
 
 struct SyncProbe {
     adapter: NativeV2DeliveryAdapter,
-    request: GitHubReviewRequest,
+    request: ForgeReviewRequest,
     environment: ResolvedEnvironment,
     starts: AtomicUsize,
 }
@@ -190,7 +190,7 @@ fn probe(outage: Outage) -> (Arc<SyncProbe>, Arc<OutageAuthority>, Arc<TimedRefr
         environment: token_environment("refreshed-token"),
         calls: AtomicUsize::new(0),
     });
-    let request = GitHubReviewRequest {
+    let request = ForgeReviewRequest {
         target: DeliveryTarget::new("acme/project", "main", "a".repeat(40)).assert_value(),
         head_branch: "zeroshot/outage".to_owned(),
         head_revision: "b".repeat(40),

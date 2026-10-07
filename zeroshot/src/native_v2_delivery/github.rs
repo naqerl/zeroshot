@@ -13,13 +13,13 @@ use crate::native_v2_delivery::git_auth::encode_basic_credential;
 use crate::native_v2_target_authority::OperatorDiagnosticStore;
 
 use super::{
-    GitHubDeliveryRead, GitHubDeliverySnapshot, GitHubHeadReconciliation,
-    GitHubReconciliationOutcome, GitHubAuthorityError, GitHubChecks, GitHubConflictMaterialization,
-    GitHubConflictOutcome, GitHubConflictRequest, GitHubCredential, GitHubDeliveryAuthority,
-    GitHubHeadSynchronization, GitHubHeadUpdateOutcome, GitHubMergeRequestOutcome,
-    GitHubPushRequest, GitHubReviewObservation, GitHubReviewReceipt, GitHubReviewRequest,
-    GitHubReviewFeedback, GitHubReviewFeedbackItem, GitHubReviewState, GitHubTargetIntegration,
-    GitHubTargetReconciliation, valid_head_update, valid_revision,
+    ForgeDeliveryRead, ForgeDeliverySnapshot, ForgeHeadReconciliation, ForgeReconciliationOutcome,
+    ForgeAuthorityError, ForgeChecks, ForgeConflictMaterialization, ForgeConflictOutcome,
+    ForgeConflictRequest, ForgeCredential, DeliveryForgeAuthority, ForgeHeadSynchronization,
+    ForgeHeadUpdateOutcome, ForgeMergeRequestOutcome, ForgePushRequest, ForgeReviewObservation,
+    ForgeReviewReceipt, ForgeReviewRequest, ForgeReviewFeedback, ForgeReviewFeedbackItem,
+    ForgeReviewState, ForgeTargetIntegration, ForgeTargetReconciliation, valid_head_update,
+    valid_revision,
 };
 
 mod api;
@@ -98,9 +98,9 @@ impl GhCliDeliveryAuthority {
 
     async fn find_review(
         &self,
-        request: &GitHubReviewRequest,
-        credential: GitHubCredential<'_>,
-    ) -> Result<Option<GitHubReviewReceipt>, GitHubAuthorityError> {
+        request: &ForgeReviewRequest,
+        credential: ForgeCredential<'_>,
+    ) -> Result<Option<ForgeReviewReceipt>, ForgeAuthorityError> {
         let value = self
             .api(
                 &review_list_arguments(&request.target, &request.head_branch)?,
@@ -108,22 +108,22 @@ impl GhCliDeliveryAuthority {
             )
             .await?;
         let reviews: Vec<PullRequestWire> =
-            serde_json::from_value(value).map_err(|_| GitHubAuthorityError::Rejected)?;
+            serde_json::from_value(value).map_err(|_| ForgeAuthorityError::Rejected)?;
         let mut exact = reviews
             .into_iter()
             .map(|review| review_receipt(review, request))
             .collect::<Result<Vec<_>, _>>()?;
         if exact.len() > 1 {
-            return Err(GitHubAuthorityError::Rejected);
+            return Err(ForgeAuthorityError::Rejected);
         }
         Ok(exact.pop())
     }
 
     async fn create_review(
         &self,
-        request: &GitHubReviewRequest,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubReviewReceipt, GitHubAuthorityError> {
+        request: &ForgeReviewRequest,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeReviewReceipt, ForgeAuthorityError> {
         let body = pull_request_body(request)?;
         let value = self
             .api(
@@ -144,21 +144,21 @@ impl GhCliDeliveryAuthority {
             )
             .await?;
         let review: PullRequestWire =
-            serde_json::from_value(value).map_err(|_| GitHubAuthorityError::Rejected)?;
+            serde_json::from_value(value).map_err(|_| ForgeAuthorityError::Rejected)?;
         if review.title.as_deref() != Some(request.title.as_str())
             || review.body.as_deref() != Some(body.as_str())
         {
-            return Err(GitHubAuthorityError::Rejected);
+            return Err(ForgeAuthorityError::Rejected);
         }
         review_receipt(review, request)
     }
 
     async fn refresh_review_metadata(
         &self,
-        request: &GitHubReviewRequest,
-        review: &GitHubReviewReceipt,
-        credential: GitHubCredential<'_>,
-    ) -> Result<(), GitHubAuthorityError> {
+        request: &ForgeReviewRequest,
+        review: &ForgeReviewReceipt,
+        credential: ForgeCredential<'_>,
+    ) -> Result<(), ForgeAuthorityError> {
         let mut wire = self.pull_request(review, credential).await?;
         require_review_identity(&wire, review)?;
         let body = refresh_pull_request_body(wire.body.as_deref(), request)?;
@@ -177,17 +177,17 @@ impl GhCliDeliveryAuthority {
         if wire.title.as_deref() != Some(request.title.as_str())
             || wire.body.as_deref() != Some(body.as_str())
         {
-            return Err(GitHubAuthorityError::Rejected);
+            return Err(ForgeAuthorityError::Rejected);
         }
         Ok(())
     }
 
     async fn patch_review(
         &self,
-        review: &GitHubReviewReceipt,
+        review: &ForgeReviewReceipt,
         fields: &[String],
-        credential: GitHubCredential<'_>,
-    ) -> Result<PullRequestWire, GitHubAuthorityError> {
+        credential: ForgeCredential<'_>,
+    ) -> Result<PullRequestWire, ForgeAuthorityError> {
         let mut arguments = vec![
             format!("repos/{}/pulls/{}", review.repository, review.review_id),
             "--method".to_owned(),
@@ -197,25 +197,25 @@ impl GhCliDeliveryAuthority {
             arguments.extend(["-f".to_owned(), field.clone()]);
         }
         let value = self.api(&arguments, credential).await?;
-        let wire = serde_json::from_value(value).map_err(|_| GitHubAuthorityError::Rejected)?;
+        let wire = serde_json::from_value(value).map_err(|_| ForgeAuthorityError::Rejected)?;
         require_review_identity(&wire, review)?;
         Ok(wire)
     }
 
     async fn policy_snapshot(
         &self,
-        review: &GitHubReviewReceipt,
-        credential: GitHubCredential<'_>,
-    ) -> Result<PolicySnapshot, GitHubAuthorityError> {
+        review: &ForgeReviewReceipt,
+        credential: ForgeCredential<'_>,
+    ) -> Result<PolicySnapshot, ForgeAuthorityError> {
         let value = self.api(&query_arguments(review)?, credential).await?;
         classify_policy(value, review)
     }
 
     async fn policy_snapshot_with_logs(
         &self,
-        review: &GitHubReviewReceipt,
-        credential: GitHubCredential<'_>,
-    ) -> Result<PolicySnapshot, GitHubAuthorityError> {
+        review: &ForgeReviewReceipt,
+        credential: ForgeCredential<'_>,
+    ) -> Result<PolicySnapshot, ForgeAuthorityError> {
         let mut snapshot = self.policy_snapshot(review, credential).await?;
         let mut logs = Vec::new();
         for job in &snapshot.failed_job_ids {
@@ -231,9 +231,9 @@ impl GhCliDeliveryAuthority {
 
     async fn pull_request(
         &self,
-        review: &GitHubReviewReceipt,
-        credential: GitHubCredential<'_>,
-    ) -> Result<PullRequestWire, GitHubAuthorityError> {
+        review: &ForgeReviewReceipt,
+        credential: ForgeCredential<'_>,
+    ) -> Result<PullRequestWire, ForgeAuthorityError> {
         let value = self
             .api(
                 &[
@@ -244,15 +244,15 @@ impl GhCliDeliveryAuthority {
                 credential,
             )
             .await?;
-        serde_json::from_value(value).map_err(|_| GitHubAuthorityError::Rejected)
+        serde_json::from_value(value).map_err(|_| ForgeAuthorityError::Rejected)
     }
 
     async fn merge_method(
         &self,
-        review: &GitHubReviewReceipt,
-        credential: GitHubCredential<'_>,
+        review: &ForgeReviewReceipt,
+        credential: ForgeCredential<'_>,
         queued: bool,
-    ) -> Result<merge_policy::MergeMethod, GitHubAuthorityError> {
+    ) -> Result<merge_policy::MergeMethod, ForgeAuthorityError> {
         if queued {
             return Ok(merge_policy::MergeMethod::Queue);
         }
@@ -264,67 +264,67 @@ impl GhCliDeliveryAuthority {
 
     async fn classify_rejected_merge(
         &self,
-        review: &GitHubReviewReceipt,
-        credential: GitHubCredential<'_>,
-        failure: &GitHubAuthorityError,
-    ) -> Result<GitHubMergeRequestOutcome, GitHubAuthorityError> {
+        review: &ForgeReviewReceipt,
+        credential: ForgeCredential<'_>,
+        failure: &ForgeAuthorityError,
+    ) -> Result<ForgeMergeRequestOutcome, ForgeAuthorityError> {
         let snapshot = self.policy_snapshot(review, credential).await?;
         let permanent_response = !failure.retryable_operation();
         match snapshot.state {
-            GitHubReviewState::Merged { .. } => Ok(GitHubMergeRequestOutcome::Accepted),
-            _ if permanent_response => Err(GitHubAuthorityError::Rejected),
-            GitHubReviewState::Conflict => Ok(GitHubMergeRequestOutcome::Conflict),
-            GitHubReviewState::Open { .. } if snapshot.head_update.is_some() => {
-                Ok(GitHubMergeRequestOutcome::HeadUpdateRequired)
+            ForgeReviewState::Merged { .. } => Ok(ForgeMergeRequestOutcome::Accepted),
+            _ if permanent_response => Err(ForgeAuthorityError::Rejected),
+            ForgeReviewState::Conflict => Ok(ForgeMergeRequestOutcome::Conflict),
+            ForgeReviewState::Open { .. } if snapshot.head_update.is_some() => {
+                Ok(ForgeMergeRequestOutcome::HeadUpdateRequired)
             }
             // A changed or pending gate cannot explain away a permanent merge rejection.
             // Preserve the command failure unless GitHub confirms a specific reconciliation.
-            GitHubReviewState::Open { .. } | GitHubReviewState::Closed => {
-                Err(GitHubAuthorityError::Rejected)
+            ForgeReviewState::Open { .. } | ForgeReviewState::Closed => {
+                Err(ForgeAuthorityError::Rejected)
             }
         }
     }
 }
 
 #[async_trait]
-impl GitHubDeliveryAuthority for GhCliDeliveryAuthority {
+impl DeliveryForgeAuthority for GhCliDeliveryAuthority {
     async fn observe_delivery(
         &self,
-        request: GitHubDeliveryRead<'_>,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubDeliverySnapshot, GitHubAuthorityError> {
+        request: ForgeDeliveryRead<'_>,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeDeliverySnapshot, ForgeAuthorityError> {
         observation::observe(self, request, credential).await
     }
 
     async fn reconcile_delivery_target(
         &self,
-        request: GitHubTargetReconciliation<'_>,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubTargetIntegration, GitHubAuthorityError> {
+        request: ForgeTargetReconciliation<'_>,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeTargetIntegration, ForgeAuthorityError> {
         target::reconcile(self, request, credential).await
     }
 
     async fn reconcile_delivery_head(
         &self,
-        request: GitHubHeadReconciliation<'_>,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubReconciliationOutcome, GitHubAuthorityError> {
+        request: ForgeHeadReconciliation<'_>,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeReconciliationOutcome, ForgeAuthorityError> {
         head::reconcile(self, request, credential).await
     }
 
     async fn push_branch(
         &self,
-        request: &GitHubPushRequest,
-        credential: GitHubCredential<'_>,
-    ) -> Result<(), GitHubAuthorityError> {
+        request: &ForgePushRequest,
+        credential: ForgeCredential<'_>,
+    ) -> Result<(), ForgeAuthorityError> {
         push::push_branch(self, request, credential).await
     }
 
     async fn open_or_update_review(
         &self,
-        request: &GitHubReviewRequest,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubReviewReceipt, GitHubAuthorityError> {
+        request: &ForgeReviewRequest,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeReviewReceipt, ForgeAuthorityError> {
         let review = match self.find_review(request, credential).await? {
             Some(review) => {
                 self.refresh_review_metadata(request, &review, credential)
@@ -342,9 +342,9 @@ impl GitHubDeliveryAuthority for GhCliDeliveryAuthority {
 
     async fn inspect_review(
         &self,
-        review: &GitHubReviewReceipt,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubReviewObservation, GitHubAuthorityError> {
+        review: &ForgeReviewReceipt,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeReviewObservation, ForgeAuthorityError> {
         let snapshot = self.policy_snapshot_with_logs(review, credential).await?;
         let head_update_required = snapshot.head_update.is_some();
         Ok(review.observation_with_readiness(
@@ -356,17 +356,17 @@ impl GitHubDeliveryAuthority for GhCliDeliveryAuthority {
 
     async fn inspect_review_feedback(
         &self,
-        review: &GitHubReviewReceipt,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubReviewFeedback, GitHubAuthorityError> {
+        review: &ForgeReviewReceipt,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeReviewFeedback, ForgeAuthorityError> {
         feedback::inspect(self, review, credential).await
     }
 
     async fn request_merge(
         &self,
-        review: &GitHubReviewReceipt,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubMergeRequestOutcome, GitHubAuthorityError> {
+        review: &ForgeReviewReceipt,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeMergeRequestOutcome, ForgeAuthorityError> {
         let snapshot = self.policy_snapshot(review, credential).await?;
         let queued = match merge_action(snapshot)? {
             MergeAction::Complete(outcome) => return Ok(outcome),
@@ -385,7 +385,7 @@ impl GitHubDeliveryAuthority for GhCliDeliveryAuthority {
         ]);
         command.args(merge_method_argument(merge_method));
         match api::command_status(command, self.config.api_deadline, credential).await {
-            Ok(()) => Ok(GitHubMergeRequestOutcome::Accepted),
+            Ok(()) => Ok(ForgeMergeRequestOutcome::Accepted),
             Err(error) => match self
                 .classify_rejected_merge(review, credential, &error)
                 .await
@@ -403,13 +403,13 @@ impl GitHubDeliveryAuthority for GhCliDeliveryAuthority {
     async fn update_review_head(
         &self,
         workspace: &std::path::Path,
-        review: &GitHubReviewReceipt,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubHeadUpdateOutcome, GitHubAuthorityError> {
+        review: &ForgeReviewReceipt,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeHeadUpdateOutcome, ForgeAuthorityError> {
         let snapshot = self.policy_snapshot(review, credential).await?;
         match snapshot.state {
-            GitHubReviewState::Conflict => Ok(GitHubHeadUpdateOutcome::Conflict),
-            GitHubReviewState::Open { .. } => match snapshot.head_update {
+            ForgeReviewState::Conflict => Ok(ForgeHeadUpdateOutcome::Conflict),
+            ForgeReviewState::Open { .. } => match snapshot.head_update {
                 Some(update) => head::update_review_head(
                     self,
                     head::HeadUpdateRequest {
@@ -420,34 +420,34 @@ impl GitHubDeliveryAuthority for GhCliDeliveryAuthority {
                     credential,
                 )
                 .await
-                .map(GitHubHeadUpdateOutcome::Updated),
-                None => Ok(GitHubHeadUpdateOutcome::Pending),
+                .map(ForgeHeadUpdateOutcome::Updated),
+                None => Ok(ForgeHeadUpdateOutcome::Pending),
             },
-            GitHubReviewState::Merged { .. } => Ok(GitHubHeadUpdateOutcome::Pending),
-            GitHubReviewState::Closed => Err(GitHubAuthorityError::Rejected),
+            ForgeReviewState::Merged { .. } => Ok(ForgeHeadUpdateOutcome::Pending),
+            ForgeReviewState::Closed => Err(ForgeAuthorityError::Rejected),
         }
     }
 
     async fn synchronize_review_head(
         &self,
-        request: GitHubHeadSynchronization<'_>,
-        credential: GitHubCredential<'_>,
-    ) -> Result<(), GitHubAuthorityError> {
+        request: ForgeHeadSynchronization<'_>,
+        credential: ForgeCredential<'_>,
+    ) -> Result<(), ForgeAuthorityError> {
         head::synchronize_review_head(self, request, credential).await
     }
 
     async fn materialize_merge_conflict(
         &self,
-        request: &GitHubConflictRequest,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubConflictOutcome, GitHubAuthorityError> {
+        request: &ForgeConflictRequest,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeConflictOutcome, ForgeAuthorityError> {
         conflict::materialize(self, request, credential).await
     }
 }
 
 fn job_log_excerpt(
-    output: Result<Vec<u8>, GitHubAuthorityError>,
-) -> Result<String, GitHubAuthorityError> {
+    output: Result<Vec<u8>, ForgeAuthorityError>,
+) -> Result<String, ForgeAuthorityError> {
     match output {
         Ok(output) => Ok(check_log_tail(&output)),
         Err(error) if error.authentication_failed() || error.retryable_operation() => Err(error),
@@ -456,21 +456,21 @@ fn job_log_excerpt(
 }
 
 enum MergeAction {
-    Complete(GitHubMergeRequestOutcome),
+    Complete(ForgeMergeRequestOutcome),
     Submit { queued: bool },
 }
 
-fn merge_action(snapshot: PolicySnapshot) -> Result<MergeAction, GitHubAuthorityError> {
+fn merge_action(snapshot: PolicySnapshot) -> Result<MergeAction, ForgeAuthorityError> {
     let outcome = match (
         snapshot.state,
         snapshot.head_update,
         snapshot.pull_request_ready,
     ) {
-        (GitHubReviewState::Merged { .. }, _, _) => GitHubMergeRequestOutcome::Accepted,
-        (GitHubReviewState::Conflict, _, _) => GitHubMergeRequestOutcome::Conflict,
+        (ForgeReviewState::Merged { .. }, _, _) => ForgeMergeRequestOutcome::Accepted,
+        (ForgeReviewState::Conflict, _, _) => ForgeMergeRequestOutcome::Conflict,
         (
-            GitHubReviewState::Open {
-                checks: GitHubChecks::NotRequired | GitHubChecks::Passed,
+            ForgeReviewState::Open {
+                checks: ForgeChecks::NotRequired | ForgeChecks::Passed,
             },
             None,
             false,
@@ -480,14 +480,14 @@ fn merge_action(snapshot: PolicySnapshot) -> Result<MergeAction, GitHubAuthority
             });
         }
         (
-            GitHubReviewState::Open {
-                checks: GitHubChecks::NotRequired | GitHubChecks::Passed,
+            ForgeReviewState::Open {
+                checks: ForgeChecks::NotRequired | ForgeChecks::Passed,
             },
             Some(_),
             false,
-        ) => GitHubMergeRequestOutcome::HeadUpdateRequired,
-        (GitHubReviewState::Open { .. }, _, _) => GitHubMergeRequestOutcome::Pending,
-        (GitHubReviewState::Closed, _, _) => return Err(GitHubAuthorityError::Rejected),
+        ) => ForgeMergeRequestOutcome::HeadUpdateRequired,
+        (ForgeReviewState::Open { .. }, _, _) => ForgeMergeRequestOutcome::Pending,
+        (ForgeReviewState::Closed, _, _) => return Err(ForgeAuthorityError::Rejected),
     };
     Ok(MergeAction::Complete(outcome))
 }
@@ -513,8 +513,8 @@ use api::check_log_tail;
 use wire::{PullRequestWire, require_review_identity, review_receipt};
 
 #[cfg(test)]
-pub(super) fn test_review_request() -> GitHubReviewRequest {
-    GitHubReviewRequest {
+pub(super) fn test_review_request() -> ForgeReviewRequest {
+    ForgeReviewRequest {
         target: super::DeliveryTarget::new(
             "acme/project",
             "main",
@@ -530,20 +530,20 @@ pub(super) fn test_review_request() -> GitHubReviewRequest {
 }
 
 fn review_query_arguments(
-    review: &GitHubReviewReceipt,
+    review: &ForgeReviewReceipt,
     query: &str,
-) -> Result<Vec<String>, GitHubAuthorityError> {
+) -> Result<Vec<String>, ForgeAuthorityError> {
     let (owner, name) = review
         .repository
         .split_once('/')
         .filter(|(owner, name)| !owner.is_empty() && !name.is_empty() && !name.contains('/'))
-        .ok_or(GitHubAuthorityError::Rejected)?;
+        .ok_or(ForgeAuthorityError::Rejected)?;
     let number = review
         .review_id
         .parse::<u64>()
         .ok()
         .filter(|number| *number > 0)
-        .ok_or(GitHubAuthorityError::Rejected)?;
+        .ok_or(ForgeAuthorityError::Rejected)?;
     Ok(vec![
         "graphql".to_owned(),
         "--paginate".to_owned(),
@@ -562,12 +562,12 @@ fn review_query_arguments(
 fn review_list_arguments(
     target: &super::DeliveryTarget,
     head_branch: &str,
-) -> Result<Vec<String>, GitHubAuthorityError> {
+) -> Result<Vec<String>, ForgeAuthorityError> {
     let owner = target
         .repository
         .split_once('/')
         .map(|(owner, _)| owner)
-        .ok_or(GitHubAuthorityError::Rejected)?;
+        .ok_or(ForgeAuthorityError::Rejected)?;
     Ok(vec![
         format!("repos/{}/pulls", target.repository),
         "--method".to_owned(),
@@ -584,7 +584,7 @@ fn review_list_arguments(
 fn clean_command(
     config: &GhCliAuthorityConfig,
     program: &PathBuf,
-    credential: GitHubCredential<'_>,
+    credential: ForgeCredential<'_>,
 ) -> Command {
     let mut command = Command::new(program);
     command
@@ -609,7 +609,7 @@ fn clean_command(
 fn git_command(
     config: &GhCliAuthorityConfig,
     workspace: &std::path::Path,
-    credential: GitHubCredential<'_>,
+    credential: ForgeCredential<'_>,
 ) -> Command {
     let mut command = local_git_command(config, workspace);
     command
@@ -631,7 +631,7 @@ fn local_git_command(config: &GhCliAuthorityConfig, workspace: &std::path::Path)
 fn authenticated_git_command(
     config: &GhCliAuthorityConfig,
     workspace: &std::path::Path,
-    credential: GitHubCredential<'_>,
+    credential: ForgeCredential<'_>,
 ) -> Command {
     let mut command = git_command(config, workspace, credential);
     let authorization = format!(
@@ -650,7 +650,7 @@ fn authenticated_git_command(
 async fn configure_delivery_identity(
     config: &GhCliAuthorityConfig,
     workspace: &std::path::Path,
-) -> Result<(), GitHubAuthorityError> {
+) -> Result<(), ForgeAuthorityError> {
     for (key, value) in [
         ("user.name", "Zeroshot"),
         ("user.email", "delivery@zeroshot.invalid"),
@@ -662,17 +662,17 @@ async fn configure_delivery_identity(
     Ok(())
 }
 
-fn git_error(error: super::git::GitError) -> GitHubAuthorityError {
+fn git_error(error: super::git::GitError) -> ForgeAuthorityError {
     match error {
-        super::git::GitError::Command(failure) => GitHubAuthorityError::Command(failure),
-        error => GitHubAuthorityError::repairable(error.to_string()),
+        super::git::GitError::Command(failure) => ForgeAuthorityError::Command(failure),
+        error => ForgeAuthorityError::repairable(error.to_string()),
     }
 }
 
 async fn bounded_status(
     mut command: Command,
     deadline: Duration,
-) -> Result<(), GitHubAuthorityError> {
+) -> Result<(), ForgeAuthorityError> {
     capture(&mut command, deadline).await?.require_success()?;
     Ok(())
 }
@@ -681,10 +681,10 @@ async fn bounded_git_output(
     command: &mut Command,
     deadline: Duration,
     maximum_bytes: usize,
-) -> Result<String, GitHubAuthorityError> {
+) -> Result<String, ForgeAuthorityError> {
     let output = capture(command, deadline).await?.require_success()?;
     if output.stdout_truncated || output.stdout.len() > maximum_bytes {
-        return Err(GitHubAuthorityError::api(
+        return Err(ForgeAuthorityError::api(
             None,
             format!("Git output exceeded {maximum_bytes} bytes\n{output}"),
         ));

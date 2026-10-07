@@ -3,8 +3,8 @@ use super::*;
 pub(super) struct RepairFailure {
     pub(super) diagnostic: String,
     pub(super) retryable: bool,
-    review: Option<Box<GitHubReviewReceipt>>,
-    authority: Option<GitHubAuthorityError>,
+    review: Option<Box<ForgeReviewReceipt>>,
+    authority: Option<ForgeAuthorityError>,
 }
 
 pub(super) fn repair(diagnostic: impl Into<String>) -> DeliveryStop {
@@ -16,7 +16,7 @@ pub(super) fn repair(diagnostic: impl Into<String>) -> DeliveryStop {
     })
 }
 
-pub(super) fn uncertain_authority(error: GitHubAuthorityError) -> DeliveryStop {
+pub(super) fn uncertain_authority(error: ForgeAuthorityError) -> DeliveryStop {
     DeliveryStop::Repair(RepairFailure {
         diagnostic: error.to_string(),
         retryable: error.retryable_operation(),
@@ -32,9 +32,9 @@ pub(super) fn finish_uncertain_authority(mut failure: RepairFailure) -> Delivery
     }
 }
 
-impl From<GitHubAuthorityError> for DeliveryStop {
-    fn from(error: GitHubAuthorityError) -> Self {
-        if matches!(error, GitHubAuthorityError::Identity(_)) {
+impl From<ForgeAuthorityError> for DeliveryStop {
+    fn from(error: ForgeAuthorityError) -> Self {
+        if matches!(error, ForgeAuthorityError::Identity(_)) {
             Self::Outcome(WorkerOutcome::declared_failure(WorkerErrorCode::Refusal))
         } else if error.authentication_failed() {
             Self::Outcome(WorkerOutcome::authentication_refusal())
@@ -42,7 +42,7 @@ impl From<GitHubAuthorityError> for DeliveryStop {
             Self::Retry(error)
         } else if matches!(
             error,
-            GitHubAuthorityError::Repairable(_) | GitHubAuthorityError::Command(_)
+            ForgeAuthorityError::Repairable(_) | ForgeAuthorityError::Command(_)
         ) {
             repair(error.to_string())
         } else {
@@ -52,7 +52,7 @@ impl From<GitHubAuthorityError> for DeliveryStop {
 }
 
 impl DeliveryStop {
-    pub(super) fn with_review(mut self, review: &GitHubReviewReceipt) -> Self {
+    pub(super) fn with_review(mut self, review: &ForgeReviewReceipt) -> Self {
         if let Self::Repair(failure) = &mut self {
             failure.review = Some(Box::new(review.clone()));
         }
@@ -73,7 +73,7 @@ impl NativeV2DeliveryAdapter {
         let review = failure
             .review
             .map(|review| *review)
-            .unwrap_or_else(|| GitHubReviewReceipt {
+            .unwrap_or_else(|| ForgeReviewReceipt {
                 review_id: String::new(),
                 repository: self.config.target.repository.clone(),
                 target_branch: self.config.target.target_branch.clone(),
@@ -133,7 +133,7 @@ impl NativeV2DeliveryAdapter {
                 &invocation.environment,
                 self.authority.credential_environment(),
             )
-            .map(GitHubCredential::expose),
+            .map(ForgeCredential::expose),
         ];
         for token in tokens.into_iter().flatten() {
             diagnostic = diagnostic

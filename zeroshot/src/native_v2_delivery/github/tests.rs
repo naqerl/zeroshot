@@ -5,14 +5,14 @@ use super::*;
 #[cfg(unix)]
 use super::observation::test_support::{authority, shell_literal, write_executable};
 use super::merge_policy::MergeMethod;
-use crate::native_v2_delivery::GitHubChecks;
+use crate::native_v2_delivery::ForgeChecks;
 
 #[cfg(unix)]
 #[path = "merge_tests.rs"]
 mod merge_tests;
 
-pub(super) fn review() -> GitHubReviewReceipt {
-    GitHubReviewReceipt {
+pub(super) fn review() -> ForgeReviewReceipt {
+    ForgeReviewReceipt {
         review_id: "17".to_owned(),
         repository: "acme/project".to_owned(),
         target_branch: "main".to_owned(),
@@ -132,7 +132,7 @@ fn set_review_state(page: &mut Value, state: &str, merged: bool) {
 }
 
 #[cfg(unix)]
-fn review_wire(request: &GitHubReviewRequest, title: Option<&str>, body: Option<&str>) -> Value {
+fn review_wire(request: &ForgeReviewRequest, title: Option<&str>, body: Option<&str>) -> Value {
     json!({
         "number": 17,
         "title": title,
@@ -282,8 +282,8 @@ fn delayed_required_workflow_registration_stays_pending_until_github_is_ready() 
     let absent = classify(approval_blocked);
     assert_eq!(
         absent.state,
-        GitHubReviewState::Open {
-            checks: GitHubChecks::Pending
+        ForgeReviewState::Open {
+            checks: ForgeChecks::Pending
         }
     );
     assert!(!absent.pull_request_ready);
@@ -295,8 +295,8 @@ fn delayed_required_workflow_registration_stays_pending_until_github_is_ready() 
     let no_ci = classify(no_ci);
     assert_eq!(
         no_ci.state,
-        GitHubReviewState::Open {
-            checks: GitHubChecks::NotRequired
+        ForgeReviewState::Open {
+            checks: ForgeChecks::NotRequired
         }
     );
     assert!(no_ci.pull_request_ready);
@@ -309,8 +309,8 @@ fn delayed_required_workflow_registration_stays_pending_until_github_is_ready() 
     ));
     assert_eq!(
         queued.state,
-        GitHubReviewState::Open {
-            checks: GitHubChecks::Pending
+        ForgeReviewState::Open {
+            checks: ForgeChecks::Pending
         }
     );
 
@@ -340,8 +340,8 @@ fn delayed_required_workflow_registration_stays_pending_until_github_is_ready() 
     let approval_blocked_ready = classify(approval_blocked_ready);
     assert_eq!(
         approval_blocked_ready.state,
-        GitHubReviewState::Open {
-            checks: GitHubChecks::Passed
+        ForgeReviewState::Open {
+            checks: ForgeChecks::Passed
         }
     );
     assert!(approval_blocked_ready.pull_request_ready);
@@ -359,8 +359,8 @@ fn delayed_required_workflow_registration_stays_pending_until_github_is_ready() 
     ));
     assert_eq!(
         ready.state,
-        GitHubReviewState::Open {
-            checks: GitHubChecks::Passed
+        ForgeReviewState::Open {
+            checks: ForgeChecks::Passed
         }
     );
     assert!(!ready.pull_request_ready);
@@ -381,8 +381,8 @@ fn approval_exception_requires_positive_review_handoff_policy_evidence() {
         let snapshot = classify(page);
         assert_eq!(
             snapshot.state,
-            GitHubReviewState::Open {
-                checks: GitHubChecks::Pending
+            ForgeReviewState::Open {
+                checks: ForgeChecks::Pending
             }
         );
         assert!(!snapshot.pull_request_ready);
@@ -408,8 +408,8 @@ fn optional_checks_never_block_or_fail_delivery() {
     ));
     assert_eq!(
         snapshot.state,
-        GitHubReviewState::Open {
-            checks: GitHubChecks::NotRequired
+        ForgeReviewState::Open {
+            checks: ForgeChecks::NotRequired
         }
     );
     assert!(snapshot.failed_job_ids.is_empty());
@@ -436,8 +436,8 @@ fn required_check_failures_win_and_preserve_diagnostics() {
         )],
     );
     let diagnostic = match snapshot.state {
-        GitHubReviewState::Open {
-            checks: GitHubChecks::Failed { diagnostic },
+        ForgeReviewState::Open {
+            checks: ForgeChecks::Failed { diagnostic },
         } => Some(diagnostic),
         _ => None,
     }
@@ -454,8 +454,8 @@ fn every_known_terminal_check_run_conclusion_is_classified() {
         let snapshot = classify_conclusion(conclusion, "CLEAN");
         assert!(matches!(
             snapshot.state,
-            GitHubReviewState::Open {
-                checks: GitHubChecks::Passed
+            ForgeReviewState::Open {
+                checks: ForgeChecks::Passed
             }
         ));
     }
@@ -470,8 +470,8 @@ fn every_known_terminal_check_run_conclusion_is_classified() {
         let snapshot = classify_conclusion(conclusion, "BLOCKED");
         assert!(matches!(
             snapshot.state,
-            GitHubReviewState::Open {
-                checks: GitHubChecks::Failed { .. }
+            ForgeReviewState::Open {
+                checks: ForgeChecks::Failed { .. }
             }
         ));
     }
@@ -488,8 +488,8 @@ fn unknown_or_nonterminal_provider_states_fail_closed_as_pending() {
         let snapshot = classify(policy_page(mergeable, merge_state, None, (false, None)));
         assert_eq!(
             snapshot.state,
-            GitHubReviewState::Open {
-                checks: GitHubChecks::Pending
+            ForgeReviewState::Open {
+                checks: ForgeChecks::Pending
             }
         );
     }
@@ -506,8 +506,8 @@ fn unknown_or_nonterminal_provider_states_fail_closed_as_pending() {
     ));
     assert_eq!(
         snapshot.state,
-        GitHubReviewState::Open {
-            checks: GitHubChecks::Pending
+        ForgeReviewState::Open {
+            checks: ForgeChecks::Pending
         }
     );
 }
@@ -518,8 +518,8 @@ fn clean_repository_without_required_checks_is_ready() {
         let snapshot = classify(policy_page("MERGEABLE", merge_state, None, (false, None)));
         assert_eq!(
             snapshot.state,
-            GitHubReviewState::Open {
-                checks: GitHubChecks::NotRequired
+            ForgeReviewState::Open {
+                checks: ForgeChecks::NotRequired
             }
         );
         assert_eq!(snapshot.head_update.is_some(), merge_state == "BEHIND");
@@ -535,8 +535,8 @@ fn drafts_and_queued_reviews_wait_for_github() {
             .clone_from(&json!(true));
         assert_eq!(
             classify(page).state,
-            GitHubReviewState::Open {
-                checks: GitHubChecks::Pending
+            ForgeReviewState::Open {
+                checks: ForgeChecks::Pending
             }
         );
     }
@@ -552,8 +552,8 @@ fn merge_queue_policy_reaches_native_submission_without_ci_special_cases() {
         let snapshot = classify(page);
         assert_eq!(
             snapshot.state,
-            GitHubReviewState::Open {
-                checks: GitHubChecks::NotRequired
+            ForgeReviewState::Open {
+                checks: ForgeChecks::NotRequired
             }
         );
         assert!(snapshot.is_merge_queue_enabled);
@@ -577,7 +577,7 @@ fn authoritative_merge_revision_is_preserved_for_every_merge_method() {
 
         assert_eq!(
             classify(page).state,
-            GitHubReviewState::Merged {
+            ForgeReviewState::Merged {
                 merge_revision: "cccccccccccccccccccccccccccccccccccccccc".to_owned()
             }
         );
@@ -607,8 +607,8 @@ fn pagination_must_be_complete_and_policy_stable() {
         classify_policy(json!([first.clone(), second]), &review())
             .assert_value()
             .state,
-        GitHubReviewState::Open {
-            checks: GitHubChecks::Passed
+        ForgeReviewState::Open {
+            checks: ForgeChecks::Passed
         }
     );
     assert_policy_pages_pending(vec![first]);
@@ -631,8 +631,8 @@ fn assert_policy_pages_pending(pages: Vec<Value>) {
         classify_policy(json!(pages), &review())
             .assert_value()
             .state,
-        GitHubReviewState::Open {
-            checks: GitHubChecks::Pending
+        ForgeReviewState::Open {
+            checks: ForgeChecks::Pending
         }
     );
 }
@@ -640,10 +640,7 @@ fn assert_policy_pages_pending(pages: Vec<Value>) {
 #[test]
 fn terminal_state_and_exact_identity_are_authoritative() {
     let mut conflict = policy_page("CONFLICTING", "DIRTY", None, (false, None));
-    assert_eq!(
-        classify(conflict.clone()).state,
-        GitHubReviewState::Conflict
-    );
+    assert_eq!(classify(conflict.clone()).state, ForgeReviewState::Conflict);
 
     let mut closed = conflict.clone();
     let pull_request = closed
@@ -652,7 +649,7 @@ fn terminal_state_and_exact_identity_are_authoritative() {
     pull_request["state"] = json!("CLOSED");
     pull_request["mergeable"] = json!("UNKNOWN");
     pull_request["mergeStateStatus"] = json!("UNKNOWN");
-    assert_eq!(classify(closed).state, GitHubReviewState::Closed);
+    assert_eq!(classify(closed).state, ForgeReviewState::Closed);
 
     let pull_request = conflict
         .pointer_mut("/data/repository/pullRequest")
@@ -664,7 +661,7 @@ fn terminal_state_and_exact_identity_are_authoritative() {
     pull_request["mergeCommit"] = json!({"oid":"cccccccccccccccccccccccccccccccccccccccc"});
     assert_eq!(
         classify(conflict.clone()).state,
-        GitHubReviewState::Merged {
+        ForgeReviewState::Merged {
             merge_revision: "cccccccccccccccccccccccccccccccccccccccc".to_owned()
         }
     );
@@ -712,8 +709,8 @@ fn required_gate_failure_includes_supporting_job_failures() {
         (false, None),
     ));
     assert_eq!(snapshot.failed_job_ids, vec![91, 92]);
-    let GitHubReviewState::Open {
-        checks: GitHubChecks::Failed { diagnostic },
+    let ForgeReviewState::Open {
+        checks: ForgeChecks::Failed { diagnostic },
     } = snapshot.state
     else {
         panic!("expected failed required gate");
@@ -726,8 +723,8 @@ fn required_gate_failure_includes_supporting_job_failures() {
 #[test]
 fn supporting_failures_do_not_change_pending_or_passed_required_policy() {
     for (status, conclusion, merge_state, expected) in [
-        ("IN_PROGRESS", None, "BLOCKED", GitHubChecks::Pending),
-        ("COMPLETED", Some("SUCCESS"), "CLEAN", GitHubChecks::Passed),
+        ("IN_PROGRESS", None, "BLOCKED", ForgeChecks::Pending),
+        ("COMPLETED", Some("SUCCESS"), "CLEAN", ForgeChecks::Passed),
     ] {
         let snapshot = classify(policy_page(
             "MERGEABLE",
@@ -738,7 +735,7 @@ fn supporting_failures_do_not_change_pending_or_passed_required_policy() {
             ]),
             (false, None),
         ));
-        assert_eq!(snapshot.state, GitHubReviewState::Open { checks: expected });
+        assert_eq!(snapshot.state, ForgeReviewState::Open { checks: expected });
         assert!(snapshot.failed_job_ids.is_empty());
     }
 }
@@ -763,8 +760,8 @@ fn failed_job_log_limit_is_explicit_and_preserves_failure_names() {
         (false, None),
     ));
     assert_eq!(snapshot.failed_job_ids.len(), 8);
-    let GitHubReviewState::Open {
-        checks: GitHubChecks::Failed { diagnostic },
+    let ForgeReviewState::Open {
+        checks: ForgeChecks::Failed { diagnostic },
     } = snapshot.state
     else {
         panic!("expected failed required gate");
@@ -785,8 +782,8 @@ fn large_first_log_cannot_hide_other_failed_job_excerpts() {
         })
         .collect::<Vec<_>>();
     include_check_logs(&mut snapshot, &logs);
-    let GitHubReviewState::Open {
-        checks: GitHubChecks::Failed { diagnostic },
+    let ForgeReviewState::Open {
+        checks: ForgeChecks::Failed { diagnostic },
     } = snapshot.state
     else {
         panic!("expected failed required gate");
@@ -813,8 +810,8 @@ fn oversized_failure_summary_marks_omitted_text() {
         Some(contexts),
         (false, None),
     ));
-    let GitHubReviewState::Open {
-        checks: GitHubChecks::Failed { diagnostic },
+    let ForgeReviewState::Open {
+        checks: ForgeChecks::Failed { diagnostic },
     } = snapshot.state
     else {
         panic!("expected failed required checks");
@@ -834,20 +831,20 @@ fn merge_actions_preserve_terminal_authority_and_queue_ownership() {
     };
     for (state, expected) in [
         (
-            GitHubReviewState::Merged {
+            ForgeReviewState::Merged {
                 merge_revision: "cccccccccccccccccccccccccccccccccccccccc".to_owned(),
             },
-            GitHubMergeRequestOutcome::Accepted,
+            ForgeMergeRequestOutcome::Accepted,
         ),
         (
-            GitHubReviewState::Conflict,
-            GitHubMergeRequestOutcome::Conflict,
+            ForgeReviewState::Conflict,
+            ForgeMergeRequestOutcome::Conflict,
         ),
         (
-            GitHubReviewState::Open {
-                checks: GitHubChecks::Pending,
+            ForgeReviewState::Open {
+                checks: ForgeChecks::Pending,
             },
-            GitHubMergeRequestOutcome::Pending,
+            ForgeMergeRequestOutcome::Pending,
         ),
     ] {
         let MergeAction::Complete(actual) = merge_action(snapshot(state, false)).assert_value()
@@ -857,9 +854,9 @@ fn merge_actions_preserve_terminal_authority_and_queue_ownership() {
         assert_eq!(actual, expected);
     }
     for queued in [false, true] {
-        for checks in [GitHubChecks::NotRequired, GitHubChecks::Passed] {
+        for checks in [ForgeChecks::NotRequired, ForgeChecks::Passed] {
             let MergeAction::Submit { queued: actual } =
-                merge_action(snapshot(GitHubReviewState::Open { checks }, queued)).assert_value()
+                merge_action(snapshot(ForgeReviewState::Open { checks }, queued)).assert_value()
             else {
                 panic!("ready policy must permit submission");
             };
@@ -867,8 +864,8 @@ fn merge_actions_preserve_terminal_authority_and_queue_ownership() {
         }
     }
     assert_eq!(
-        merge_action(snapshot(GitHubReviewState::Closed, false)).assert_error(),
-        GitHubAuthorityError::Rejected
+        merge_action(snapshot(ForgeReviewState::Closed, false)).assert_error(),
+        ForgeAuthorityError::Rejected
     );
 }
 
@@ -896,7 +893,7 @@ async fn review_opening_rediscovery_and_metadata_refresh_are_identity_fenced() {
         existing_root.path(),
         uniform_review_responses(json!([exact.clone()]), &exact),
     )
-    .open_or_update_review(&request, GitHubCredential("test-token"))
+    .open_or_update_review(&request, ForgeCredential("test-token"))
     .await
     .assert_value();
     assert_eq!(existing, review());
@@ -906,7 +903,7 @@ async fn review_opening_rediscovery_and_metadata_refresh_are_identity_fenced() {
         created_root.path(),
         uniform_review_responses(json!([]), &exact),
     )
-    .open_or_update_review(&request, GitHubCredential("test-token"))
+    .open_or_update_review(&request, ForgeCredential("test-token"))
     .await
     .assert_value();
     assert_eq!(created, review());
@@ -928,7 +925,7 @@ async fn review_opening_rediscovery_and_metadata_refresh_are_identity_fenced() {
             patched: refreshed,
         },
     )
-    .refresh_review_metadata(&request, &review(), GitHubCredential("test-token"))
+    .refresh_review_metadata(&request, &review(), ForgeCredential("test-token"))
     .await
     .assert_value();
 
@@ -937,10 +934,10 @@ async fn review_opening_rediscovery_and_metadata_refresh_are_identity_fenced() {
         ambiguous_root.path(),
         uniform_review_responses(json!([exact.clone(), exact.clone()]), &exact),
     )
-    .find_review(&request, GitHubCredential("test-token"))
+    .find_review(&request, ForgeCredential("test-token"))
     .await
     .assert_error();
-    assert_eq!(ambiguous, GitHubAuthorityError::Rejected);
+    assert_eq!(ambiguous, ForgeAuthorityError::Rejected);
 
     let mismatched = review_wire(
         &request,
@@ -957,10 +954,10 @@ async fn review_opening_rediscovery_and_metadata_refresh_are_identity_fenced() {
             patched: mismatched,
         },
     )
-    .create_review(&request, GitHubCredential("test-token"))
+    .create_review(&request, ForgeCredential("test-token"))
     .await
     .assert_error();
-    assert_eq!(mismatched, GitHubAuthorityError::Rejected);
+    assert_eq!(mismatched, ForgeAuthorityError::Rejected);
 }
 
 #[cfg(unix)]
@@ -984,18 +981,18 @@ async fn failed_check_logs_are_enriched_but_transport_failures_remain_typed() {
         "printf '%s\\n' 'setup passed' 'assertion failed at boundary'",
     );
     let observation = authority(program, root.path())
-        .inspect_review(&review(), GitHubCredential("test-token"))
+        .inspect_review(&review(), ForgeCredential("test-token"))
         .await
         .assert_value();
-    let GitHubReviewState::Open {
-        checks: GitHubChecks::Failed { diagnostic },
+    let ForgeReviewState::Open {
+        checks: ForgeChecks::Failed { diagnostic },
     } = observation.state
     else {
         panic!("required failed check must remain failed");
     };
     assert!(diagnostic.contains("assertion failed at boundary"));
 
-    let unavailable = job_log_excerpt(Err(GitHubAuthorityError::api(
+    let unavailable = job_log_excerpt(Err(ForgeAuthorityError::api(
         Some(403),
         "resource not accessible",
     )))
@@ -1003,7 +1000,7 @@ async fn failed_check_logs_are_enriched_but_transport_failures_remain_typed() {
     assert!(unavailable.contains("GitHub job log unavailable"));
 
     for status in [401, 429] {
-        let error = job_log_excerpt(Err(GitHubAuthorityError::api(
+        let error = job_log_excerpt(Err(ForgeAuthorityError::api(
             Some(status),
             "transport refusal",
         )))
@@ -1029,12 +1026,12 @@ async fn transient_merge_failure_is_reclassified_from_the_latest_authoritative_p
     set_review_state(&mut closed, "CLOSED", false);
 
     let cases = [
-        (merged, Ok(GitHubMergeRequestOutcome::Accepted)),
-        (conflict, Ok(GitHubMergeRequestOutcome::Conflict)),
-        (behind, Ok(GitHubMergeRequestOutcome::HeadUpdateRequired)),
-        (pending, Err(GitHubAuthorityError::Rejected)),
-        (ready, Err(GitHubAuthorityError::Rejected)),
-        (closed, Err(GitHubAuthorityError::Rejected)),
+        (merged, Ok(ForgeMergeRequestOutcome::Accepted)),
+        (conflict, Ok(ForgeMergeRequestOutcome::Conflict)),
+        (behind, Ok(ForgeMergeRequestOutcome::HeadUpdateRequired)),
+        (pending, Err(ForgeAuthorityError::Rejected)),
+        (ready, Err(ForgeAuthorityError::Rejected)),
+        (closed, Err(ForgeAuthorityError::Rejected)),
     ];
     for (page, expected) in cases {
         let root = tempfile::tempdir().assert_value();
@@ -1042,8 +1039,8 @@ async fn transient_merge_failure_is_reclassified_from_the_latest_authoritative_p
         let actual = authority(program, root.path())
             .classify_rejected_merge(
                 &review(),
-                GitHubCredential("test-token"),
-                &GitHubAuthorityError::api(None, "merge transport failed").temporary(),
+                ForgeCredential("test-token"),
+                &ForgeAuthorityError::api(None, "merge transport failed").temporary(),
             )
             .await;
         assert_eq!(actual, expected);

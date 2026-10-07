@@ -5,19 +5,19 @@ use super::wire::{GitReferenceWire, reference_revision};
 #[derive(Clone, Copy)]
 struct TargetContext<'a> {
     authority: &'a GhCliDeliveryAuthority,
-    request: GitHubTargetReconciliation<'a>,
+    request: ForgeTargetReconciliation<'a>,
 }
 
 pub(super) async fn reconcile(
     authority: &GhCliDeliveryAuthority,
-    request: GitHubTargetReconciliation<'_>,
-    credential: GitHubCredential<'_>,
-) -> Result<GitHubTargetIntegration, GitHubAuthorityError> {
+    request: ForgeTargetReconciliation<'_>,
+    credential: ForgeCredential<'_>,
+) -> Result<ForgeTargetIntegration, ForgeAuthorityError> {
     let context = TargetContext { authority, request };
     let target_revision = observe_target(context, credential).await?;
     fetch_target(context, &target_revision, credential).await?;
     let outcome = integrate(context, &target_revision).await?;
-    Ok(GitHubTargetIntegration {
+    Ok(ForgeTargetIntegration {
         target_revision,
         outcome,
     })
@@ -25,8 +25,8 @@ pub(super) async fn reconcile(
 
 async fn observe_target(
     context: TargetContext<'_>,
-    credential: GitHubCredential<'_>,
-) -> Result<String, GitHubAuthorityError> {
+    credential: ForgeCredential<'_>,
+) -> Result<String, ForgeAuthorityError> {
     let target = context.request.target;
     let value = context
         .authority
@@ -45,8 +45,8 @@ async fn observe_target(
 async fn fetch_target(
     context: TargetContext<'_>,
     target_revision: &str,
-    credential: GitHubCredential<'_>,
-) -> Result<(), GitHubAuthorityError> {
+    credential: ForgeCredential<'_>,
+) -> Result<(), ForgeAuthorityError> {
     let mut fetch = authenticated_git_command(
         &context.authority.config,
         context.request.workspace,
@@ -72,7 +72,7 @@ async fn fetch_target(
 async fn integrate(
     context: TargetContext<'_>,
     target_revision: &str,
-) -> Result<GitHubReconciliationOutcome, GitHubAuthorityError> {
+) -> Result<ForgeReconciliationOutcome, ForgeAuthorityError> {
     let git = context.authority.workspace_git();
     let (head, _) = git
         .workspace_state(context.request.workspace)
@@ -83,7 +83,7 @@ async fn integrate(
     provenance.args(["merge-base", "--is-ancestor", source_revision, &head]);
     bounded_status(provenance, context.authority.config.api_deadline).await?;
     if is_ancestor(context, target_revision, &head).await? {
-        return Ok(GitHubReconciliationOutcome::Unchanged);
+        return Ok(ForgeReconciliationOutcome::Unchanged);
     }
     let candidate = git
         .prepare_revision(
@@ -101,7 +101,7 @@ async fn merge_target(
     context: TargetContext<'_>,
     target_revision: &str,
     candidate: &str,
-) -> Result<GitHubReconciliationOutcome, GitHubAuthorityError> {
+) -> Result<ForgeReconciliationOutcome, ForgeAuthorityError> {
     let mut command = local_command(context);
     command.args([
         "-c",
@@ -120,7 +120,7 @@ async fn merge_target(
         Some(1) if has_exact_conflict(context, target_revision, candidate).await? => {}
         _ => return Err(output.into()),
     }
-    Ok(GitHubReconciliationOutcome::NeedsWork(format!(
+    Ok(ForgeReconciliationOutcome::NeedsWork(format!(
         "trusted delivery fetched and integrated captured target revision {target_revision}; \
          inspect and test the resulting workspace, resolving any conflicts, before another delivery\n{output}",
     )))
@@ -130,7 +130,7 @@ async fn require_completed_integration(
     context: TargetContext<'_>,
     target_revision: &str,
     candidate: &str,
-) -> Result<(), GitHubAuthorityError> {
+) -> Result<(), ForgeAuthorityError> {
     let git = context.authority.workspace_git();
     let (head, dirty) = git
         .workspace_state(context.request.workspace)
@@ -140,7 +140,7 @@ async fn require_completed_integration(
         || !is_ancestor(context, candidate, &head).await?
         || !is_ancestor(context, target_revision, &head).await?
     {
-        return Err(GitHubAuthorityError::repairable(
+        return Err(ForgeAuthorityError::repairable(
             "Git merge reported success without a clean, completed integration preserving both \
              the candidate and captured target ancestry; inspect the preserved workspace",
         ));
@@ -152,7 +152,7 @@ async fn has_exact_conflict(
     context: TargetContext<'_>,
     target_revision: &str,
     candidate: &str,
-) -> Result<bool, GitHubAuthorityError> {
+) -> Result<bool, ForgeAuthorityError> {
     for (reference, expected) in [("HEAD", candidate), ("MERGE_HEAD", target_revision)] {
         let value = bounded_git_output(
             local_command(context).args(["rev-parse", "--verify", reference]),
@@ -177,7 +177,7 @@ async fn is_ancestor(
     context: TargetContext<'_>,
     ancestor: &str,
     descendant: &str,
-) -> Result<bool, GitHubAuthorityError> {
+) -> Result<bool, ForgeAuthorityError> {
     let output = capture(
         local_command(context).args(["merge-base", "--is-ancestor", ancestor, descendant]),
         context.authority.config.api_deadline,

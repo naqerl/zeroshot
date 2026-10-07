@@ -20,14 +20,14 @@ mod review_head;
 mod tests;
 
 pub use command::GitCommandFailure;
-pub use authority_error::{GitHubApiFailure, GitHubAuthorityError};
+pub use authority_error::{ForgeApiFailure, ForgeAuthorityError};
 pub use forge::{DeliveryForge, DeliveryForgeError, GiteaForge};
 pub use gitea::{GiteaAuthorityConfig, GiteaDeliveryAuthority};
 pub use github::{GhCliAuthorityConfig, GhCliDeliveryAuthority};
 pub use review_head::{
-    GitHubDeliveryRead, GitHubDeliverySnapshot, GitHubHeadReconciliation,
-    GitHubHeadSynchronization, GitHubHeadUpdateOutcome, GitHubMergeRequestOutcome,
-    GitHubReconciliationOutcome, GitHubTargetIntegration, GitHubTargetReconciliation,
+    ForgeDeliveryRead, ForgeDeliverySnapshot, ForgeHeadReconciliation, ForgeHeadSynchronization,
+    ForgeHeadUpdateOutcome, ForgeMergeRequestOutcome, ForgeReconciliationOutcome,
+    ForgeTargetIntegration, ForgeTargetReconciliation,
 };
 pub use contract::{is_matching_success_receipt, validate_delivery_contract};
 #[cfg(test)]
@@ -305,23 +305,23 @@ impl NativeV2DeliveryConfig {
 
 /// Borrowed credential authority. It is intentionally neither serializable nor printable.
 #[derive(Clone, Copy)]
-pub struct GitHubCredential<'a>(&'a str);
+pub struct ForgeCredential<'a>(&'a str);
 
-impl<'a> GitHubCredential<'a> {
+impl<'a> ForgeCredential<'a> {
     #[must_use]
     pub fn expose(self) -> &'a str {
         self.0
     }
 }
 
-impl fmt::Debug for GitHubCredential<'_> {
+impl fmt::Debug for ForgeCredential<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("GitHubCredential([REDACTED])")
+        formatter.write_str("ForgeCredential([REDACTED])")
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GitHubPushRequest {
+pub struct ForgePushRequest {
     pub workspace: PathBuf,
     pub target: DeliveryTarget,
     pub head_branch: String,
@@ -329,22 +329,22 @@ pub struct GitHubPushRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GitHubReviewRequest {
+pub struct ForgeReviewRequest {
     pub target: DeliveryTarget,
     pub head_branch: String,
     pub head_revision: String,
     pub title: String,
     pub description: String,
-    pub source_issue: Option<GitHubSourceIssue>,
+    pub source_issue: Option<ForgeSourceIssue>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GitHubSourceIssue {
+pub struct ForgeSourceIssue {
     pub number: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GitHubReviewReceipt {
+pub struct ForgeReviewReceipt {
     pub review_id: String,
     pub repository: String,
     pub target_branch: String,
@@ -353,7 +353,7 @@ pub struct GitHubReviewReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum GitHubChecks {
+pub enum ForgeChecks {
     NotRequired,
     Pending,
     Passed,
@@ -361,32 +361,32 @@ pub enum GitHubChecks {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum GitHubReviewState {
-    Open { checks: GitHubChecks },
+pub enum ForgeReviewState {
+    Open { checks: ForgeChecks },
     Merged { merge_revision: String },
     Conflict,
     Closed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GitHubReviewObservation {
+pub struct ForgeReviewObservation {
     pub review_id: String,
     pub repository: String,
     pub target_branch: String,
     pub head_branch: String,
     pub head_revision: String,
-    pub state: GitHubReviewState,
+    pub state: ForgeReviewState,
     pub pull_request_ready: bool,
     pub head_update_required: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GitHubReviewFeedback {
-    pub items: Vec<GitHubReviewFeedbackItem>,
+pub struct ForgeReviewFeedback {
+    pub items: Vec<ForgeReviewFeedbackItem>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GitHubReviewFeedbackItem {
+pub struct ForgeReviewFeedbackItem {
     pub key: String,
     pub version: String,
     pub author: String,
@@ -395,26 +395,26 @@ pub struct GitHubReviewFeedbackItem {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GitHubConflictRequest {
+pub struct ForgeConflictRequest {
     pub workspace: PathBuf,
-    pub review: GitHubReviewReceipt,
+    pub review: ForgeReviewReceipt,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GitHubConflictMaterialization {
+pub struct ForgeConflictMaterialization {
     pub target_revision: String,
     pub conflicted_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum GitHubConflictOutcome {
-    Materialized(GitHubConflictMaterialization),
+pub enum ForgeConflictOutcome {
+    Materialized(ForgeConflictMaterialization),
     ObservationChanged,
 }
 
-/// Target-owned, bounded GitHub effects. Implementations must bound every network operation.
+/// Target-owned, bounded forge effects. Implementations must bound every network operation.
 #[async_trait]
-pub trait GitHubDeliveryAuthority: Send + Sync {
+pub trait DeliveryForgeAuthority: Send + Sync {
     /// The environment variable that carries this authority's delivery credential.
     fn credential_environment(&self) -> &'static str {
         GITHUB_TOKEN_ENV
@@ -423,89 +423,89 @@ pub trait GitHubDeliveryAuthority: Send + Sync {
     /// Observes the bound PR and branch without committing, pushing, or changing metadata.
     async fn observe_delivery(
         &self,
-        request: GitHubDeliveryRead<'_>,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubDeliverySnapshot, GitHubAuthorityError>;
+        request: ForgeDeliveryRead<'_>,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeDeliverySnapshot, ForgeAuthorityError>;
 
     /// Integrates an exact current target revision before the run branch is first published.
     async fn reconcile_delivery_target(
         &self,
-        request: GitHubTargetReconciliation<'_>,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubTargetIntegration, GitHubAuthorityError>;
+        request: ForgeTargetReconciliation<'_>,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeTargetIntegration, ForgeAuthorityError>;
 
     /// Fetches the observed head and preserves local work while reconciling its published ancestry.
     async fn reconcile_delivery_head(
         &self,
-        request: GitHubHeadReconciliation<'_>,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubReconciliationOutcome, GitHubAuthorityError>;
+        request: ForgeHeadReconciliation<'_>,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeReconciliationOutcome, ForgeAuthorityError>;
 
     async fn push_branch(
         &self,
-        request: &GitHubPushRequest,
-        credential: GitHubCredential<'_>,
-    ) -> Result<(), GitHubAuthorityError>;
+        request: &ForgePushRequest,
+        credential: ForgeCredential<'_>,
+    ) -> Result<(), ForgeAuthorityError>;
 
     /// Opens the review or updates the existing run-stable review after an authored loop revisit.
     async fn open_or_update_review(
         &self,
-        request: &GitHubReviewRequest,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubReviewReceipt, GitHubAuthorityError>;
+        request: &ForgeReviewRequest,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeReviewReceipt, ForgeAuthorityError>;
 
     async fn inspect_review(
         &self,
-        review: &GitHubReviewReceipt,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubReviewObservation, GitHubAuthorityError>;
+        review: &ForgeReviewReceipt,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeReviewObservation, ForgeAuthorityError>;
 
     /// Reads every visible PR discussion surface behind one stable review/head identity fence.
     async fn inspect_review_feedback(
         &self,
-        _review: &GitHubReviewReceipt,
-        _credential: GitHubCredential<'_>,
-    ) -> Result<GitHubReviewFeedback, GitHubAuthorityError> {
-        Ok(GitHubReviewFeedback { items: Vec::new() })
+        _review: &ForgeReviewReceipt,
+        _credential: ForgeCredential<'_>,
+    ) -> Result<ForgeReviewFeedback, ForgeAuthorityError> {
+        Ok(ForgeReviewFeedback { items: Vec::new() })
     }
 
-    /// Requests provider-native integration after GitHub reports its merge policy ready.
+    /// Requests provider-native integration after the forge reports its merge policy ready.
     /// Acceptance is not proof; only a later merged observation confirms success.
     async fn request_merge(
         &self,
-        review: &GitHubReviewReceipt,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubMergeRequestOutcome, GitHubAuthorityError>;
+        review: &ForgeReviewReceipt,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeMergeRequestOutcome, ForgeAuthorityError>;
 
     /// Advances a stale non-queue review head through one provider-authorized CAS transition.
     async fn update_review_head(
         &self,
         _workspace: &std::path::Path,
-        _review: &GitHubReviewReceipt,
-        _credential: GitHubCredential<'_>,
-    ) -> Result<GitHubHeadUpdateOutcome, GitHubAuthorityError> {
-        Ok(GitHubHeadUpdateOutcome::Pending)
+        _review: &ForgeReviewReceipt,
+        _credential: ForgeCredential<'_>,
+    ) -> Result<ForgeHeadUpdateOutcome, ForgeAuthorityError> {
+        Ok(ForgeHeadUpdateOutcome::Pending)
     }
 
     /// Adopts one provider-authorized review-head transition in the local workspace.
     /// Existing authorities that adopt before returning `Updated` may use this no-op default.
     async fn synchronize_review_head(
         &self,
-        _request: GitHubHeadSynchronization<'_>,
-        _credential: GitHubCredential<'_>,
-    ) -> Result<(), GitHubAuthorityError> {
+        _request: ForgeHeadSynchronization<'_>,
+        _credential: ForgeCredential<'_>,
+    ) -> Result<(), ForgeAuthorityError> {
         Ok(())
     }
 
     /// Fetches and integrates the exact current target revision without exposing credentials to
     /// an agent. A materialized conflict must remain in the workspace; a changed observation must
-    /// leave the original review head clean so delivery can re-observe GitHub.
+    /// leave the original review head clean so delivery can re-observe the forge.
     async fn materialize_merge_conflict(
         &self,
-        _request: &GitHubConflictRequest,
-        _credential: GitHubCredential<'_>,
-    ) -> Result<GitHubConflictOutcome, GitHubAuthorityError> {
-        Err(GitHubAuthorityError::Rejected)
+        _request: &ForgeConflictRequest,
+        _credential: ForgeCredential<'_>,
+    ) -> Result<ForgeConflictOutcome, ForgeAuthorityError> {
+        Err(ForgeAuthorityError::Rejected)
     }
 }
 
@@ -514,16 +514,16 @@ pub use adapter::NativeV2DeliveryAdapter;
 fn delivery_credential<'a>(
     environment: &'a ResolvedEnvironment,
     environment_name: &str,
-) -> Option<GitHubCredential<'a>> {
+) -> Option<ForgeCredential<'a>> {
     let name = EnvironmentVariableName::new(environment_name).ok()?;
     let token = environment.get(&name)?;
-    (!token.trim().is_empty() && token.len() <= MAX_TOKEN_BYTES).then_some(GitHubCredential(token))
+    (!token.trim().is_empty() && token.len() <= MAX_TOKEN_BYTES).then_some(ForgeCredential(token))
 }
 
 struct DeliveryResult<'a> {
     mode: DeliveryMode,
     outcome: &'a str,
-    review: &'a GitHubReviewReceipt,
+    review: &'a ForgeReviewReceipt,
     merge_revision: Option<&'a str>,
 }
 
@@ -597,7 +597,7 @@ fn valid_mode_outcome(mode: DeliveryMode, outcome: &str) -> bool {
 
 fn conflict_diagnostic(
     authority_diagnostic: &str,
-    materialization: &GitHubConflictMaterialization,
+    materialization: &ForgeConflictMaterialization,
 ) -> Option<String> {
     if !valid_revision(&materialization.target_revision)
         || materialization.conflicted_paths.is_empty()
@@ -673,7 +673,7 @@ fn delivery_result(result: &DeliveryResult<'_>) -> Value {
     Value::Object(fields)
 }
 
-fn valid_review(request: &GitHubReviewRequest, review: &GitHubReviewReceipt) -> bool {
+fn valid_review(request: &ForgeReviewRequest, review: &ForgeReviewReceipt) -> bool {
     valid_review_id(&review.review_id)
         && review.repository == request.target.repository
         && review.target_branch == request.target.target_branch
@@ -681,7 +681,7 @@ fn valid_review(request: &GitHubReviewRequest, review: &GitHubReviewReceipt) -> 
         && review.head_revision == request.head_revision
 }
 
-fn valid_observation(review: &GitHubReviewReceipt, observation: &GitHubReviewObservation) -> bool {
+fn valid_observation(review: &ForgeReviewReceipt, observation: &ForgeReviewObservation) -> bool {
     observation.review_id == review.review_id
         && observation.repository == review.repository
         && observation.target_branch == review.target_branch

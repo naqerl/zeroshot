@@ -29,7 +29,7 @@ use crate::native_v2_copilot::{CopilotConfig, CopilotLocalUser};
 use crate::native_v2_capsule::provider_process::{COPILOT_LOCAL_ENVIRONMENT, LocalHarnessEnvironment};
 use crate::native_v2_delivery::{
     DeliveryForge, DeliveryTarget, GhCliAuthorityConfig, GhCliDeliveryAuthority,
-    GitHubDeliveryAuthority, GiteaAuthorityConfig, GiteaDeliveryAuthority, NativeV2DeliveryConfig,
+    DeliveryForgeAuthority, GiteaAuthorityConfig, GiteaDeliveryAuthority, NativeV2DeliveryConfig,
     GITEA_TOKEN_ENV,
 };
 use crate::native_v2_runner::{NativeNodeRunner, NodeRunner};
@@ -296,7 +296,7 @@ fn build_local_candidate_config(
     .map_err(|_| LocalCompositionError::ResolvedSource)?;
     let forge = local_delivery_forge(workspace).unwrap_or(DeliveryForge::GitHub);
     let delivery_token = local_delivery_token(&forge, github_token, native_environment);
-    let authority: Arc<dyn GitHubDeliveryAuthority> = match &forge {
+    let authority: Arc<dyn DeliveryForgeAuthority> = match &forge {
         DeliveryForge::GitHub => {
             let mut github_config = GhCliAuthorityConfig::hosted(runtime_home);
             github_config.git_program = PathBuf::from("git");
@@ -318,7 +318,7 @@ fn build_local_candidate_config(
             target,
             poll: Default::default(),
         },
-        github: authority,
+        authority,
     };
     if owner_scoped {
         build_local_owner_native_v2_candidate(admitted, config).map_err(Into::into)

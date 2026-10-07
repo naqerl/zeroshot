@@ -42,11 +42,11 @@ use crate::native_v2_contract::{
     SourceRevisionId, ResolvedSource,
 };
 use crate::native_v2_delivery::{
-    GitHubDeliveryRead, GitHubDeliverySnapshot, GitHubHeadReconciliation,
-    GitHubReconciliationOutcome, GitHubTargetIntegration, GitHubTargetReconciliation,
-    DeliveryPollPolicy, DeliveryTarget, GitHubAuthorityError, GitHubChecks, GitHubCredential,
-    GitHubMergeRequestOutcome, GitHubPushRequest, GitHubReviewObservation, GitHubReviewReceipt,
-    GitHubReviewRequest, GitHubReviewState, GITHUB_TOKEN_ENV,
+    ForgeDeliveryRead, ForgeDeliverySnapshot, ForgeHeadReconciliation, ForgeReconciliationOutcome,
+    ForgeTargetIntegration, ForgeTargetReconciliation, DeliveryPollPolicy, DeliveryTarget,
+    ForgeAuthorityError, ForgeChecks, ForgeCredential, ForgeMergeRequestOutcome, ForgePushRequest,
+    ForgeReviewObservation, ForgeReviewReceipt, ForgeReviewRequest, ForgeReviewState,
+    GITHUB_TOKEN_ENV,
 };
 use crate::native_v2_runner::NodeRole;
 use crate::native_v2_supervisor::{RunEnvironment, RunRuntimeExit};
@@ -72,12 +72,12 @@ impl ScriptedGitHub {
 }
 
 #[async_trait]
-impl GitHubDeliveryAuthority for ScriptedGitHub {
+impl DeliveryForgeAuthority for ScriptedGitHub {
     async fn reconcile_delivery_target(
         &self,
-        request: GitHubTargetReconciliation<'_>,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubTargetIntegration, GitHubAuthorityError> {
+        request: ForgeTargetReconciliation<'_>,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeTargetIntegration, ForgeAuthorityError> {
         crate::native_v2_candidate::test_support::local_delivery_authority(
             request.workspace,
             &self.remote,
@@ -88,18 +88,18 @@ impl GitHubDeliveryAuthority for ScriptedGitHub {
 
     async fn observe_delivery(
         &self,
-        request: GitHubDeliveryRead<'_>,
-        _credential: GitHubCredential<'_>,
-    ) -> Result<GitHubDeliverySnapshot, GitHubAuthorityError> {
+        request: ForgeDeliveryRead<'_>,
+        _credential: ForgeCredential<'_>,
+    ) -> Result<ForgeDeliverySnapshot, ForgeAuthorityError> {
         let head_revision = request
             .known_review
             .map(|review| review.head_revision.clone());
         let review = request.known_review.map(|review| {
-            review.observation(GitHubReviewState::Open {
-                checks: GitHubChecks::Pending,
+            review.observation(ForgeReviewState::Open {
+                checks: ForgeChecks::Pending,
             })
         });
-        Ok(GitHubDeliverySnapshot {
+        Ok(ForgeDeliverySnapshot {
             review,
             head_revision,
         })
@@ -107,19 +107,19 @@ impl GitHubDeliveryAuthority for ScriptedGitHub {
 
     async fn reconcile_delivery_head(
         &self,
-        _request: GitHubHeadReconciliation<'_>,
-        _credential: GitHubCredential<'_>,
-    ) -> Result<GitHubReconciliationOutcome, GitHubAuthorityError> {
-        Ok(GitHubReconciliationOutcome::Unchanged)
+        _request: ForgeHeadReconciliation<'_>,
+        _credential: ForgeCredential<'_>,
+    ) -> Result<ForgeReconciliationOutcome, ForgeAuthorityError> {
+        Ok(ForgeReconciliationOutcome::Unchanged)
     }
 
     async fn push_branch(
         &self,
-        request: &GitHubPushRequest,
-        credential: GitHubCredential<'_>,
-    ) -> Result<(), GitHubAuthorityError> {
+        request: &ForgePushRequest,
+        credential: ForgeCredential<'_>,
+    ) -> Result<(), ForgeAuthorityError> {
         if credential.expose() != "test-github-token" {
-            return Err(GitHubAuthorityError::Rejected);
+            return Err(ForgeAuthorityError::Rejected);
         }
         let status = tokio::process::Command::new("/usr/bin/git")
             .arg("-C")
@@ -129,9 +129,9 @@ impl GitHubDeliveryAuthority for ScriptedGitHub {
             .arg(format!("HEAD:refs/heads/{}", request.head_branch))
             .status()
             .await
-            .map_err(|_| GitHubAuthorityError::Unavailable)?;
+            .map_err(|_| ForgeAuthorityError::Unavailable)?;
         if !status.success() {
-            return Err(GitHubAuthorityError::Rejected);
+            return Err(ForgeAuthorityError::Rejected);
         }
         self.pushed.store(true, Ordering::SeqCst);
         Ok(())
@@ -139,15 +139,15 @@ impl GitHubDeliveryAuthority for ScriptedGitHub {
 
     async fn open_or_update_review(
         &self,
-        request: &GitHubReviewRequest,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubReviewReceipt, GitHubAuthorityError> {
+        request: &ForgeReviewRequest,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeReviewReceipt, ForgeAuthorityError> {
         if credential.expose() != "test-github-token" || !self.pushed.load(Ordering::SeqCst) {
-            return Err(GitHubAuthorityError::Rejected);
+            return Err(ForgeAuthorityError::Rejected);
         }
         let target = request.target.clone();
         let head = (request.head_branch.clone(), request.head_revision.clone());
-        Ok(GitHubReviewReceipt {
+        Ok(ForgeReviewReceipt {
             review_id: "17".to_owned(),
             repository: target.repository,
             target_branch: target.target_branch,
@@ -158,19 +158,19 @@ impl GitHubDeliveryAuthority for ScriptedGitHub {
 
     async fn inspect_review(
         &self,
-        review: &GitHubReviewReceipt,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubReviewObservation, GitHubAuthorityError> {
+        review: &ForgeReviewReceipt,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeReviewObservation, ForgeAuthorityError> {
         if credential.expose() != "test-github-token" {
-            return Err(GitHubAuthorityError::Rejected);
+            return Err(ForgeAuthorityError::Rejected);
         }
         let state = if self.merge_requested.load(Ordering::SeqCst) {
-            GitHubReviewState::Merged {
+            ForgeReviewState::Merged {
                 merge_revision: review.head_revision.clone(),
             }
         } else {
-            GitHubReviewState::Open {
-                checks: GitHubChecks::NotRequired,
+            ForgeReviewState::Open {
+                checks: ForgeChecks::NotRequired,
             }
         };
         Ok(review.observation(state))
@@ -178,14 +178,14 @@ impl GitHubDeliveryAuthority for ScriptedGitHub {
 
     async fn request_merge(
         &self,
-        _review: &GitHubReviewReceipt,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubMergeRequestOutcome, GitHubAuthorityError> {
+        _review: &ForgeReviewReceipt,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeMergeRequestOutcome, ForgeAuthorityError> {
         if credential.expose() != "test-github-token" {
-            return Err(GitHubAuthorityError::Rejected);
+            return Err(ForgeAuthorityError::Rejected);
         }
         self.merge_requested.store(true, Ordering::SeqCst);
-        Ok(GitHubMergeRequestOutcome::Accepted)
+        Ok(ForgeMergeRequestOutcome::Accepted)
     }
 }
 
@@ -278,7 +278,7 @@ struct CandidateAllocator {
     claims: ClaimAuthority,
     workspace: PathBuf,
     target: DeliveryTarget,
-    github: Arc<ScriptedGitHub>,
+    authority: Arc<ScriptedGitHub>,
     agent: Arc<ScriptedAgent>,
     cleanup: Arc<ConfirmCleanup>,
 }
@@ -320,7 +320,7 @@ impl CapsuleAllocator for CandidateAllocator {
                 poll: DeliveryPollPolicy::new(3, Duration::ZERO)
                     .map_err(|_| CapsuleAllocationUnavailable::Runtime)?,
             },
-            self.github.clone(),
+            self.authority.clone(),
         ));
         let local = assemble_runner(
             admitted,
@@ -364,7 +364,7 @@ async fn cloud_oecp_candidate_runs_worker_and_trusted_merge_entirely_through_v2(
         claims: ClaimAuthority::default(),
         workspace: repository.workspace.clone(),
         target,
-        github: github.clone(),
+        authority: github.clone(),
         agent: agent.clone(),
         cleanup: cleanup.clone(),
     });

@@ -2,15 +2,15 @@ use crate::native_v2_delivery::command::{capture, GitCommandFailure};
 use crate::native_v2_target_authority::NewOperatorDiagnostic;
 
 use super::{
-    GhCliDeliveryAuthority, GitHubAuthorityError, GitHubCredential, GitHubPushRequest,
+    GhCliDeliveryAuthority, ForgeAuthorityError, ForgeCredential, ForgePushRequest,
     authenticated_git_command,
 };
 
 pub(super) async fn push_branch(
     authority: &GhCliDeliveryAuthority,
-    request: &GitHubPushRequest,
-    credential: GitHubCredential<'_>,
-) -> Result<(), GitHubAuthorityError> {
+    request: &ForgePushRequest,
+    credential: ForgeCredential<'_>,
+) -> Result<(), ForgeAuthorityError> {
     let mut command = authenticated_git_command(&authority.config, &request.workspace, credential);
     command
         .arg("push")

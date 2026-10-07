@@ -63,7 +63,7 @@ fn fixture_program() -> PathBuf {
 }
 
 struct ObservationOptions<'a> {
-    known_review: Option<&'a GitHubReviewReceipt>,
+    known_review: Option<&'a ForgeReviewReceipt>,
     include_review: bool,
 }
 
@@ -72,20 +72,20 @@ async fn observe_fixture(
     observed_review: Value,
     reference: FixtureReference,
     options: ObservationOptions<'_>,
-) -> Result<GitHubDeliverySnapshot, GitHubAuthorityError> {
+) -> Result<ForgeDeliverySnapshot, ForgeAuthorityError> {
     let root = tempfile::tempdir().assert_value();
     write_fixture(root.path(), list, observed_review, reference);
     let authority = authority(fixture_program(), root.path());
     let target = target();
     observe(
         &authority,
-        GitHubDeliveryRead {
+        ForgeDeliveryRead {
             target: &target,
             head_branch: "zeroshot/v2-test",
             known_review: options.known_review,
             include_review: options.include_review,
         },
-        GitHubCredential("test-token"),
+        ForgeCredential("test-token"),
     )
     .await
 }
@@ -128,21 +128,21 @@ async fn observation_discovers_optional_review_and_preserves_terminal_states() {
     .assert_value();
     assert_eq!(
         snapshot.review.as_ref().map(|review| &review.state),
-        Some(&GitHubReviewState::Open {
-            checks: GitHubChecks::Pending
+        Some(&ForgeReviewState::Open {
+            checks: ForgeChecks::Pending
         })
     );
 
     for (wire, expected) in [
         (
             review("closed", true, Some(MERGE), HEAD),
-            GitHubReviewState::Merged {
+            ForgeReviewState::Merged {
                 merge_revision: MERGE.to_owned(),
             },
         ),
         (
             review("closed", false, None, HEAD),
-            GitHubReviewState::Closed,
+            ForgeReviewState::Closed,
         ),
     ] {
         let known = receipt();
@@ -180,7 +180,7 @@ async fn observation_fails_closed_on_ambiguous_or_changing_authority() {
     .await
     .assert_error();
     assert!(
-        matches!(&duplicate, GitHubAuthorityError::Identity(_)),
+        matches!(&duplicate, ForgeAuthorityError::Identity(_)),
         "duplicate reviews must fail with an identity error, got {duplicate:?}"
     );
 
@@ -214,7 +214,7 @@ async fn observation_fails_closed_on_ambiguous_or_changing_authority() {
         )
         .await
         .assert_error();
-        assert_eq!(error, GitHubAuthorityError::Rejected);
+        assert_eq!(error, ForgeAuthorityError::Rejected);
     }
 
     let without_review = observe_fixture(

@@ -18,7 +18,7 @@ use crate::native_v2_codex::{NativeV2CodexAdapter, NativeV2CodexConfig};
 use crate::native_v2_copilot::{CopilotAdapter, CopilotConfig};
 use crate::native_v2_contract::{AdmittedRun, NodeInvocation, NodeRuntimeBinding, RuntimePlan};
 use crate::native_v2_delivery::{
-    GitHubDeliveryAuthority, NativeV2DeliveryAdapter, NativeV2DeliveryConfig,
+    DeliveryForgeAuthority, NativeV2DeliveryAdapter, NativeV2DeliveryConfig,
 };
 use crate::native_v2_runner::{
     DriverControl, DriverInvocation, NativeNodeRunner, NodeDriver, NodeRunnerError, NodeSession,
@@ -42,7 +42,7 @@ pub enum NativeV2HarnessConfig {
 pub struct NativeV2CandidateConfig {
     pub harness: NativeV2HarnessConfig,
     pub delivery: NativeV2DeliveryConfig,
-    pub github: Arc<dyn GitHubDeliveryAuthority>,
+    pub authority: Arc<dyn DeliveryForgeAuthority>,
 }
 
 #[derive(Clone, Copy)]
@@ -147,7 +147,7 @@ fn build_candidate(
 ) -> Result<NativeNodeRunner, NativeV2CandidateError> {
     validate_config(admitted, &config)?;
     let delivery = Arc::new(
-        NativeV2DeliveryAdapter::new(config.delivery, config.github)
+        NativeV2DeliveryAdapter::new(config.delivery, config.authority)
             .with_trusted_github_token(github_token),
     );
     match config.harness {

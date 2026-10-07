@@ -72,21 +72,21 @@ impl TargetFixture {
         );
     }
 
-    async fn reconcile(&self) -> GitHubTargetIntegration {
+    async fn reconcile(&self) -> ForgeTargetIntegration {
         self.try_reconcile().await.assert_value()
     }
 
-    async fn try_reconcile(&self) -> Result<GitHubTargetIntegration, GitHubAuthorityError> {
+    async fn try_reconcile(&self) -> Result<ForgeTargetIntegration, ForgeAuthorityError> {
         let target =
             DeliveryTarget::new("acme/project", "main", &self.repository.base).assert_value();
         self.authority
             .reconcile_delivery_target(
-                GitHubTargetReconciliation {
+                ForgeTargetReconciliation {
                     workspace: &self.repository.workspace,
                     target: &target,
                     commit_message: "feat: preserve candidate",
                 },
-                GitHubCredential("test-token"),
+                ForgeCredential("test-token"),
             )
             .await
     }
@@ -105,7 +105,7 @@ async fn exact_target_integration_preserves_upstream_workflow_and_dirty_candidat
     assert_eq!(outcome.target_revision, captured);
     assert!(matches!(
         outcome.outcome,
-        GitHubReconciliationOutcome::NeedsWork(_)
+        ForgeReconciliationOutcome::NeedsWork(_)
     ));
     assert_eq!(
         fs::read_to_string(
@@ -152,7 +152,7 @@ async fn target_integration_completes_despite_inherited_merge_preferences() {
 
         assert!(matches!(
             integration.outcome,
-            GitHubReconciliationOutcome::NeedsWork(_)
+            ForgeReconciliationOutcome::NeedsWork(_)
         ));
         for revision in [&fixture.repository.base, &fixture.target_revision] {
             git(
@@ -172,7 +172,7 @@ async fn target_integration_completes_despite_inherited_merge_preferences() {
         assert_eq!(git_output(workspace, &["config", key]), value);
         assert_eq!(
             fixture.reconcile().await.outcome,
-            GitHubReconciliationOutcome::Unchanged,
+            ForgeReconciliationOutcome::Unchanged,
             "completed integration must progress beyond the review loop"
         );
     }
@@ -205,7 +205,7 @@ async fn configured_signing_failure_preserves_policy_and_work_for_repair() {
             .await
             .expect_err("authored signing policy must not be silently bypassed");
 
-        assert!(matches!(&error, GitHubAuthorityError::Command(_)));
+        assert!(matches!(&error, ForgeAuthorityError::Command(_)));
         let diagnostic = error.to_string();
         assert!(
             diagnostic.contains("fixture signer unavailable"),
@@ -296,7 +296,7 @@ async fn an_already_integrated_target_does_not_commit_new_dirty_work() {
     let fixture = TargetFixture::new();
     assert!(matches!(
         fixture.reconcile().await.outcome,
-        GitHubReconciliationOutcome::NeedsWork(_)
+        ForgeReconciliationOutcome::NeedsWork(_)
     ));
     let head = git_output(&fixture.repository.workspace, &["rev-parse", "HEAD"]);
     fs::write(
@@ -306,7 +306,7 @@ async fn an_already_integrated_target_does_not_commit_new_dirty_work() {
     .assert_value();
     assert_eq!(
         fixture.reconcile().await.outcome,
-        GitHubReconciliationOutcome::Unchanged
+        ForgeReconciliationOutcome::Unchanged
     );
     assert_eq!(
         git_output(&fixture.repository.workspace, &["rev-parse", "HEAD"]),
@@ -336,7 +336,7 @@ async fn divergent_target_changes_leave_real_conflicts_and_delivery_identity() {
         &["config", "user.email", "worker@example.invalid"],
     );
     let outcome = fixture.reconcile().await;
-    let GitHubReconciliationOutcome::NeedsWork(diagnostic) = outcome.outcome else {
+    let ForgeReconciliationOutcome::NeedsWork(diagnostic) = outcome.outcome else {
         panic!("expected conflict repair");
     };
     assert!(diagnostic.contains("CONFLICT"));
@@ -398,11 +398,11 @@ async fn explicit_source_pins_can_be_ahead_of_or_diverge_from_the_target() {
         .assert_value();
         let outcome = fixture.reconcile().await;
         if target_is_ancestor {
-            assert_eq!(outcome.outcome, GitHubReconciliationOutcome::Unchanged);
+            assert_eq!(outcome.outcome, ForgeReconciliationOutcome::Unchanged);
         } else {
             assert!(matches!(
                 outcome.outcome,
-                GitHubReconciliationOutcome::NeedsWork(_)
+                ForgeReconciliationOutcome::NeedsWork(_)
             ));
         }
         assert_eq!(

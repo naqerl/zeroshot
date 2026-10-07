@@ -23,7 +23,7 @@ struct LegacyIssueInput {
 pub(super) struct PreparedDeliveryInput {
     pub(super) title: String,
     pub(super) description: String,
-    pub(super) source_issue: Option<GitHubSourceIssue>,
+    pub(super) source_issue: Option<ForgeSourceIssue>,
 }
 
 pub(super) fn delivery_input(input: &Value) -> Result<PreparedDeliveryInput, DeliveryStop> {
@@ -44,7 +44,7 @@ pub(super) fn delivery_input(input: &Value) -> Result<PreparedDeliveryInput, Del
     Ok(legacy_input(Some(parse_source_issue(&input.issue_number)?)))
 }
 
-fn legacy_input(source_issue: Option<GitHubSourceIssue>) -> PreparedDeliveryInput {
+fn legacy_input(source_issue: Option<ForgeSourceIssue>) -> PreparedDeliveryInput {
     PreparedDeliveryInput {
         title: LEGACY_TITLE.to_owned(),
         description: LEGACY_DESCRIPTION.to_owned(),
@@ -52,20 +52,20 @@ fn legacy_input(source_issue: Option<GitHubSourceIssue>) -> PreparedDeliveryInpu
     }
 }
 
-fn optional_source_issue(value: Option<&str>) -> Result<Option<GitHubSourceIssue>, DeliveryStop> {
+fn optional_source_issue(value: Option<&str>) -> Result<Option<ForgeSourceIssue>, DeliveryStop> {
     let Some(value) = value.filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
     parse_source_issue(value).map(Some)
 }
 
-fn parse_source_issue(value: &str) -> Result<GitHubSourceIssue, DeliveryStop> {
+fn parse_source_issue(value: &str) -> Result<ForgeSourceIssue, DeliveryStop> {
     let number = value
         .parse::<u64>()
         .ok()
         .filter(|number| *number > 0 && number.to_string() == value)
         .ok_or_else(|| DeliveryStop::Outcome(WorkerOutcome::malformed()))?;
-    Ok(GitHubSourceIssue { number })
+    Ok(ForgeSourceIssue { number })
 }
 
 fn malformed<T>(result: Result<T, serde_json::Error>) -> Result<T, DeliveryStop> {

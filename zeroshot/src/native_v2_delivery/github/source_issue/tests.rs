@@ -1,10 +1,10 @@
 use super::*;
-use crate::native_v2_delivery::GitHubSourceIssue;
+use crate::native_v2_delivery::ForgeSourceIssue;
 
 #[test]
 fn reference_is_created_inside_generated_metadata() {
-    let request = GitHubReviewRequest {
-        source_issue: Some(GitHubSourceIssue { number: 208 }),
+    let request = ForgeReviewRequest {
+        source_issue: Some(ForgeSourceIssue { number: 208 }),
         ..test_review_request()
     };
     assert_eq!(
@@ -24,17 +24,17 @@ fn reference_is_created_inside_generated_metadata() {
 
 #[test]
 fn refresh_replaces_managed_issue_reference_and_preserves_human_text() {
-    let original = GitHubReviewRequest {
+    let original = ForgeReviewRequest {
         description: "Old description.".to_owned(),
-        source_issue: Some(GitHubSourceIssue { number: 208 }),
+        source_issue: Some(ForgeSourceIssue { number: 208 }),
         ..test_review_request()
     };
     let current = format!(
         "Human preface.\n\n{}\n\nHuman notes.\n\nCloses #999",
         pull_request_body(&original).unwrap()
     );
-    let changed = GitHubReviewRequest {
-        source_issue: Some(GitHubSourceIssue { number: 209 }),
+    let changed = ForgeReviewRequest {
+        source_issue: Some(ForgeSourceIssue { number: 209 }),
         ..test_review_request()
     };
     assert_eq!(
@@ -50,7 +50,7 @@ fn refresh_replaces_managed_issue_reference_and_preserves_human_text() {
         )
     );
 
-    let removed = GitHubReviewRequest {
+    let removed = ForgeReviewRequest {
         source_issue: None,
         ..test_review_request()
     };
@@ -70,15 +70,15 @@ fn refresh_rejects_unowned_legacy_reference_without_rewriting_body() {
         "Closes #208"
     );
     let unmanaged = "Created by Zeroshot v2.\n\nCloses #208";
-    let request = GitHubReviewRequest {
-        source_issue: Some(GitHubSourceIssue { number: 209 }),
+    let request = ForgeReviewRequest {
+        source_issue: Some(ForgeSourceIssue { number: 209 }),
         ..test_review_request()
     };
 
     for body in [marked, unmanaged] {
         assert_eq!(
             refresh_pull_request_body(Some(body), &request),
-            Err(GitHubAuthorityError::Rejected)
+            Err(ForgeAuthorityError::Rejected)
         );
     }
 }

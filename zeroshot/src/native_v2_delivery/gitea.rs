@@ -18,12 +18,12 @@ use tokio::process::Command;
 use super::command::{capture, local_git_command_with_identity, GitCommandFailure};
 use super::git::{GitError, SystemGit};
 use super::{
-    valid_revision, GitHubAuthorityError, GitHubChecks, GitHubConflictMaterialization,
-    GitHubConflictOutcome, GitHubConflictRequest, GitHubCredential, GitHubDeliveryAuthority,
-    GitHubDeliveryRead, GitHubDeliverySnapshot, GitHubHeadReconciliation,
-    GitHubMergeRequestOutcome, GitHubPushRequest, GitHubReconciliationOutcome,
-    GitHubReviewFeedback, GitHubReviewFeedbackItem, GitHubReviewObservation, GitHubReviewReceipt,
-    GitHubReviewRequest, GitHubReviewState, GitHubTargetIntegration, GitHubTargetReconciliation,
+    valid_revision, ForgeAuthorityError, ForgeChecks, ForgeConflictMaterialization,
+    ForgeConflictOutcome, ForgeConflictRequest, ForgeCredential, DeliveryForgeAuthority,
+    ForgeDeliveryRead, ForgeDeliverySnapshot, ForgeHeadReconciliation, ForgeMergeRequestOutcome,
+    ForgePushRequest, ForgeReconciliationOutcome, ForgeReviewFeedback, ForgeReviewFeedbackItem,
+    ForgeReviewObservation, ForgeReviewReceipt, ForgeReviewRequest, ForgeReviewState,
+    ForgeTargetIntegration, ForgeTargetReconciliation,
 };
 
 const DEFAULT_API_DEADLINE: Duration = Duration::from_secs(2 * 60);
@@ -79,12 +79,12 @@ impl std::fmt::Debug for GiteaDeliveryAuthority {
 struct RestCall<'a> {
     method: Method,
     path: String,
-    credential: GitHubCredential<'a>,
+    credential: ForgeCredential<'a>,
     body: Option<Value>,
 }
 
 impl<'a> RestCall<'a> {
-    fn get(path: String, credential: GitHubCredential<'a>) -> Self {
+    fn get(path: String, credential: ForgeCredential<'a>) -> Self {
         Self {
             method: Method::GET,
             path,
@@ -108,14 +108,14 @@ struct ReviewQuery<'a> {
     repository: &'a str,
     head_branch: &'a str,
     target_branch: &'a str,
-    credential: GitHubCredential<'a>,
+    credential: ForgeCredential<'a>,
 }
 
 struct FetchCommit<'a> {
     workspace: &'a Path,
     repository: &'a str,
     revision: &'a str,
-    credential: GitHubCredential<'a>,
+    credential: ForgeCredential<'a>,
 }
 
 impl GiteaDeliveryAuthority {
@@ -156,7 +156,7 @@ impl GiteaDeliveryAuthority {
     fn authenticated_git_command(
         &self,
         workspace: &Path,
-        credential: GitHubCredential<'_>,
+        credential: ForgeCredential<'_>,
     ) -> Command {
         let mut command = self.local_command(workspace);
         let authorization = format!("AUTHORIZATION: token {}", credential.expose());
@@ -173,7 +173,7 @@ impl GiteaDeliveryAuthority {
         command
     }
 
-    async fn rest(&self, call: RestCall<'_>) -> Result<Option<Value>, GitHubAuthorityError> {
+    async fn rest(&self, call: RestCall<'_>) -> Result<Option<Value>, ForgeAuthorityError> {
         let RestCall {
             method,
             path,
@@ -195,14 +195,14 @@ impl GiteaDeliveryAuthority {
         let response = tokio::time::timeout(self.config.api_deadline, request.send())
             .await
             .map_err(|_| {
-                GitHubAuthorityError::api(
+                ForgeAuthorityError::api(
                     None,
                     format!("Gitea {method} {path} exceeded its deadline"),
                 )
                 .temporary()
             })?
             .map_err(|error| {
-                GitHubAuthorityError::api(
+                ForgeAuthorityError::api(
                     None,
                     format!(
                         "Gitea {method} {path} transport failure: {}",
@@ -215,14 +215,14 @@ impl GiteaDeliveryAuthority {
         let bytes = tokio::time::timeout(self.config.api_deadline, response.bytes())
             .await
             .map_err(|_| {
-                GitHubAuthorityError::api(
+                ForgeAuthorityError::api(
                     Some(status.as_u16()),
                     format!("Gitea {method} {path} response exceeded its deadline"),
                 )
                 .temporary()
             })?
             .map_err(|error| {
-                GitHubAuthorityError::api(
+                ForgeAuthorityError::api(
                     Some(status.as_u16()),
                     format!(
                         "Gitea {method} {path} response failure: {}",
@@ -232,7 +232,7 @@ impl GiteaDeliveryAuthority {
                 .temporary()
             })?;
         if bytes.len() > MAX_RESPONSE_BYTES {
-            return Err(GitHubAuthorityError::api(
+            return Err(ForgeAuthorityError::api(
                 Some(status.as_u16()),
                 format!("Gitea {method} {path} response exceeded {MAX_RESPONSE_BYTES} bytes"),
             ));
@@ -243,7 +243,7 @@ impl GiteaDeliveryAuthority {
                 "Gitea {method} {path} failed: HTTP {status}: {}",
                 bounded(&text)
             );
-            let error = GitHubAuthorityError::api(Some(status.as_u16()), diagnostic);
+            let error = ForgeAuthorityError::api(Some(status.as_u16()), diagnostic);
             return if status.as_u16() == 429 || status.is_server_error() {
                 Err(error.temporary())
             } else {
@@ -254,7 +254,7 @@ impl GiteaDeliveryAuthority {
             return Ok(None);
         }
         let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
-            GitHubAuthorityError::api(
+            ForgeAuthorityError::api(
                 Some(status.as_u16()),
                 format!("Gitea {method} {path} returned malformed JSON"),
             )
@@ -265,8 +265,8 @@ impl GiteaDeliveryAuthority {
     async fn rest_pages<T: serde::de::DeserializeOwned>(
         &self,
         path: String,
-        credential: GitHubCredential<'_>,
-    ) -> Result<Vec<T>, GitHubAuthorityError> {
+        credential: ForgeCredential<'_>,
+    ) -> Result<Vec<T>, ForgeAuthorityError> {
         let mut values = Vec::new();
         for page in 1..=MAX_FEEDBACK_PAGES {
             let value = self
@@ -279,7 +279,7 @@ impl GiteaDeliveryAuthority {
             let complete = page_values.len() < PULL_PAGE_SIZE;
             values.append(&mut page_values);
             if values.len() > MAX_FEEDBACK_ITEMS {
-                return Err(GitHubAuthorityError::api(
+                return Err(ForgeAuthorityError::api(
                     None,
                     format!(
                         "Gitea PR feedback exceeded the absolute backstop of {MAX_FEEDBACK_ITEMS} \
@@ -291,7 +291,7 @@ impl GiteaDeliveryAuthority {
                 return Ok(values);
             }
         }
-        Err(GitHubAuthorityError::api(
+        Err(ForgeAuthorityError::api(
             None,
             "Gitea PR feedback pagination exceeded its bound".to_owned(),
         )
@@ -302,8 +302,8 @@ impl GiteaDeliveryAuthority {
         &self,
         repository: &str,
         branch: &str,
-        credential: GitHubCredential<'_>,
-    ) -> Result<Option<String>, GitHubAuthorityError> {
+        credential: ForgeCredential<'_>,
+    ) -> Result<Option<String>, ForgeAuthorityError> {
         let result = self
             .rest(RestCall::get(
                 format!("/repos/{repository}/branches/{branch}"),
@@ -314,7 +314,7 @@ impl GiteaDeliveryAuthority {
             Ok(value) => {
                 let wire: BranchWire = decode(value)?;
                 if !valid_revision(&wire.commit.id) {
-                    return Err(GitHubAuthorityError::Rejected);
+                    return Err(ForgeAuthorityError::Rejected);
                 }
                 Ok(Some(wire.commit.id))
             }
@@ -326,7 +326,7 @@ impl GiteaDeliveryAuthority {
     async fn find_review(
         &self,
         query: ReviewQuery<'_>,
-    ) -> Result<Option<GitHubReviewReceipt>, GitHubAuthorityError> {
+    ) -> Result<Option<ForgeReviewReceipt>, ForgeAuthorityError> {
         let ReviewQuery {
             repository,
             head_branch,
@@ -346,7 +346,7 @@ impl GiteaDeliveryAuthority {
                 let wire: PullWire = decode(value)?;
                 let receipt = receipt_from_pull(&wire, repository)?;
                 if receipt.head_branch != head_branch || receipt.target_branch != target_branch {
-                    return Err(GitHubAuthorityError::identity(
+                    return Err(ForgeAuthorityError::identity(
                         "Gitea returned a pull request for a different branch pair",
                     ));
                 }
@@ -361,8 +361,8 @@ impl GiteaDeliveryAuthority {
         &self,
         repository: &str,
         review_id: &str,
-        credential: GitHubCredential<'_>,
-    ) -> Result<PullWire, GitHubAuthorityError> {
+        credential: ForgeCredential<'_>,
+    ) -> Result<PullWire, ForgeAuthorityError> {
         let value = self
             .rest(RestCall::get(
                 format!("/repos/{repository}/pulls/{review_id}"),
@@ -376,8 +376,8 @@ impl GiteaDeliveryAuthority {
         &self,
         repository: &str,
         revision: &str,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubChecks, GitHubAuthorityError> {
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeChecks, ForgeAuthorityError> {
         let value = self
             .rest(RestCall::get(
                 format!("/repos/{repository}/commits/{revision}/status"),
@@ -390,19 +390,19 @@ impl GiteaDeliveryAuthority {
 
     async fn confirm_pushed_head(
         &self,
-        request: &GitHubPushRequest,
-        credential: GitHubCredential<'_>,
-    ) -> Result<(), GitHubAuthorityError> {
+        request: &ForgePushRequest,
+        credential: ForgeCredential<'_>,
+    ) -> Result<(), ForgeAuthorityError> {
         match self
             .branch_revision(&request.target.repository, &request.head_branch, credential)
             .await?
         {
             Some(revision) if revision == request.head_revision => Ok(()),
-            Some(revision) => Err(GitHubAuthorityError::identity(format!(
+            Some(revision) => Err(ForgeAuthorityError::identity(format!(
                 "Gitea branch {} is at {revision}; expected {}",
                 request.head_branch, request.head_revision
             ))),
-            None => Err(GitHubAuthorityError::api(
+            None => Err(ForgeAuthorityError::api(
                 Some(404),
                 format!("Gitea branch {} is not visible", request.head_branch),
             )
@@ -410,7 +410,7 @@ impl GiteaDeliveryAuthority {
         }
     }
 
-    async fn fetch_commit(&self, request: FetchCommit<'_>) -> Result<(), GitHubAuthorityError> {
+    async fn fetch_commit(&self, request: FetchCommit<'_>) -> Result<(), ForgeAuthorityError> {
         let FetchCommit {
             workspace,
             repository,
@@ -432,7 +432,7 @@ impl GiteaDeliveryAuthority {
         bounded_status(verify, self.config.api_deadline).await
     }
 
-    async fn configure_identity(&self, workspace: &Path) -> Result<(), GitHubAuthorityError> {
+    async fn configure_identity(&self, workspace: &Path) -> Result<(), ForgeAuthorityError> {
         for (key, value) in [
             ("user.name", "Zeroshot"),
             ("user.email", "delivery@zeroshot.invalid"),
@@ -449,7 +449,7 @@ impl GiteaDeliveryAuthority {
         workspace: &Path,
         ancestor: &str,
         descendant: &str,
-    ) -> Result<bool, GitHubAuthorityError> {
+    ) -> Result<bool, ForgeAuthorityError> {
         let output = capture(
             self.local_command(workspace).args([
                 "merge-base",
@@ -467,7 +467,7 @@ impl GiteaDeliveryAuthority {
         Ok(true)
     }
 
-    async fn has_conflicts(&self, workspace: &Path) -> Result<bool, GitHubAuthorityError> {
+    async fn has_conflicts(&self, workspace: &Path) -> Result<bool, ForgeAuthorityError> {
         let output = bounded_git_output(
             self.local_command(workspace)
                 .args(["diff", "--name-only", "--diff-filter=U"]),
@@ -482,14 +482,14 @@ impl GiteaDeliveryAuthority {
         workspace: &Path,
         target_revision: &str,
         candidate: &str,
-    ) -> Result<(), GitHubAuthorityError> {
+    ) -> Result<(), ForgeAuthorityError> {
         let git = self.workspace_git();
         let (head, dirty) = git.workspace_state(workspace).await.map_err(git_error)?;
         if dirty
             || !self.is_ancestor(workspace, candidate, &head).await?
             || !self.is_ancestor(workspace, target_revision, &head).await?
         {
-            return Err(GitHubAuthorityError::repairable(
+            return Err(ForgeAuthorityError::repairable(
                 "Git merge reported success without a clean, completed integration preserving both \
                  the candidate and captured target ancestry; inspect the preserved workspace",
             ));
@@ -499,15 +499,15 @@ impl GiteaDeliveryAuthority {
 
     async fn reconcile_delivery_target_inner(
         &self,
-        request: GitHubTargetReconciliation<'_>,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubTargetIntegration, GitHubAuthorityError> {
+        request: ForgeTargetReconciliation<'_>,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeTargetIntegration, ForgeAuthorityError> {
         let repository = &request.target.repository;
         let target_revision = self
             .branch_revision(repository, &request.target.target_branch, credential)
             .await?
             .ok_or_else(|| {
-                GitHubAuthorityError::api(
+                ForgeAuthorityError::api(
                     Some(404),
                     format!(
                         "Gitea target branch {} is not visible",
@@ -536,9 +536,9 @@ impl GiteaDeliveryAuthority {
             .is_ancestor(request.workspace, &target_revision, &head)
             .await?
         {
-            return Ok(GitHubTargetIntegration {
+            return Ok(ForgeTargetIntegration {
                 target_revision,
-                outcome: GitHubReconciliationOutcome::Unchanged,
+                outcome: ForgeReconciliationOutcome::Unchanged,
             });
         }
         let candidate = git
@@ -568,9 +568,9 @@ impl GiteaDeliveryAuthority {
             Some(0) => {
                 self.require_completed_integration(request.workspace, &target_revision, &candidate)
                     .await?;
-                Ok(GitHubTargetIntegration {
+                Ok(ForgeTargetIntegration {
                     target_revision,
-                    outcome: GitHubReconciliationOutcome::NeedsWork(diagnostic),
+                    outcome: ForgeReconciliationOutcome::NeedsWork(diagnostic),
                 })
             }
             Some(1)
@@ -578,9 +578,9 @@ impl GiteaDeliveryAuthority {
                     .workspace_has_exact_conflict(request.workspace, &target_revision, &candidate)
                     .await? =>
             {
-                Ok(GitHubTargetIntegration {
+                Ok(ForgeTargetIntegration {
                     target_revision,
-                    outcome: GitHubReconciliationOutcome::NeedsWork(diagnostic),
+                    outcome: ForgeReconciliationOutcome::NeedsWork(diagnostic),
                 })
             }
             _ => Err(output.into()),
@@ -592,7 +592,7 @@ impl GiteaDeliveryAuthority {
         workspace: &Path,
         target_revision: &str,
         candidate: &str,
-    ) -> Result<bool, GitHubAuthorityError> {
+    ) -> Result<bool, ForgeAuthorityError> {
         for (reference, expected) in [("HEAD", candidate), ("MERGE_HEAD", target_revision)] {
             let value = bounded_git_output(
                 self.local_command(workspace)
@@ -614,7 +614,7 @@ impl GiteaDeliveryAuthority {
         Ok(!output.stdout.is_empty() || output.stdout_truncated)
     }
 
-    async fn workspace_head(&self, workspace: &Path) -> Result<String, GitHubAuthorityError> {
+    async fn workspace_head(&self, workspace: &Path) -> Result<String, ForgeAuthorityError> {
         let mut command = self.local_command(workspace);
         command.args(["rev-parse", "HEAD"]);
         bounded_git_output(&mut command, self.config.api_deadline).await
@@ -624,7 +624,7 @@ impl GiteaDeliveryAuthority {
         &self,
         workspace: &Path,
         head_revision: &str,
-    ) -> Result<(), GitHubAuthorityError> {
+    ) -> Result<(), ForgeAuthorityError> {
         let head = self.workspace_head(workspace).await?;
         let status = capture(
             self.local_command(workspace).args([
@@ -639,10 +639,10 @@ impl GiteaDeliveryAuthority {
         let clean = status.stdout.is_empty() && !status.stdout_truncated;
         (head.trim() == head_revision && clean)
             .then_some(())
-            .ok_or(GitHubAuthorityError::Rejected)
+            .ok_or(ForgeAuthorityError::Rejected)
     }
 
-    async fn merge_in_progress(&self, workspace: &Path) -> Result<bool, GitHubAuthorityError> {
+    async fn merge_in_progress(&self, workspace: &Path) -> Result<bool, ForgeAuthorityError> {
         let mut command = self.local_command(workspace);
         command.args(["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
         match capture(&mut command, self.config.api_deadline)
@@ -651,7 +651,7 @@ impl GiteaDeliveryAuthority {
         {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
-            _ => Err(GitHubAuthorityError::Rejected),
+            _ => Err(ForgeAuthorityError::Rejected),
         }
     }
 
@@ -659,7 +659,7 @@ impl GiteaDeliveryAuthority {
         &self,
         workspace: &Path,
         target_revision: &str,
-    ) -> Result<i32, GitHubAuthorityError> {
+    ) -> Result<i32, ForgeAuthorityError> {
         self.configure_identity(workspace).await?;
         let mut command = self.local_command(workspace);
         command.args([
@@ -682,10 +682,7 @@ impl GiteaDeliveryAuthority {
         }
     }
 
-    async fn conflicted_paths(
-        &self,
-        workspace: &Path,
-    ) -> Result<Vec<String>, GitHubAuthorityError> {
+    async fn conflicted_paths(&self, workspace: &Path) -> Result<Vec<String>, ForgeAuthorityError> {
         let output = capture(
             self.local_command(workspace)
                 .args(["diff", "--name-only", "--diff-filter=U", "-z"]),
@@ -694,12 +691,12 @@ impl GiteaDeliveryAuthority {
         .await?
         .require_success()?;
         if output.stdout_truncated || output.stdout.len() > MAX_CONFLICT_PATH_OUTPUT_BYTES {
-            return Err(GitHubAuthorityError::repairable(
+            return Err(ForgeAuthorityError::repairable(
                 "Git conflict path inspection was truncated after merge materialization",
             ));
         }
         if !output.stdout.is_empty() && !output.stdout.ends_with('\0') {
-            return Err(GitHubAuthorityError::repairable(
+            return Err(ForgeAuthorityError::repairable(
                 "Git conflict path inspection returned malformed output after merge materialization",
             ));
         }
@@ -713,7 +710,7 @@ impl GiteaDeliveryAuthority {
                         .components()
                         .all(|component| matches!(component, Component::Normal(_)));
                 valid.then(|| path.to_owned()).ok_or_else(|| {
-                    GitHubAuthorityError::repairable(
+                    ForgeAuthorityError::repairable(
                         "Git conflict path inspection returned an unsafe path after merge \
                              materialization",
                     )
@@ -726,7 +723,7 @@ impl GiteaDeliveryAuthority {
         &self,
         workspace: &Path,
         head_revision: &str,
-    ) -> Result<(), GitHubAuthorityError> {
+    ) -> Result<(), ForgeAuthorityError> {
         if self.merge_in_progress(workspace).await? {
             let mut command = self.local_command(workspace);
             command.args(["merge", "--abort"]);
@@ -740,7 +737,7 @@ impl GiteaDeliveryAuthority {
         &self,
         workspace: &Path,
         target_revision: &str,
-    ) -> Result<(), GitHubAuthorityError> {
+    ) -> Result<(), ForgeAuthorityError> {
         let mut command = self.local_command(workspace);
         command.args(["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
         bounded_git_output(&mut command, self.config.api_deadline)
@@ -749,7 +746,7 @@ impl GiteaDeliveryAuthority {
             .filter(|merge_head| merge_head.trim() == target_revision)
             .map(|_| ())
             .ok_or_else(|| {
-                GitHubAuthorityError::repairable(
+                ForgeAuthorityError::repairable(
                     "Git merge did not retain the expected target revision in MERGE_HEAD",
                 )
             })
@@ -757,9 +754,9 @@ impl GiteaDeliveryAuthority {
 
     async fn materialize_conflict_inner(
         &self,
-        request: &GitHubConflictRequest,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubConflictOutcome, GitHubAuthorityError> {
+        request: &ForgeConflictRequest,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeConflictOutcome, ForgeAuthorityError> {
         let workspace = request.workspace.as_path();
         let review = &request.review;
         self.require_clean_review_head(workspace, &review.head_revision)
@@ -768,7 +765,7 @@ impl GiteaDeliveryAuthority {
             .branch_revision(&review.repository, &review.target_branch, credential)
             .await?
             .ok_or_else(|| {
-                GitHubAuthorityError::api(
+                ForgeAuthorityError::api(
                     Some(404),
                     format!(
                         "Gitea target branch {} is not visible",
@@ -789,22 +786,22 @@ impl GiteaDeliveryAuthority {
         if merge_status == 0 && conflicted_paths.is_empty() {
             self.restore_clean_review_head(workspace, &review.head_revision)
                 .await?;
-            return Ok(GitHubConflictOutcome::ObservationChanged);
+            return Ok(ForgeConflictOutcome::ObservationChanged);
         }
         if merge_status != 1 || conflicted_paths.is_empty() {
-            return Err(GitHubAuthorityError::repairable(
+            return Err(ForgeAuthorityError::repairable(
                 "Git merge did not leave the exact expected conflict state",
             ));
         }
         let head = self.workspace_head(workspace).await?;
         if head.trim() != review.head_revision {
-            return Err(GitHubAuthorityError::repairable(
+            return Err(ForgeAuthorityError::repairable(
                 "Git merge changed the reviewed HEAD while materializing a conflict",
             ));
         }
         self.require_merge_head(workspace, &target_revision).await?;
-        Ok(GitHubConflictOutcome::Materialized(
-            GitHubConflictMaterialization {
+        Ok(ForgeConflictOutcome::Materialized(
+            ForgeConflictMaterialization {
                 target_revision,
                 conflicted_paths,
             },
@@ -813,9 +810,9 @@ impl GiteaDeliveryAuthority {
 
     async fn reconcile_delivery_head_inner(
         &self,
-        request: GitHubHeadReconciliation<'_>,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubReconciliationOutcome, GitHubAuthorityError> {
+        request: ForgeHeadReconciliation<'_>,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeReconciliationOutcome, ForgeAuthorityError> {
         require_identity(request.published, request.observed)?;
         self.fetch_commit(FetchCommit {
             workspace: request.workspace,
@@ -833,7 +830,7 @@ impl GiteaDeliveryAuthority {
                 )
                 .await?
         {
-            return Ok(GitHubReconciliationOutcome::Refused(format!(
+            return Ok(ForgeReconciliationOutcome::Refused(format!(
                 "remote history was rewritten: published head {}; observed head {}; local work was \
                  preserved",
                 request.published.head_revision, request.observed.head_revision,
@@ -844,8 +841,8 @@ impl GiteaDeliveryAuthority {
 
     async fn reconcile_workspace(
         &self,
-        request: GitHubHeadReconciliation<'_>,
-    ) -> Result<GitHubReconciliationOutcome, GitHubAuthorityError> {
+        request: ForgeHeadReconciliation<'_>,
+    ) -> Result<ForgeReconciliationOutcome, ForgeAuthorityError> {
         let git = self.workspace_git();
         let (head, dirty) = git
             .workspace_state(request.workspace)
@@ -855,14 +852,14 @@ impl GiteaDeliveryAuthority {
             .is_ancestor(request.workspace, &request.observed.head_revision, &head)
             .await?
         {
-            return Ok(GitHubReconciliationOutcome::Unchanged);
+            return Ok(ForgeReconciliationOutcome::Unchanged);
         }
         if request.adopting_existing {
             if !self
                 .is_ancestor(request.workspace, &head, &request.observed.head_revision)
                 .await?
             {
-                return Ok(GitHubReconciliationOutcome::Refused(format!(
+                return Ok(ForgeReconciliationOutcome::Refused(format!(
                     "existing remote head {} does not descend from retained local head {head}; local \
                      work was preserved",
                     request.observed.head_revision,
@@ -870,7 +867,7 @@ impl GiteaDeliveryAuthority {
             }
             let mut anchor = request.observed.clone();
             anchor.head_revision = head;
-            return Box::pin(self.reconcile_workspace(GitHubHeadReconciliation {
+            return Box::pin(self.reconcile_workspace(ForgeHeadReconciliation {
                 published: &anchor,
                 adopting_existing: false,
                 ..request
@@ -881,7 +878,7 @@ impl GiteaDeliveryAuthority {
             .is_ancestor(request.workspace, &request.published.head_revision, &head)
             .await?
         {
-            return Ok(GitHubReconciliationOutcome::Refused(format!(
+            return Ok(ForgeReconciliationOutcome::Refused(format!(
                 "local history no longer contains published head {}; local head {head}; observed \
                  head {}; work was preserved",
                 request.published.head_revision, request.observed.head_revision,
@@ -903,9 +900,9 @@ impl GiteaDeliveryAuthority {
 
     async fn integrate_head(
         &self,
-        request: GitHubHeadReconciliation<'_>,
+        request: ForgeHeadReconciliation<'_>,
         authorized: bool,
-    ) -> Result<GitHubReconciliationOutcome, GitHubAuthorityError> {
+    ) -> Result<ForgeReconciliationOutcome, ForgeAuthorityError> {
         let mut command = self.local_command(request.workspace);
         command.args([
             "-c",
@@ -927,29 +924,29 @@ impl GiteaDeliveryAuthority {
         );
         if output.exit_status == Some(0) {
             return Ok(if authorized {
-                GitHubReconciliationOutcome::Adopted
+                ForgeReconciliationOutcome::Adopted
             } else {
-                GitHubReconciliationOutcome::NeedsWork(diagnostic)
+                ForgeReconciliationOutcome::NeedsWork(diagnostic)
             });
         }
         if self.has_conflicts(request.workspace).await? {
-            return Ok(GitHubReconciliationOutcome::NeedsWork(diagnostic));
+            return Ok(ForgeReconciliationOutcome::NeedsWork(diagnostic));
         }
         Err(output.into())
     }
 }
 
 #[async_trait]
-impl GitHubDeliveryAuthority for GiteaDeliveryAuthority {
+impl DeliveryForgeAuthority for GiteaDeliveryAuthority {
     fn credential_environment(&self) -> &'static str {
         super::GITEA_TOKEN_ENV
     }
 
     async fn observe_delivery(
         &self,
-        request: GitHubDeliveryRead<'_>,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubDeliverySnapshot, GitHubAuthorityError> {
+        request: ForgeDeliveryRead<'_>,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeDeliverySnapshot, ForgeAuthorityError> {
         let repository = &request.target.repository;
         let identity = match (
             request.include_review,
@@ -976,7 +973,7 @@ impl GitHubDeliveryAuthority for GiteaDeliveryAuthority {
                     .await?;
                 let receipt = receipt_from_pull(&wire, repository)?;
                 if receipt.review_id != identity.review_id {
-                    return Err(GitHubAuthorityError::identity(format!(
+                    return Err(ForgeAuthorityError::identity(format!(
                         "expected PR {}; observed PR {}",
                         identity.review_id, receipt.review_id
                     )));
@@ -990,7 +987,7 @@ impl GitHubDeliveryAuthority for GiteaDeliveryAuthority {
             .branch_revision(repository, request.head_branch, credential)
             .await?;
         require_consistent_head(review.as_ref(), head_revision.as_deref())?;
-        Ok(GitHubDeliverySnapshot {
+        Ok(ForgeDeliverySnapshot {
             review,
             head_revision,
         })
@@ -998,27 +995,27 @@ impl GitHubDeliveryAuthority for GiteaDeliveryAuthority {
 
     async fn reconcile_delivery_target(
         &self,
-        request: GitHubTargetReconciliation<'_>,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubTargetIntegration, GitHubAuthorityError> {
+        request: ForgeTargetReconciliation<'_>,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeTargetIntegration, ForgeAuthorityError> {
         self.reconcile_delivery_target_inner(request, credential)
             .await
     }
 
     async fn reconcile_delivery_head(
         &self,
-        request: GitHubHeadReconciliation<'_>,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubReconciliationOutcome, GitHubAuthorityError> {
+        request: ForgeHeadReconciliation<'_>,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeReconciliationOutcome, ForgeAuthorityError> {
         self.reconcile_delivery_head_inner(request, credential)
             .await
     }
 
     async fn push_branch(
         &self,
-        request: &GitHubPushRequest,
-        credential: GitHubCredential<'_>,
-    ) -> Result<(), GitHubAuthorityError> {
+        request: &ForgePushRequest,
+        credential: ForgeCredential<'_>,
+    ) -> Result<(), ForgeAuthorityError> {
         let mut command = self.authenticated_git_command(&request.workspace, credential);
         command
             .arg("push")
@@ -1048,9 +1045,9 @@ impl GitHubDeliveryAuthority for GiteaDeliveryAuthority {
 
     async fn open_or_update_review(
         &self,
-        request: &GitHubReviewRequest,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubReviewReceipt, GitHubAuthorityError> {
+        request: &ForgeReviewRequest,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeReviewReceipt, ForgeAuthorityError> {
         let repository = &request.target.repository;
         if let Some(existing) = self
             .find_review(ReviewQuery {
@@ -1080,7 +1077,7 @@ impl GitHubDeliveryAuthority for GiteaDeliveryAuthority {
                 || receipt.head_branch != existing.head_branch
                 || receipt.target_branch != existing.target_branch
             {
-                return Err(GitHubAuthorityError::identity(
+                return Err(ForgeAuthorityError::identity(
                     "Gitea updated a different pull request identity",
                 ));
             }
@@ -1092,13 +1089,13 @@ impl GitHubDeliveryAuthority for GiteaDeliveryAuthority {
         {
             Some(revision) if revision == request.head_revision => {}
             Some(revision) => {
-                return Err(GitHubAuthorityError::identity(format!(
+                return Err(ForgeAuthorityError::identity(format!(
                     "Gitea run branch {} is at {revision}; expected {}",
                     request.head_branch, request.head_revision
                 )));
             }
             None => {
-                return Err(GitHubAuthorityError::api(
+                return Err(ForgeAuthorityError::api(
                     Some(404),
                     format!(
                         "Gitea run branch {} is not visible before review creation",
@@ -1126,9 +1123,9 @@ impl GitHubDeliveryAuthority for GiteaDeliveryAuthority {
 
     async fn inspect_review(
         &self,
-        review: &GitHubReviewReceipt,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubReviewObservation, GitHubAuthorityError> {
+        review: &ForgeReviewReceipt,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeReviewObservation, ForgeAuthorityError> {
         let wire = self
             .observe_pull(&review.repository, &review.review_id, credential)
             .await?;
@@ -1137,7 +1134,7 @@ impl GitHubDeliveryAuthority for GiteaDeliveryAuthority {
             || receipt.head_branch != review.head_branch
             || receipt.target_branch != review.target_branch
         {
-            return Err(GitHubAuthorityError::identity(
+            return Err(ForgeAuthorityError::identity(
                 "Gitea review identity changed during inspection",
             ));
         }
@@ -1146,15 +1143,15 @@ impl GitHubDeliveryAuthority for GiteaDeliveryAuthority {
                 let revision = wire
                     .merge_commit_sha
                     .filter(|revision| valid_revision(revision))
-                    .ok_or(GitHubAuthorityError::Rejected)?;
-                Ok(receipt.observation(GitHubReviewState::Merged {
+                    .ok_or(ForgeAuthorityError::Rejected)?;
+                Ok(receipt.observation(ForgeReviewState::Merged {
                     merge_revision: revision,
                 }))
             }
-            "closed" => Ok(receipt.observation(GitHubReviewState::Closed)),
+            "closed" => Ok(receipt.observation(ForgeReviewState::Closed)),
             "open" => {
                 if wire.mergeable == Some(false) {
-                    return Ok(receipt.observation(GitHubReviewState::Conflict));
+                    return Ok(receipt.observation(ForgeReviewState::Conflict));
                 }
                 let checks = self
                     .checks(&review.repository, &review.head_revision, credential)
@@ -1164,20 +1161,20 @@ impl GitHubDeliveryAuthority for GiteaDeliveryAuthority {
                 // modes on the `Mergeable` path instead of waiting forever for a policy step that
                 // never arrives.
                 Ok(receipt.observation_with_readiness(
-                    GitHubReviewState::Open { checks },
+                    ForgeReviewState::Open { checks },
                     false,
                     false,
                 ))
             }
-            _ => Err(GitHubAuthorityError::Rejected),
+            _ => Err(ForgeAuthorityError::Rejected),
         }
     }
 
     async fn inspect_review_feedback(
         &self,
-        review: &GitHubReviewReceipt,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubReviewFeedback, GitHubAuthorityError> {
+        review: &ForgeReviewReceipt,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeReviewFeedback, ForgeAuthorityError> {
         let before = self
             .observe_pull(&review.repository, &review.review_id, credential)
             .await?;
@@ -1214,7 +1211,7 @@ impl GitHubDeliveryAuthority for GiteaDeliveryAuthority {
             .observe_pull(&review.repository, &review.review_id, credential)
             .await?;
         require_review_fence(&after, review, "after feedback read").map_err(|_| {
-            GitHubAuthorityError::Unavailable
+            ForgeAuthorityError::Unavailable
                 .with_context("Gitea PR identity changed while feedback was paginated")
         })?;
         collect_feedback_items(issue_comments, reviews, review_comments)
@@ -1222,19 +1219,19 @@ impl GitHubDeliveryAuthority for GiteaDeliveryAuthority {
 
     async fn request_merge(
         &self,
-        review: &GitHubReviewReceipt,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubMergeRequestOutcome, GitHubAuthorityError> {
+        review: &ForgeReviewReceipt,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeMergeRequestOutcome, ForgeAuthorityError> {
         let wire = self
             .observe_pull(&review.repository, &review.review_id, credential)
             .await?;
         match wire.state.as_str() {
-            "closed" if wire.merged => return Ok(GitHubMergeRequestOutcome::Accepted),
-            "closed" => return Err(GitHubAuthorityError::Rejected),
+            "closed" if wire.merged => return Ok(ForgeMergeRequestOutcome::Accepted),
+            "closed" => return Err(ForgeAuthorityError::Rejected),
             _ => {}
         }
         if wire.mergeable == Some(false) {
-            return Ok(GitHubMergeRequestOutcome::Conflict);
+            return Ok(ForgeMergeRequestOutcome::Conflict);
         }
         match self
             .rest(
@@ -1254,19 +1251,17 @@ impl GitHubDeliveryAuthority for GiteaDeliveryAuthority {
             )
             .await
         {
-            Ok(_) => Ok(GitHubMergeRequestOutcome::Accepted),
-            Err(error) if error.api_status() == Some(409) => {
-                Ok(GitHubMergeRequestOutcome::Conflict)
-            }
+            Ok(_) => Ok(ForgeMergeRequestOutcome::Accepted),
+            Err(error) if error.api_status() == Some(409) => Ok(ForgeMergeRequestOutcome::Conflict),
             Err(error) => match self
                 .observe_pull(&review.repository, &review.review_id, credential)
                 .await
             {
                 Ok(observed) if observed.state == "closed" && observed.merged => {
-                    Ok(GitHubMergeRequestOutcome::Accepted)
+                    Ok(ForgeMergeRequestOutcome::Accepted)
                 }
                 Ok(observed) if observed.mergeable == Some(false) => {
-                    Ok(GitHubMergeRequestOutcome::Conflict)
+                    Ok(ForgeMergeRequestOutcome::Conflict)
                 }
                 _ => Err(error),
             },
@@ -1275,9 +1270,9 @@ impl GitHubDeliveryAuthority for GiteaDeliveryAuthority {
 
     async fn materialize_merge_conflict(
         &self,
-        request: &GitHubConflictRequest,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitHubConflictOutcome, GitHubAuthorityError> {
+        request: &ForgeConflictRequest,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeConflictOutcome, ForgeAuthorityError> {
         self.materialize_conflict_inner(request, credential).await
     }
 }
@@ -1377,15 +1372,15 @@ struct FeedbackItemDraft<'a> {
 
 fn require_review_fence(
     wire: &PullWire,
-    review: &GitHubReviewReceipt,
+    review: &ForgeReviewReceipt,
     phase: &str,
-) -> Result<(), GitHubAuthorityError> {
+) -> Result<(), ForgeAuthorityError> {
     let receipt = receipt_from_pull(wire, &review.repository)?;
     if receipt.review_id != review.review_id
         || receipt.head_branch != review.head_branch
         || receipt.target_branch != review.target_branch
     {
-        return Err(GitHubAuthorityError::identity(format!(
+        return Err(ForgeAuthorityError::identity(format!(
             "Gitea review identity changed {phase}"
         )));
     }
@@ -1396,13 +1391,13 @@ fn collect_feedback_items(
     issue_comments: Vec<IssueCommentWire>,
     reviews: Vec<ReviewWire>,
     review_comments: Vec<ReviewCommentWire>,
-) -> Result<GitHubReviewFeedback, GitHubAuthorityError> {
+) -> Result<ForgeReviewFeedback, ForgeAuthorityError> {
     let count = issue_comments
         .len()
         .saturating_add(reviews.len())
         .saturating_add(review_comments.len());
     if count > MAX_FEEDBACK_ITEMS {
-        return Err(GitHubAuthorityError::api(
+        return Err(ForgeAuthorityError::api(
             None,
             format!(
                 "Gitea PR feedback exceeded the absolute backstop of {MAX_FEEDBACK_ITEMS} items"
@@ -1414,10 +1409,10 @@ fn collect_feedback_items(
     items.extend(reviews.into_iter().filter_map(review_item));
     items.extend(review_comments.into_iter().filter_map(review_comment_item));
     items.sort_by(|left, right| left.key.cmp(&right.key));
-    Ok(GitHubReviewFeedback { items })
+    Ok(ForgeReviewFeedback { items })
 }
 
-fn issue_comment_item(comment: IssueCommentWire) -> Option<GitHubReviewFeedbackItem> {
+fn issue_comment_item(comment: IssueCommentWire) -> Option<ForgeReviewFeedbackItem> {
     Some(feedback_item(FeedbackItemDraft {
         key: format!("issue_comment:{}", comment.id),
         provider_version: &comment.updated_at,
@@ -1427,7 +1422,7 @@ fn issue_comment_item(comment: IssueCommentWire) -> Option<GitHubReviewFeedbackI
     }))
 }
 
-fn review_item(summary: ReviewWire) -> Option<GitHubReviewFeedbackItem> {
+fn review_item(summary: ReviewWire) -> Option<ForgeReviewFeedbackItem> {
     let body = nonempty_feedback(summary.body.as_deref()).or_else(|| {
         (summary.state == "REQUEST_CHANGES" || summary.state == "CHANGES_REQUESTED")
             .then(|| "Review requested changes without a written summary.".to_owned())
@@ -1450,7 +1445,7 @@ fn review_item(summary: ReviewWire) -> Option<GitHubReviewFeedbackItem> {
     }))
 }
 
-fn review_comment_item(comment: ReviewCommentWire) -> Option<GitHubReviewFeedbackItem> {
+fn review_comment_item(comment: ReviewCommentWire) -> Option<ForgeReviewFeedbackItem> {
     let line = comment.position.or(comment.original_position);
     let location = Some(format!(
         "path={} line={} commit={}",
@@ -1475,7 +1470,7 @@ fn review_comment_item(comment: ReviewCommentWire) -> Option<GitHubReviewFeedbac
     }))
 }
 
-fn feedback_item(draft: FeedbackItemDraft<'_>) -> GitHubReviewFeedbackItem {
+fn feedback_item(draft: FeedbackItemDraft<'_>) -> ForgeReviewFeedbackItem {
     let FeedbackItemDraft {
         key,
         provider_version,
@@ -1495,7 +1490,7 @@ fn feedback_item(draft: FeedbackItemDraft<'_>) -> GitHubReviewFeedbackItem {
         digest.update(value.as_bytes());
         digest.update([0]);
     }
-    GitHubReviewFeedbackItem {
+    ForgeReviewFeedbackItem {
         key,
         version: format!("{:x}", digest.finalize()),
         author,
@@ -1537,23 +1532,23 @@ fn encode_head_path(value: &str) -> String {
         .join("/")
 }
 
-fn decode<T: for<'de> Deserialize<'de>>(value: Option<Value>) -> Result<T, GitHubAuthorityError> {
-    let value = value.ok_or(GitHubAuthorityError::Rejected)?;
-    serde_json::from_value(value).map_err(|_| GitHubAuthorityError::Rejected)
+fn decode<T: for<'de> Deserialize<'de>>(value: Option<Value>) -> Result<T, ForgeAuthorityError> {
+    let value = value.ok_or(ForgeAuthorityError::Rejected)?;
+    serde_json::from_value(value).map_err(|_| ForgeAuthorityError::Rejected)
 }
 
 fn receipt_from_pull(
     pull: &PullWire,
     repository: &str,
-) -> Result<GitHubReviewReceipt, GitHubAuthorityError> {
+) -> Result<ForgeReviewReceipt, ForgeAuthorityError> {
     if !valid_revision(&pull.head.sha)
         || !valid_revision(&pull.base.sha)
         || pull.head.reference.is_empty()
         || pull.base.reference.is_empty()
     {
-        return Err(GitHubAuthorityError::Rejected);
+        return Err(ForgeAuthorityError::Rejected);
     }
-    Ok(GitHubReviewReceipt {
+    Ok(ForgeReviewReceipt {
         review_id: pull.number.to_string(),
         repository: repository.to_owned(),
         target_branch: pull.base.reference.clone(),
@@ -1562,44 +1557,44 @@ fn receipt_from_pull(
     })
 }
 
-fn classify_pull_state(wire: &PullWire) -> Result<GitHubReviewState, GitHubAuthorityError> {
+fn classify_pull_state(wire: &PullWire) -> Result<ForgeReviewState, ForgeAuthorityError> {
     match wire.state.as_str() {
         "closed" if wire.merged => wire
             .merge_commit_sha
             .clone()
             .filter(|revision| valid_revision(revision))
-            .map(|merge_revision| GitHubReviewState::Merged { merge_revision })
-            .ok_or(GitHubAuthorityError::Rejected),
-        "closed" => Ok(GitHubReviewState::Closed),
-        "open" if wire.mergeable == Some(false) => Ok(GitHubReviewState::Conflict),
-        "open" => Ok(GitHubReviewState::Open {
-            checks: GitHubChecks::Pending,
+            .map(|merge_revision| ForgeReviewState::Merged { merge_revision })
+            .ok_or(ForgeAuthorityError::Rejected),
+        "closed" => Ok(ForgeReviewState::Closed),
+        "open" if wire.mergeable == Some(false) => Ok(ForgeReviewState::Conflict),
+        "open" => Ok(ForgeReviewState::Open {
+            checks: ForgeChecks::Pending,
         }),
-        _ => Err(GitHubAuthorityError::Rejected),
+        _ => Err(ForgeAuthorityError::Rejected),
     }
 }
 
-fn classify_checks(wire: &StatusWire) -> GitHubChecks {
+fn classify_checks(wire: &StatusWire) -> ForgeChecks {
     if wire.statuses.is_empty() {
-        return GitHubChecks::NotRequired;
+        return ForgeChecks::NotRequired;
     }
     match wire.state.to_ascii_lowercase().as_str() {
-        "success" => GitHubChecks::Passed,
-        "pending" => GitHubChecks::Pending,
-        "failure" | "error" => GitHubChecks::Failed {
+        "success" => ForgeChecks::Passed,
+        "pending" => ForgeChecks::Pending,
+        "failure" | "error" => ForgeChecks::Failed {
             diagnostic: format!("Gitea reports combined commit status {}", wire.state),
         },
-        _ => GitHubChecks::Pending,
+        _ => ForgeChecks::Pending,
     }
 }
 
 fn require_consistent_head(
-    review: Option<&GitHubReviewObservation>,
+    review: Option<&ForgeReviewObservation>,
     head: Option<&str>,
-) -> Result<(), GitHubAuthorityError> {
+) -> Result<(), ForgeAuthorityError> {
     if let (Some(review), Some(head)) = (review, head) {
-        if matches!(review.state, GitHubReviewState::Open { .. }) && review.head_revision != head {
-            return Err(GitHubAuthorityError::Unavailable.with_context(format!(
+        if matches!(review.state, ForgeReviewState::Open { .. }) && review.head_revision != head {
+            return Err(ForgeAuthorityError::Unavailable.with_context(format!(
                 "Gitea PR/ref observations changed: PR head {}, ref head {head}",
                 review.head_revision,
             )));
@@ -1609,9 +1604,9 @@ fn require_consistent_head(
 }
 
 fn require_identity(
-    published: &GitHubReviewReceipt,
-    observed: &GitHubReviewReceipt,
-) -> Result<(), GitHubAuthorityError> {
+    published: &ForgeReviewReceipt,
+    observed: &ForgeReviewReceipt,
+) -> Result<(), ForgeAuthorityError> {
     let bound_review_changed =
         !published.review_id.is_empty() && published.review_id != observed.review_id;
     if bound_review_changed
@@ -1619,24 +1614,24 @@ fn require_identity(
         || published.target_branch != observed.target_branch
         || published.head_branch != observed.head_branch
     {
-        return Err(GitHubAuthorityError::identity(format!(
+        return Err(ForgeAuthorityError::identity(format!(
             "published identity {published:?}; observed identity {observed:?}",
         )));
     }
     Ok(())
 }
 
-fn git_error(error: GitError) -> GitHubAuthorityError {
+fn git_error(error: GitError) -> ForgeAuthorityError {
     match error {
-        GitError::Command(failure) => GitHubAuthorityError::Command(failure),
-        error => GitHubAuthorityError::repairable(error.to_string()),
+        GitError::Command(failure) => ForgeAuthorityError::Command(failure),
+        error => ForgeAuthorityError::repairable(error.to_string()),
     }
 }
 
 async fn bounded_status(
     mut command: Command,
     deadline: Duration,
-) -> Result<(), GitHubAuthorityError> {
+) -> Result<(), ForgeAuthorityError> {
     capture(&mut command, deadline).await?.require_success()?;
     Ok(())
 }
@@ -1644,17 +1639,17 @@ async fn bounded_status(
 async fn bounded_git_output(
     command: &mut Command,
     deadline: Duration,
-) -> Result<String, GitHubAuthorityError> {
+) -> Result<String, ForgeAuthorityError> {
     let output = capture(command, deadline).await?.require_success()?;
     if output.stdout_truncated || output.stdout.len() > 4 * 1_024 {
-        return Err(GitHubAuthorityError::repairable(
+        return Err(ForgeAuthorityError::repairable(
             "Git output was truncated during delivery reconciliation",
         ));
     }
     Ok(output.stdout)
 }
 
-fn redact(value: &str, credential: GitHubCredential<'_>) -> String {
+fn redact(value: &str, credential: ForgeCredential<'_>) -> String {
     value.replace(credential.expose(), "[REDACTED]")
 }
 

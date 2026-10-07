@@ -15,9 +15,9 @@ struct ObservedReview {
 
 pub(super) async fn observe(
     authority: &GhCliDeliveryAuthority,
-    request: GitHubDeliveryRead<'_>,
-    credential: GitHubCredential<'_>,
-) -> Result<GitHubDeliverySnapshot, GitHubAuthorityError> {
+    request: ForgeDeliveryRead<'_>,
+    credential: ForgeCredential<'_>,
+) -> Result<ForgeDeliverySnapshot, ForgeAuthorityError> {
     let identity = match (
         request.include_review,
         request
@@ -34,19 +34,19 @@ pub(super) async fn observe(
     };
     let head_revision = observe_ref(authority, request, credential).await?;
     require_consistent_head(review.as_ref(), head_revision.as_deref())?;
-    Ok(GitHubDeliverySnapshot {
+    Ok(ForgeDeliverySnapshot {
         review,
         head_revision,
     })
 }
 
 fn require_consistent_head(
-    review: Option<&GitHubReviewObservation>,
+    review: Option<&ForgeReviewObservation>,
     head: Option<&str>,
-) -> Result<(), GitHubAuthorityError> {
+) -> Result<(), ForgeAuthorityError> {
     if let (Some(review), Some(head)) = (review, head) {
-        if matches!(review.state, GitHubReviewState::Open { .. }) && review.head_revision != head {
-            return Err(GitHubAuthorityError::Unavailable.with_context(format!(
+        if matches!(review.state, ForgeReviewState::Open { .. }) && review.head_revision != head {
+            return Err(ForgeAuthorityError::Unavailable.with_context(format!(
                 "GitHub PR/ref observations changed: PR head {}, ref head {head}",
                 review.head_revision,
             )));
@@ -57,9 +57,9 @@ fn require_consistent_head(
 
 async fn find_identity(
     authority: &GhCliDeliveryAuthority,
-    request: GitHubDeliveryRead<'_>,
-    credential: GitHubCredential<'_>,
-) -> Result<Option<GitHubReviewReceipt>, GitHubAuthorityError> {
+    request: ForgeDeliveryRead<'_>,
+    credential: ForgeCredential<'_>,
+) -> Result<Option<ForgeReviewReceipt>, ForgeAuthorityError> {
     let value = authority
         .api(
             &review_list_arguments(request.target, request.head_branch)?,
@@ -72,7 +72,7 @@ async fn find_identity(
         .map(|wire| read_review_receipt(wire, request.target, request.head_branch))
         .collect::<Result<Vec<_>, _>>()?;
     if identities.len() > 1 {
-        return Err(GitHubAuthorityError::identity(
+        return Err(ForgeAuthorityError::identity(
             "multiple PRs match the run branch",
         ));
     }
@@ -81,10 +81,10 @@ async fn find_identity(
 
 async fn observe_review(
     authority: &GhCliDeliveryAuthority,
-    request: GitHubDeliveryRead<'_>,
-    identity: &GitHubReviewReceipt,
-    credential: GitHubCredential<'_>,
-) -> Result<GitHubReviewObservation, GitHubAuthorityError> {
+    request: ForgeDeliveryRead<'_>,
+    identity: &ForgeReviewReceipt,
+    credential: ForgeCredential<'_>,
+) -> Result<ForgeReviewObservation, ForgeAuthorityError> {
     let value = authority
         .api(
             &[
@@ -101,31 +101,29 @@ async fn observe_review(
     let wire: ObservedReview = super::api::decode_response(value, credential)?;
     let receipt = read_review_receipt(wire.identity, request.target, request.head_branch)?;
     if receipt.review_id != identity.review_id {
-        return Err(GitHubAuthorityError::identity(format!(
+        return Err(ForgeAuthorityError::identity(format!(
             "expected PR {}; observed PR {}",
             identity.review_id, receipt.review_id,
         )));
     }
     let state = match (wire.state.as_str(), wire.merged, wire.merge_commit_sha) {
-        ("closed", true, Some(revision)) if valid_revision(&revision) => {
-            GitHubReviewState::Merged {
-                merge_revision: revision,
-            }
-        }
-        ("closed", false, _) => GitHubReviewState::Closed,
-        ("open", false, _) => GitHubReviewState::Open {
-            checks: GitHubChecks::Pending,
+        ("closed", true, Some(revision)) if valid_revision(&revision) => ForgeReviewState::Merged {
+            merge_revision: revision,
         },
-        _ => return Err(GitHubAuthorityError::Rejected),
+        ("closed", false, _) => ForgeReviewState::Closed,
+        ("open", false, _) => ForgeReviewState::Open {
+            checks: ForgeChecks::Pending,
+        },
+        _ => return Err(ForgeAuthorityError::Rejected),
     };
     Ok(receipt.observation(state))
 }
 
 async fn observe_ref(
     authority: &GhCliDeliveryAuthority,
-    request: GitHubDeliveryRead<'_>,
-    credential: GitHubCredential<'_>,
-) -> Result<Option<String>, GitHubAuthorityError> {
+    request: ForgeDeliveryRead<'_>,
+    credential: ForgeCredential<'_>,
+) -> Result<Option<String>, ForgeAuthorityError> {
     let result = authority
         .api(
             &[format!(
@@ -153,8 +151,8 @@ pub(super) mod test_support {
     pub(in crate::native_v2_delivery::github) const OTHER_HEAD: &str =
         "cccccccccccccccccccccccccccccccccccccccc";
 
-    pub(in crate::native_v2_delivery::github) fn receipt() -> GitHubReviewReceipt {
-        GitHubReviewReceipt {
+    pub(in crate::native_v2_delivery::github) fn receipt() -> ForgeReviewReceipt {
+        ForgeReviewReceipt {
             review_id: "17".to_owned(),
             repository: "acme/project".to_owned(),
             target_branch: "main".to_owned(),
@@ -164,10 +162,10 @@ pub(super) mod test_support {
     }
 
     pub(in crate::native_v2_delivery::github) fn assert_retryable_api(
-        error: &GitHubAuthorityError,
+        error: &ForgeAuthorityError,
         context: &str,
     ) {
-        assert!(matches!(error, GitHubAuthorityError::Api(_)));
+        assert!(matches!(error, ForgeAuthorityError::Api(_)));
         assert!(error.retryable_operation());
         assert!(error.to_string().contains(context));
     }

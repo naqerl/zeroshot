@@ -28,7 +28,7 @@ impl NativeV2DeliveryAdapter {
         let mut retry = preflight::OperationRetry::default();
         loop {
             ensure_active(preparation.control)?;
-            let request = GitHubTargetReconciliation {
+            let request = ForgeTargetReconciliation {
                 workspace: &self.config.workspace,
                 target: &self.config.target,
                 commit_message,
@@ -54,7 +54,7 @@ impl NativeV2DeliveryAdapter {
 
     async fn target_integration_result(
         &self,
-        integration: GitHubTargetIntegration,
+        integration: ForgeTargetIntegration,
         before: &(String, bool),
         control: &DriverControl,
     ) -> Result<(), DeliveryStop> {
@@ -64,7 +64,7 @@ impl NativeV2DeliveryAdapter {
         let outcome = self
             .reconciliation_result(integration.outcome, before)
             .await?;
-        if let GitHubReconciliationOutcome::Refused(diagnostic) = outcome {
+        if let ForgeReconciliationOutcome::Refused(diagnostic) = outcome {
             return self.refuse_delivery(control, &diagnostic).await;
         }
         let previous = self.delivery_state().review_base_revision;
@@ -74,8 +74,8 @@ impl NativeV2DeliveryAdapter {
             != integration.target_revision;
         self.record_review_base(Some(integration.target_revision));
         match outcome {
-            GitHubReconciliationOutcome::Unchanged if !baseline_changed => Ok(()),
-            GitHubReconciliationOutcome::NeedsWork(diagnostic) => Err(recovery::repair(diagnostic)),
+            ForgeReconciliationOutcome::Unchanged if !baseline_changed => Ok(()),
+            ForgeReconciliationOutcome::NeedsWork(diagnostic) => Err(recovery::repair(diagnostic)),
             _ => Err(recovery::repair(
                 "the target revision advanced; verify the candidate against reviewBaseRevision \
                  before publication, preserving upstream changes and the requested feature",

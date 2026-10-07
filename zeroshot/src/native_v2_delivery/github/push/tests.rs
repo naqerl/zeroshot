@@ -49,8 +49,8 @@ exit 17
     let basic = encode_basic_credential(token);
 
     assert!(matches!(
-        push_branch(&authority, &request, GitHubCredential(token)).await,
-        Err(GitHubAuthorityError::Command(_))
+        push_branch(&authority, &request, ForgeCredential(token)).await,
+        Err(ForgeAuthorityError::Command(_))
     ));
 
     let snapshot = store.snapshot(&run_id);
@@ -113,7 +113,7 @@ async fn successful_push_does_not_record_a_diagnostic() {
     })
     .with_operator_diagnostics(run_id.clone(), store.clone());
 
-    push_branch(&authority, &request, GitHubCredential("raw-github-token"))
+    push_branch(&authority, &request, ForgeCredential("raw-github-token"))
         .await
         .assert_value();
 
@@ -147,7 +147,7 @@ async fn ambiguous_push_requires_an_exact_remote_head_observation() {
             push_deadline: Duration::from_secs(1),
         });
         assert_eq!(
-            push_branch(&authority, &request, GitHubCredential("test-token"))
+            push_branch(&authority, &request, ForgeCredential("test-token"))
                 .await
                 .is_ok(),
             revision == &request.head_revision
@@ -156,9 +156,9 @@ async fn ambiguous_push_requires_an_exact_remote_head_observation() {
 }
 
 #[cfg(unix)]
-fn push_request(repository: &TestGitRepository) -> GitHubPushRequest {
+fn push_request(repository: &TestGitRepository) -> ForgePushRequest {
     let review = super::super::test_review_request();
-    GitHubPushRequest {
+    ForgePushRequest {
         workspace: repository.workspace.clone(),
         target: review.target,
         head_branch: review.head_branch,

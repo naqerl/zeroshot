@@ -67,20 +67,20 @@ struct UpdatedRepositoryWire {
 struct HeadUpdateContext<'a> {
     authority: &'a GhCliDeliveryAuthority,
     workspace: &'a Path,
-    credential: GitHubCredential<'a>,
+    credential: ForgeCredential<'a>,
 }
 
 pub(super) struct HeadUpdateRequest<'a> {
     pub(super) workspace: &'a Path,
-    pub(super) review: &'a GitHubReviewReceipt,
+    pub(super) review: &'a ForgeReviewReceipt,
     pub(super) pull_request_id: &'a str,
 }
 
 pub(super) async fn update_review_head(
     authority: &GhCliDeliveryAuthority,
     request: HeadUpdateRequest<'_>,
-    credential: GitHubCredential<'_>,
-) -> Result<GitHubReviewReceipt, GitHubAuthorityError> {
+    credential: ForgeCredential<'_>,
+) -> Result<ForgeReviewReceipt, ForgeAuthorityError> {
     let context = HeadUpdateContext {
         authority,
         workspace: request.workspace,
@@ -99,9 +99,9 @@ pub(super) async fn update_review_head(
 
 pub(super) async fn synchronize_review_head(
     authority: &GhCliDeliveryAuthority,
-    request: GitHubHeadSynchronization<'_>,
-    credential: GitHubCredential<'_>,
-) -> Result<(), GitHubAuthorityError> {
+    request: ForgeHeadSynchronization<'_>,
+    credential: ForgeCredential<'_>,
+) -> Result<(), ForgeAuthorityError> {
     adopt_local_head(
         HeadUpdateContext {
             authority,
@@ -128,17 +128,17 @@ fn update_arguments(pull_request_id: &str, expected_head: &str) -> Vec<String> {
 
 fn updated_receipt(
     value: Value,
-    previous: &GitHubReviewReceipt,
+    previous: &ForgeReviewReceipt,
     pull_request_id: &str,
-) -> Result<GitHubReviewReceipt, GitHubAuthorityError> {
+) -> Result<ForgeReviewReceipt, ForgeAuthorityError> {
     let wire: UpdateHeadWire =
-        serde_json::from_value(value).map_err(|_| GitHubAuthorityError::Rejected)?;
+        serde_json::from_value(value).map_err(|_| ForgeAuthorityError::Rejected)?;
     let updated = wire
         .data
         .update_pull_request_branch
         .and_then(|payload| payload.pull_request)
-        .ok_or(GitHubAuthorityError::Rejected)?;
-    let receipt = GitHubReviewReceipt {
+        .ok_or(ForgeAuthorityError::Rejected)?;
+    let receipt = ForgeReviewReceipt {
         review_id: updated.number.to_string(),
         repository: updated.repository.name_with_owner,
         target_branch: updated.base_ref_name,
@@ -147,13 +147,13 @@ fn updated_receipt(
     };
     (updated.id == pull_request_id && valid_head_update(previous, &receipt))
         .then_some(receipt)
-        .ok_or(GitHubAuthorityError::Rejected)
+        .ok_or(ForgeAuthorityError::Rejected)
 }
 
 async fn require_local_head(
     context: HeadUpdateContext<'_>,
     expected: &str,
-) -> Result<(), GitHubAuthorityError> {
+) -> Result<(), ForgeAuthorityError> {
     let head = git_output(
         git_command(
             &context.authority.config,
@@ -177,7 +177,7 @@ async fn require_local_head(
     if head.trim() == expected && status.is_empty() {
         return Ok(());
     }
-    Err(GitHubAuthorityError::repairable(format!(
+    Err(ForgeAuthorityError::repairable(format!(
         "Local Git state cannot adopt the authorized head: expected HEAD {expected}, actual HEAD {}\n\
              git status --porcelain=v1 --untracked-files=all:\n{status}",
         head.trim()
@@ -186,9 +186,9 @@ async fn require_local_head(
 
 async fn adopt_local_head(
     context: HeadUpdateContext<'_>,
-    previous: &GitHubReviewReceipt,
-    updated: &GitHubReviewReceipt,
-) -> Result<(), GitHubAuthorityError> {
+    previous: &ForgeReviewReceipt,
+    updated: &ForgeReviewReceipt,
+) -> Result<(), ForgeAuthorityError> {
     if !local_transition_required(context, previous, updated).await? {
         return Ok(());
     }
@@ -198,9 +198,9 @@ async fn adopt_local_head(
 
 async fn fetch_head(
     context: HeadUpdateContext<'_>,
-    previous: &GitHubReviewReceipt,
-    updated: &GitHubReviewReceipt,
-) -> Result<(), GitHubAuthorityError> {
+    previous: &ForgeReviewReceipt,
+    updated: &ForgeReviewReceipt,
+) -> Result<(), ForgeAuthorityError> {
     let mut fetch = authenticated_git_command(
         &context.authority.config,
         context.workspace,
@@ -218,9 +218,9 @@ async fn fetch_head(
 
 async fn adopt_fetched_head(
     context: HeadUpdateContext<'_>,
-    previous: &GitHubReviewReceipt,
-    updated: &GitHubReviewReceipt,
-) -> Result<(), GitHubAuthorityError> {
+    previous: &ForgeReviewReceipt,
+    updated: &ForgeReviewReceipt,
+) -> Result<(), ForgeAuthorityError> {
     if !local_transition_required(context, previous, updated).await? {
         return Ok(());
     }
@@ -248,9 +248,9 @@ async fn adopt_fetched_head(
 
 async fn local_transition_required(
     context: HeadUpdateContext<'_>,
-    previous: &GitHubReviewReceipt,
-    updated: &GitHubReviewReceipt,
-) -> Result<bool, GitHubAuthorityError> {
+    previous: &ForgeReviewReceipt,
+    updated: &ForgeReviewReceipt,
+) -> Result<bool, ForgeAuthorityError> {
     if require_local_head(context, &updated.head_revision)
         .await
         .is_ok()
@@ -264,7 +264,7 @@ async fn local_transition_required(
 async fn git_output(
     command: &mut Command,
     deadline: Duration,
-) -> Result<String, GitHubAuthorityError> {
+) -> Result<String, ForgeAuthorityError> {
     bounded_git_output(command, deadline, MAX_GIT_OUTPUT_BYTES).await
 }
 

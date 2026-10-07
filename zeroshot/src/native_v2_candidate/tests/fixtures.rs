@@ -159,7 +159,7 @@ pub(super) async fn admitted(kind: RuntimePlanKind) -> AdmittedRun {
 pub(super) fn candidate_config(
     kind: RuntimePlanKind,
     repository: &TempRepository,
-    github: Arc<ScriptedGitHub>,
+    authority: Arc<ScriptedGitHub>,
 ) -> NativeV2CandidateConfig {
     let pool = HostedProcessPool::new(10_002, 10_002, 20_000).assert_value_with("pool");
     let harness = match kind {
@@ -205,7 +205,7 @@ pub(super) fn candidate_config(
                 .assert_value_with("target"),
             poll: DeliveryPollPolicy::new(2, Duration::ZERO).assert_value_with("poll"),
         },
-        github,
+        authority,
     }
 }
 

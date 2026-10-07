@@ -14,8 +14,8 @@ impl GhCliDeliveryAuthority {
     pub(super) async fn api(
         &self,
         arguments: &[String],
-        credential: GitHubCredential<'_>,
-    ) -> Result<Value, GitHubAuthorityError> {
+        credential: ForgeCredential<'_>,
+    ) -> Result<Value, ForgeAuthorityError> {
         let output = self.api_output(arguments, credential).await?;
         serde_json::from_slice(&output).map_err(|error| {
             let (text, truncated) = api_diagnostic_text(output, false, MAX_API_OUTPUT_BYTES, credential);
@@ -28,8 +28,8 @@ impl GhCliDeliveryAuthority {
     pub(super) async fn api_output(
         &self,
         arguments: &[String],
-        credential: GitHubCredential<'_>,
-    ) -> Result<Vec<u8>, GitHubAuthorityError> {
+        credential: ForgeCredential<'_>,
+    ) -> Result<Vec<u8>, ForgeAuthorityError> {
         let mut command = clean_command(&self.config, &self.config.gh_program, credential);
         command.arg("api").args(arguments).stdout(Stdio::piped());
         let context = format!("command: {:?} api {arguments:?}", self.config.gh_program);
@@ -54,8 +54,8 @@ impl GhCliDeliveryAuthority {
         &self,
         repository: &str,
         job: u64,
-        credential: GitHubCredential<'_>,
-    ) -> Result<Vec<u8>, GitHubAuthorityError> {
+        credential: ForgeCredential<'_>,
+    ) -> Result<Vec<u8>, ForgeAuthorityError> {
         let mut arguments = vec![
             format!("repos/{repository}/actions/jobs/{job}/logs"),
             "--method".to_owned(),
@@ -75,9 +75,9 @@ impl GhCliDeliveryAuthority {
 
     pub(super) async fn confirm_review_head(
         &self,
-        request: &GitHubReviewRequest,
-        credential: GitHubCredential<'_>,
-    ) -> Result<(), GitHubAuthorityError> {
+        request: &ForgeReviewRequest,
+        credential: ForgeCredential<'_>,
+    ) -> Result<(), ForgeAuthorityError> {
         let reference = self
             .read_reference(&request.target.repository, &request.head_branch, credential)
             .await?;
@@ -86,23 +86,23 @@ impl GhCliDeliveryAuthority {
 
     pub(super) async fn confirm_pushed_head(
         &self,
-        request: &GitHubPushRequest,
-        credential: GitHubCredential<'_>,
-    ) -> Result<(), GitHubAuthorityError> {
+        request: &ForgePushRequest,
+        credential: ForgeCredential<'_>,
+    ) -> Result<(), ForgeAuthorityError> {
         let reference = self
             .read_reference(&request.target.repository, &request.head_branch, credential)
             .await?;
         let revision = reference_revision(reference, &request.head_branch)?;
         (revision == request.head_revision)
             .then_some(())
-            .ok_or(GitHubAuthorityError::Rejected)
+            .ok_or(ForgeAuthorityError::Rejected)
     }
 
     pub(super) async fn target_revision(
         &self,
-        review: &GitHubReviewReceipt,
-        credential: GitHubCredential<'_>,
-    ) -> Result<String, GitHubAuthorityError> {
+        review: &ForgeReviewReceipt,
+        credential: ForgeCredential<'_>,
+    ) -> Result<String, ForgeAuthorityError> {
         let reference = self
             .read_reference(&review.repository, &review.target_branch, credential)
             .await?;
@@ -112,8 +112,8 @@ impl GhCliDeliveryAuthority {
         &self,
         repository: &str,
         branch: &str,
-        credential: GitHubCredential<'_>,
-    ) -> Result<GitReferenceWire, GitHubAuthorityError> {
+        credential: ForgeCredential<'_>,
+    ) -> Result<GitReferenceWire, ForgeAuthorityError> {
         let value = self
             .api(
                 &[format!("repos/{repository}/git/ref/heads/{branch}")],
@@ -126,8 +126,8 @@ impl GhCliDeliveryAuthority {
 
 pub(super) fn decode_response<T: serde::de::DeserializeOwned>(
     value: Value,
-    credential: GitHubCredential<'_>,
-) -> Result<T, GitHubAuthorityError> {
+    credential: ForgeCredential<'_>,
+) -> Result<T, ForgeAuthorityError> {
     T::deserialize(&value).map_err(|error| {
         let (text, truncated) = api_diagnostic_text(
             value.to_string().into_bytes(),
@@ -148,8 +148,8 @@ pub(super) fn decode_response<T: serde::de::DeserializeOwned>(
 pub(super) async fn command_status(
     mut command: Command,
     deadline: Duration,
-    credential: GitHubCredential<'_>,
-) -> Result<(), GitHubAuthorityError> {
+    credential: ForgeCredential<'_>,
+) -> Result<(), ForgeAuthorityError> {
     capture(&mut command, deadline)
         .await
         .and_then(|output| output.require_success())
@@ -160,11 +160,11 @@ pub(super) async fn command_status(
                 .exit_status
                 .filter(|_| !failure.stderr_truncated)
                 .map(|_| github_api_error(failure.stderr.as_bytes()));
-            let status = response.as_ref().and_then(GitHubAuthorityError::api_status);
+            let status = response.as_ref().and_then(ForgeAuthorityError::api_status);
             let retryable = failure.retryable_transport()
                 || response
                     .as_ref()
-                    .is_some_and(GitHubAuthorityError::retryable_operation)
+                    .is_some_and(ForgeAuthorityError::retryable_operation)
                 || status.is_none() && github_transport_error(&failure.stderr);
             let error = redacted_api_error(status, failure.to_string(), credential);
             if retryable { error.temporary() } else { error }
@@ -174,8 +174,8 @@ pub(super) async fn command_status(
 async fn bounded_output(
     mut command: Command,
     deadline: Duration,
-    credential: GitHubCredential<'_>,
-) -> Result<Vec<u8>, GitHubAuthorityError> {
+    credential: ForgeCredential<'_>,
+) -> Result<Vec<u8>, ForgeAuthorityError> {
     command
         .kill_on_drop(true)
         .stdout(Stdio::piped())
@@ -239,13 +239,11 @@ impl ApiOutput {
         self,
         status: Option<std::process::ExitStatus>,
         context: &str,
-        credential: GitHubCredential<'_>,
-    ) -> GitHubAuthorityError {
+        credential: ForgeCredential<'_>,
+    ) -> ForgeAuthorityError {
         // Incomplete stderr is not an authoritative HTTP response.
         let api_error = status.map(|_| github_api_error(&self.stderr));
-        let api_status = api_error
-            .as_ref()
-            .and_then(GitHubAuthorityError::api_status);
+        let api_status = api_error.as_ref().and_then(ForgeAuthorityError::api_status);
         let (stdout, stdout_truncated) = api_diagnostic_text(
             self.stdout,
             status.is_none(),
@@ -282,20 +280,20 @@ impl ApiOutput {
 fn redacted_api_error(
     status: Option<u16>,
     diagnostic: impl Into<String>,
-    credential: GitHubCredential<'_>,
-) -> GitHubAuthorityError {
+    credential: ForgeCredential<'_>,
+) -> ForgeAuthorityError {
     let diagnostic = diagnostic
         .into()
         .replace(credential.expose(), "[REDACTED]")
         .replace(&encode_basic_credential(credential.expose()), "[REDACTED]");
-    GitHubAuthorityError::api(status, diagnostic)
+    ForgeAuthorityError::api(status, diagnostic)
 }
 
 fn api_diagnostic_text(
     bytes: Vec<u8>,
     incomplete: bool,
     capture_limit: usize,
-    credential: GitHubCredential<'_>,
+    credential: ForgeCredential<'_>,
 ) -> (String, bool) {
     let truncated = incomplete || bytes.len() > capture_limit;
     let (mut text, truncated) =
@@ -335,7 +333,7 @@ where
     }
 }
 
-fn github_api_error(output: &[u8]) -> GitHubAuthorityError {
+fn github_api_error(output: &[u8]) -> ForgeAuthorityError {
     let text = String::from_utf8_lossy(output);
     let value = github_api_error_value(&text);
     let status = value
@@ -356,7 +354,7 @@ fn github_api_error(output: &[u8]) -> GitHubAuthorityError {
                     })
                     .is_some_and(github_rate_limit_message)
             }));
-    let failure = GitHubAuthorityError::api(status, text.into_owned());
+    let failure = ForgeAuthorityError::api(status, text.into_owned());
     if rate_limited {
         failure.temporary()
     } else {
@@ -414,9 +412,9 @@ fn github_api_status_from_text(text: &str) -> Option<u16> {
     digits.parse().ok()
 }
 
-fn validate_api_output(output: Vec<u8>) -> Result<Vec<u8>, GitHubAuthorityError> {
+fn validate_api_output(output: Vec<u8>) -> Result<Vec<u8>, ForgeAuthorityError> {
     if output.is_empty() || output.len() > MAX_API_OUTPUT_BYTES {
-        return Err(GitHubAuthorityError::Rejected);
+        return Err(ForgeAuthorityError::Rejected);
     }
     Ok(output)
 }

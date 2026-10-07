@@ -5,14 +5,14 @@ use crate::execution::driver::DriverCancellation;
 use crate::native_v2_runner::EnvironmentRefreshError;
 
 struct ReviewSyncInvocation<'a> {
-    request: &'a GitHubReviewRequest,
-    credential: GitHubCredential<'a>,
+    request: &'a ForgeReviewRequest,
+    credential: ForgeCredential<'a>,
     control: &'a DriverControl,
     remaining: Duration,
 }
 
 struct ReviewSyncState<'a, 'environment> {
-    request: &'a GitHubReviewRequest,
+    request: &'a ForgeReviewRequest,
     credentials: &'a mut DeliveryCredentials<'environment>,
     control: &'a DriverControl,
     deadline: tokio::time::Instant,
@@ -79,8 +79,8 @@ impl ReviewSyncState<'_, '_> {
 }
 
 enum ReviewSyncProgress {
-    Complete(GitHubReviewReceipt),
-    Failed(GitHubAuthorityError),
+    Complete(ForgeReviewReceipt),
+    Failed(ForgeAuthorityError),
     TimedOut,
 }
 
@@ -93,7 +93,7 @@ enum CredentialRefreshProgress {
 struct ReviewSyncFailure<'a> {
     control: &'a DriverControl,
     attempt: usize,
-    error: GitHubAuthorityError,
+    error: ForgeAuthorityError,
     deadline: tokio::time::Instant,
     retry_interval: Duration,
 }
@@ -107,10 +107,10 @@ enum ReviewSyncDisposition {
 impl NativeV2DeliveryAdapter {
     pub(super) async fn synchronize_review(
         &self,
-        request: &GitHubReviewRequest,
+        request: &ForgeReviewRequest,
         credentials: &mut DeliveryCredentials<'_>,
         control: &DriverControl,
-    ) -> Result<GitHubReviewReceipt, DeliveryStop> {
+    ) -> Result<ForgeReviewReceipt, DeliveryStop> {
         let mut retry = preflight::OperationRetry::default();
         loop {
             let error = match self
@@ -134,10 +134,10 @@ impl NativeV2DeliveryAdapter {
 
     async fn synchronize_review_batch(
         &self,
-        request: &GitHubReviewRequest,
+        request: &ForgeReviewRequest,
         credentials: &mut DeliveryCredentials<'_>,
         control: &DriverControl,
-    ) -> Result<GitHubReviewReceipt, DeliveryStop> {
+    ) -> Result<ForgeReviewReceipt, DeliveryStop> {
         let deadline = tokio::time::Instant::now() + REVIEW_SYNC_DEADLINE;
         let mut retry_interval = REVIEW_SYNC_INTERVAL;
         let mut last_failure = None;
@@ -159,7 +159,7 @@ impl NativeV2DeliveryAdapter {
                 ReviewSyncProgress::TimedOut => {
                     return Err(last_failure.map_or_else(
                         || temporary_sync_failure("GitHub review synchronization timed out").into(),
-                        |error: GitHubAuthorityError| {
+                        |error: ForgeAuthorityError| {
                             error
                                 .with_context("GitHub review synchronization timed out")
                                 .into()
@@ -243,8 +243,8 @@ impl NativeV2DeliveryAdapter {
     }
 }
 
-fn temporary_sync_failure(message: &str) -> GitHubAuthorityError {
-    GitHubAuthorityError::Unavailable.with_context(message)
+fn temporary_sync_failure(message: &str) -> ForgeAuthorityError {
+    ForgeAuthorityError::Unavailable.with_context(message)
 }
 
 async fn refresh_within_deadline<F>(

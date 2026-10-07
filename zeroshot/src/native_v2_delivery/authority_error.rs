@@ -2,19 +2,19 @@ use std::fmt;
 
 const MAX_GITHUB_API_DIAGNOSTIC_BYTES: usize = 32 * 1024;
 
-/// Bounded provider-owned GitHub API failure detail.
+/// Bounded provider-owned forge API failure detail.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GitHubApiFailure {
+pub struct ForgeApiFailure {
     status: Option<u16>,
     diagnostic: Box<str>,
     transient: bool,
 }
 
-impl GitHubApiFailure {
+impl ForgeApiFailure {
     fn new(status: Option<u16>, diagnostic: impl Into<String>) -> Self {
         let mut diagnostic = diagnostic.into();
         if diagnostic.contains('\0') {
-            diagnostic = "GitHub API diagnostic redacted".to_owned();
+            diagnostic = "forge API diagnostic redacted".to_owned();
         }
         if diagnostic.len() > MAX_GITHUB_API_DIAGNOSTIC_BYTES {
             let mut boundary = MAX_GITHUB_API_DIAGNOSTIC_BYTES - "\n[diagnostic truncated]".len();
@@ -43,29 +43,29 @@ impl GitHubApiFailure {
     }
 }
 
-impl fmt::Display for GitHubApiFailure {
+impl fmt::Display for ForgeApiFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.diagnostic)
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum GitHubAuthorityError {
-    #[error("GitHub delivery authority is unavailable")]
+pub enum ForgeAuthorityError {
+    #[error("the delivery forge is unavailable")]
     Unavailable,
-    #[error("GitHub rejected delivery")]
+    #[error("the delivery forge rejected the operation")]
     Rejected,
-    #[error("GitHub delivery identity mismatch: {0}")]
+    #[error("delivery identity mismatch: {0}")]
     Identity(Box<str>),
-    #[error("GitHub API request failed: {0}")]
-    Api(GitHubApiFailure),
-    #[error("GitHub delivery left repository work requiring repair: {0}")]
+    #[error("forge API request failed: {0}")]
+    Api(ForgeApiFailure),
+    #[error("the delivery forge left repository work requiring repair: {0}")]
     Repairable(Box<str>),
     #[error("{0}")]
     Command(Box<super::GitCommandFailure>),
 }
 
-impl GitHubAuthorityError {
+impl ForgeAuthorityError {
     pub(super) fn api_status(&self) -> Option<u16> {
         match self {
             Self::Api(failure) => failure.status,
@@ -74,7 +74,7 @@ impl GitHubAuthorityError {
     }
 
     pub(super) fn api(status: Option<u16>, diagnostic: impl Into<String>) -> Self {
-        Self::Api(GitHubApiFailure::new(status, diagnostic))
+        Self::Api(ForgeApiFailure::new(status, diagnostic))
     }
 
     pub(super) fn retryable_review_sync(&self) -> bool {
@@ -115,14 +115,14 @@ impl GitHubAuthorityError {
     }
 
     pub(super) fn identity(diagnostic: impl Into<String>) -> Self {
-        Self::Identity(GitHubApiFailure::new(None, diagnostic).diagnostic)
+        Self::Identity(ForgeApiFailure::new(None, diagnostic).diagnostic)
     }
 
     pub(super) fn with_context(self, context: impl fmt::Display) -> Self {
         match self {
             Self::Api(failure) => {
                 let mut wrapped =
-                    GitHubApiFailure::new(failure.status, format!("{context}\n{failure}"));
+                    ForgeApiFailure::new(failure.status, format!("{context}\n{failure}"));
                 wrapped.transient = failure.transient;
                 Self::Api(wrapped)
             }
@@ -130,24 +130,27 @@ impl GitHubAuthorityError {
             Self::Repairable(detail) => Self::repairable(format!("{context}\n{detail}")),
             Self::Unavailable => Self::api(
                 None,
-                format!("{context}\nGitHub delivery authority is unavailable"),
+                format!("{context}\nthe delivery forge is unavailable"),
             )
             .temporary(),
-            Self::Rejected => Self::api(None, format!("{context}\nGitHub rejected delivery")),
+            Self::Rejected => Self::api(
+                None,
+                format!("{context}\nthe delivery forge rejected the operation"),
+            ),
             Self::Command(failure) => Self::Command(Box::new(failure.with_context(context))),
         }
     }
 
     pub(super) fn review_head_not_visible() -> Self {
-        Self::api(None, "GitHub review head revision is not visible").temporary()
+        Self::api(None, "the review head revision is not visible").temporary()
     }
 
     pub(super) fn repairable(diagnostic: impl Into<String>) -> Self {
-        Self::Repairable(GitHubApiFailure::new(None, diagnostic).diagnostic)
+        Self::Repairable(ForgeApiFailure::new(None, diagnostic).diagnostic)
     }
 }
 
-impl From<super::GitCommandFailure> for GitHubAuthorityError {
+impl From<super::GitCommandFailure> for ForgeAuthorityError {
     fn from(failure: super::GitCommandFailure) -> Self {
         Self::Command(Box::new(failure))
     }

@@ -1,29 +1,28 @@
 use super::*;
 
-fn kind(error: &GitHubAuthorityError) -> &'static str {
+fn kind(error: &ForgeAuthorityError) -> &'static str {
     match error {
-        GitHubAuthorityError::Unavailable => "unavailable",
-        GitHubAuthorityError::Rejected => "rejected",
-        GitHubAuthorityError::Identity(_) => "identity",
-        GitHubAuthorityError::Api(_) => "api",
-        GitHubAuthorityError::Repairable(_) => "repairable",
-        GitHubAuthorityError::Command(_) => "command",
+        ForgeAuthorityError::Unavailable => "unavailable",
+        ForgeAuthorityError::Rejected => "rejected",
+        ForgeAuthorityError::Identity(_) => "identity",
+        ForgeAuthorityError::Api(_) => "api",
+        ForgeAuthorityError::Repairable(_) => "repairable",
+        ForgeAuthorityError::Command(_) => "command",
     }
 }
 
 #[test]
 fn api_diagnostics_redact_nul_and_truncate_utf8_safely() {
-    let GitHubAuthorityError::Api(redacted) =
-        GitHubAuthorityError::api(Some(500), "visible\0secret")
+    let ForgeAuthorityError::Api(redacted) = ForgeAuthorityError::api(Some(500), "visible\0secret")
     else {
         panic!("expected API failure");
     };
-    assert_eq!(redacted.to_string(), "GitHub API diagnostic redacted");
+    assert_eq!(redacted.to_string(), "forge API diagnostic redacted");
 
     let marker = "\n[diagnostic truncated]";
     let boundary = MAX_GITHUB_API_DIAGNOSTIC_BYTES - marker.len();
     let diagnostic = format!("{}🦀{}", "x".repeat(boundary - 1), "tail".repeat(16));
-    let GitHubAuthorityError::Api(truncated) = GitHubAuthorityError::api(None, diagnostic) else {
+    let ForgeAuthorityError::Api(truncated) = ForgeAuthorityError::api(None, diagnostic) else {
         panic!("expected API failure");
     };
     let truncated = truncated.to_string();
@@ -36,7 +35,7 @@ fn api_diagnostics_redact_nul_and_truncate_utf8_safely() {
 fn context_preserves_authority_failure_policy() {
     let cases = [
         (
-            GitHubAuthorityError::identity("wrong review"),
+            ForgeAuthorityError::identity("wrong review"),
             "identity",
             None,
             false,
@@ -44,7 +43,7 @@ fn context_preserves_authority_failure_policy() {
             false,
         ),
         (
-            GitHubAuthorityError::repairable("conflicted index"),
+            ForgeAuthorityError::repairable("conflicted index"),
             "repairable",
             None,
             false,
@@ -52,7 +51,7 @@ fn context_preserves_authority_failure_policy() {
             false,
         ),
         (
-            GitHubAuthorityError::Rejected,
+            ForgeAuthorityError::Rejected,
             "api",
             None,
             false,
@@ -60,7 +59,7 @@ fn context_preserves_authority_failure_policy() {
             false,
         ),
         (
-            GitHubAuthorityError::Unavailable,
+            ForgeAuthorityError::Unavailable,
             "api",
             None,
             true,
@@ -68,7 +67,7 @@ fn context_preserves_authority_failure_policy() {
             true,
         ),
         (
-            GitHubAuthorityError::api(Some(401), "bad credentials"),
+            ForgeAuthorityError::api(Some(401), "bad credentials"),
             "api",
             Some(401),
             false,
@@ -76,7 +75,7 @@ fn context_preserves_authority_failure_policy() {
             false,
         ),
         (
-            GitHubAuthorityError::api(Some(429), "rate limited"),
+            ForgeAuthorityError::api(Some(429), "rate limited"),
             "api",
             Some(429),
             true,
@@ -94,7 +93,7 @@ fn context_preserves_authority_failure_policy() {
         assert!(contextual.to_string().contains("synchronizing review"));
     }
 
-    let refusal = GitHubAuthorityError::Rejected.temporary();
+    let refusal = ForgeAuthorityError::Rejected.temporary();
     assert_eq!(kind(&refusal), "rejected");
     assert!(!refusal.retryable_review_sync());
     assert!(!refusal.retryable_operation());
