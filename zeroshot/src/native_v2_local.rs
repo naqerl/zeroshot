@@ -147,11 +147,24 @@ pub(crate) fn capture_local_native_environment(
     let mut environment = LocalHarnessEnvironment::new(
         crate::native_v2_capsule::provider_process::current_process_environment(),
     );
+    resolve_relative_home_overrides(&mut environment, invoking_directory)?;
+    Ok(environment.into_values())
+}
+
+/// Resolves every harness home override that the invoking shell may have set relatively against
+/// the invoking directory, before the controller detaches. The variable is forwarded to the
+/// harness child, whose working directory differs, so leaving it relative would change what it
+/// points at.
+fn resolve_relative_home_overrides(
+    environment: &mut LocalHarnessEnvironment,
+    invoking_directory: &Path,
+) -> Result<(), LocalCompositionError> {
     for name in [
         "CODEX_HOME",
         "CLAUDE_CONFIG_DIR",
         "COPILOT_HOME",
         "COPILOT_PROVIDERS_CONFIG",
+        "PI_CODING_AGENT_DIR",
     ] {
         let Some(value) = environment.get_mut(name) else {
             continue;
@@ -165,7 +178,7 @@ pub(crate) fn capture_local_native_environment(
                 .map_err(|_| LocalCompositionError::NativeEnvironment)?;
         }
     }
-    Ok(environment.into_values())
+    Ok(())
 }
 
 pub(crate) fn local_resolved_source(

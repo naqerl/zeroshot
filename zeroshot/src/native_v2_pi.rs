@@ -150,6 +150,8 @@ pub struct PiAdapter {
     prefix_arguments: Vec<String>,
     workspace: PathBuf,
     runtime_home: PathBuf,
+    /// Current-user home for the built-in local target; `None` for hosted placements.
+    local_user_home: Option<PathBuf>,
     contained: bool,
     native_local: bool,
     base_environment: PiProcessEnvironment,
@@ -169,13 +171,22 @@ impl PiAdapter {
     /// Local adapter. A native-local lane reuses the user's stored Pi login; every other lane
     /// receives a private agent directory and drops the ambient credentials of its lane.
     pub fn new_local(configuration: PiConfig) -> Result<Self, PiAdapterConfigError> {
-        let native_local = configuration.provider.natively_authenticated();
+        let provider = configuration.provider;
+        let native_local = provider.natively_authenticated();
         let local_environment = configuration
             .native_environment
             .selected(PI_LOCAL_ENVIRONMENT);
         let mut adapter = Self::configured(configuration, ProviderProcessRunners::local(), false)?;
         adapter.local_environment = local_environment;
-        if !native_local {
+        if native_local {
+            // Keep the selected lane's own credential so a user who exports a key instead of
+            // storing one still authenticates, but drop every other lane's. A foreign ambient
+            // credential that reached the child would be rejected by the credential check.
+            let own = command::native_local_credentials(provider);
+            adapter
+                .local_environment
+                .retain(|name, _| !is_pi_credential(name) || own.contains(&name.as_str()));
+        } else {
             adapter
                 .local_environment
                 .retain(|name, _| !is_pi_credential(name));
@@ -198,6 +209,7 @@ impl PiAdapter {
             prefix_arguments: configuration.prefix_arguments,
             workspace: configuration.workspace,
             runtime_home: configuration.runtime_home,
+            local_user_home: configuration.local_user_home,
             contained,
             native_local: !contained && provider.natively_authenticated(),
             base_environment: configuration.base_environment,
@@ -285,7 +297,7 @@ impl PiAdapter {
                 NodeRunnerError::DriverDetail(format!("Pi provider configuration failed: {error}"))
             })?;
         }
-        command(PiCommandRequest {
+        let mut command = command(PiCommandRequest {
             provider: self.provider,
             native_local,
             contained: self.contained,
@@ -297,7 +309,31 @@ impl PiAdapter {
             agent_dir: &agent_dir,
             session_dir: &sessions,
             session_id,
-        })
+        })?;
+        // Every Pi child needs a home: Pi resolves its native agent directory, and its tools their
+        // user-relative state, from `HOME`. A local run uses the invoking user's home so a
+        // native-local lane finds `~/.pi/agent`; a contained run has no user home of its own and
+        // falls back to its private runtime home, matching the capsule base environment.
+        let runtime_home = self
+            .runtime_home
+            .to_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                NodeRunnerError::DriverDetail(
+                    "Pi runtime home is not a valid non-empty platform path".to_owned(),
+                )
+            })?;
+        let provider_home = self
+            .local_user_home
+            .as_deref()
+            .and_then(Path::to_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(runtime_home);
+        command
+            .environment
+            .entry("HOME".to_owned())
+            .or_insert_with(|| provider_home.to_owned());
+        Ok(command)
     }
 
     /// The launch command for one turn, exposed so tests can assert the endpoint and home

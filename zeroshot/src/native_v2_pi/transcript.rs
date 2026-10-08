@@ -46,9 +46,6 @@ pub(crate) struct PiTranscript {
     terminal: Option<Terminal>,
     /// Assistant text blocks of the message currently streaming, keyed by content index.
     blocks: Vec<Option<String>>,
-    /// Assistant text of the last completed message, which becomes the node response.
-    /// `agent_end` may precede automatic retry or queued work, so it is not terminal.
-    settled: bool,
     /// Latest cumulative usage reported by the provider.
     usage: Option<TokenUsageDelta>,
     malformed: usize,
@@ -67,7 +64,6 @@ impl PiTranscript {
             session_id: None,
             terminal: None,
             blocks: Vec::new(),
-            settled: false,
             usage: None,
             malformed: 0,
             redactions,
@@ -75,20 +71,11 @@ impl PiTranscript {
     }
 
     pub(super) fn push(&mut self, chunk: &[u8]) -> Vec<PiEmission> {
-        if self.settled {
-            // Keep framing bytes bounded without retaining more than the shared guard.
-            self.lines.discard();
-            return Vec::new();
-        }
         let records = self.lines.push(chunk);
         self.accept(records)
     }
 
     pub(super) fn finish_stream(&mut self) -> Vec<PiEmission> {
-        if self.settled {
-            self.lines.discard();
-            return Vec::new();
-        }
         self.lines
             .finish()
             .map_or_else(Vec::new, |record| self.accept([record]))
@@ -167,9 +154,6 @@ impl PiTranscript {
                 continue;
             };
             self.accept_record(&value, &mut emissions);
-            if self.settled {
-                break;
-            }
         }
         emissions
     }
