@@ -61,6 +61,10 @@ fn add_submodule(directory: &Path, source: &Path, name: &str) {
 fn git(directory: &Path, arguments: &[&str]) -> String {
     let output = Command::new("git")
         .current_dir(directory)
+        // Keep the fixture hermetic: a developer's global `rerere.enabled` would otherwise
+        // pre-create `.git/rr-cache` and change what these tests observe.
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .args([
             "-c",
             "user.name=Checkpoint tests",
@@ -68,6 +72,8 @@ fn git(directory: &Path, arguments: &[&str]) -> String {
             "user.email=checkpoint@example.invalid",
             "-c",
             "commit.gpgsign=false",
+            "-c",
+            "rerere.enabled=false",
         ])
         .args(arguments)
         .output()

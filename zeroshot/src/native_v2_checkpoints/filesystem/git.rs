@@ -303,7 +303,12 @@ fn git_command(workspace: &Path, working_directory: Option<&Path>) -> Command {
     command.args(["-c", "core.longpaths=true"]);
     command
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_NO_LAZY_FETCH", "1");
+        .env("GIT_NO_LAZY_FETCH", "1")
+        // Snapshot capture and restore must observe the repository, not the invoking user's
+        // global git policy: a developer's `rerere.autoupdate` would otherwise rewrite the
+        // restored index.
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
     command
 }
 
