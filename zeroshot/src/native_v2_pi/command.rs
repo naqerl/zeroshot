@@ -342,7 +342,7 @@ fn accept_bedrock(environment: &BTreeMap<String, String>) -> Result<(), NodeRunn
     if !complete {
         return Err(NodeRunnerError::Driver);
     }
-    validate_absent(environment, &FOREIGN_CREDENTIALS[..4])
+    validate_absent(environment, &FOREIGN_CREDENTIALS)
 }
 
 /// The gateway lane carries a caller-owned endpoint, key, and wire protocol through Pi's own
@@ -378,7 +378,7 @@ fn accept_gateway(environment: &BTreeMap<String, String>) -> Result<(), NodeRunn
     // credential boundary too rather than only once the provider document is built.
     crate::native_v2_pi::provider_document::validate_api(api)
         .map_err(|_| NodeRunnerError::Driver)?;
-    validate_absent(environment, &FOREIGN_CREDENTIALS[..4])
+    validate_absent(environment, &FOREIGN_CREDENTIALS)
 }
 
 /// A present-but-empty declared credential fails closed instead of falling back to a stored login.

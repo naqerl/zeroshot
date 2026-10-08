@@ -306,6 +306,12 @@ fn coverage_contract_pi_local_configuration_only_inherits_its_own_lane_credentia
             .local_environment
             .contains_key("ANTHROPIC_API_KEY")
     );
+    // Its own lane is kept, but a foreign lane's ambient credential is dropped: leaving it in
+    // would be rejected by the credential boundary and fail the whole turn.
+    assert!(
+        !anthropic.local_environment.contains_key("OPENAI_API_KEY"),
+        "a native-local lane must not inherit another lane's credential"
+    );
 
     let openai = PiAdapter::new_local(adapter_configuration(
         PiProvider::OpenAi,
@@ -1207,5 +1213,96 @@ fn coverage_contract_pi_homes_stay_inside_the_private_session_home() {
     assert_eq!(
         super::session_id::session_directory(home),
         home.join("sessions")
+    );
+}
+
+#[test]
+fn coverage_contract_pi_native_local_lane_drops_a_foreign_ambient_credential() {
+    // A native-local lane keeps its own exported key but must not inherit another lane's: the
+    // credential boundary rejects a foreign one, so forwarding it would fail the whole turn.
+    let directory = TestDirectory::new("pi-foreign-ambient");
+    let files = files(&directory);
+    let adapter = PiAdapter::new_local(adapter_configuration(
+        PiProvider::Anthropic,
+        "pi",
+        BTreeMap::from([
+            (
+                "ANTHROPIC_API_KEY".to_owned(),
+                "ambient-anthropic".to_owned(),
+            ),
+            ("OPENAI_API_KEY".to_owned(), "ambient-openai".to_owned()),
+        ]),
+    ))
+    .assert_value();
+    let command = adapter
+        .command_for_test(
+            &invocation(
+                agent_binding("claude-sonnet-4-5", None, SessionScope::Execution, &[]),
+                NodeRole::Worker,
+                resolved(&[], &[]),
+            ),
+            &files,
+            "zs-fixed",
+        )
+        .assert_value_with("a foreign ambient credential must not fail the lane");
+    assert_eq!(
+        command
+            .environment
+            .get("ANTHROPIC_API_KEY")
+            .map(String::as_str),
+        Some("ambient-anthropic")
+    );
+    assert!(!command.environment.contains_key("OPENAI_API_KEY"));
+}
+
+#[test]
+fn coverage_contract_pi_child_receives_the_provider_home() {
+    let directory = TestDirectory::new("pi-home");
+    let files = files(&directory);
+    let driver = invocation(
+        agent_binding("claude-sonnet-4-5", None, SessionScope::Execution, &[]),
+        NodeRole::Worker,
+        resolved(&[], &[]),
+    );
+
+    // A local native-local lane resolves Pi's agent directory from the invoking user's home.
+    let local = PiAdapter::new_local(adapter_configuration(
+        PiProvider::Anthropic,
+        "pi",
+        BTreeMap::new(),
+    ))
+    .assert_value();
+    let local_command = local
+        .command_for_test(&driver, &files, "zs-fixed")
+        .assert_value();
+    assert_eq!(
+        local_command.environment.get("HOME").map(String::as_str),
+        Some("/user")
+    );
+
+    // A hosted lane has no user home, so its private runtime home is the fallback. It also has no
+    // ambient credential, so it must carry a declared one.
+    let hosted = PiAdapter::new(adapter_configuration(
+        PiProvider::Anthropic,
+        "pi",
+        BTreeMap::new(),
+    ))
+    .assert_value();
+    let hosted_driver = invocation(
+        agent_binding(
+            "claude-sonnet-4-5",
+            None,
+            SessionScope::Execution,
+            &["ANTHROPIC_API_KEY"],
+        ),
+        NodeRole::Worker,
+        resolved(&["ANTHROPIC_API_KEY"], &[("ANTHROPIC_API_KEY", "declared")]),
+    );
+    let hosted_command = hosted
+        .command_for_test(&hosted_driver, &files, "zs-fixed")
+        .assert_value();
+    assert_eq!(
+        hosted_command.environment.get("HOME").map(String::as_str),
+        Some("/runtime")
     );
 }
