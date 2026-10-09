@@ -165,8 +165,14 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   bounded SHA-256 of the node-instance or execution identity, because Pi accepts
   `[A-Za-z0-9._-]` with an alphanumeric first and last character and imposes no other bound. Pi reports a failed or aborted model response in its event
   stream while still exiting successfully, so the terminal event's stop reason decides provider
-  success and exit status alone is insufficient. Pi has no response-schema flag, so the shared prompt
-  contract plus local validation remains authoritative and corrections stay bounded to two turns.
+  success and exit status alone is insufficient. Pi exposes no response-schema flag, so the Pi lane
+  carries the machine-readable provider schema in the prompt rather than the `NodeResponseContract`
+  object, and correction turns restate that same schema so the retries converge. The schema dialect
+  follows the lane's wire protocol: the `anthropic` and `bedrock` lanes and a gateway
+  `anthropic-messages` protocol use the neutral schema, while the `openai` and `openrouter` lanes
+  and the gateway `openai-responses`/`openai-completions` protocols use OpenAI strict mode; a
+  gateway lane must name its protocol through `GATEWAY_API`. Local validation remains authoritative
+  and corrections stay bounded to two turns.
 - Copilot uses the pinned CLI's headless JSON-RPC protocol 3, with provider `github` and
   caller-owned model IDs. Structured output and corrections share one session; node-instance
   revisits resume from the current user's `COPILOT_HOME` locally and a private home when contained.

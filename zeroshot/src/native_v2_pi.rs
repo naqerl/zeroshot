@@ -34,7 +34,8 @@ use crate::native_v2_capsule::provider_process::{
 use crate::native_v2_contract::{NodeRuntimeBinding, PiProvider};
 use crate::native_v2_runner::{
     AgentResponse, DriverControl, DriverInvocation, LiveOutput, LiveOutputStream, NodeRunnerError,
-    ResolvedEnvironment, render_agent_prompt, resolve_agent_response,
+    ProviderSchemaDialect, ResolvedEnvironment, render_agent_prompt_with_schema,
+    resolve_agent_response_with_schema,
 };
 use command::{PiCommandRequest, command};
 use provider_document::{
@@ -45,12 +46,42 @@ use session_id::{agent_directory, observe_session, session_directory};
 use transcript::{PiAttempt, PiEmission, PiResult, PiTranscript};
 use turn_process::PiProcessStart;
 
-/// Renders the shared provider-neutral node turn contract.
-fn prompt(invocation: &DriverInvocation) -> Result<String, NodeRunnerError> {
-    render_agent_prompt(
+/// The provider schema dialect that matches the wire protocol a lane actually speaks.
+///
+/// Pi has no response-schema flag, so the schema travels in the prompt. The dialect still has to
+/// describe optional fields the way the resolver accepts them, so it follows the lane's protocol:
+/// the built-in `openai` lane uses Responses and the `openrouter` lane uses OpenAI-compatible chat
+/// completions, while the `anthropic` and `amazon-bedrock` lanes have no OpenAI strict mode and so
+/// use the neutral schema. The gateway lane's protocol is caller-owned and named by `GATEWAY_API`,
+/// never inferred from the opaque model identifier.
+fn schema_dialect(
+    provider: PiProvider,
+    resolved: &ResolvedEnvironment,
+) -> Result<ProviderSchemaDialect, NodeRunnerError> {
+    Ok(match provider {
+        PiProvider::Anthropic | PiProvider::Bedrock => ProviderSchemaDialect::Standard,
+        PiProvider::OpenAi | PiProvider::OpenRouter => ProviderSchemaDialect::OpenAiStrict,
+        PiProvider::Gateway => match declared_api(resolved, command::GATEWAY_API)?.as_str() {
+            "anthropic-messages" => ProviderSchemaDialect::Standard,
+            _ => ProviderSchemaDialect::OpenAiStrict,
+        },
+    })
+}
+
+/// Renders the shared provider-neutral node turn with the machine-readable response schema.
+///
+/// Pi has no response-schema flag, so the schema travels in the prompt. The contract object is
+/// deliberately not shown: its `kind` discriminator is runtime bookkeeping that Pi otherwise copies
+/// into its final response.
+fn prompt(
+    dialect: ProviderSchemaDialect,
+    invocation: &DriverInvocation,
+) -> Result<String, NodeRunnerError> {
+    render_agent_prompt_with_schema(
         invocation.agent_instructions()?,
         &invocation.node.input,
         &invocation.response,
+        dialect,
     )
     .map_err(|error| with_driver_detail(error, "Pi prompt could not be serialized"))
 }
@@ -400,7 +431,7 @@ impl PiAdapter {
             PiAttempt::Complete(result) => {
                 observe_session(result.session_id.as_deref(), &expected)
                     .map_err(|detail| NodeRunnerError::DriverDetail(detail.to_owned()))?;
-                resolve_pi_response(turn, result, &redactions).await
+                resolve_pi_response(turn, result, &redactions, state.dialect).await
             }
             PiAttempt::Failed(failure) => {
                 observe_session(failure.session_id.as_deref(), &expected)
@@ -453,8 +484,10 @@ async fn resolve_pi_response(
     turn: &PiTurn<'_>,
     result: PiResult,
     redactions: &[String],
+    dialect: ProviderSchemaDialect,
 ) -> Result<PiTurnAdvance, NodeRunnerError> {
-    let response = resolve_agent_response(&turn.invocation.response, &result.message)?;
+    let response =
+        resolve_agent_response_with_schema(&turn.invocation.response, &result.message, dialect)?;
     if let Some(error) = response.correction_error() {
         report_provider_error("Pi", &error, redactions, turn.control).await?;
     }

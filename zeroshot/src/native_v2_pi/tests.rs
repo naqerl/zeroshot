@@ -24,7 +24,8 @@ use crate::native_v2_contract::{
     NodeInvocation, NodeRuntimeBinding, PiProvider,
 };
 use crate::native_v2_runner::{
-    DriverInvocation, NodeResponseContract, NodeRole, NodeSession, ResolvedEnvironment,
+    DriverInvocation, NodeResponseContract, NodeRole, NodeSession, ProviderSchemaDialect,
+    ResolvedEnvironment,
 };
 use crate::worker_catalog::{ModelId, ReasoningEffort};
 
@@ -255,6 +256,86 @@ fn coverage_contract_pi_local_configuration_rejects_an_empty_executable() {
         )),
         Err(PiAdapterConfigError::EmptyExecutable)
     ));
+}
+
+#[test]
+fn coverage_contract_pi_prompt_carries_the_response_schema_not_the_contract() {
+    // This mirrors the failing gateway lane: the model previously saw only the contract object and
+    // copied its `kind` discriminator into the final response.
+    let fields = ["GATEWAY_BASE_URL", "GATEWAY_API_KEY", "GATEWAY_API"];
+    let environment = resolved(
+        &fields,
+        &[
+            ("GATEWAY_BASE_URL", "https://gateway.example/v1"),
+            ("GATEWAY_API_KEY", "sk-gateway"),
+            ("GATEWAY_API", "openai-completions"),
+        ],
+    );
+    let invocation = invocation(
+        agent_binding(
+            "deepseek-v4.1-flash",
+            None,
+            SessionScope::Execution,
+            &fields,
+        ),
+        NodeRole::Worker,
+        environment,
+    );
+    let dialect =
+        super::schema_dialect(PiProvider::Gateway, &invocation.environment).assert_value();
+    assert_eq!(dialect, ProviderSchemaDialect::OpenAiStrict);
+    let prompt = super::prompt(dialect, &invocation).assert_value();
+    let schema = invocation.response.provider_schema(dialect);
+    assert!(prompt.contains(&serde_json::to_string(&schema).assert_value()));
+    assert!(prompt.contains("Runtime-owned response schema:"));
+    assert!(prompt.contains("never return the schema itself"));
+    assert!(!prompt.contains("Runtime-owned response contract:"));
+    assert!(!prompt.contains("\"kind\":\"worker\""));
+}
+
+#[test]
+fn coverage_contract_pi_schema_dialect_matches_the_wire_protocol() {
+    let gateway = |api: &str| {
+        super::schema_dialect(
+            PiProvider::Gateway,
+            &resolved(
+                &["GATEWAY_BASE_URL", "GATEWAY_API_KEY", "GATEWAY_API"],
+                &[
+                    ("GATEWAY_BASE_URL", "https://gateway.example/v1"),
+                    ("GATEWAY_API_KEY", "sk-gateway"),
+                    ("GATEWAY_API", api),
+                ],
+            ),
+        )
+        .assert_value()
+    };
+    // Anthropic Messages has no strict-schema mode; both OpenAI protocols do.
+    assert_eq!(
+        gateway("anthropic-messages"),
+        ProviderSchemaDialect::Standard
+    );
+    assert_eq!(
+        gateway("openai-responses"),
+        ProviderSchemaDialect::OpenAiStrict
+    );
+    assert_eq!(
+        gateway("openai-completions"),
+        ProviderSchemaDialect::OpenAiStrict
+    );
+    for (provider, expected) in [
+        (PiProvider::Anthropic, ProviderSchemaDialect::Standard),
+        (PiProvider::Bedrock, ProviderSchemaDialect::Standard),
+        (PiProvider::OpenAi, ProviderSchemaDialect::OpenAiStrict),
+        (PiProvider::OpenRouter, ProviderSchemaDialect::OpenAiStrict),
+    ] {
+        assert_eq!(
+            super::schema_dialect(provider, &resolved(&[], &[])).assert_value(),
+            expected,
+            "unexpected dialect for {provider:?}"
+        );
+    }
+    // A gateway lane must name its protocol rather than guessing a neutral one.
+    assert!(super::schema_dialect(PiProvider::Gateway, &resolved(&[], &[])).is_err());
 }
 
 #[test]
