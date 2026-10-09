@@ -26,6 +26,10 @@ use super::{
     ForgeTargetIntegration, ForgeTargetReconciliation,
 };
 
+mod policy;
+
+use policy::GiteaPolicySnapshot;
+
 const DEFAULT_API_DEADLINE: Duration = Duration::from_secs(2 * 60);
 const DEFAULT_PUSH_DEADLINE: Duration = Duration::from_secs(10 * 60);
 const MAX_RESPONSE_BYTES: usize = 1_048_576;
@@ -372,20 +376,133 @@ impl GiteaDeliveryAuthority {
         decode(value)
     }
 
-    async fn checks(
+    async fn commit_status(
         &self,
         repository: &str,
         revision: &str,
         credential: ForgeCredential<'_>,
-    ) -> Result<ForgeChecks, ForgeAuthorityError> {
+    ) -> Result<StatusWire, ForgeAuthorityError> {
         let value = self
             .rest(RestCall::get(
                 format!("/repos/{repository}/commits/{revision}/status"),
                 credential,
             ))
             .await?;
-        let wire: StatusWire = decode(value)?;
-        Ok(classify_checks(&wire))
+        decode(value)
+    }
+
+    /// Read the base branch's protection rule, if any.
+    ///
+    /// Gitea addresses a protection rule by a single path segment, so wildcard rules and branch
+    /// names containing `/` are not addressable through this by-name route. Gitea has no ruleset
+    /// concept and no linear-history requirement to reconcile either.
+    async fn branch_protection(
+        &self,
+        repository: &str,
+        branch: &str,
+        credential: ForgeCredential<'_>,
+    ) -> Result<Option<BranchProtectionWire>, ForgeAuthorityError> {
+        match self
+            .rest(RestCall::get(
+                format!(
+                    "/repos/{repository}/branch_protections/{}",
+                    encode_base_segment(branch)
+                ),
+                credential,
+            ))
+            .await
+        {
+            Ok(value) => Ok(Some(decode(value)?)),
+            Err(error) if error.api_status() == Some(404) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn review_summaries(
+        &self,
+        repository: &str,
+        review_id: &str,
+        credential: ForgeCredential<'_>,
+    ) -> Result<Vec<ReviewWire>, ForgeAuthorityError> {
+        self.rest_pages(
+            format!("/repos/{repository}/pulls/{review_id}/reviews"),
+            credential,
+        )
+        .await
+    }
+
+    /// Reconstruct the closest GitHub merge-policy snapshot from Gitea's REST surface.
+    async fn policy_read(
+        &self,
+        review: &ForgeReviewReceipt,
+        credential: ForgeCredential<'_>,
+    ) -> Result<GiteaPolicyRead, ForgeAuthorityError> {
+        let repository = review.repository.as_str();
+        let pull = self
+            .observe_pull(repository, &review.review_id, credential)
+            .await?;
+        let snapshot = match classify_pull_state(&pull)? {
+            ForgeReviewState::Open { .. } => {
+                let protection = self
+                    .branch_protection(repository, &pull.base.reference, credential)
+                    .await?;
+                // Reviews are only read when the protection rule actually consumes them, matching
+                // GitHub's single policy query and keeping unrelated reads off the wire.
+                let reviews = match protection.as_ref() {
+                    Some(protection)
+                        if protection.required_approvals > 0
+                            || protection.block_on_rejected_reviews =>
+                    {
+                        self.review_summaries(repository, &review.review_id, credential)
+                            .await?
+                    }
+                    _ => Vec::new(),
+                };
+                // Checks stay pinned to the admitted review revision, matching the previous
+                // behaviour even though Gitea would also expose the current pull head.
+                let status = self
+                    .commit_status(repository, &review.head_revision, credential)
+                    .await?;
+                policy::classify_open_snapshot(&pull, protection.as_ref(), &reviews, &status)?
+            }
+            terminal => GiteaPolicySnapshot {
+                state: terminal,
+                pull_request_ready: false,
+            },
+        };
+        Ok(GiteaPolicyRead { pull, snapshot })
+    }
+
+    async fn repository_policy(
+        &self,
+        repository: &str,
+        credential: ForgeCredential<'_>,
+    ) -> Result<RepositoryPolicyWire, ForgeAuthorityError> {
+        let value = self
+            .rest(RestCall::get(format!("/repos/{repository}"), credential))
+            .await?;
+        decode(value)
+    }
+
+    /// Re-read the pull request after a rejected merge and reconcile the observed state.
+    ///
+    /// Mirrors GitHub's `classify_rejected_merge`: a merged pull request is an accepted delivery
+    /// (a lost response), a genuinely conflicting pull request is routable, and anything else is a
+    /// permanent policy refusal whose diagnostic the caller preserves.
+    async fn classify_rejected_merge(
+        &self,
+        repository: &str,
+        review_id: &str,
+        credential: ForgeCredential<'_>,
+    ) -> Result<ForgeMergeRequestOutcome, ForgeAuthorityError> {
+        let pull = self.observe_pull(repository, review_id, credential).await?;
+        if pull.state == "closed" && pull.merged {
+            return Ok(ForgeMergeRequestOutcome::Accepted);
+        }
+        if pull.state == "open" && pull.mergeable == Some(false) {
+            return Ok(ForgeMergeRequestOutcome::Conflict);
+        }
+        Err(ForgeAuthorityError::Rejected)
     }
 
     async fn confirm_pushed_head(
@@ -1126,10 +1243,8 @@ impl DeliveryForgeAuthority for GiteaDeliveryAuthority {
         review: &ForgeReviewReceipt,
         credential: ForgeCredential<'_>,
     ) -> Result<ForgeReviewObservation, ForgeAuthorityError> {
-        let wire = self
-            .observe_pull(&review.repository, &review.review_id, credential)
-            .await?;
-        let receipt = receipt_from_pull(&wire, &review.repository)?;
+        let read = self.policy_read(review, credential).await?;
+        let receipt = receipt_from_pull(&read.pull, &review.repository)?;
         if receipt.review_id != review.review_id
             || receipt.head_branch != review.head_branch
             || receipt.target_branch != review.target_branch
@@ -1138,36 +1253,13 @@ impl DeliveryForgeAuthority for GiteaDeliveryAuthority {
                 "Gitea review identity changed during inspection",
             ));
         }
-        match wire.state.as_str() {
-            "closed" if wire.merged => {
-                let revision = wire
-                    .merge_commit_sha
-                    .filter(|revision| valid_revision(revision))
-                    .ok_or(ForgeAuthorityError::Rejected)?;
-                Ok(receipt.observation(ForgeReviewState::Merged {
-                    merge_revision: revision,
-                }))
-            }
-            "closed" => Ok(receipt.observation(ForgeReviewState::Closed)),
-            "open" => {
-                if wire.mergeable == Some(false) {
-                    return Ok(receipt.observation(ForgeReviewState::Conflict));
-                }
-                let checks = self
-                    .checks(&review.repository, &review.head_revision, credential)
-                    .await?;
-                // Gitea has no separate merge-policy/approval gate to report, so passing checks
-                // are immediately mergeable. Reporting `pull_request_ready = false` keeps merge
-                // modes on the `Mergeable` path instead of waiting forever for a policy step that
-                // never arrives.
-                Ok(receipt.observation_with_readiness(
-                    ForgeReviewState::Open { checks },
-                    false,
-                    false,
-                ))
-            }
-            _ => Err(ForgeAuthorityError::Rejected),
-        }
+        // Gitea exposes no operation to advance a pull request head, so `head_update_required` is
+        // always false; a required up-to-date head surfaces as a typed refusal from `policy_read`.
+        Ok(receipt.observation_with_readiness(
+            read.snapshot.state,
+            read.snapshot.pull_request_ready,
+            false,
+        ))
     }
 
     async fn inspect_review_feedback(
@@ -1222,17 +1314,15 @@ impl DeliveryForgeAuthority for GiteaDeliveryAuthority {
         review: &ForgeReviewReceipt,
         credential: ForgeCredential<'_>,
     ) -> Result<ForgeMergeRequestOutcome, ForgeAuthorityError> {
-        let wire = self
-            .observe_pull(&review.repository, &review.review_id, credential)
+        let read = self.policy_read(review, credential).await?;
+        if let Some(outcome) = gitea_merge_action(&read.snapshot)? {
+            return Ok(outcome);
+        }
+        let policy = self
+            .repository_policy(&review.repository, credential)
             .await?;
-        match wire.state.as_str() {
-            "closed" if wire.merged => return Ok(ForgeMergeRequestOutcome::Accepted),
-            "closed" => return Err(ForgeAuthorityError::Rejected),
-            _ => {}
-        }
-        if wire.mergeable == Some(false) {
-            return Ok(ForgeMergeRequestOutcome::Conflict);
-        }
+        let method = policy::select_merge_method(&policy)?;
+        let body = merge_request_body(method, &read.pull, review);
         match self
             .rest(
                 RestCall::get(
@@ -1243,27 +1333,21 @@ impl DeliveryForgeAuthority for GiteaDeliveryAuthority {
                     credential,
                 )
                 .method(Method::POST)
-                .body(json!({
-                    "Do": "merge",
-                    "MergeTitleField": review.head_revision,
-                    "MergeMessageField": review.head_revision,
-                })),
+                .body(body),
             )
             .await
         {
             Ok(_) => Ok(ForgeMergeRequestOutcome::Accepted),
-            Err(error) if error.api_status() == Some(409) => Ok(ForgeMergeRequestOutcome::Conflict),
             Err(error) => match self
-                .observe_pull(&review.repository, &review.review_id, credential)
+                .classify_rejected_merge(&review.repository, &review.review_id, credential)
                 .await
             {
-                Ok(observed) if observed.state == "closed" && observed.merged => {
-                    Ok(ForgeMergeRequestOutcome::Accepted)
-                }
-                Ok(observed) if observed.mergeable == Some(false) => {
-                    Ok(ForgeMergeRequestOutcome::Conflict)
-                }
-                _ => Err(error),
+                Ok(outcome) => Ok(outcome),
+                Err(_) => Err(error.with_context(format!(
+                    "Merge request for {}#{} into {} using {:?} failed. Check the Gitea/Forgejo \
+                     rejection and base-branch policy before retrying delivery.",
+                    review.repository, review.review_id, review.target_branch, method,
+                ))),
             },
         }
     }
@@ -1306,13 +1390,55 @@ struct PullWire {
     base: RefWire,
     #[serde(default)]
     mergeable: Option<bool>,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    merge_base: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct StatusWire {
     state: String,
     #[serde(default)]
-    statuses: Vec<Value>,
+    statuses: Vec<StatusContextWire>,
+}
+
+#[derive(Deserialize)]
+struct StatusContextWire {
+    #[serde(default)]
+    context: String,
+    #[serde(default)]
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct RepositoryPolicyWire {
+    #[serde(default)]
+    allow_merge_commits: bool,
+    #[serde(default)]
+    allow_squash_merge: bool,
+    #[serde(default)]
+    allow_rebase: bool,
+    #[serde(default)]
+    allow_rebase_explicit: bool,
+}
+
+#[derive(Deserialize, Default)]
+struct BranchProtectionWire {
+    #[serde(default)]
+    enable_status_check: bool,
+    #[serde(default)]
+    status_check_contexts: Vec<String>,
+    #[serde(default)]
+    required_approvals: i64,
+    #[serde(default)]
+    block_on_outdated_branch: bool,
+    #[serde(default)]
+    block_on_rejected_reviews: bool,
+    #[serde(default)]
+    require_signed_commits: bool,
 }
 
 #[derive(Deserialize)]
@@ -1342,6 +1468,10 @@ struct ReviewWire {
     user: UserWire,
     #[serde(default)]
     body: Option<String>,
+    #[serde(default)]
+    official: bool,
+    #[serde(default)]
+    dismissed: bool,
 }
 
 #[derive(Deserialize)]
@@ -1586,6 +1716,52 @@ fn classify_checks(wire: &StatusWire) -> ForgeChecks {
         },
         _ => ForgeChecks::Pending,
     }
+}
+
+struct GiteaPolicyRead {
+    pull: PullWire,
+    snapshot: GiteaPolicySnapshot,
+}
+
+/// Map a reconstructed Gitea policy snapshot onto the shared merge outcome.
+///
+/// Mirrors GitHub's `merge_action`: an already-merged or conflicting pull request is terminal, a
+/// policy-blocked pull request reports `Pending`, and a ready pull request returns `None` so the
+/// caller submits the merge.
+fn gitea_merge_action(
+    snapshot: &GiteaPolicySnapshot,
+) -> Result<Option<ForgeMergeRequestOutcome>, ForgeAuthorityError> {
+    let outcome = match (&snapshot.state, snapshot.pull_request_ready) {
+        (ForgeReviewState::Merged { .. }, _) => Some(ForgeMergeRequestOutcome::Accepted),
+        (ForgeReviewState::Conflict, _) => Some(ForgeMergeRequestOutcome::Conflict),
+        (
+            ForgeReviewState::Open {
+                checks: ForgeChecks::NotRequired | ForgeChecks::Passed,
+            },
+            false,
+        ) => None,
+        (ForgeReviewState::Open { .. }, _) => Some(ForgeMergeRequestOutcome::Pending),
+        (ForgeReviewState::Closed, _) => return Err(ForgeAuthorityError::Rejected),
+    };
+    Ok(outcome)
+}
+
+fn merge_request_body(
+    method: policy::GiteaMergeMethod,
+    pull: &PullWire,
+    review: &ForgeReviewReceipt,
+) -> Value {
+    // Gitea writes the merge message itself, so only the pull request title is forwarded. The
+    // reviewed head revision is pinned with `head_commit_id`; the head SHA is never used as the
+    // title or message.
+    let mut body = json!({
+        "Do": method.do_value(),
+        "head_commit_id": review.head_revision,
+    });
+    if !pull.title.is_empty() {
+        body["MergeTitleField"] = json!(pull.title);
+    }
+    body
 }
 
 fn require_consistent_head(

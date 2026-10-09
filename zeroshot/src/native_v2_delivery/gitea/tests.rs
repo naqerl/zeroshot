@@ -52,9 +52,26 @@ fn pull(
         head: reference("zeroshot/run/42", HEAD),
         base: reference("main", OTHER),
         mergeable,
+        title: "Delivery candidate".to_owned(),
+        draft: false,
+        merge_base: Some(OTHER.to_owned()),
     }
 }
 
+fn recorded_field(request: &str, field: &str) -> Value {
+    let value: Value = serde_json::from_str(request).expect("JSON request body");
+    value.get(field).cloned().unwrap_or(Value::Null)
+}
+
+fn merge_request_body(server: &TestGitea) -> Value {
+    let requests = server.requests();
+    let bodies = server.request_bodies();
+    let index = requests
+        .iter()
+        .position(|(method, target)| method == "POST" && target.ends_with("/merge"))
+        .expect("merge request");
+    serde_json::from_str(&bodies[index]).expect("JSON merge body")
+}
 #[test]
 fn combined_commit_status_maps_to_checks() {
     let empty = StatusWire {
@@ -65,19 +82,28 @@ fn combined_commit_status_maps_to_checks() {
 
     let passed = StatusWire {
         state: "success".to_owned(),
-        statuses: vec![json!({"status": "success"})],
+        statuses: vec![StatusContextWire {
+            context: "ci/build".to_owned(),
+            status: "success".to_owned(),
+        }],
     };
     assert_eq!(classify_checks(&passed), ForgeChecks::Passed);
 
     let pending = StatusWire {
         state: "pending".to_owned(),
-        statuses: vec![json!({"status": "pending"})],
+        statuses: vec![StatusContextWire {
+            context: "ci/build".to_owned(),
+            status: "pending".to_owned(),
+        }],
     };
     assert_eq!(classify_checks(&pending), ForgeChecks::Pending);
 
     let failed = StatusWire {
         state: "failure".to_owned(),
-        statuses: vec![json!({"status": "failure"})],
+        statuses: vec![StatusContextWire {
+            context: "ci/build".to_owned(),
+            status: "failure".to_owned(),
+        }],
     };
     assert!(matches!(
         classify_checks(&failed),
@@ -109,6 +135,254 @@ fn pull_state_classification_is_terminal_aware() {
     );
     assert!(classify_pull_state(&pull("closed", true, None, None)).is_err());
     assert!(classify_pull_state(&pull("weird", false, None, None)).is_err());
+}
+
+fn repository_policy(
+    merge: bool,
+    squash: bool,
+    rebase: bool,
+    rebase_explicit: bool,
+) -> RepositoryPolicyWire {
+    RepositoryPolicyWire {
+        allow_merge_commits: merge,
+        allow_squash_merge: squash,
+        allow_rebase: rebase,
+        allow_rebase_explicit: rebase_explicit,
+    }
+}
+
+fn protection_wire(contexts: &[&str], approvals: i64) -> BranchProtectionWire {
+    BranchProtectionWire {
+        enable_status_check: !contexts.is_empty(),
+        status_check_contexts: contexts
+            .iter()
+            .map(|context| (*context).to_owned())
+            .collect(),
+        required_approvals: approvals,
+        ..BranchProtectionWire::default()
+    }
+}
+
+fn review(state: &str, official: bool, dismissed: bool, login: &str) -> ReviewWire {
+    ReviewWire {
+        id: 1,
+        state: state.to_owned(),
+        submitted_at: None,
+        commit_id: None,
+        user: UserWire {
+            login: login.to_owned(),
+        },
+        body: None,
+        official,
+        dismissed,
+    }
+}
+
+fn status(state: &str, contexts: &[(&str, &str)]) -> StatusWire {
+    StatusWire {
+        state: state.to_owned(),
+        statuses: contexts
+            .iter()
+            .map(|(context, status)| StatusContextWire {
+                context: (*context).to_owned(),
+                status: (*status).to_owned(),
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn merge_method_selection_matches_github_order() {
+    // Each single allowed method selects itself.
+    assert_eq!(
+        policy::select_merge_method(&repository_policy(true, false, false, false)).expect("merge"),
+        policy::GiteaMergeMethod::Merge
+    );
+    assert_eq!(
+        policy::select_merge_method(&repository_policy(false, true, false, false)).expect("squash"),
+        policy::GiteaMergeMethod::Squash
+    );
+    assert_eq!(
+        policy::select_merge_method(&repository_policy(false, false, true, false)).expect("rebase"),
+        policy::GiteaMergeMethod::Rebase
+    );
+    // Several allowed methods resolve in GitHub's merge, squash, rebase order.
+    assert_eq!(
+        policy::select_merge_method(&repository_policy(true, true, true, true)).expect("merge"),
+        policy::GiteaMergeMethod::Merge
+    );
+    assert_eq!(
+        policy::select_merge_method(&repository_policy(true, true, false, false)).expect("merge"),
+        policy::GiteaMergeMethod::Merge
+    );
+    assert_eq!(
+        policy::select_merge_method(&repository_policy(false, true, true, false)).expect("squash"),
+        policy::GiteaMergeMethod::Squash
+    );
+    assert_eq!(
+        policy::select_merge_method(&repository_policy(false, false, true, true)).expect("rebase"),
+        policy::GiteaMergeMethod::Rebase
+    );
+    assert_eq!(policy::GiteaMergeMethod::Squash.do_value(), "squash");
+
+    let none = policy::select_merge_method(&repository_policy(false, false, false, false))
+        .expect_err("no method");
+    assert!(none.to_string().contains("No merge method"));
+    assert!(!none.retryable_operation());
+
+    let rebase_merge = policy::select_merge_method(&repository_policy(false, false, false, true))
+        .expect_err("rebase-merge only");
+    assert!(rebase_merge.to_string().contains("rebase-merge"));
+    assert!(!rebase_merge.retryable_operation());
+}
+
+#[test]
+fn required_checks_gate_on_protection_contexts() {
+    let pull = pull("open", false, None, Some(true));
+    let passed = status("success", &[("ci/build", "success")]);
+    let missing = status("success", &[("other", "success")]);
+    let failed = status("failure", &[("ci/build", "failure")]);
+
+    let protection = protection_wire(&["ci/build"], 0);
+    let ready =
+        policy::classify_open_snapshot(&pull, Some(&protection), &[], &passed).expect("ready");
+    assert_eq!(
+        ready.state,
+        ForgeReviewState::Open {
+            checks: ForgeChecks::Passed
+        }
+    );
+
+    let waiting =
+        policy::classify_open_snapshot(&pull, Some(&protection), &[], &missing).expect("waiting");
+    assert_eq!(
+        waiting.state,
+        ForgeReviewState::Open {
+            checks: ForgeChecks::Pending
+        }
+    );
+
+    let failed =
+        policy::classify_open_snapshot(&pull, Some(&protection), &[], &failed).expect("failed");
+    assert!(matches!(
+        failed.state,
+        ForgeReviewState::Open {
+            checks: ForgeChecks::Failed { .. }
+        }
+    ));
+    assert!(!failed.pull_request_ready);
+
+    // Without protection contexts, the combined commit status is preserved.
+    let fallback = policy::classify_open_snapshot(&pull, None, &[], &status("success", &[]))
+        .expect("fallback");
+    assert_eq!(
+        fallback.state,
+        ForgeReviewState::Open {
+            checks: ForgeChecks::NotRequired
+        }
+    );
+}
+
+#[test]
+fn required_approvals_and_rejected_reviews_gate_merge() {
+    let pull = pull("open", false, None, Some(true));
+    let passed = status("success", &[("ci/build", "success")]);
+    let protection = protection_wire(&[], 1);
+
+    let missing = policy::classify_open_snapshot(&pull, Some(&protection), &[], &passed)
+        .expect("missing approval");
+    assert!(missing.pull_request_ready);
+    assert_eq!(
+        missing.state,
+        ForgeReviewState::Open {
+            checks: ForgeChecks::Passed
+        }
+    );
+
+    let dismissed = review("APPROVED", true, true, "alice");
+    let unofficial = review("APPROVED", false, false, "bob");
+    let met = policy::classify_open_snapshot(
+        &pull,
+        Some(&protection),
+        &[
+            dismissed,
+            unofficial,
+            review("APPROVED", true, false, "carol"),
+        ],
+        &passed,
+    )
+    .expect("approved");
+    assert!(!met.pull_request_ready);
+    assert_eq!(
+        met.state,
+        ForgeReviewState::Open {
+            checks: ForgeChecks::Passed
+        }
+    );
+
+    // Distinct approvers are required; a repeated approver does not satisfy two approvals.
+    let two = protection_wire(&[], 2);
+    let repeated = policy::classify_open_snapshot(
+        &pull,
+        Some(&two),
+        &[
+            review("APPROVED", true, false, "carol"),
+            review("APPROVED", true, false, "carol"),
+        ],
+        &passed,
+    )
+    .expect("repeated approver");
+    assert!(repeated.pull_request_ready);
+
+    let mut rejected = protection_wire(&[], 0);
+    rejected.block_on_rejected_reviews = true;
+    let blocked = policy::classify_open_snapshot(
+        &pull,
+        Some(&rejected),
+        &[review("REQUEST_CHANGES", true, false, "dave")],
+        &passed,
+    )
+    .expect("rejected review");
+    assert!(!blocked.pull_request_ready);
+    assert_eq!(
+        blocked.state,
+        ForgeReviewState::Open {
+            checks: ForgeChecks::Pending
+        }
+    );
+}
+
+#[test]
+fn outdated_branch_and_signature_policy_are_handled() {
+    let mut behind = pull("open", false, None, Some(true));
+    behind.merge_base = Some(HEAD.to_owned());
+    let passed = status("success", &[("ci/build", "success")]);
+    let mut outdated = protection_wire(&[], 0);
+    outdated.block_on_outdated_branch = true;
+    let refusal = policy::classify_open_snapshot(&behind, Some(&outdated), &[], &passed)
+        .expect_err("outdated branch");
+    assert!(refusal.to_string().contains("updatePullRequestBranch"));
+    assert!(!refusal.retryable_operation());
+
+    // A current head is not refused.
+    let current = pull("open", false, None, Some(true));
+    let snapshot =
+        policy::classify_open_snapshot(&current, Some(&outdated), &[], &passed).expect("current");
+    assert!(!snapshot.pull_request_ready);
+
+    // Signatures disable the readiness handoff but never the merge gate itself; a real rejection
+    // still flows through the failure classifier.
+    let mut signed = protection_wire(&[], 0);
+    signed.require_signed_commits = true;
+    let snapshot =
+        policy::classify_open_snapshot(&current, Some(&signed), &[], &passed).expect("signed");
+    assert!(!snapshot.pull_request_ready);
+    assert_eq!(
+        snapshot.state,
+        ForgeReviewState::Open {
+            checks: ForgeChecks::Passed
+        }
+    );
 }
 
 #[test]
@@ -366,6 +640,7 @@ async fn inspect_review_reads_branch_checks() {
             })
             .to_string(),
         ),
+        (404, json!({"message": "no protection"}).to_string()),
         (
             200,
             json!({"state": "success", "statuses": [{"status": "success"}]}).to_string(),
@@ -383,7 +658,8 @@ async fn inspect_review_reads_branch_checks() {
         .inspect_review(&receipt, credential())
         .await
         .expect("observation");
-    // Gitea has no merge-policy gate, so passing checks are mergeable and never "PR ready".
+    // Without a protection rule there is no approval gate, so passing checks are mergeable and
+    // never reported as a pull-request-readiness handoff.
     assert!(!observation.pull_request_ready);
     assert_eq!(
         observation.state,
@@ -394,6 +670,10 @@ async fn inspect_review_reads_branch_checks() {
     let requests = server.requests();
     assert_eq!(
         requests[1].1,
+        "/api/v1/repos/acme/project/branch_protections/main"
+    );
+    assert_eq!(
+        requests[2].1,
         format!("/api/v1/repos/acme/project/commits/{HEAD}/status")
     );
 }
@@ -589,6 +869,22 @@ async fn request_merge_accepts_once_gitea_merges() {
                 "head": {"ref": "zeroshot/run/42", "sha": HEAD},
                 "base": {"ref": "main", "sha": OTHER},
                 "mergeable": true,
+                "title": "Delivery candidate",
+            })
+            .to_string(),
+        ),
+        (404, json!({"message": "no protection"}).to_string()),
+        (
+            200,
+            json!({"state": "success", "statuses": [{"status": "success"}]}).to_string(),
+        ),
+        (
+            200,
+            json!({
+                "allow_merge_commits": true,
+                "allow_squash_merge": true,
+                "allow_rebase": true,
+                "allow_rebase_explicit": false,
             })
             .to_string(),
         ),
@@ -610,8 +906,22 @@ async fn request_merge_accepts_once_gitea_merges() {
         ForgeMergeRequestOutcome::Accepted
     );
     let requests = server.requests();
-    assert_eq!(requests[1].0, "POST");
-    assert_eq!(requests[1].1, "/api/v1/repos/acme/project/pulls/7/merge");
+    assert_eq!(requests[4].0, "POST");
+    assert_eq!(requests[4].1, "/api/v1/repos/acme/project/pulls/7/merge");
+    let bodies = server.request_bodies();
+    assert_eq!(recorded_field(&bodies[4], "Do"), json!("merge"));
+    assert_eq!(recorded_field(&bodies[4], "head_commit_id"), json!(HEAD));
+    assert_eq!(
+        recorded_field(&bodies[4], "MergeTitleField"),
+        json!("Delivery candidate")
+    );
+    assert_eq!(recorded_field(&bodies[4], "MergeMessageField"), Value::Null);
+    // `merge_when_checks_succeed` defers the merge server-side and would let delivery report a
+    // merge that has not happened, so it must never appear on the request.
+    assert_eq!(
+        recorded_field(&bodies[4], "MergeWhenChecksSucceed"),
+        Value::Null
+    );
 }
 
 const MERGE_SHA: &str = "cccccccccccccccccccccccccccccccccccccccc";
@@ -638,6 +948,17 @@ enum Scenario {
     CredentialExpires,
     ReviewSyncRace,
     ReviewIdentityMismatch,
+    SquashOnly,
+    RebaseMergeOnly,
+    MissingApproval,
+    Approved,
+    RejectedReview,
+    RequiresSignatures,
+    OutdatedBranch,
+    RequiredContextMissing,
+    RequiredContextFailed,
+    MergeConflictRace,
+    MergeLostResponse,
 }
 
 struct GiteaState {
@@ -675,6 +996,9 @@ impl PullState {
             "head": {"ref": self.head_ref, "sha": self.head_sha},
             "base": {"ref": self.base_ref, "sha": self.base_sha},
             "mergeable": self.mergeable,
+            "title": "Gitea delivery candidate",
+            "draft": false,
+            "merge_base": self.base_sha,
         })
     }
 }
@@ -726,6 +1050,15 @@ impl GiteaState {
         match self.scenario {
             Scenario::NoChecks => "{\"state\":\"success\",\"statuses\":[]}",
             Scenario::CiFailed => "{\"state\":\"failure\",\"statuses\":[{\"status\":\"failure\"}]}",
+            Scenario::RequiredContextMissing => {
+                "{\"state\":\"success\",\"statuses\":[{\"context\":\"other\",\"status\":\"success\"}]}"
+            }
+            Scenario::RequiredContextFailed => {
+                "{\"state\":\"failure\",\"statuses\":[{\"context\":\"ci/build\",\"status\":\"failure\"}]}"
+            }
+            Scenario::MissingApproval | Scenario::Approved => {
+                "{\"state\":\"success\",\"statuses\":[{\"context\":\"ci/build\",\"status\":\"success\"}]}"
+            }
             Scenario::RegistrationRace if read == 1 => {
                 "{\"state\":\"pending\",\"statuses\":[{\"status\":\"pending\"}]}"
             }
@@ -759,7 +1092,7 @@ struct RecordedRequest {
 
 struct TestGitea {
     base_url: String,
-    recorded: Arc<Mutex<Vec<(String, String)>>>,
+    recorded: Arc<Mutex<Vec<RecordedRequest>>>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
     state: Option<Arc<GiteaState>>,
@@ -813,7 +1146,21 @@ impl TestGitea {
     }
 
     fn requests(&self) -> Vec<(String, String)> {
-        self.recorded.lock().expect("recorded").clone()
+        self.recorded
+            .lock()
+            .expect("recorded")
+            .iter()
+            .map(|request| (request.method.clone(), request.target.clone()))
+            .collect()
+    }
+
+    fn request_bodies(&self) -> Vec<String> {
+        self.recorded
+            .lock()
+            .expect("recorded")
+            .iter()
+            .map(|request| request.body.clone())
+            .collect()
     }
 
     fn state(&self) -> &Arc<GiteaState> {
@@ -833,14 +1180,10 @@ impl Drop for TestGitea {
 fn serve(
     stream: &mut TcpStream,
     responses: &Mutex<VecDeque<(u16, String)>>,
-    recorded: &Mutex<Vec<(String, String)>>,
+    recorded: &Mutex<Vec<RecordedRequest>>,
     state: Option<&GiteaState>,
 ) {
     let request = read_request(stream);
-    recorded
-        .lock()
-        .expect("recorded")
-        .push((request.method.clone(), request.target.clone()));
     let (status, body) = match state {
         Some(state) => respond_scenario(state, &request),
         None => responses
@@ -849,6 +1192,7 @@ fn serve(
             .pop_front()
             .unwrap_or((500, "{\"message\":\"unscripted request\"}".to_owned())),
     };
+    recorded.lock().expect("recorded").push(request);
     let response = format!(
         "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         reason(status),
@@ -866,11 +1210,21 @@ fn respond_scenario(state: &GiteaState, request: &RecordedRequest) -> (u16, Stri
         return (401, json!({"message": "unauthorized"}).to_string());
     }
     let path = request.target.split('?').next().unwrap_or_default();
+    if path == "/api/v1/repos/acme/project" {
+        return (200, repository_settings(state.scenario).to_string());
+    }
     let Some(rest) = path.strip_prefix("/api/v1/repos/acme/project/") else {
         return (404, json!({"message": "unknown repository"}).to_string());
     };
     let segments: Vec<&str> = rest.split('/').collect();
     match (request.method.as_str(), segments.as_slice()) {
+        ("GET", ["branch_protections", _branch]) => match branch_protection_body(state.scenario) {
+            Some(body) => (200, body.to_string()),
+            None => (
+                404,
+                json!({"message": "branch protection not found"}).to_string(),
+            ),
+        },
         ("GET", ["branches", rest @ ..]) if !rest.is_empty() => {
             let branch = rest.join("/");
             state.branch_reads.fetch_add(1, Ordering::SeqCst);
@@ -895,7 +1249,7 @@ fn respond_scenario(state: &GiteaState, request: &RecordedRequest) -> (u16, Stri
             }
         }
         ("GET", ["issues", _id, "comments"]) => (200, "[]".to_owned()),
-        ("GET", ["pulls", _id, "reviews"]) => (200, "[]".to_owned()),
+        ("GET", ["pulls", _id, "reviews"]) => (200, reviews_body(state.scenario).to_string()),
         ("GET", ["pulls", _id, "reviews", _rid, "comments"]) => (200, "[]".to_owned()),
         ("POST", ["pulls", _id, "merge"]) => respond_merge(state),
         ("GET", ["pulls", _id]) => respond_pull(state, mismatch_id(state)),
@@ -926,6 +1280,9 @@ fn respond_pull(state: &GiteaState, mismatch: bool) -> (u16, String) {
             }
             if state.scenario == Scenario::StrictBehind {
                 value["mergeable"] = json!(false);
+            }
+            if state.scenario == Scenario::OutdatedBranch {
+                value["merge_base"] = json!(HEAD);
             }
             (200, value.to_string())
         }
@@ -975,7 +1332,24 @@ fn respond_merge(state: &GiteaState) -> (u16, String) {
     let request = state.merge_requests.fetch_add(1, Ordering::SeqCst) + 1;
     match state.scenario {
         Scenario::ProtectedBranch => {
-            return (409, json!({"message": "branch is protected"}).to_string());
+            return (
+                405,
+                json!({"message": "branch protection refused the merge"}).to_string(),
+            );
+        }
+        Scenario::MergeConflictRace => {
+            if let Some(pull) = state.review.lock().expect("review").as_mut() {
+                pull.mergeable = false;
+            }
+            return (409, json!({"message": "merge conflict"}).to_string());
+        }
+        Scenario::MergeLostResponse => {
+            if let Some(pull) = state.review.lock().expect("review").as_mut() {
+                pull.state = "closed".to_owned();
+                pull.merged = true;
+                pull.merge_commit_sha = Some(MERGE_SHA.to_owned());
+            }
+            return (409, json!({"message": "head moved"}).to_string());
         }
         Scenario::NeverConfirmsMerge => {
             return (200, json!({"message": "merge requested"}).to_string());
@@ -1008,10 +1382,67 @@ fn reason(status: u16) -> &'static str {
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         409 => "Conflict",
         422 => "Unprocessable Entity",
         500 => "Internal Server Error",
         _ => "Response",
+    }
+}
+
+fn repository_settings(scenario: Scenario) -> Value {
+    let (merge, squash, rebase, rebase_explicit) = match scenario {
+        Scenario::SquashOnly => (false, true, false, false),
+        Scenario::RebaseMergeOnly => (false, false, false, true),
+        _ => (true, true, true, true),
+    };
+    json!({
+        "allow_merge_commits": merge,
+        "allow_squash_merge": squash,
+        "allow_rebase": rebase,
+        "allow_rebase_explicit": rebase_explicit,
+        // A non-default UI preference the delivery path must deliberately ignore.
+        "default_merge_style": "squash",
+    })
+}
+
+fn branch_protection_body(scenario: Scenario) -> Option<Value> {
+    let (enable, contexts, approvals, outdated, rejected, signed) = match scenario {
+        Scenario::MissingApproval => (true, vec!["ci/build"], 1, false, false, false),
+        Scenario::Approved => (true, vec!["ci/build"], 2, false, false, false),
+        Scenario::RejectedReview => (true, vec![], 0, false, true, false),
+        Scenario::RequiresSignatures => (false, vec![], 0, false, false, true),
+        Scenario::OutdatedBranch => (false, vec![], 0, true, false, false),
+        Scenario::RequiredContextMissing | Scenario::RequiredContextFailed => {
+            (true, vec!["ci/build"], 0, false, false, false)
+        }
+        _ => return None,
+    };
+    Some(json!({
+        "enable_status_check": enable,
+        "status_check_contexts": contexts,
+        "required_approvals": approvals,
+        "block_on_outdated_branch": outdated,
+        "block_on_rejected_reviews": rejected,
+        "require_signed_commits": signed,
+    }))
+}
+
+fn reviews_body(scenario: Scenario) -> Value {
+    match scenario {
+        Scenario::Approved => json!([
+            {"id": 11, "state": "APPROVED", "official": true, "dismissed": false, "user": {"login": "alice"}},
+            {"id": 12, "state": "APPROVED", "official": true, "dismissed": false, "user": {"login": "alice"}},
+            {"id": 13, "state": "APPROVED", "official": true, "dismissed": false, "user": {"login": "bob"}},
+        ]),
+        Scenario::MissingApproval => json!([
+            {"id": 11, "state": "APPROVED", "official": true, "dismissed": true, "user": {"login": "dismissed"}},
+            {"id": 12, "state": "APPROVED", "official": false, "dismissed": false, "user": {"login": "unofficial"}},
+        ]),
+        Scenario::RejectedReview => json!([
+            {"id": 11, "state": "REQUEST_CHANGES", "official": true, "dismissed": false, "user": {"login": "reviewer"}},
+        ]),
+        _ => json!([]),
     }
 }
 
@@ -1369,8 +1800,252 @@ async fn policy_failures_are_typed_api_errors() {
 }
 
 #[tokio::test]
-async fn protected_branch_merge_is_reported_as_a_conflict() {
+async fn protected_branch_rejection_preserves_the_base_policy_diagnostic() {
     let fixture = AuthorityScenario::new(Scenario::ProtectedBranch, "gitea-protected");
+    let receipt = fixture
+        .authority
+        .open_or_update_review(&review_request(&fixture), credential())
+        .await
+        .assert_value();
+    let failure = fixture
+        .authority
+        .request_merge(&receipt, credential())
+        .await
+        .expect_err("a protected branch must refuse the merge");
+    assert!(
+        failure.to_string().contains("base-branch policy"),
+        "the refusal must name the base-branch policy: {failure}"
+    );
+    assert!(!failure.retryable_operation(), "{failure}");
+    assert_eq!(
+        fixture.server.state().merge_requests.load(Ordering::SeqCst),
+        1
+    );
+}
+
+#[tokio::test]
+async fn merge_method_follows_the_repository_settings_and_pins_the_reviewed_head() {
+    let fixture = AuthorityScenario::new(Scenario::SquashOnly, "gitea-squash");
+    let receipt = fixture
+        .authority
+        .open_or_update_review(&review_request(&fixture), credential())
+        .await
+        .assert_value();
+    assert_eq!(
+        fixture
+            .authority
+            .request_merge(&receipt, credential())
+            .await
+            .assert_value(),
+        ForgeMergeRequestOutcome::Accepted
+    );
+    let body = merge_request_body(&fixture.server);
+    assert_eq!(body.get("Do"), Some(&json!("squash")));
+    assert_eq!(body.get("head_commit_id"), Some(&json!(fixture.revision)));
+    assert_eq!(body.get("MergeMessageField"), None);
+    let title = body
+        .get("MergeTitleField")
+        .and_then(Value::as_str)
+        .expect("pull request title");
+    assert!(!title.is_empty());
+    assert_ne!(title, fixture.revision);
+}
+
+#[tokio::test]
+async fn rebase_merge_only_repository_is_refused() {
+    let fixture = AuthorityScenario::new(Scenario::RebaseMergeOnly, "gitea-rebase-merge");
+    let receipt = fixture
+        .authority
+        .open_or_update_review(&review_request(&fixture), credential())
+        .await
+        .assert_value();
+    let failure = fixture
+        .authority
+        .request_merge(&receipt, credential())
+        .await
+        .expect_err("rebase-merge has no GitHub equivalent");
+    assert!(failure.to_string().contains("rebase-merge"), "{failure}");
+    assert!(!failure.retryable_operation(), "{failure}");
+    assert_eq!(
+        fixture.server.state().merge_requests.load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn required_approvals_gate_the_merge_until_distinct_approvers_arrive() {
+    let fixture = AuthorityScenario::new(Scenario::MissingApproval, "gitea-approval");
+    let receipt = fixture
+        .authority
+        .open_or_update_review(&review_request(&fixture), credential())
+        .await
+        .assert_value();
+    let observation = fixture
+        .authority
+        .inspect_review(&receipt, credential())
+        .await
+        .assert_value();
+    assert!(observation.pull_request_ready);
+    assert_eq!(
+        observation.state,
+        ForgeReviewState::Open {
+            checks: ForgeChecks::Passed
+        }
+    );
+    assert_eq!(
+        fixture
+            .authority
+            .request_merge(&receipt, credential())
+            .await
+            .assert_value(),
+        ForgeMergeRequestOutcome::Pending
+    );
+    assert_eq!(
+        fixture.server.state().merge_requests.load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn distinct_approvers_unblock_the_merge() {
+    let fixture = AuthorityScenario::new(Scenario::Approved, "gitea-approved");
+    let receipt = fixture
+        .authority
+        .open_or_update_review(&review_request(&fixture), credential())
+        .await
+        .assert_value();
+    let observation = fixture
+        .authority
+        .inspect_review(&receipt, credential())
+        .await
+        .assert_value();
+    assert!(!observation.pull_request_ready);
+    assert_eq!(
+        observation.state,
+        ForgeReviewState::Open {
+            checks: ForgeChecks::Passed
+        }
+    );
+    assert_eq!(
+        fixture
+            .authority
+            .request_merge(&receipt, credential())
+            .await
+            .assert_value(),
+        ForgeMergeRequestOutcome::Accepted
+    );
+}
+
+#[tokio::test]
+async fn rejected_reviews_block_the_merge_gate() {
+    let fixture = AuthorityScenario::new(Scenario::RejectedReview, "gitea-rejected-review");
+    let receipt = fixture
+        .authority
+        .open_or_update_review(&review_request(&fixture), credential())
+        .await
+        .assert_value();
+    assert_eq!(
+        fixture
+            .authority
+            .request_merge(&receipt, credential())
+            .await
+            .assert_value(),
+        ForgeMergeRequestOutcome::Pending
+    );
+    assert_eq!(
+        fixture.server.state().merge_requests.load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn signature_policy_does_not_disable_the_merge_gate() {
+    let fixture = AuthorityScenario::new(Scenario::RequiresSignatures, "gitea-signatures");
+    let receipt = fixture
+        .authority
+        .open_or_update_review(&review_request(&fixture), credential())
+        .await
+        .assert_value();
+    assert_eq!(
+        fixture
+            .authority
+            .request_merge(&receipt, credential())
+            .await
+            .assert_value(),
+        ForgeMergeRequestOutcome::Accepted
+    );
+}
+
+#[tokio::test]
+async fn required_status_contexts_gate_the_merge() {
+    for (scenario, expected_pending) in [
+        (Scenario::RequiredContextMissing, true),
+        (Scenario::RequiredContextFailed, false),
+    ] {
+        let fixture = AuthorityScenario::new(scenario, "gitea-context");
+        let receipt = fixture
+            .authority
+            .open_or_update_review(&review_request(&fixture), credential())
+            .await
+            .assert_value();
+        let observation = fixture
+            .authority
+            .inspect_review(&receipt, credential())
+            .await
+            .assert_value();
+        if expected_pending {
+            assert_eq!(
+                observation.state,
+                ForgeReviewState::Open {
+                    checks: ForgeChecks::Pending
+                }
+            );
+        } else {
+            assert!(matches!(
+                observation.state,
+                ForgeReviewState::Open {
+                    checks: ForgeChecks::Failed { .. }
+                }
+            ));
+        }
+        assert_eq!(
+            fixture
+                .authority
+                .request_merge(&receipt, credential())
+                .await
+                .assert_value(),
+            ForgeMergeRequestOutcome::Pending
+        );
+        assert_eq!(
+            fixture.server.state().merge_requests.load(Ordering::SeqCst),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn outdated_branch_requirement_is_refused() {
+    let fixture = AuthorityScenario::new(Scenario::OutdatedBranch, "gitea-outdated");
+    let receipt = fixture
+        .authority
+        .open_or_update_review(&review_request(&fixture), credential())
+        .await
+        .assert_value();
+    let failure = fixture
+        .authority
+        .request_merge(&receipt, credential())
+        .await
+        .expect_err("an up-to-date requirement has no Gitea equivalent");
+    assert!(
+        failure.to_string().contains("updatePullRequestBranch"),
+        "{failure}"
+    );
+    assert!(!failure.retryable_operation(), "{failure}");
+}
+
+#[tokio::test]
+async fn merge_conflict_race_is_reconciled() {
+    let fixture = AuthorityScenario::new(Scenario::MergeConflictRace, "gitea-merge-race");
     let receipt = fixture
         .authority
         .open_or_update_review(&review_request(&fixture), credential())
@@ -1384,9 +2059,23 @@ async fn protected_branch_merge_is_reported_as_a_conflict() {
             .assert_value(),
         ForgeMergeRequestOutcome::Conflict
     );
+}
+
+#[tokio::test]
+async fn lost_merge_response_is_reconciled_as_accepted() {
+    let fixture = AuthorityScenario::new(Scenario::MergeLostResponse, "gitea-merge-lost");
+    let receipt = fixture
+        .authority
+        .open_or_update_review(&review_request(&fixture), credential())
+        .await
+        .assert_value();
     assert_eq!(
-        fixture.server.state().merge_requests.load(Ordering::SeqCst),
-        1
+        fixture
+            .authority
+            .request_merge(&receipt, credential())
+            .await
+            .assert_value(),
+        ForgeMergeRequestOutcome::Accepted
     );
 }
 
@@ -2505,7 +3194,7 @@ exit "$status"
         assert!(!requests.is_empty());
         for (method, target) in &requests {
             assert!(
-                target.starts_with("/api/v1/repos/acme/project/"),
+                target.starts_with("/api/v1/repos/acme/project"),
                 "unexpected target: {method} {target}"
             );
             assert!(!target.contains("test-token"));
