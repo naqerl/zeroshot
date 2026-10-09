@@ -15,14 +15,14 @@ use crate::native_v2_capsule::provider_process::{
     ProviderExecution, ProviderFilesystemConfig, ProviderFailure, ProviderFailureRetry,
     ProviderSessionCore, impl_provider_node_session,
 };
-use crate::native_v2_contract::{NodeInvocation, NodeRuntimeBinding};
+use crate::native_v2_contract::{NodeInvocation, NodeRuntimeBinding, PiProvider};
 use crate::native_v2_runner::{
     AgentResponse, AgentResponseState, DriverControl, DriverInvocation, NodeDriver,
-    NodeRunnerError, NodeSession, ResolvedEnvironment, SessionFactory,
+    NodeRunnerError, NodeSession, ProviderSchemaDialect, ResolvedEnvironment, SessionFactory,
 };
 
 use super::session_id::pi_session_id;
-use super::{PiAdapter, PiTurn, prompt};
+use super::{PiAdapter, PiTurn, prompt, schema_dialect};
 
 pub(crate) struct PiSession {
     pub(crate) core: ProviderSessionCore,
@@ -47,6 +47,9 @@ impl_provider_node_session!(PiSession);
 /// One logical node session: the derived Pi session ID plus the correction state.
 pub(super) struct PiRunState {
     pub(super) session_id: String,
+    /// The schema dialect matching the lane's wire protocol, shared with response resolution so a
+    /// correction restates the same schema the initial prompt carried.
+    pub(super) dialect: ProviderSchemaDialect,
     response: AgentResponseState,
     retry: ProviderFailureRetry,
 }
@@ -98,7 +101,11 @@ impl NodeDriver for PiAdapter {
             control: &control,
             execution: &execution,
         };
-        let mut state = PiRunState::new(&invocation, self.redactions(&invocation.environment))?;
+        let mut state = PiRunState::new(
+            self.provider,
+            &invocation,
+            self.redactions(&invocation.environment),
+        )?;
         loop {
             if let Some(outcome) = self
                 .advance_run(&turn, &mut state, &control)
@@ -139,15 +146,18 @@ impl PiAdapter {
 
 impl PiRunState {
     fn new(
+        provider: PiProvider,
         invocation: &DriverInvocation,
         redactions: Vec<String>,
     ) -> Result<Self, NodeRunnerError> {
         let session_id = pi_session_id(&identity(invocation)?).map_err(|detail| {
             NodeRunnerError::DriverDetail(format!("Pi session identity is unusable: {detail}"))
         })?;
-        let prompt = prompt(invocation)?;
+        let dialect = schema_dialect(provider, &invocation.environment)?;
+        let prompt = prompt(dialect, invocation)?;
         Ok(Self {
             session_id,
+            dialect,
             response: AgentResponseState::new(prompt.clone()),
             retry: ProviderFailureRetry::new("Pi", prompt, redactions),
         })
