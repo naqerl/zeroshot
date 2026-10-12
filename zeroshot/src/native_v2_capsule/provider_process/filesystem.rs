@@ -183,17 +183,10 @@ impl ProviderExecutionFiles {
     pub(crate) fn own_provider_file(&self, path: &Path) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         {
-            use std::os::unix::ffi::OsStrExt;
             use std::os::unix::fs::MetadataExt;
 
             let owner = fs::symlink_metadata(self.home.path())?;
-            let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
-                .map_err(|_| io::Error::other("provider file path is invalid"))?;
-            // SAFETY: the path is a live NUL-free C string and the owner comes from lstat of the
-            // directory this file was written into.
-            if unsafe { libc::lchown(c_path.as_ptr(), Some(owner.uid()), Some(owner.gid())) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
+            std::os::unix::fs::lchown(path, Some(owner.uid()), Some(owner.gid()))?;
         }
         #[cfg(not(target_os = "linux"))]
         let _ = path;

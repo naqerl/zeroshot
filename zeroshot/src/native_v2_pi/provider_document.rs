@@ -270,5 +270,5 @@ fn declared(resolved: &ResolvedEnvironment) -> BTreeMap<String, String> {
 }
 
 #[cfg(test)]
-#[path = "native_v2_pi/provider_document/tests.rs"]
+#[path = "provider_document/tests.rs"]
 mod tests;

@@ -3,6 +3,10 @@
 //! Kept outside the production-named source file so production coverage totals exclude them
 //! (`AGENTS.md`, `COVERAGE_IGNORE_REGEX` in `.github/workflows/coverage.yml`).
 
+// The shared fixtures below (`TestDirectory::read`, `environment_name`) are Unix-only, as they are
+// for every other harness adapter's test file.
+#![cfg(unix)]
+
 use super::{
     ANTHROPIC, EndpointDocument, GATEWAY, GatewayDocument, MODELS_FILE, OPENAI, SUPPORTED_APIS,
     declared_api, declared_base_url, gateway_base_url, models_document, write_endpoint,

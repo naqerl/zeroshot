@@ -62,5 +62,5 @@ pub(super) fn observe_session(observed: Option<&str>, expected: &str) -> Result<
 }
 
 #[cfg(test)]
-#[path = "native_v2_pi/session_id/tests.rs"]
+#[path = "session_id/tests.rs"]
 mod tests;

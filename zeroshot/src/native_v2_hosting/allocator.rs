@@ -2,6 +2,7 @@ mod environment_hooks;
 use environment_hooks::HookContext;
 mod identity_leases;
 mod lifecycle;
+mod pi_lane;
 use lifecycle::AllocationTurns;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,7 +35,7 @@ use crate::native_v2_cloud::{
 };
 use crate::native_v2_codex::NativeV2CodexConfig;
 use crate::native_v2_contract::{AdmittedRun, RuntimePlan};
-use crate::native_v2_pi::{PiConfig, PiProcessEnvironment};
+use crate::native_v2_pi::PiProcessEnvironment;
 use crate::native_v2_delivery::{
     DeliveryLineage, GhCliAuthorityConfig, GhCliDeliveryAuthority, NativeV2DeliveryConfig,
 };
@@ -702,30 +703,7 @@ impl ProductionCapsuleAllocator {
                 }))
             }
             RuntimePlan::Pi { provider, .. } => {
-                let base_environment = self
-                    .config
-                    .pi_process_environment
-                    .for_capsule(&filesystem.runtime_home, &search_path)
-                    .map_err(|_| CapsuleAllocationUnavailable::Runtime)?;
-                let mut values = base_environment.clone_values();
-                values.insert(
-                    "ZEROSHOT_TOOLS".to_owned(),
-                    environment::tools_directory(run_root)
-                        .to_string_lossy()
-                        .into_owned(),
-                );
-                Ok(NativeV2HarnessConfig::Pi(PiConfig {
-                    provider: *provider,
-                    executable: self.config.pi_executable.clone(),
-                    prefix_arguments: self.config.pi_prefix_arguments.clone(),
-                    workspace: filesystem.workspace.clone(),
-                    runtime_home: filesystem.runtime_home.clone(),
-                    local_user_home: None,
-                    native_environment: Default::default(),
-                    base_environment: PiProcessEnvironment::new(values)
-                        .map_err(|_| CapsuleAllocationUnavailable::Runtime)?,
-                    process_pool,
-                }))
+                pi_lane::harness_config(&self.config, *provider, filesystem, process_pool)
             }
             RuntimePlan::Claude { provider, .. } => {
                 let base_environment = self

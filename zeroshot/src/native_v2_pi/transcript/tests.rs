@@ -118,10 +118,12 @@ fn a_recovered_retry_settles_as_success() {
     transcript.push(
         [
             &json!({"type": "message_end", "message": {"role": "assistant", "content": [],
-                    "stopReason": "error", "errorMessage": "529 overloaded"}}).to_string(),
+                    "stopReason": "error", "errorMessage": "529 overloaded"}})
+            .to_string(),
             &json!({"type": "auto_retry_start", "attempt": 1}).to_string(),
             &json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "stop",
-                    "content": [{"type": "text", "text": "Recovered answer"}]}}).to_string(),
+                    "content": [{"type": "text", "text": "Recovered answer"}]}})
+            .to_string(),
             "",
         ]
         .join("\n")
@@ -140,9 +142,11 @@ fn a_failure_after_the_final_answer_still_fails() {
     transcript.push(
         [
             &json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "stop",
-                    "content": [{"type": "text", "text": "Partial answer"}]}}).to_string(),
+                    "content": [{"type": "text", "text": "Partial answer"}]}})
+            .to_string(),
             &json!({"type": "message_end", "message": {"role": "assistant", "content": [],
-                    "stopReason": "aborted", "errorMessage": "aborted by user"}}).to_string(),
+                    "stopReason": "aborted", "errorMessage": "aborted by user"}})
+            .to_string(),
             "",
         ]
         .join("\n")
@@ -201,8 +205,7 @@ fn a_zero_exit_provider_failure_reports_the_provider_detail() {
 fn a_process_failure_wins_over_a_complete_message() {
     let mut transcript = PiTranscript::new(Vec::new());
     transcript.push(assistant("done").to_string().as_bytes());
-    let super::PiAttempt::Failed(failure) =
-        transcript.finish(Some("pi exited with 1")).unwrap()
+    let super::PiAttempt::Failed(failure) = transcript.finish(Some("pi exited with 1")).unwrap()
     else {
         panic!("expected a failure");
     };

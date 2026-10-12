@@ -365,5 +365,5 @@ fn add_optional_usage(
 }
 
 #[cfg(test)]
-#[path = "native_v2_pi/transcript/tests.rs"]
+#[path = "transcript/tests.rs"]
 mod tests;
