@@ -194,7 +194,9 @@ impl ProviderExecutionFiles {
     }
 
     /// Files for tests that only read the home and workspace paths, without launching a process.
-    #[cfg(test)]
+    ///
+    /// Only the Unix-gated adapter tests use this, so it is compiled for the same platforms.
+    #[cfg(all(test, unix))]
     pub(crate) fn for_test(
         root: &Path,
         scope: crate::execution::process::HostedProcessScope,

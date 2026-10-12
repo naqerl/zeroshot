@@ -2,22 +2,25 @@
 //!
 //! Kept outside the production-named source file so production coverage totals exclude them
 //! (`AGENTS.md`, `COVERAGE_IGNORE_REGEX` in `.github/workflows/coverage.yml`).
-
-// The shared fixtures below (`TestDirectory::read`, `environment_name`) are Unix-only, as they are
-// for every other harness adapter's test file.
-#![cfg(unix)]
+//!
+//! These assertions are portable, so unlike the adapter's own test file they are not gated to Unix.
 
 use super::{
     ANTHROPIC, EndpointDocument, GATEWAY, GatewayDocument, MODELS_FILE, OPENAI, SUPPORTED_APIS,
     declared_api, declared_base_url, gateway_base_url, models_document, write_endpoint,
     write_gateway,
 };
-use crate::native_v2_candidate::test_support::{TestDirectory, environment_name};
+use crate::native_v2_candidate::test_support::TestDirectory;
 use crate::native_v2_contract::{
     DeclaredConnections, DeclaredEnvironment, EnvironmentVariableName, NodeRuntimeBinding,
 };
 use crate::native_v2_runner::ResolvedEnvironment;
 use std::collections::BTreeMap;
+
+/// The shared `environment_name` fixture is Unix-only; the contract type it wraps is not.
+fn environment_name(value: &str) -> EnvironmentVariableName {
+    EnvironmentVariableName::new(value).unwrap()
+}
 
 /// A resolved environment carrying exactly the supplied values, through the declared-connection
 /// path the runner uses.
@@ -107,7 +110,7 @@ fn the_written_provider_file_holds_no_secret() {
         },
     )
     .unwrap();
-    let written = directory.read("agent/models.json");
+    let written = std::fs::read_to_string(directory.child("agent/models.json")).unwrap();
     assert!(written.contains("$GATEWAY_API_KEY"));
     assert!(!written.contains("sk-gateway"));
 }
@@ -142,8 +145,8 @@ fn the_gateway_document_is_written_and_validated() {
     .unwrap();
     assert_eq!(path, agent_dir.join(MODELS_FILE));
     assert!(
-        directory
-            .read("agent/models.json")
+        std::fs::read_to_string(directory.child("agent/models.json"))
+            .unwrap()
             .contains("anthropic-messages")
     );
 

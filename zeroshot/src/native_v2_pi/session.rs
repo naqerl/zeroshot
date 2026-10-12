@@ -36,7 +36,8 @@ impl PiSession {
     }
 
     /// A session with no live provider process, for tests that exercise argv and identity only.
-    #[cfg(test)]
+    /// Only the Unix-gated adapter tests use it, so it is compiled for the same platforms.
+    #[cfg(all(test, unix))]
     pub(crate) fn for_test() -> Self {
         Self::new()
     }

@@ -387,8 +387,9 @@ impl PiAdapter {
     }
 
     /// The launch command for one turn, exposed so tests can assert the endpoint and home
-    /// decisions without launching a process.
-    #[cfg(test)]
+    /// decisions without launching a process. Only the Unix-gated adapter tests use it, so it is
+    /// compiled for the same platforms.
+    #[cfg(all(test, unix))]
     pub(crate) fn command_for_test(
         &self,
         invocation: &DriverInvocation,
