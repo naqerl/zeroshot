@@ -13,6 +13,8 @@ const harnessLabels = new Map([
 export function RuntimeEditor(p: {
   document: Document;
   schema: any;
+  /** JSON path of the field the last validation rejected, e.g. `runtime.nodes.work.model`. */
+  invalidField?: string;
   edit: (next: Document, key?: string) => void;
   openJson: () => void;
 }) {
@@ -26,6 +28,7 @@ export function RuntimeEditor(p: {
       (v.properties?.harness?.const ?? v.properties?.harness?.enum?.[0]) === doc.runtime.harness
   );
   const providerRef = variant?.properties?.provider?.$ref?.split('/').pop();
+  const invalid = (field: string) => p.invalidField === `runtime.${field}` || undefined;
   const providers =
     p.schema?.$defs?.[providerRef]?.enum ?? variant?.properties?.provider?.enum ?? [];
   function runtimeChange(key: string, value: string) {
@@ -40,6 +43,7 @@ export function RuntimeEditor(p: {
       <Field label="Harness">
         <select
           value={doc.runtime.harness}
+          aria-invalid={invalid('harness')}
           onChange={(e) => runtimeChange('harness', e.target.value)}
         >
           <option value="">Choose harness</option>
@@ -53,6 +57,7 @@ export function RuntimeEditor(p: {
       <Field label="Provider">
         <select
           value={doc.runtime.provider}
+          aria-invalid={invalid('provider')}
           onChange={(e) => runtimeChange('provider', e.target.value)}
         >
           <option value="">Choose provider</option>
@@ -64,7 +69,11 @@ export function RuntimeEditor(p: {
         </select>
       </Field>
       <Field label="Run size">
-        <select value={doc.runtime.size} onChange={(e) => runtimeChange('size', e.target.value)}>
+        <select
+          value={doc.runtime.size}
+          aria-invalid={invalid('size')}
+          onChange={(e) => runtimeChange('size', e.target.value)}
+        >
           {(p.schema?.$defs?.RunSize?.enum ?? []).map((s: string) => (
             <option key={s}>{s}</option>
           ))}
@@ -91,6 +100,7 @@ export function RuntimeEditor(p: {
             ) : bindingFor(doc.runtime, n.name)?.kind === 'agent' ? (
               <ModelPicker
                 compact
+                invalid={invalid(`nodes.${n.name}.model`)}
                 label={`Model for ${n.name}`}
                 harness={doc.runtime.harness}
                 provider={doc.runtime.provider}

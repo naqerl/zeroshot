@@ -2,12 +2,12 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/brand/zeroshot-hero-dark.png">
-  <img alt="Zeroshot: the agent that wrote the code should not be the one that says it works. Independent review and repair." src="docs/brand/zeroshot-hero-light.png" width="100%">
+  <img alt="zeroshot: the agent that wrote the code should not be the one that says it works. Independent review and repair." src="docs/brand/zeroshot-hero-light.png" width="100%">
 </picture>
 
 &nbsp;
 
-<a href="https://discord.gg/fZyzf2Cut9"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/brand/social/discord-cta-dark.png"><img alt="Join the Zeroshot community on Discord" src="docs/brand/social/discord-cta-light.png" height="30"></picture></a>
+<a href="https://theopenengine.com/discord"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/brand/social/discord-cta-dark.png"><img alt="Join the zeroshot community on Discord" src="docs/brand/social/discord-cta-light.png" height="30"></picture></a>
 <a href="https://zeroshot.sh/?utm_source=github&utm_medium=readme&utm_campaign=zeroshot"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/brand/social/zeroshot-site-dark.png"><img alt="Website · zeroshot.sh" src="docs/brand/social/zeroshot-site-light.png" height="30"></picture></a>
 <a href="https://theopenengine.com/?utm_source=github&utm_medium=readme&utm_campaign=zeroshot"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/brand/social/website-dark.png"><img alt="The Open Engine · theopenengine.com" src="docs/brand/social/website-light.png" height="30"></picture></a>
 <a href="https://x.com/OpenEngineHQ"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/brand/social/x-dark.png"><img alt="X · @OpenEngineHQ" src="docs/brand/social/x-light.png" height="30"></picture></a>
@@ -18,7 +18,7 @@
 [![Build](https://img.shields.io/github/actions/workflow/status/the-open-engine/zeroshot/ci.yml?branch=main&style=flat&label=build&labelColor=171411)](https://github.com/the-open-engine/zeroshot/actions/workflows/ci.yml?query=branch%3Amain)
 [![Opcore](https://img.shields.io/github/actions/workflow/status/the-open-engine/zeroshot/opcore.yml?branch=main&style=flat&label=opcore&labelColor=171411)](https://github.com/the-open-engine/zeroshot/actions/workflows/opcore.yml?query=branch%3Amain)
 [![Coverage](https://coveralls.io/repos/github/the-open-engine/zeroshot/badge.svg?branch=main)](https://coveralls.io/github/the-open-engine/zeroshot?branch=main)
-[![Docs](https://img.shields.io/github/actions/workflow/status/the-open-engine/zeroshot/docs.yml?branch=main&style=flat&label=docs&labelColor=171411)](https://the-open-engine.github.io/zeroshot/)
+[![Docs](https://img.shields.io/github/actions/workflow/status/the-open-engine/zeroshot/docs.yml?branch=main&style=flat&label=docs&labelColor=171411)](https://zeroshot.sh/docs/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-171411?style=flat)](LICENSE)
 
 &nbsp;
@@ -27,44 +27,56 @@
 
 </div>
 
-# Zeroshot
+# zeroshot
 
 **The agent that writes the code should not be the one that decides it works.**
 
-We built Zeroshot because we were tired of being gaslit by agents telling us broken code was ready.
+We built zeroshot because we were tired of being gaslit by agents telling us broken code was ready.
 
-Zeroshot turns a software goal into an explicit multi-agent graph: one agent implements, independent
-agents review, failures go back to a bounded repair loop, and nothing is delivered until the graph's
-checks pass. The implementing agent never approves its own work. Zeroshot doesn't replace Claude
-Code, Codex or Copilot. It runs one of them as the worker and as the reviewers.
+zeroshot runs a QA process your coding agent can't skip. You define it as a graph: which agents
+review, what must pass, where a rejection loops back. In the built-in `software-change` workflow,
+one agent implements, independent agents review, and failures go back to a bounded repair loop.
+Git delivery waits for both reviewers to accept. zeroshot doesn't replace Claude Code, Codex or
+Copilot. It runs one of them as the worker and as the reviewers.
 
-Use the built-in graph or bring your own topology. Add reviewers, tests, and repair loops, then save
-the setup as a profile for the next task.
+Use the built-in graph or draw your own: code review, your own reviewers and test agents, any model
+per node. Save the setup as a profile for the next task.
 
-The product site, [zeroshot.sh](https://zeroshot.sh/?utm_source=github&utm_medium=readme&utm_campaign=zeroshot), has the FAQ and Zeroshot Cloud pricing.
+## Skills and review graphs
 
-**[▶ Video: a single agent vs. Zeroshot](https://x.com/eivindmeyer_cv/status/2106898797771288828)** (scripted)
+A skill is advice: the agent still decides whether to follow its reviewer's feedback and when to
+stop. A zeroshot graph defines the required reviews and repair loop before execution; the engine
+follows it mechanically until the reviews accept or the retry limit is reached.
 
-Questions, ideas, or a run worth showing? Join the [Zeroshot community on Discord](https://discord.gg/fZyzf2Cut9).
+Add custom agent nodes: a security reviewer, a bugfinder that writes tests, or an agent that checks
+the app in a browser. Choose each node's model and instructions, which nodes run in parallel, and
+where rejected work goes for repair.
 
-## Install
+The product site, [zeroshot.sh](https://zeroshot.sh/?utm_source=github&utm_medium=readme&utm_campaign=zeroshot), has the FAQ.
+
+**[▶ Video: a single agent vs. zeroshot](https://x.com/eivindmeyer_cv/status/2106898797771288828)** (scripted)
+
+Questions, ideas, or a run worth showing? Join the [zeroshot community on Discord](https://theopenengine.com/discord).
+
+## Get started
+
+Prefer Cloud? [Cloud setup →](https://cloud.zeroshot.sh/docs)
+
+### Run locally
 
 ```bash
 npm install -g @the-open-engine-company/zeroshot
 ```
 
 The installer requires Node.js 18 or newer and installs a verified native binary for Linux
-x64/arm64, macOS x64/arm64, or Windows x64. It also installs one Zeroshot skill for Codex, GitHub
+x64/arm64, macOS x64/arm64, or Windows x64. It also installs one zeroshot skill for Codex, GitHub
 Copilot, Pi, and Claude Code at user scope.
 
 For local execution, install and sign in to Codex, Claude Code, GitHub Copilot, or Pi. Local runs can
 reuse the harness's existing login, including subscription-backed sessions. See the
 [installation guide](docs/getting-started/install.md) for harness prerequisites.
 
-> **Zeroshot v8 is a hard interface cutover.** v8 replaces the Node.js runtime with a native
-> `zeroshot` binary.
-
-## Run your first task
+#### Run your first task
 
 This example uses Codex and keeps delivery local. **The worker edits the current Git worktree**,
 so start in a clean worktree intended for the task.
@@ -110,6 +122,11 @@ running. The CLI also provides `zeroshot list`, `zeroshot status RUN_ID`, and `z
 
 For other harnesses and providers, see [Runtimes and connections](docs/concepts/runtimes-and-connections.md).
 
+### Run in the cloud
+
+Connect GitHub and bring your own model API keys.
+[Cloud setup guide →](https://cloud.zeroshot.sh/docs)
+
 ## What the built-in workflow does
 
 1. A worker implements the task.
@@ -128,12 +145,24 @@ and environment you provide.
   <picture>
     <source media="(prefers-reduced-motion: reduce)" srcset="docs/assets/zeroshot-workflow.svg">
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/zeroshot-demo-dark.gif">
-    <img src="docs/assets/zeroshot-demo.gif" alt="Animated Zeroshot workflow: implementation, parallel acceptance and code review, repair, and optional Git delivery" width="960">
+    <img src="docs/assets/zeroshot-demo.gif" alt="Animated zeroshot workflow: implementation, parallel acceptance and code review, repair, and optional Git delivery" width="960">
   </picture>
   <br>
   <em>Both reviews run again after a repair. Git delivery is optional.</em><br>
   <a href="docs/assets/zeroshot-workflow.svg">Static diagram</a>
 </div>
+
+## Auto-research
+
+The built-in `auto-research` template runs ten iterations by default; set a positive
+`options.iterations` value in the run input to choose another count. Three scouts propose
+directions, then a planner chooses an experiment and either the current candidate or a restorable
+archived candidate as its starting point. Independent judges check the evidence and method, while
+the progress judge decides whether the result should replace the current candidate under the task
+charter. A valid result can go into the archive without replacing it. An auditor checks the ledger,
+archive, and workspace before the next iteration.
+
+Inspect the graph with `zeroshot template show auto-research`.
 
 ## Bring your own graph topology
 
@@ -152,8 +181,8 @@ E2E tests
 Delivery
 ```
 
-Only the review loop and delivery are built in. You define the other stages, their tools, services
-and credentials, and where failures go for repair.
+The software-change review loop, auto-research graph, and delivery are built in. You define other
+stages, their tools, services and credentials, and where failures go for repair.
 
 Inspect the built-in graph as a starting point:
 
@@ -217,9 +246,8 @@ Keep the first result local, then enable the delivery mode that fits your proces
 PR and ship runs address visible pull request review feedback by default; pass `--no-pr-feedback` to
 ignore it.
 
-Graphs can execute locally, on a self-hosted target, or in Zeroshot Cloud. Each environment needs
-its own tools and authentication setup. Hosted merge plans, which coordinate several dependent jobs,
-are a Zeroshot Cloud feature.
+Graphs can execute locally or on a self-hosted target. Each environment needs its own tools and
+authentication setup.
 
 ### Self-hosted: run the Docker target
 
@@ -240,25 +268,12 @@ The target also serves its profile editor and run viewer at `http://127.0.0.1:80
 See the [target image guide](docker/zeroshot-target/README.md) for persistent storage, network
 isolation, builds, and HTTPS.
 
-### Zeroshot Cloud: close the laptop
-
-Use the built-in `cloud` target at `https://api.cloud.zeroshot.sh` for a shared team queue and
-durable run history:
-
-```bash
-zeroshot target login cloud
-```
-
-Open the printed link to sign in with the device code already filled in. Use `--target cloud` when
-submitting runs. The [Zeroshot Cloud docs](https://cloud.zeroshot.sh/docs) cover organizations, the
-GitHub App, saved connections and profiles, and starting runs from issues.
-
 A failed run with a recoverable workspace can be
 [restarted or resumed](docs/guides/observe-and-control.md#restart-or-resume-a-failed-run).
 
 ## Research graph
 
-Zeroshot also includes an `auto-research` graph for ten bounded iterations of experiments with
+zeroshot also includes an `auto-research` graph for ten bounded iterations of experiments with
 independent review of evidence, method, and progress. It keeps adopted, record-only, and aborted
 results under `.zeroshot/research`; add `--push` when each finalized iteration should be published.
 
@@ -271,18 +286,17 @@ See [Execution](docs/concepts/execution.md) for the research workflow's decision
 
 ## Community
 
-- [Discord](https://discord.gg/fZyzf2Cut9): ask questions, share runs and graphs, and talk to the team.
+- [Discord](https://theopenengine.com/discord): ask questions, share runs and graphs, and talk to the team.
 - [GitHub Issues](https://github.com/the-open-engine/zeroshot/issues): reproducible bugs and feature requests.
 
 ## Reference
 
-- [Versioned documentation](https://the-open-engine.github.io/zeroshot/)
-- [Zeroshot Cloud documentation](https://cloud.zeroshot.sh/docs)
+- [Versioned documentation](https://zeroshot.sh/docs/)
 - [Get started](docs/getting-started/first-run.md)
 - [CLI reference](docs/zeroshot-cli.md)
 - [Target image guide](docker/zeroshot-target/README.md)
 - [Python SDK](sdks/python/README.md)
-- [Cluster API reference](https://the-open-engine.github.io/zeroshot/current/reference/cluster/api/)
+- [Cluster API reference](https://zeroshot.sh/docs/current/reference/cluster/api/)
 - [Graph contract](docs/reference/cluster/graph.md)
 
 Also check out: [Opcore](https://github.com/the-open-engine/opcore).

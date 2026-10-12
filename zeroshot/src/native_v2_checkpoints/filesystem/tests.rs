@@ -105,8 +105,58 @@ fn staging_directory_is_private_at_creation_and_removed_with_its_contents() {
     }
     fs::create_dir(path.join("nested")).assert_value();
     fs::write(path.join("nested/file"), "unfinished capture").assert_value();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path.join("nested"), fs::Permissions::from_mode(0o555)).assert_value();
+    }
     drop(stage);
     assert!(!path.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn disposable_tree_removes_readonly_ordinary_nested_directories() {
+    let root = tempfile::tempdir().assert_value();
+    let stage = super::private_stage(root.path(), ".test-").assert_value();
+    let nested = stage.path().join("nested");
+    fs::create_dir(&nested).assert_value();
+    let file = nested.join("file");
+    fs::write(&file, "unfinished capture").assert_value();
+    for entry in [&file, &nested] {
+        let mut permissions = fs::metadata(entry).assert_value().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(entry, permissions).assert_value();
+    }
+
+    super::remove_disposable_tree(stage.path()).assert_value_with("remove ordinary nested tree");
+    assert!(!stage.path().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn disposable_tree_cleanup_does_not_follow_workspace_symlinks() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let root = tempfile::tempdir().assert_value();
+    let stage = super::private_stage(root.path(), ".test-").assert_value();
+    let outside = root.path().join("outside");
+    fs::create_dir(&outside).assert_value();
+    fs::write(outside.join("retained"), "original").assert_value();
+    let nested = stage.path().join("readonly");
+    fs::create_dir(&nested).assert_value();
+    symlink(&outside, nested.join("link")).assert_value();
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o555)).assert_value();
+
+    super::remove_disposable_tree(stage.path()).assert_value();
+
+    assert!(!stage.path().exists());
+    assert_eq!(
+        fs::read_to_string(outside.join("retained")).assert_value(),
+        "original"
+    );
+    assert!(super::remove_disposable_tree(&root.path().join("missing")).is_ok());
+    assert!(super::remove_disposable_tree(&outside.join("retained")).is_err());
 }
 
 #[test]
@@ -135,6 +185,104 @@ fn workspace_copy_reads_file_contents_and_preserves_attributes() {
             .permissions()
             .readonly()
     );
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_tool(program: &str, arguments: &[&str], path: &Path) -> String {
+    let output = Command::new(program)
+        .args(arguments)
+        .arg(path)
+        .output()
+        .assert_value();
+    assert!(output.status.success(), "{program} {arguments:?} failed");
+    String::from_utf8(output.stdout).assert_value()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_volume_type(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).assert_value();
+    // SAFETY: statfs writes only into the zeroed buffer, and the path is NUL-terminated.
+    let mut volume = unsafe { std::mem::zeroed::<libc::statfs>() };
+    assert_eq!(unsafe { libc::statfs(path.as_ptr(), &mut volume) }, 0);
+    // SAFETY: the kernel NUL-terminates f_fstypename within its fixed buffer.
+    unsafe { std::ffi::CStr::from_ptr(volume.f_fstypename.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_workspace_copy_clones_independent_files_on_apfs() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let require_clone = std::env::var_os("ZEROSHOT_REQUIRE_APFS_CLONE").is_some();
+    let root = tempfile::tempdir().assert_value();
+    // Other volume types take the portable copy, which drops the xattr this test observes.
+    let volume = macos_volume_type(root.path());
+    if volume != "apfs" {
+        assert!(
+            !require_clone,
+            "required clone probe needs apfs, not {volume}"
+        );
+        eprintln!("APFS clone test skipped on a {volume} temporary volume");
+        return;
+    }
+    let source = root.path().join("source");
+    let destination = root.path().join("cloned");
+    fs::write(&source, "original").assert_value();
+    // Only a clone carries extended attributes; the portable copy drops them.
+    run_macos_tool("xattr", &["-w", "dev.zeroshot.test", "cloned"], &source);
+    let mut permissions = fs::metadata(&source).assert_value().permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&source, permissions).assert_value();
+
+    crate::native_v2_capsule::provider_process::copy_workspace_entry(&source, &destination)
+        .assert_value();
+
+    assert_eq!(
+        run_macos_tool("xattr", &["-p", "dev.zeroshot.test"], &destination).trim(),
+        "cloned"
+    );
+    assert!(
+        fs::metadata(&destination)
+            .assert_value()
+            .permissions()
+            .readonly()
+    );
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).assert_value();
+    fs::write(&destination, "changed").assert_value();
+    assert_eq!(fs::read_to_string(&source).assert_value(), "original");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_workspace_copy_of_locked_file_stays_removable() {
+    use std::os::macos::fs::MetadataExt;
+
+    let root = tempfile::tempdir().assert_value();
+    let source = root.path().join("locked");
+    let stage = root.path().join("stage");
+    fs::create_dir(&stage).assert_value();
+    fs::write(&source, "locked").assert_value();
+    run_macos_tool("chflags", &["uchg"], &source);
+
+    let copied = crate::native_v2_capsule::provider_process::copy_workspace_entry(
+        &source,
+        &stage.join("locked"),
+    );
+    run_macos_tool("chflags", &["nouchg"], &source);
+
+    copied.assert_value();
+    let metadata = fs::metadata(stage.join("locked")).assert_value();
+    assert_eq!(metadata.st_flags(), 0);
+    assert_eq!(
+        fs::read_to_string(stage.join("locked")).assert_value(),
+        "locked"
+    );
+    super::remove_disposable_tree(&stage).assert_value();
+    assert!(!stage.exists());
 }
 
 #[test]
