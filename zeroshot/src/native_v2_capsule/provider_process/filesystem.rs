@@ -174,6 +174,32 @@ impl ProviderExecutionFiles {
         self.home.path()
     }
 
+    /// Gives one file the private home's own owner.
+    ///
+    /// The home belongs to the provider identity, so an artifact the controller writes into it
+    /// afterwards would otherwise stay owned by the controller and be unreadable to the hosted
+    /// child that needs it. An owner-to-owner change is permitted without privilege, and a local run
+    /// owns both paths already, so this is a no-op there.
+    pub(crate) fn own_provider_file(&self, path: &Path) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            use std::os::unix::fs::MetadataExt;
+
+            let owner = fs::symlink_metadata(self.home.path())?;
+            let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| io::Error::other("provider file path is invalid"))?;
+            // SAFETY: the path is a live NUL-free C string and the owner comes from lstat of the
+            // directory this file was written into.
+            if unsafe { libc::lchown(c_path.as_ptr(), Some(owner.uid()), Some(owner.gid())) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = path;
+        Ok(())
+    }
+
     /// Files for tests that only read the home and workspace paths, without launching a process.
     #[cfg(test)]
     pub(crate) fn for_test(

@@ -336,8 +336,15 @@ impl PiAdapter {
             && document.is_none()
             && !command::credential_declared(self.provider, &invocation.environment);
         if let Some(document) = document {
-            document.map_err(|error| {
+            let path = document.map_err(|error| {
                 NodeRunnerError::DriverDetail(format!("Pi provider configuration failed: {error}"))
+            })?;
+            // The controller writes this file into a home that already belongs to the provider
+            // identity, and a hosted child cannot read a document the controller still owns.
+            files.own_provider_file(&path).map_err(|error| {
+                NodeRunnerError::DriverDetail(format!(
+                    "Pi provider configuration ownership failed: {error}"
+                ))
             })?;
         }
         let mut command = command(PiCommandRequest {
