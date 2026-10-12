@@ -85,6 +85,10 @@ struct EndpointDocument<'a> {
     api: Option<&'a str>,
     model: Option<&'a str>,
     reasoning: bool,
+    /// Environment field the document interpolates as `apiKey`, or `None` to omit the field so Pi
+    /// resolves its own environment credential. A present `apiKey` that does not resolve suppresses
+    /// Pi's environment auth, so it is written only for a field the lane actually supplies.
+    api_key_field: Option<&'a str>,
 }
 
 /// A caller-owned gateway endpoint: the base URL, the wire protocol the caller named, the model
@@ -104,10 +108,9 @@ fn models_document(selection: ProviderOverride, endpoint: EndpointDocument<'_>) 
     if let Some(api) = endpoint.api {
         provider.insert("api".to_owned(), json!(api));
     }
-    provider.insert(
-        "apiKey".to_owned(),
-        json!(format!("${}", selection.api_key_field)),
-    );
+    if let Some(api_key_field) = endpoint.api_key_field {
+        provider.insert("apiKey".to_owned(), json!(format!("${api_key_field}")));
+    }
     // A registered provider needs one model entry before it resolves any identifier. The entry
     // binds the caller's own identifier, and `reasoning` mirrors the binding's authored effort so
     // Pi does not silently discard it. Context window, output limit, and cost stay unset: Pi owns
@@ -147,6 +150,7 @@ pub(super) fn write_gateway(
                 api: Some(document.api),
                 model: Some(document.model),
                 reasoning: document.reasoning,
+                api_key_field: Some(GATEWAY.api_key_field),
             },
         ),
     )
@@ -165,11 +169,13 @@ pub(super) fn validate_api(api: &str) -> Result<(), PiProviderDocumentError> {
 }
 
 /// Writes a built-in-provider endpoint override, which keeps that provider's own protocol and its
-/// built-in model catalog.
+/// built-in model catalog. `api_key_field` names the credential field the document interpolates,
+/// or `None` to omit `apiKey` so Pi resolves the lane's environment credential itself.
 pub(super) fn write_endpoint(
     agent_dir: &Path,
     selection: ProviderOverride,
     base_url: &str,
+    api_key_field: Option<&str>,
 ) -> Result<PathBuf, PiProviderDocumentError> {
     write_document(
         agent_dir,
@@ -180,6 +186,7 @@ pub(super) fn write_endpoint(
                 api: None,
                 model: None,
                 reasoning: false,
+                api_key_field,
             },
         ),
     )
@@ -328,6 +335,7 @@ mod tests {
                 api: Some("openai-completions"),
                 model: Some("provider-model"),
                 reasoning: true,
+                api_key_field: Some(GATEWAY.api_key_field),
             },
         );
         let provider = &document["providers"][GATEWAY.provider];
@@ -463,6 +471,7 @@ mod tests {
                 api: None,
                 model: None,
                 reasoning: false,
+                api_key_field: Some(ANTHROPIC.api_key_field),
             },
         );
         let provider = &document["providers"]["anthropic"];
@@ -476,6 +485,30 @@ mod tests {
     }
 
     #[test]
+    fn the_anthropic_endpoint_omits_api_key_when_only_a_token_is_available() {
+        // Pi suppresses its own environment auth when a `models.json` `apiKey` does not resolve, so
+        // a caller-owned endpoint that carries `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_OAUTH_TOKEN`
+        // must omit `apiKey` and let Pi resolve that token from the environment itself.
+        let document = models_document(
+            ANTHROPIC,
+            EndpointDocument {
+                base_url: "https://messages.example",
+                api: None,
+                model: None,
+                reasoning: false,
+                api_key_field: None,
+            },
+        );
+        let provider = &document["providers"]["anthropic"];
+        assert_eq!(provider["baseUrl"], "https://messages.example");
+        assert!(
+            provider.get("apiKey").is_none(),
+            "an unavailable key field must not suppress Pi's environment auth"
+        );
+        assert!(provider.get("api").is_none());
+    }
+
+    #[test]
     fn the_openai_document_keeps_pis_own_responses_protocol() {
         // The OpenAI lane retargets the endpoint and keeps the built-in protocol, so an endpoint
         // for this lane must speak Responses. The gateway lane is the one that can name a protocol.
@@ -486,6 +519,7 @@ mod tests {
                 api: None,
                 model: None,
                 reasoning: false,
+                api_key_field: Some(OPENAI.api_key_field),
             },
         );
         let provider = &document["providers"]["openai"];
@@ -500,7 +534,13 @@ mod tests {
         assert_eq!(MODELS_FILE, "models.json");
         let directory = TestDirectory::new("pi-anthropic-file");
         let agent_dir = directory.child("agent");
-        let path = write_endpoint(&agent_dir, ANTHROPIC, "https://messages.example").unwrap();
+        let path = write_endpoint(
+            &agent_dir,
+            ANTHROPIC,
+            "https://messages.example",
+            Some(ANTHROPIC.api_key_field),
+        )
+        .unwrap();
         assert_eq!(path, agent_dir.join("models.json"));
     }
 

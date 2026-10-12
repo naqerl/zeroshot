@@ -159,7 +159,10 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   stored `auth.json` credential outranks a `models.json` `apiKey` on any provider, so the declared
   key must still reach the child through the environment, and a declared endpoint or a declared lane
   credential ends native-login reuse so a stored credential is never sent to a caller-owned host and
-  never outranks the declared one. A native-local lane reuses
+  never outranks the declared one. An endpoint override interpolates the lane's key field only when
+  the connection supplies it; the anthropic override omits `apiKey` when `ANTHROPIC_API_KEY` is
+  absent so Pi's own `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_OAUTH_TOKEN` environment auth still resolves.
+  A native-local lane reuses
   the user's stored Pi login from its agent directory; every other lane receives a private agent
   directory so no ambient configuration, catalog, or credential is inherited. Session identity is a
   bounded SHA-256 of the node-instance or execution identity, because Pi accepts

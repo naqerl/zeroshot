@@ -372,6 +372,11 @@ fn coverage_contract_pi_local_configuration_only_inherits_its_own_lane_credentia
             "ambient-anthropic".to_owned(),
         ),
         ("OPENAI_API_KEY".to_owned(), "ambient-openai".to_owned()),
+        ("AWS_REGION".to_owned(), "us-east-1".to_owned()),
+        (
+            "AWS_BEARER_TOKEN_BEDROCK".to_owned(),
+            "ambient-bedrock".to_owned(),
+        ),
         ("HTTPS_PROXY".to_owned(), "https://proxy.invalid".to_owned()),
     ]);
 
@@ -401,6 +406,23 @@ fn coverage_contract_pi_local_configuration_only_inherits_its_own_lane_credentia
     ))
     .assert_value();
     assert!(openai.local_environment.contains_key("OPENAI_API_KEY"));
+    // A Bedrock region is foreign to every lane but Bedrock, so a non-bedrock lane drops it before
+    // the credential boundary can reject the turn. The Bedrock lane still reads its own region,
+    // though its bearer token remains a declared requirement.
+    assert!(!anthropic.local_environment.contains_key("AWS_REGION"));
+    assert!(!openai.local_environment.contains_key("AWS_REGION"));
+    let bedrock = PiAdapter::new_local(adapter_configuration(
+        PiProvider::Bedrock,
+        "pi",
+        native.clone(),
+    ))
+    .assert_value();
+    assert!(bedrock.local_environment.contains_key("AWS_REGION"));
+    assert!(
+        !bedrock
+            .local_environment
+            .contains_key("AWS_BEARER_TOKEN_BEDROCK")
+    );
 
     // A non-native lane must not inherit any lane credential from the invoking shell.
     let openrouter = PiAdapter::new_local(adapter_configuration(
@@ -415,6 +437,7 @@ fn coverage_contract_pi_local_configuration_only_inherits_its_own_lane_credentia
             .contains_key("ANTHROPIC_API_KEY")
     );
     assert!(!openrouter.local_environment.contains_key("OPENAI_API_KEY"));
+    assert!(!openrouter.local_environment.contains_key("AWS_REGION"));
     // Transport selectors are shared by every lane.
     assert!(openrouter.local_environment.contains_key("HTTPS_PROXY"));
 
@@ -507,6 +530,13 @@ fn coverage_contract_pi_declared_connections_may_not_shadow_reserved_configurati
         "PI_TELEMETRY",
         "HOME",
         "TMPDIR",
+        // The harness-owned base environment is reserved too, so a declared connection cannot
+        // replace the search path, locale, terminal, or tools directory the adapter supplies.
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "ZEROSHOT_TOOLS",
     ] {
         let directory = TestDirectory::new("pi-reserved");
         let files = files(&directory);
@@ -741,6 +771,47 @@ fn coverage_contract_pi_a_declared_endpoint_ends_native_login_reuse() {
         agent_dir.join(MODELS_FILE).is_file(),
         "a declared endpoint writes the provider document Pi reads"
     );
+}
+
+#[test]
+fn coverage_contract_pi_endpoint_with_only_a_token_omits_the_api_key_field() {
+    // A caller-owned endpoint with only `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_OAUTH_TOKEN` must omit
+    // `apiKey`: a present-but-unresolved `apiKey` suppresses Pi's own environment auth.
+    let directory = TestDirectory::new("pi-anthropic-token-endpoint");
+    let files = files(&directory);
+    let agent_dir = files.home().to_path_buf();
+    let adapter = PiAdapter::new_local(adapter_configuration(
+        PiProvider::Anthropic,
+        "pi",
+        BTreeMap::new(),
+    ))
+    .assert_value();
+    let fields = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"];
+    let invocation = invocation(
+        agent_binding(
+            "provider-owned-model",
+            None,
+            SessionScope::Execution,
+            &fields,
+        ),
+        NodeRole::Worker,
+        resolved(
+            &fields,
+            &[
+                ("ANTHROPIC_AUTH_TOKEN", "declared-token"),
+                ("ANTHROPIC_BASE_URL", "https://messages.example"),
+            ],
+        ),
+    );
+    adapter
+        .command_for_test(&invocation, &files, "zs-fixed")
+        .assert_value_with("token-only endpoint launch");
+    let written = std::fs::read_to_string(agent_dir.join(MODELS_FILE)).assert_value();
+    assert!(
+        !written.contains("apiKey"),
+        "an unavailable key field must not suppress Pi's environment auth"
+    );
+    assert!(written.contains("https://messages.example"));
 }
 
 #[test]
@@ -1079,6 +1150,99 @@ fn coverage_contract_pi_foreign_lane_credentials_are_refused() {
 }
 
 #[test]
+fn coverage_contract_pi_bedrock_pair_is_foreign_to_every_non_bedrock_lane() {
+    // A Bedrock credential or region must not ride along on a lane that authenticates elsewhere.
+    for (provider, accepted) in [
+        (
+            PiProvider::Anthropic,
+            ("ANTHROPIC_API_KEY", "anthropic-key"),
+        ),
+        (PiProvider::OpenAi, ("OPENAI_API_KEY", "openai-key")),
+        (
+            PiProvider::OpenRouter,
+            ("OPENROUTER_API_KEY", "openrouter-key"),
+        ),
+    ] {
+        for foreign in ["AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION"] {
+            let directory = TestDirectory::new("pi-bedrock-foreign");
+            let files = files(&directory);
+            let command = super::command::command(PiCommandRequest {
+                provider,
+                native_local: false,
+                contained: false,
+                executable: "pi",
+                prefix_arguments: &[],
+                invocation: &invocation(
+                    agent_binding(
+                        "provider/model",
+                        None,
+                        SessionScope::Execution,
+                        &[accepted.0, foreign],
+                    ),
+                    NodeRole::Worker,
+                    resolved(
+                        &[accepted.0, foreign],
+                        &[(accepted.0, accepted.1), (foreign, "foreign")],
+                    ),
+                ),
+                files: &files,
+                local_environment: &BTreeMap::new(),
+                agent_dir: directory.path(),
+                session_dir: &directory.child("sessions"),
+                session_id: "zs-fixed",
+            });
+            assert!(
+                command.is_err(),
+                "{foreign} must not ride along on {provider:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn coverage_contract_pi_gateway_refuses_the_bedrock_pair() {
+    for foreign in ["AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION"] {
+        let directory = TestDirectory::new("pi-gateway-bedrock");
+        let files = files(&directory);
+        let fields = [
+            "GATEWAY_BASE_URL",
+            "GATEWAY_API_KEY",
+            "GATEWAY_API",
+            foreign,
+        ];
+        let command = super::command::command(PiCommandRequest {
+            provider: PiProvider::Gateway,
+            native_local: false,
+            contained: false,
+            executable: "pi",
+            prefix_arguments: &[],
+            invocation: &invocation(
+                agent_binding("provider/model", None, SessionScope::Execution, &fields),
+                NodeRole::Worker,
+                resolved(
+                    &fields,
+                    &[
+                        ("GATEWAY_BASE_URL", "https://gateway.example/api/v1"),
+                        ("GATEWAY_API_KEY", "sk-gateway"),
+                        ("GATEWAY_API", "openai-completions"),
+                        (foreign, "foreign"),
+                    ],
+                ),
+            ),
+            files: &files,
+            local_environment: &BTreeMap::new(),
+            agent_dir: directory.path(),
+            session_dir: &directory.child("sessions"),
+            session_id: "zs-fixed",
+        });
+        assert!(
+            command.is_err(),
+            "{foreign} must not reach the gateway lane"
+        );
+    }
+}
+
+#[test]
 fn coverage_contract_pi_present_but_empty_declared_credential_fails_closed() {
     for (provider, field) in [
         (PiProvider::Anthropic, "ANTHROPIC_API_KEY"),
@@ -1266,6 +1430,28 @@ fn coverage_contract_pi_usage_is_recorded_for_the_turn() {
         usage.cache_creation_input_tokens.map(|count| count.get()),
         Some(1)
     );
+}
+
+#[test]
+fn coverage_contract_pi_usage_accumulates_across_a_turns_model_requests() {
+    // Pi resets usage for each assistant message, and one turn issues one model request per tool
+    // step, so the turn total is the sum of each message's settled usage rather than the last one's.
+    let mut transcript = super::PiTranscript::new(Vec::new());
+    let stream = [
+        r#"{"type":"message_start","message":{"role":"assistant"}}"#,
+        r#"{"type":"message_update","usage":{"input":11,"output":23},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"a"}}"#,
+        r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"a"}],"usage":{"input":11,"output":23},"stopReason":"toolUse"}}"#,
+        r#"{"type":"message_start","message":{"role":"assistant"}}"#,
+        // The second message reports usage only on its settled message, so the assertion proves
+        // `message_end` usage is read rather than relying on the streaming update.
+        r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"b"}}"#,
+        r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"b"}],"usage":{"input":100,"output":7},"stopReason":"stop"}}"#,
+    ]
+    .join("\n");
+    transcript.push(format!("{stream}\n").as_bytes());
+    let usage = transcript.token_usage().expect("usage is recorded");
+    assert_eq!(usage.input_tokens.get(), 111);
+    assert_eq!(usage.output_tokens.get(), 30);
 }
 #[test]
 fn coverage_contract_pi_binding_effort_absent_omits_the_thinking_argument() {

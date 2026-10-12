@@ -2,8 +2,8 @@
 //!
 //! One adapter serves the graph-wide Pi provider lane. Admission has already selected the model,
 //! effort, session scope, and declared environment for each node. Pi exposes no permission
-//! control of its own, so containment and the shared prompt renderer are the isolation boundary,
-//! exactly as for the Copilot lane.
+//! control of its own, so the adapter appends no permission argument and a contained run is bounded
+//! by the disposable capsule; the shared prompt renderer carries the rest.
 //!
 //! The adapter drives `pi --mode json`: one process per turn, the prompt on stdin, and an LF-framed
 //! JSONL event stream on stdout. Nothing here appends a permission argument, because Pi has no
@@ -209,18 +209,23 @@ impl PiAdapter {
             .selected(PI_LOCAL_ENVIRONMENT);
         let mut adapter = Self::configured(configuration, ProviderProcessRunners::local(), false)?;
         adapter.local_environment = local_environment;
+        // A Bedrock region is foreign to every lane but Bedrock. Forwarding it would make the
+        // credential boundary reject an otherwise valid non-bedrock turn, while the bedrock lane
+        // still reads its own ambient region. Everything else is a lane credential, and a foreign
+        // ambient credential that reached the child would be rejected by the credential check.
+        let foreign = |name: &str| {
+            is_pi_credential(name)
+                || (provider != PiProvider::Bedrock && name == command::AWS_REGION)
+        };
         if native_local {
             // Keep the selected lane's own credential so a user who exports a key instead of
-            // storing one still authenticates, but drop every other lane's. A foreign ambient
-            // credential that reached the child would be rejected by the credential check.
+            // storing one still authenticates, but drop every other lane's.
             let own = command::native_local_credentials(provider);
             adapter
                 .local_environment
-                .retain(|name, _| !is_pi_credential(name) || own.contains(&name.as_str()));
+                .retain(|name, _| !foreign(name) || own.contains(&name.as_str()));
         } else {
-            adapter
-                .local_environment
-                .retain(|name, _| !is_pi_credential(name));
+            adapter.local_environment.retain(|name, _| !foreign(name));
         }
         Ok(adapter)
     }
@@ -250,8 +255,8 @@ impl PiAdapter {
     }
 
     /// Per-session private homes. The agent directory holds Pi's configuration, model catalog, and
-    /// `models.json`; sessions live in a sibling directory so a node instance keeps one session
-    /// across loop revisits.
+    /// `models.json`; sessions live in a `sessions` child directory so a node instance keeps one
+    /// session across loop revisits.
     fn homes(&self, files: &ProviderExecutionFiles) -> (PathBuf, PathBuf) {
         let home = files.home();
         (agent_directory(home), session_directory(home))
@@ -300,7 +305,12 @@ impl PiAdapter {
                     declared_base_url(&invocation.environment, command::ANTHROPIC_BASE_URL)
                         .or_else(|| self.ambient_base_url(command::ANTHROPIC_BASE_URL));
                 base_url.map(|base_url| {
-                    write_endpoint(&agent_dir, provider_document::ANTHROPIC, &base_url)
+                    write_endpoint(
+                        &agent_dir,
+                        provider_document::ANTHROPIC,
+                        &base_url,
+                        anthropic_api_key_field(&invocation.environment),
+                    )
                 })
             }
             PiProvider::OpenAi => {
@@ -313,7 +323,9 @@ impl PiAdapter {
                     })
                     .or_else(|| self.ambient_base_url(command::OPENAI_BASE_URL))
                     .or_else(|| self.ambient_base_url(command::OPENAI_API_BASE));
-                base_url.map(|base_url| write_endpoint(&agent_dir, OPENAI, &base_url))
+                base_url.map(|base_url| {
+                    write_endpoint(&agent_dir, OPENAI, &base_url, Some(OPENAI.api_key_field))
+                })
             }
             _ => None,
         };
@@ -414,6 +426,19 @@ fn is_pi_credential(name: &str) -> bool {
     )
 }
 
+/// The credential field an anthropic endpoint override may interpolate as `apiKey`.
+///
+/// Pi's own environment auth covers `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_OAUTH_TOKEN`, but a
+/// `models.json` `apiKey` that fails to resolve suppresses that fallback. So reference
+/// `ANTHROPIC_API_KEY` only when the declared connection actually supplies it; otherwise omit
+/// `apiKey` and let Pi resolve the token from the environment.
+fn anthropic_api_key_field(resolved: &ResolvedEnvironment) -> Option<&'static str> {
+    resolved
+        .iter()
+        .any(|(name, value)| name.as_str() == command::ANTHROPIC_KEY && !value.is_empty())
+        .then_some(command::ANTHROPIC_KEY)
+}
+
 impl PiAdapter {
     async fn advance_turn(
         &self,
@@ -463,7 +488,8 @@ impl PiAdapter {
         };
         let mut command = self.command(turn.invocation, &files, &state.session_id)?;
         // The minimal base environment supplies the executable search path and any run tool
-        // directory. It is never read from the ambient process, and a declared value wins.
+        // directory. It is never read from the ambient process, and a declared connection cannot
+        // shadow these names, so the base value always fills an unset name.
         for (name, value) in self.base_environment.clone_values() {
             command
                 .environment

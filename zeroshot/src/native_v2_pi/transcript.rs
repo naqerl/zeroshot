@@ -44,10 +44,13 @@ pub(crate) struct PiTranscript {
     lines: ProviderJsonLines,
     session_id: Option<String>,
     terminal: Option<Terminal>,
-    /// Assistant text blocks of the message currently streaming, keyed by content index.
-    blocks: Vec<Option<String>>,
-    /// Latest cumulative usage reported by the provider.
+    /// Usage already committed from assistant messages that have ended this turn. Pi resets usage
+    /// for each assistant message, and one turn runs one model request per tool step, so the turn
+    /// total is the sum across messages.
     usage: Option<TokenUsageDelta>,
+    /// Latest cumulative usage for the assistant message currently streaming. Pi reports usage as
+    /// the running total of its message, so each update replaces this rather than adding to it.
+    current_usage: Option<TokenUsageDelta>,
     malformed: usize,
     redactions: Vec<String>,
 }
@@ -63,8 +66,8 @@ impl PiTranscript {
             lines: ProviderJsonLines::new(),
             session_id: None,
             terminal: None,
-            blocks: Vec::new(),
             usage: None,
+            current_usage: None,
             malformed: 0,
             redactions,
         }
@@ -82,7 +85,11 @@ impl PiTranscript {
     }
 
     pub(super) fn token_usage(&self) -> Option<TokenUsageDelta> {
-        self.usage
+        match (self.usage, self.current_usage) {
+            (Some(total), Some(current)) => add_usage(total, current).or(Some(total)),
+            (Some(total), None) => Some(total),
+            (None, current) => current,
+        }
     }
 
     /// True only when the provider reported a usable answer. A failed or aborted model response is
@@ -168,8 +175,21 @@ impl PiTranscript {
                     self.session_id = Some(id.to_owned());
                 }
             }
+            "message_start" => {
+                // A new assistant message is a new model request whose usage starts over, so the
+                // previous message's latest usage becomes part of the turn total. A `message_end`
+                // normally commits it already; this also covers a stream that omitted one.
+                if value
+                    .get("message")
+                    .and_then(|message| message.get("role"))
+                    .and_then(Value::as_str)
+                    == Some("assistant")
+                {
+                    self.commit_usage();
+                }
+            }
             "message_update" => {
-                self.record_usage(value);
+                self.record_usage(value.get("usage"));
                 if let Some(text) = self.record_delta(value) {
                     push_text(emissions, LiveOutputStream::Output, &text);
                 }
@@ -203,7 +223,10 @@ impl PiTranscript {
             return;
         }
         let text = assistant_text(message);
-        self.blocks.clear();
+        // The settled message carries the authoritative usage for this model request, so replace
+        // any streaming value with it before committing the message to the turn total.
+        self.record_usage(message.get("usage"));
+        self.commit_usage();
         match message.get("stopReason").and_then(Value::as_str) {
             // An error or aborted stop reason means the turn produced no usable answer, even
             // though Pi exits successfully and reports it only in the event stream.
@@ -225,45 +248,21 @@ impl PiTranscript {
         }
     }
 
-    fn record_delta(&mut self, value: &Value) -> Option<String> {
+    fn record_delta(&self, value: &Value) -> Option<String> {
         let event = value.get("assistantMessageEvent")?;
-        let index = event.get("contentIndex").and_then(Value::as_u64)? as usize;
         match event.get("type").and_then(Value::as_str)? {
-            "text_start" => {
-                self.replace_block(index, "");
-                None
-            }
-            "text_delta" => {
-                let delta = event.get("delta").and_then(Value::as_str)?;
-                if self.blocks.len() <= index {
-                    // A delta before its start event still accumulates: the value, not the event
-                    // order, is what the final message is built from.
-                    self.blocks.resize(index + 1, None);
-                }
-                self.blocks[index]
-                    .get_or_insert_with(String::new)
-                    .push_str(delta);
-                Some(delta.to_owned())
-            }
-            "text_end" => {
-                // The completed block is authoritative and replaces the accumulated deltas.
-                let content = event.get("content").and_then(Value::as_str)?;
-                self.replace_block(index, content);
-                None
-            }
+            // Pi streams a model response as many small `text_delta` events. The final assistant
+            // message, not these deltas, is the node's response, so only live output is kept here.
+            "text_delta" => event
+                .get("delta")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             _ => None,
         }
     }
 
-    fn replace_block(&mut self, index: usize, content: &str) {
-        if self.blocks.len() <= index {
-            self.blocks.resize(index + 1, None);
-        }
-        self.blocks[index] = Some(content.to_owned());
-    }
-
-    fn record_usage(&mut self, value: &Value) {
-        let Some(usage) = value.get("usage").filter(|usage| usage.is_object()) else {
+    fn record_usage(&mut self, usage: Option<&Value>) {
+        let Some(usage) = usage.filter(|usage| usage.is_object()) else {
             return;
         };
         // Pi reports provider-native key names, so they are mapped into the protocol shape rather
@@ -279,12 +278,22 @@ impl PiTranscript {
         let (Some(input), Some(output)) = (count("input"), count("output")) else {
             return;
         };
-        self.usage = Some(TokenUsageDelta {
+        self.current_usage = Some(TokenUsageDelta {
             input_tokens: input,
             output_tokens: output,
             cache_read_input_tokens: count("cacheRead"),
             cache_creation_input_tokens: count("cacheWrite"),
         });
+    }
+
+    /// Folds the in-flight assistant message's usage into the turn total.
+    fn commit_usage(&mut self) {
+        if let Some(current) = self.current_usage.take() {
+            self.usage = Some(match self.usage {
+                Some(total) => add_usage(total, current).unwrap_or(total),
+                None => current,
+            });
+        }
     }
 
     fn safe(&self, text: &str) -> String {
@@ -323,6 +332,34 @@ fn push_text(emissions: &mut Vec<PiEmission>, stream: LiveOutputStream, text: &s
         stream,
         text: text.to_owned(),
     });
+}
+
+/// Adds two usage deltas, failing closed if any counter would exceed its bound.
+fn add_usage(left: TokenUsageDelta, right: TokenUsageDelta) -> Option<TokenUsageDelta> {
+    Some(TokenUsageDelta {
+        input_tokens: left.input_tokens.checked_add(right.input_tokens)?,
+        output_tokens: left.output_tokens.checked_add(right.output_tokens)?,
+        cache_read_input_tokens: add_optional_usage(
+            left.cache_read_input_tokens,
+            right.cache_read_input_tokens,
+        )?,
+        cache_creation_input_tokens: add_optional_usage(
+            left.cache_creation_input_tokens,
+            right.cache_creation_input_tokens,
+        )?,
+    })
+}
+
+/// Cache counters are reported only when every message reported them, so a partial pair stays
+/// absent rather than inventing a total for the turn.
+fn add_optional_usage(
+    left: Option<TokenCount>,
+    right: Option<TokenCount>,
+) -> Option<Option<TokenCount>> {
+    match (left, right) {
+        (Some(left), Some(right)) => left.checked_add(right).map(Some),
+        _ => Some(None),
+    }
 }
 
 #[cfg(test)]

@@ -101,12 +101,17 @@ RUN for tool in cargo cargo-clippy cargo-fmt clippy-driver rustc rustdoc rustfmt
     && ldconfig
 
 COPY --chmod=0755 docker/zeroshot-target/harness.sh /usr/local/libexec/zeroshot-harness
+# `--strict-allow-scripts` fails the install unless every dependency install script is listed:
+#   @anthropic-ai/claude-code: postinstall installs the native launcher.
+#   esbuild: postinstall downloads/links the platform-specific binary.
+#   @google/genai: its preinstall is a no-op but npm still classifies it as an install script.
+#   protobufjs: postinstall generates its runtime descriptors.
 RUN install -d /opt/zeroshot/bin /opt/zeroshot/harness/lib/node_modules \
     && cp /usr/local/bin/node /opt/zeroshot/bin/node \
     && npm install --global --no-audit --no-fund "npm@${NPM_VERSION}" \
     && npm install --global --prefix /opt/zeroshot/harness --no-audit --no-fund \
         --strict-allow-scripts \
-        --allow-scripts=@anthropic-ai/claude-code \
+        --allow-scripts=@anthropic-ai/claude-code,esbuild,@google/genai,protobufjs \
         "@github/copilot@${COPILOT_VERSION}" \
         "@openai/codex@${CODEX_VERSION}" \
         "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \

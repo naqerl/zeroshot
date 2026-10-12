@@ -50,7 +50,8 @@ const ANTHROPIC_CREDENTIALS: [&str; 3] = [ANTHROPIC_KEY, ANTHROPIC_AUTH, ANTHROP
 const OPENAI_CREDENTIALS: [&str; 1] = [OPENAI_KEY];
 
 /// Credentials belonging to any other lane. A declared value from one of these must not stand in
-/// for the selected lane's credential.
+/// for the selected lane's credential. The Bedrock pair is handled separately so the bedrock lane
+/// can still require it while every other lane rejects it.
 const FOREIGN_CREDENTIALS: [&str; 5] = [
     ANTHROPIC_KEY,
     ANTHROPIC_AUTH,
@@ -58,6 +59,10 @@ const FOREIGN_CREDENTIALS: [&str; 5] = [
     OPENAI_KEY,
     OPENROUTER_KEY,
 ];
+
+/// The Bedrock credential pair. It is foreign to every non-bedrock lane and required together by
+/// the bedrock lane.
+const BEDROCK_CREDENTIALS: [&str; 2] = [AWS_BEARER_TOKEN_BEDROCK, AWS_REGION];
 
 /// Names the adapter reserves. A declared connection colliding with one is a provider failure
 /// rather than a silent override.
@@ -273,7 +278,9 @@ impl EnvironmentRequest<'_> {
 /// Rejects a declared connection that would shadow adapter-reserved process configuration.
 fn validate_reserved(resolved: &ResolvedEnvironment) -> Result<(), NodeRunnerError> {
     for (name, _) in resolved.iter() {
-        if RESERVED.contains(&name.as_str()) {
+        if RESERVED.contains(&name.as_str())
+            || super::MINIMAL_ENVIRONMENT_NAMES.contains(&name.as_str())
+        {
             return Err(NodeRunnerError::DriverDetail(format!(
                 "Pi declared environment conflicts with reserved process configuration {name}"
             )));
@@ -325,6 +332,7 @@ fn accept_lane(
     reject_empty(environment, accepted)?;
     let foreign: Vec<&str> = FOREIGN_CREDENTIALS
         .iter()
+        .chain(BEDROCK_CREDENTIALS.iter())
         .copied()
         .filter(|name| !accepted.contains(name))
         .collect();
@@ -345,9 +353,6 @@ fn accept_bedrock(environment: &BTreeMap<String, String>) -> Result<(), NodeRunn
     validate_absent(environment, &FOREIGN_CREDENTIALS)
 }
 
-/// The gateway lane carries a caller-owned endpoint, key, and wire protocol through Pi's own
-/// `models.json`. The base URL and key stay in the declared connection and the synthesized file
-/// holds no secret. The protocol is authored, never detected.
 /// The declared credential fields a native-local lane accepts. A declared value on such a lane must
 /// still end stored-login reuse: Pi resolves its agent directory ahead of the process environment,
 /// so without a private agent directory a declared credential would be silently outranked by the
@@ -367,6 +372,9 @@ pub(super) fn credential_declared(provider: PiProvider, environment: &ResolvedEn
         .any(|field| environment.iter().any(|(name, _)| name.as_str() == *field))
 }
 
+/// The gateway lane carries a caller-owned endpoint, key, and wire protocol through Pi's own
+/// `models.json`. The base URL and key stay in the declared connection and the synthesized file
+/// holds no secret. The protocol is authored, never detected.
 fn accept_gateway(environment: &BTreeMap<String, String>) -> Result<(), NodeRunnerError> {
     let _ = gateway::connection(environment)?;
     let api = environment
@@ -378,7 +386,8 @@ fn accept_gateway(environment: &BTreeMap<String, String>) -> Result<(), NodeRunn
     // credential boundary too rather than only once the provider document is built.
     crate::native_v2_pi::provider_document::validate_api(api)
         .map_err(|_| NodeRunnerError::Driver)?;
-    validate_absent(environment, &FOREIGN_CREDENTIALS)
+    validate_absent(environment, &FOREIGN_CREDENTIALS)?;
+    validate_absent(environment, &BEDROCK_CREDENTIALS)
 }
 
 /// A present-but-empty declared credential fails closed instead of falling back to a stored login.

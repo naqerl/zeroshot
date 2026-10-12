@@ -414,10 +414,10 @@ fn local_harness(
             runtime_home: runtime_home.to_owned(),
             local_user_home: current_user_home(&native_environment),
             native_environment: native_environment.clone(),
-            base_environment: PiProcessEnvironment::new(BTreeMap::from([
-                ("PATH".to_owned(), search_path.clone()),
-                ("ZEROSHOT_TOOLS".to_owned(), String::new()),
-            ]))?,
+            base_environment: PiProcessEnvironment::new(BTreeMap::from([(
+                "PATH".to_owned(),
+                search_path.clone(),
+            )]))?,
             process_pool,
         }),
     };
