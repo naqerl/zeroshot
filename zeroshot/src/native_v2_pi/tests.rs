@@ -1120,6 +1120,8 @@ fn coverage_contract_pi_native_local_lane_leaves_the_agent_directory_unset() {
 
 #[path = "tests/credentials.rs"]
 mod credentials;
+#[path = "tests/process.rs"]
+mod process;
 
 #[test]
 fn coverage_contract_pi_session_identity_is_derived_per_scope() {
