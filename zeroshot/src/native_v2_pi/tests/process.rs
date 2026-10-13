@@ -90,12 +90,9 @@ async fn run_invocation(
         }
         seen
     });
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(60),
-        adapter.run(invocation, control),
-    )
-    .await
-    .assert_value_with("a scripted Pi turn must finish");
+    let outcome = tokio::time::timeout(Duration::from_secs(60), adapter.run(invocation, control))
+        .await
+        .assert_value_with("a scripted Pi turn must finish");
     drop(cancel);
     let seen = drain.await.assert_value();
     (outcome, seen)
@@ -303,10 +300,7 @@ async fn a_provider_that_never_reads_its_stdin_reports_the_input_failure() {
     let Err(NodeRunnerError::DriverDetail(detail)) = outcome else {
         panic!("expected an input failure detail, got {outcome:?}");
     };
-    assert!(
-        detail.contains("provider process input failed"),
-        "{detail}"
-    );
+    assert!(detail.contains("provider process input failed"), "{detail}");
     assert!(
         marker.exists(),
         "the provider must have started before the input failed"
@@ -425,7 +419,12 @@ async fn a_gateway_run_requires_its_authored_wire_protocol() {
     let adapter = PiAdapter::new_local(configuration).assert_value();
     let fields = ["GATEWAY_BASE_URL", "GATEWAY_API_KEY"];
     let turn = invocation(
-        agent_binding("provider-owned-model", None, SessionScope::Execution, &fields),
+        agent_binding(
+            "provider-owned-model",
+            None,
+            SessionScope::Execution,
+            &fields,
+        ),
         NodeRole::Worker,
         resolved(
             &fields,

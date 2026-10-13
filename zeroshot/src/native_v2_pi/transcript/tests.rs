@@ -354,7 +354,10 @@ fn assistant_text_requires_content_of_a_supported_shape() {
     // blocks, and a text block that carries no text are all unusable as an answer.
     assert_eq!(assistant_text(&json!({"role": "assistant"})), None);
     assert_eq!(assistant_text(&json!({"content": 5})), None);
-    assert_eq!(assistant_text(&json!({"content": [{"type": "text"}]})), None);
+    assert_eq!(
+        assistant_text(&json!({"content": [{"type": "text"}]})),
+        None
+    );
     assert_eq!(
         assistant_text(&json!({"content": [
             {"type": "text", "text": "ok"},
@@ -422,7 +425,7 @@ fn usage_that_is_not_a_complete_counted_object_is_ignored() {
         json!({"type": "message_update", "usage": {"input": SAFE_TOKEN_COUNT + 1, "output": 3},
                "assistantMessageEvent": {"type": "start"}})
         .to_string(),
-        "",
+        String::new(),
     ]
     .join("\n");
     transcript.push(stream.as_bytes());
@@ -538,7 +541,8 @@ fn one_oversized_record_is_dropped_without_losing_the_answer() {
     let mut transcript = PiTranscript::new(Vec::new());
     let mut oversized = vec![
         b'x';
-        crate::native_v2_capsule::provider_json_lines::MAX_PROVIDER_JSONL_RECORD_BYTES + 1
+        crate::native_v2_capsule::provider_json_lines::MAX_PROVIDER_JSONL_RECORD_BYTES
+            + 1
     ];
     oversized.push(b'\n');
     transcript.push(&oversized);
@@ -569,6 +573,14 @@ fn redactions_are_deduplicated_and_applied_longest_first() {
     let super::PiAttempt::Failed(failure) = transcript.finish(None).unwrap() else {
         panic!("expected a failure");
     };
-    assert!(!failure.diagnostic.contains("sk-"), "{}", failure.diagnostic);
-    assert!(!failure.diagnostic.contains("secret"), "{}", failure.diagnostic);
+    assert!(
+        !failure.diagnostic.contains("sk-"),
+        "{}",
+        failure.diagnostic
+    );
+    assert!(
+        !failure.diagnostic.contains("secret"),
+        "{}",
+        failure.diagnostic
+    );
 }

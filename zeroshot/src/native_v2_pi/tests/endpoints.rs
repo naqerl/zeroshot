@@ -10,10 +10,7 @@
 
 use super::*;
 
-fn local_adapter(
-    provider: PiProvider,
-    native_environment: BTreeMap<String, String>,
-) -> PiAdapter {
+fn local_adapter(provider: PiProvider, native_environment: BTreeMap<String, String>) -> PiAdapter {
     PiAdapter::new_local(adapter_configuration(provider, "pi", native_environment)).assert_value()
 }
 
@@ -28,8 +25,10 @@ fn endpoint_command(
     files: &ProviderExecutionFiles,
     fields: &[&str],
     values: &[(&str, &str)],
-) -> Result<crate::execution::process::ProcessSessionCommand, crate::native_v2_runner::NodeRunnerError>
-{
+) -> Result<
+    crate::execution::process::ProcessSessionCommand,
+    crate::native_v2_runner::NodeRunnerError,
+> {
     adapter.command_for_test(
         &invocation(
             agent_binding("gpt-5.6", None, SessionScope::Execution, fields),
@@ -57,7 +56,10 @@ fn coverage_contract_pi_openai_lane_turns_a_declared_base_url_into_a_provider_ov
         ],
     )
     .assert_value_with("declared OpenAI endpoint");
-    assert_eq!(value(&command.argv, "--provider").as_deref(), Some("openai"));
+    assert_eq!(
+        value(&command.argv, "--provider").as_deref(),
+        Some("openai")
+    );
     // A caller-owned endpoint ends native login reuse and writes the private document Pi reads.
     assert_eq!(
         command
@@ -67,7 +69,10 @@ fn coverage_contract_pi_openai_lane_turns_a_declared_base_url_into_a_provider_ov
         Some(files.home().to_string_lossy().as_ref())
     );
     let document = written_models(&files);
-    assert!(document.contains("https://openai-proxy.example/v1"), "{document}");
+    assert!(
+        document.contains("https://openai-proxy.example/v1"),
+        "{document}"
+    );
     assert!(document.contains("$OPENAI_API_KEY"), "{document}");
     // The declared secret is referenced, never written into the document.
     assert!(!document.contains("declared"), "{document}");
@@ -111,8 +116,8 @@ fn coverage_contract_pi_openai_lane_honors_an_ambient_base_url() {
             ),
         ]),
     );
-    let command = endpoint_command(&adapter, &files, &[], &[])
-        .assert_value_with("ambient OpenAI endpoint");
+    let command =
+        endpoint_command(&adapter, &files, &[], &[]).assert_value_with("ambient OpenAI endpoint");
     assert_eq!(
         command
             .environment
@@ -228,7 +233,10 @@ fn coverage_contract_pi_gateway_requires_a_complete_connection_before_launch() {
         &fields,
         &[("GATEWAY_BASE_URL", "https://gateway.example/v1")],
     );
-    assert!(outcome.is_err(), "an incomplete gateway connection must fail");
+    assert!(
+        outcome.is_err(),
+        "an incomplete gateway connection must fail"
+    );
 }
 
 #[test]

@@ -247,7 +247,10 @@ fn coverage_contract_pi_bedrock_lane_rejects_a_present_but_empty_pair_member() {
             NodeRole::Worker,
             resolved(
                 &["AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION"],
-                &[("AWS_BEARER_TOKEN_BEDROCK", "bedrock-token"), ("AWS_REGION", "")],
+                &[
+                    ("AWS_BEARER_TOKEN_BEDROCK", "bedrock-token"),
+                    ("AWS_REGION", ""),
+                ],
             ),
         ),
         files: &files,

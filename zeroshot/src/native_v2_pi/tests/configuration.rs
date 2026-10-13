@@ -11,18 +11,19 @@ use super::*;
 
 #[test]
 fn coverage_contract_pi_capsule_environment_supplies_a_home_and_default_search_path() {
-    let environment = PiProcessEnvironment::new(BTreeMap::from([(
-        "LANG".to_owned(),
-        "C".to_owned(),
-    )]))
-    .assert_value();
+    let environment =
+        PiProcessEnvironment::new(BTreeMap::from([("LANG".to_owned(), "C".to_owned())]))
+            .assert_value();
     let capsule = environment
         .for_capsule(Path::new("/run/pi-home"), "/usr/bin:/bin")
         .assert_value();
     let values = capsule.clone_values();
     // The capsule owns the child's home; the run supplies the executable search path.
     assert_eq!(values.get("HOME").map(String::as_str), Some("/run/pi-home"));
-    assert_eq!(values.get("PATH").map(String::as_str), Some("/usr/bin:/bin"));
+    assert_eq!(
+        values.get("PATH").map(String::as_str),
+        Some("/usr/bin:/bin")
+    );
     assert_eq!(values.get("LANG").map(String::as_str), Some("C"));
 }
 
@@ -67,7 +68,7 @@ fn coverage_contract_pi_command_rejects_an_empty_runtime_home() {
     );
     assert!(
         matches!(
-            outcome,
+            &outcome,
             Err(crate::native_v2_runner::NodeRunnerError::DriverDetail(detail))
                 if detail.contains("runtime home")
         ),

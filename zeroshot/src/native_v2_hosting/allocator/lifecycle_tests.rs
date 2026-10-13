@@ -550,7 +550,9 @@ fn hosted_pi_harness_builds_the_contained_lane_from_the_capsule() {
         values.get("ZEROSHOT_TOOLS").map(String::as_str),
         Some(root.child("tools").to_string_lossy().as_ref())
     );
-    assert!(values
-        .get("PATH")
-        .is_some_and(|path| path.starts_with(&format!("{}:", root.child("tools/bin").display()))));
+    assert!(
+        values.get("PATH").is_some_and(
+            |path| path.starts_with(&format!("{}:", root.child("tools/bin").display()))
+        )
+    );
 }
