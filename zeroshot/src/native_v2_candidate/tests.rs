@@ -24,6 +24,7 @@ use crate::native_v2_candidate::test_support::{TestGitRepository, git_output};
 use crate::native_v2_admission::NativeV2Admission;
 use crate::native_v2_capsule::{NativeCapsuleNodeEndpoint, RemoteCapsuleNodeRunner};
 use crate::native_v2_claude::ClaudeProcessEnvironment;
+use crate::native_v2_pi::PiProcessEnvironment;
 use crate::native_v2_cli::execution::{CliExecutionContext, execute_native_v2_cli_with_context};
 use crate::native_v2_cli::{
     CliOutcome, CliRunForceResult, CliRunListResult, CliRunStatusResult,
@@ -549,9 +550,29 @@ async fn coverage_contract_candidate_builders_bind_only_to_their_admitted_lane_a
 
     build_local_native_v2_candidate(
         &claude,
-        candidate_config(RuntimePlanKind::Claude, &repository, github),
+        candidate_config(RuntimePlanKind::Claude, &repository, github.clone()),
     )
     .assert_value_with("local Claude candidate");
+
+    let pi = admitted(RuntimePlanKind::Pi).await;
+    build_native_v2_candidate(
+        &pi,
+        candidate_config(RuntimePlanKind::Pi, &repository, github.clone()),
+    )
+    .assert_value_with("Pi candidate");
+    build_local_native_v2_candidate(
+        &pi,
+        candidate_config(RuntimePlanKind::Pi, &repository, github.clone()),
+    )
+    .assert_value_with("local Pi candidate");
+    assert_eq!(
+        validate_config(
+            &pi,
+            &candidate_config(RuntimePlanKind::Codex, &repository, github),
+        )
+        .assert_error(),
+        NativeV2CandidateError::RuntimeMismatch
+    );
 }
 
 #[test]

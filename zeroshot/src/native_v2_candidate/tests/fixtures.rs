@@ -7,13 +7,14 @@ use crate::native_v2_candidate::test_support::git_delivery_node;
 pub(super) enum RuntimePlanKind {
     Codex,
     Claude,
+    Pi,
 }
 
 pub(super) fn runtime(kind: RuntimePlanKind) -> RuntimePlan {
     let agent = NodeRuntimeBinding::Agent {
         model: worker_catalog::ModelId::new(match kind {
             RuntimePlanKind::Codex => "gpt-5.6-sol",
-            RuntimePlanKind::Claude => "claude-sonnet-5",
+            RuntimePlanKind::Claude | RuntimePlanKind::Pi => "claude-sonnet-5",
         })
         .assert_value_with("model"),
         effort: Some(ReasoningEffort::Max),
@@ -49,6 +50,11 @@ pub(super) fn runtime(kind: RuntimePlanKind) -> RuntimePlan {
         },
         RuntimePlanKind::Claude => RuntimePlan::Claude {
             provider: crate::native_v2_contract::ClaudeProvider::Anthropic,
+            size: RunSize::Medium,
+            nodes,
+        },
+        RuntimePlanKind::Pi => RuntimePlan::Pi {
+            provider: crate::native_v2_contract::PiProvider::Anthropic,
             size: RunSize::Medium,
             nodes,
         },
@@ -190,6 +196,17 @@ pub(super) fn candidate_config(
                 ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
             ]))
             .assert_value_with("Claude environment"),
+            process_pool: pool,
+        }),
+        RuntimePlanKind::Pi => NativeV2HarnessConfig::Pi(PiConfig {
+            provider: crate::native_v2_contract::PiProvider::Anthropic,
+            executable: "/usr/bin/false".to_owned(),
+            prefix_arguments: Vec::new(),
+            workspace: repository.workspace.clone(),
+            runtime_home: repository.root.child("pi-runtime"),
+            local_user_home: None,
+            native_environment: Default::default(),
+            base_environment: PiProcessEnvironment::default(),
             process_pool: pool,
         }),
     };
