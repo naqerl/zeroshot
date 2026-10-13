@@ -171,11 +171,16 @@ async fn a_provider_that_exits_nonzero_without_a_terminal_reports_the_exit_statu
 
 #[tokio::test]
 async fn a_turn_cancelled_while_the_provider_runs_settles_as_cancelled() {
+    // The script announces that it is running before it sleeps, so the cancel provably lands on a
+    // live process: cancelling before startup would take the other, already-covered path and the
+    // test would pass without exercising a running provider or its cleanup.
     let directory = TestDirectory::new("pi-scripted-mid-turn-cancel");
-    let adapter = scripted_adapter(
-        &directory,
-        &script(&["{\"type\":\"message_update\"}"]).replace("exit 0", "sleep 15\nexit 0"),
+    let marker = directory.child("pi-running");
+    let body = format!(
+        "#!/bin/sh\ncat > /dev/null &\n: > '{marker}'\nsleep 15\nexit 0\n",
+        marker = marker.display()
     );
+    let adapter = std::sync::Arc::new(scripted_adapter(&directory, &body));
     let (cancel, control, mut durable) = control();
     let drain = tokio::spawn(async move {
         let mut seen = Vec::new();
@@ -184,19 +189,24 @@ async fn a_turn_cancelled_while_the_provider_runs_settles_as_cancelled() {
         }
         seen
     });
-    let cancel_after_start = cancel.clone();
-    let canceller = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let _ = cancel_after_start.send(true);
-    });
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(60),
-        adapter.run(scripted_invocation(), control),
-    )
-    .await
-    .assert_value_with("a cancelled Pi turn must still finish");
-    canceller.await.assert_value();
-    drop(cancel);
+    let run = {
+        let adapter = adapter.clone();
+        tokio::spawn(async move { adapter.run(scripted_invocation(), control).await })
+    };
+    let mut running = false;
+    for _ in 0..500 {
+        if marker.exists() {
+            running = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(running, "the scripted provider never started");
+    cancel.send(true).assert_value();
+    let outcome = tokio::time::timeout(Duration::from_secs(60), run)
+        .await
+        .assert_value_with("a cancelled Pi turn must still finish")
+        .assert_value();
     let _seen = drain.await.assert_value();
     assert!(
         matches!(outcome, Err(NodeRunnerError::Cancelled)),
@@ -206,8 +216,8 @@ async fn a_turn_cancelled_while_the_provider_runs_settles_as_cancelled() {
 
 #[tokio::test]
 async fn a_lost_output_consumer_fails_the_turn_instead_of_hanging_it() {
-    // The durable log is bounded, so a consumer that disappears must surface as a delivery failure
-    // (and as the diagnostic that path adds), never as a turn that waits forever.
+    // The durable log is bounded, so a consumer that disappears must surface as a failure that
+    // names the closed output, never as a turn that waits forever on a full channel.
     let directory = TestDirectory::new("pi-scripted-lost-consumer");
     let adapter = scripted_adapter(&directory, &script(&[NARRATION, COMPLETED_TURN]));
     let (_cancel, control, durable) = control();
