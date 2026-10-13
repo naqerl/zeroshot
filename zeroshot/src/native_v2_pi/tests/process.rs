@@ -290,7 +290,7 @@ async fn a_provider_that_never_reads_its_stdin_reports_the_input_failure() {
     let directory = TestDirectory::new("pi-scripted-input-failure");
     let marker = directory.child("closed-stdin");
     let body = format!(
-        "#!/bin/sh\nexec 0<&-\n: > '{marker}'\nsleep 30\nexit 0\n",
+        "#!/bin/sh\n: > '{marker}'\nexec 0<&-\nsleep 30\nexit 0\n",
         marker = marker.display()
     );
     let adapter = scripted_adapter(&directory, &body);
