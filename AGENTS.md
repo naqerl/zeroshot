@@ -69,6 +69,27 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   present positive safe integer from caller input and re-verifies the concrete graph. An absent
   value retains the default. The generic execution and loop-entry budgets remain authoritative.
 - Runtime selection requires caller-authored `harness`, `provider`, and `model` values.
+- The run-level `harness`/`provider` pair is the default lane. An agent node binding may carry a
+  typed `lane` override (`RuntimeLane`); `git_delivery` bindings cannot. Candidates build one
+  adapter per distinct effective lane and route each node to its own lane's adapter, never falling
+  back to another lane; adapters keep their provider fixed and never switch it per turn. Provider
+  access is derived per node from its effective lane, and connection requirements are the union
+  over nodes. Targets advertise `openengine.node-runtime-lanes/v1`. The CLI refuses to submit or
+  store a lane-bearing plan on a target without that exact marker kind, after discovery and before
+  acquiring an access token, so no request body is sent. An absent marker, or one of a different
+  kind, never fails discovery, but a marker object with extra fields does. The marker stays exactly
+  `{"kind": ...}`: later capability data, such as which harnesses a target can run, gets its own new
+  extension key, because older clients ignore unknown extension keys but reject unknown fields
+  inside a marker. `TargetDiscoveryExtensions` must keep ignoring unknown keys. Local `run`/`resume`
+  and `zeroshot acp` check every lane's executable on the captured search path before launch,
+  report a missing one as a usage error, and never probe login state. Checkpoint resumes defer
+  lookup to provider startup after the controller restores the selected workspace under its lease. Each `zeroshot acp` session
+  checks against its own workspace when it opens and returns the error as ACP invalid params; the
+  startup check also runs, but only when every search-path entry is absolute. The lookup is
+  `find_executable`: it follows the OS search that spawning relies on, including Rust's Windows
+  bare-program fallback after the authored PATH misses. UI model fields and saved suggestions use
+  each node's effective lane; shared model edits are available only within one lane. Review-loop
+  reviewers retain the writer's authored lane and model, but not its credentials or session.
 - The `gateway` provider resolves `GATEWAY_BASE_URL` and `GATEWAY_API_KEY` through named
   connections. Codex uses Responses with bearer authentication; Claude uses Messages with
   `x-api-key`. Preserve caller-owned base paths and model identifiers without protocol detection.
@@ -88,9 +109,9 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   transport selectors cannot contradict an explicitly selected OpenRouter, Bedrock, or gateway lane.
 - Provider access defaults are materialized from the authored runtime at the execution-placement
   boundary. Omitted connections remain omitted in author-owned local profiles. Local Codex/OpenAI,
-  Claude/Anthropic, and Copilot/GitHub lanes reuse native login state without inventing a
-  connection requirement; contained placements and non-native lanes add only their canonical
-  missing requirements. Explicit
+  Claude/Anthropic, Copilot/GitHub, Pi/Anthropic, and Pi/OpenAI lanes reuse native login state
+  without inventing a connection requirement; contained placements and non-native lanes add only
+  their canonical missing requirements. Explicit
   compatible authored fields always win. Remote profiles materialize contained requirements before
   storage, and the effective runtime drives the existing connection resolver and recovery contracts.
   The local CLI captures the invoking shell in its private one-shot bootstrap, consumes and deletes

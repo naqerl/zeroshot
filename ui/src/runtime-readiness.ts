@@ -1,4 +1,11 @@
-import { allNodes, bindingFor, executable, type Document } from './domain';
+import {
+  allNodes,
+  bindingFor,
+  executable,
+  type Binding,
+  type Runtime,
+  type Document,
+} from './domain';
 
 /** A runtime setting the profile still needs before the server can check it. */
 export type MissingRuntimeSetting = { field: string; message: string };
@@ -22,4 +29,11 @@ export function missingRuntimeSetting(doc: Document): MissingRuntimeSetting | un
         message: `Choose a model for \`${unset.name}\`.`,
       }
     : undefined;
+}
+
+export type RuntimeLane = Pick<Runtime, 'harness' | 'provider'>;
+
+/** An authored node lane overrides the graph default as one complete pair. */
+export function effectiveLane(runtime: Runtime, binding?: Binding): RuntimeLane {
+  return binding?.lane ?? { harness: runtime.harness, provider: runtime.provider };
 }

@@ -3,6 +3,7 @@ import { allNodes, bindingFor, clone, executable, type Document, type Runtime } 
 import { Field } from './Field';
 import { ModelPicker } from './ModelPicker';
 import { modelGroups } from './models';
+import { effectiveLane } from './runtime-readiness';
 
 const harnessLabels = new Map([
   ['codex', 'Codex'],
@@ -28,9 +29,15 @@ export function RuntimeEditor(p: {
   const agents = nodes.filter((n) => kind(n.name) === 'agent').map((n) => n.name);
   const model = (name: string) => bindingFor(doc.runtime, name)?.model ?? '';
   const shared = new Set(agents.map(model)).size <= 1;
-  // Most profiles use one model throughout, so per-agent choices start hidden unless they differ.
-  const [perAgent, setPerAgent] = useState(!shared);
-  const recent = p.recentModels?.(doc.runtime.harness, doc.runtime.provider) ?? [];
+  const lane = (name: string) => effectiveLane(doc.runtime, bindingFor(doc.runtime, name));
+  const firstLane = lane(agents[0]);
+  const mixedLanes = agents.some((name) => {
+    const effective = lane(name);
+    return effective.harness !== firstLane.harness || effective.provider !== firstLane.provider;
+  });
+  // A shared model field is meaningful only when all agents use the same harness and provider.
+  const [showPerAgent, setPerAgent] = useState(!shared);
+  const perAgent = mixedLanes || showPerAgent;
   const variants = p.schema?.oneOf ?? p.schema?.anyOf ?? [];
   const harnesses = variants
     .map((v: any) => v.properties?.harness?.const ?? v.properties?.harness?.enum?.[0])
@@ -62,26 +69,30 @@ export function RuntimeEditor(p: {
   }
   // One agent, or agents that agree, show their model; agents that differ show an empty field.
   const value = (names: string[]) => (shared || names.length === 1 ? model(names[0]) : '');
-  const picker = (names: string[], label: string, extra: Partial<ModelPickerProps> = {}) => (
-    <ModelPicker
-      compact
-      label={label}
-      harness={doc.runtime.harness}
-      provider={doc.runtime.provider}
-      suggestions={modelGroups(doc.runtime, recent, value(names))}
-      value={value(names)}
-      invalid={names.some((name) => invalid(`nodes.${name}.model`, modelChanged(name)))}
-      onChange={(value) => modelChange(names, value)}
-      {...extra}
-    />
-  );
+  const picker = (names: string[], label: string, extra: Partial<ModelPickerProps> = {}) => {
+    const effective = lane(names[0]);
+    const recent = p.recentModels?.(effective.harness, effective.provider) ?? [];
+    return (
+      <ModelPicker
+        compact
+        label={label}
+        harness={effective.harness}
+        provider={effective.provider}
+        suggestions={modelGroups(doc.runtime, recent, value(names), effective)}
+        value={value(names)}
+        invalid={names.some((name) => invalid(`nodes.${name}.model`, modelChanged(name)))}
+        onChange={(value) => modelChange(names, value)}
+        {...extra}
+      />
+    );
+  };
   // With one shared model, only nodes that still need a worker get their own row.
   const rows = nodes.filter(
     (n) => perAgent || !['agent', 'git_delivery'].includes(kind(n.name) ?? '')
   );
   return (
     <>
-      <p className="runtime-scope">Applies to the whole graph.</p>
+      <p className="runtime-scope">Defaults for agents without a harness and provider override.</p>
       <Field label="Harness">
         <select
           value={doc.runtime.harness}
@@ -124,7 +135,7 @@ export function RuntimeEditor(p: {
       <div className="section-rule" />
       <div className="section-title model-heading">
         <span>{perAgent ? 'Agent models' : 'Model'}</span>
-        {agents.length > 1 && (
+        {agents.length > 1 && !mixedLanes && (
           <button
             type="button"
             className="text-button"

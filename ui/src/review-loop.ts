@@ -137,9 +137,7 @@ function reviewMappings(selected: GraphNode) {
   for (const key of ['inputBindings', 'writeBindings'])
     if (!Array.isArray(selected[key] ?? []))
       throw new Error('Repair the activity’s unsupported mappings before adding a review loop.');
-  return uniquePaths(
-    (selected.writeBindings ?? []).map((binding: any) => binding.target)
-  );
+  return uniquePaths((selected.writeBindings ?? []).map((binding: any) => binding.target));
 }
 
 function reviewPlacement(document: Document, activityName: string) {
@@ -400,6 +398,7 @@ export function createReviewLoop(
     kind: 'agent',
     model: originalRuntime.model ?? '',
     ...(originalRuntime.effort ? { effort: originalRuntime.effort } : {}),
+    ...(originalRuntime.lane ? { lane: clone(originalRuntime.lane) } : {}),
   };
   assertDocument(next);
   return { document: next, name: loopName };

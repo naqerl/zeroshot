@@ -1,8 +1,8 @@
 mod environment_hooks;
 use environment_hooks::HookContext;
 mod identity_leases;
+mod lanes;
 mod lifecycle;
-mod pi_lane;
 use lifecycle::AllocationTurns;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,22 +19,19 @@ use tokio::sync::{Mutex, watch};
 
 use crate::execution::process::{HostedProcessIdentity, HostedProcessPool, HostedProcessScope};
 use crate::native_v2_admission::writer_nodes;
-use crate::native_v2_candidate::{
-    NativeV2CandidateConfig, NativeV2HarnessConfig, build_native_v2_candidate,
-};
+use crate::native_v2_candidate::{NativeV2CandidateConfig, build_native_v2_candidate};
 use crate::native_v2_capsule::{
     CapsuleFilesystem, CapsuleFilesystemSpec, NativeCapsuleNodeEndpoint, RemoteCapsuleNodeRunner,
     prepare_capsule_filesystem,
 };
-use crate::native_v2_claude::{ClaudeAdapterConfig, ClaudeProcessEnvironment};
+use crate::native_v2_claude::ClaudeProcessEnvironment;
 use crate::native_v2_cloud::{
     AllocatedCapsule, CapsuleAllocationRequest, CapsuleAllocationUnavailable, CapsuleAllocator,
     CapsuleCleanup, CapsulePreparation, CapsuleCleanupUnavailable, CapsuleDestroyed,
     ControllerClaimUnavailable, ExclusiveControllerClaim, RetainedAllocationRequest,
     RetainedAllocationUnavailable,
 };
-use crate::native_v2_codex::NativeV2CodexConfig;
-use crate::native_v2_contract::{AdmittedRun, RuntimePlan};
+use crate::native_v2_contract::AdmittedRun;
 use crate::native_v2_pi::PiProcessEnvironment;
 use crate::native_v2_delivery::{
     DeliveryLineage, GhCliAuthorityConfig, GhCliDeliveryAuthority, NativeV2DeliveryConfig,
@@ -400,7 +397,7 @@ impl ProductionCapsuleAllocator {
         let candidate = build_native_v2_candidate(
             request.admitted,
             NativeV2CandidateConfig {
-                harness: self.harness(request.admitted, &filesystem, active_process_pool)?,
+                lanes: self.lanes(request.admitted, &filesystem, active_process_pool)?,
                 delivery: NativeV2DeliveryConfig::for_hosted_workspace(
                     DeliveryLineage::new(
                         delivery_run_id.clone(),
@@ -657,82 +654,6 @@ impl ProductionCapsuleAllocator {
             .and_then(HostedProcessIdentity::prepare_command_domain)
             .map_err(|_| CapsuleAllocationUnavailable::Runtime)?;
         Ok(identity)
-    }
-
-    fn harness(
-        &self,
-        admitted: &AdmittedRun,
-        filesystem: &CapsuleFilesystem,
-        process_pool: HostedProcessPool,
-    ) -> Result<NativeV2HarnessConfig, CapsuleAllocationUnavailable> {
-        let run_root = filesystem
-            .workspace
-            .parent()
-            .ok_or(CapsuleAllocationUnavailable::Runtime)?;
-        let search_path = environment::search_path(run_root, &self.config.executable_search_path);
-        let base_environment = BTreeMap::from([(
-            "ZEROSHOT_TOOLS".to_owned(),
-            environment::tools_directory(run_root)
-                .to_string_lossy()
-                .into_owned(),
-        )]);
-        match &admitted.runtime {
-            RuntimePlan::Copilot { .. } => Ok(NativeV2HarnessConfig::Copilot(
-                crate::native_v2_copilot::CopilotConfig {
-                    executable: self.config.copilot_executable.clone(),
-                    workspace: filesystem.workspace.clone(),
-                    runtime_home: filesystem.runtime_home.clone(),
-                    local_user: None,
-                    base_environment: base_environment.clone(),
-                    local_command_environment: std::collections::BTreeMap::new(),
-                    search_path: search_path.clone(),
-                    process_pool,
-                },
-            )),
-            RuntimePlan::Codex { provider, .. } => {
-                Ok(NativeV2HarnessConfig::Codex(NativeV2CodexConfig {
-                    provider: *provider,
-                    executable: self.config.codex_executable.clone(),
-                    workspace: filesystem.workspace.clone(),
-                    runtime_home: filesystem.runtime_home.clone(),
-                    local_user: None,
-                    native_environment: Default::default(),
-                    base_environment: base_environment.clone(),
-                    search_path: search_path.clone(),
-                    process_pool,
-                }))
-            }
-            RuntimePlan::Pi { provider, .. } => {
-                pi_lane::harness_config(&self.config, *provider, filesystem, process_pool)
-            }
-            RuntimePlan::Claude { provider, .. } => {
-                let base_environment = self
-                    .config
-                    .claude_process_environment
-                    .for_capsule(&filesystem.runtime_home, &search_path)
-                    .map_err(|_| CapsuleAllocationUnavailable::Runtime)?;
-                let mut values = base_environment.clone_values();
-                values.insert(
-                    "ZEROSHOT_TOOLS".to_owned(),
-                    environment::tools_directory(run_root)
-                        .to_string_lossy()
-                        .into_owned(),
-                );
-                let base_environment = ClaudeProcessEnvironment::new(values)
-                    .map_err(|_| CapsuleAllocationUnavailable::Runtime)?;
-                Ok(NativeV2HarnessConfig::Claude(ClaudeAdapterConfig {
-                    provider: *provider,
-                    executable: self.config.claude_executable.clone(),
-                    prefix_arguments: self.config.claude_prefix_arguments.clone(),
-                    workspace: filesystem.workspace.clone(),
-                    runtime_home: filesystem.runtime_home.clone(),
-                    local_user_home: None,
-                    native_environment: Default::default(),
-                    base_environment,
-                    process_pool,
-                }))
-            }
-        }
     }
 
     #[cfg(test)]

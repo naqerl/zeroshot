@@ -154,3 +154,77 @@ test('runtime model editing does not offer implicit conversion of unknown or mis
     assert.deepEqual(doc, before);
   }
 });
+
+test('different effective lanes keep separate model fields even when their IDs agree', () => {
+  const doc = document('codex', 'openai');
+  doc.runtime.nodes.reviewer.model = doc.runtime.nodes.worker.model;
+  doc.runtime.nodes.reviewer.lane = { harness: 'claude', provider: 'openrouter' };
+  doc.runtime.nodes.worker.lane = { harness: 'codex', provider: 'openrouter' };
+  const before = structuredClone(doc);
+  const edits: Document[] = [];
+  let reviewer: ReactElement<any> | undefined;
+  within(
+    () =>
+      RuntimeEditor({
+        document: doc,
+        schema: {},
+        recentModels: (harness, provider) => [`${harness}/${provider}/recent`],
+        edit: (next) => edits.push(next),
+      }),
+    (tree) => {
+      const pickers = tree.filter((element) => element.type === ModelPicker);
+      assert.equal(pickers.length, 2);
+      assert.equal(
+        tree.some((element) => element.props.children === 'Use one model for all'),
+        false
+      );
+      reviewer = pickers.find((picker) => picker.props.label === 'Model for reviewer');
+      assert.deepEqual(
+        [reviewer!.props.harness, reviewer!.props.provider],
+        ['claude', 'openrouter']
+      );
+      assert.deepEqual(reviewer!.props.suggestions, [
+        { label: 'Recently used', models: ['claude/openrouter/recent'] },
+      ]);
+      const worker = pickers.find((picker) => picker.props.label === 'Model for worker')!;
+      assert.deepEqual([worker.props.harness, worker.props.provider], ['codex', 'openrouter']);
+      assert.deepEqual(worker.props.suggestions, [
+        { label: 'Recently used', models: ['codex/openrouter/recent'] },
+      ]);
+    }
+  );
+  reviewer!.props.onChange('provider-owned/new-id');
+  assert.equal(edits[0].runtime.nodes.reviewer.model, 'provider-owned/new-id');
+  assert.deepEqual(edits[0].runtime.nodes.reviewer.lane, before.runtime.nodes.reviewer.lane);
+  assert.deepEqual(edits[0].runtime.nodes.worker, before.runtime.nodes.worker);
+  assert.deepEqual(doc, before);
+});
+
+test('a shared picker uses the common override rather than the graph default', () => {
+  const doc = document('codex', 'openai');
+  for (const name of ['worker', 'reviewer']) {
+    doc.runtime.nodes[name].model = 'common-id';
+    doc.runtime.nodes[name].lane = { harness: 'claude', provider: 'anthropic' };
+  }
+  within(
+    () =>
+      RuntimeEditor({
+        document: doc,
+        schema: {},
+        edit: () => {},
+        recentModels: (harness, provider) => {
+          assert.deepEqual([harness, provider], ['claude', 'anthropic']);
+          return ['native-subscription-model'];
+        },
+      }),
+    (tree) => {
+      const pickers = tree.filter((element) => element.type === ModelPicker);
+      assert.equal(pickers.length, 1);
+      assert.equal(pickers[0].props.label, 'Model for all agents');
+      assert.deepEqual(
+        [pickers[0].props.harness, pickers[0].props.provider],
+        ['claude', 'anthropic']
+      );
+    }
+  );
+});

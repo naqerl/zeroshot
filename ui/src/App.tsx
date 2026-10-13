@@ -12,7 +12,7 @@ import {
 } from './workflow-authoring';
 import type { WorkflowEdge } from './workflow-projection';
 import { type Bootstrap, type Summary } from './api';
-import { missingRuntimeSetting } from './runtime-readiness';
+import { effectiveLane, missingRuntimeSetting } from './runtime-readiness';
 import type { WorkspaceServices } from './workspace-services';
 import { createHostedProfile, useHostWorkspace } from './use-host-workspace';
 import { workspaceStorageKeys } from './workspace-storage';
@@ -839,10 +839,17 @@ function useProfileActions(
   function acceptSaved(acknowledged: NonNullable<ReturnType<typeof acknowledgeProfileSave>>) {
     // Local and hosted saves both land here, so both feed model suggestions.
     const { runtime } = acknowledged.base;
-    rememberModels(
-      storage.recentModels(runtime.harness, runtime.provider),
-      documentModels(runtime)
+    const lanes = new Map(
+      Object.values(runtime.nodes).map((binding) => {
+        const lane = effectiveLane(runtime, binding);
+        return [JSON.stringify([lane.harness, lane.provider]), lane];
+      })
     );
+    for (const lane of lanes.values())
+      rememberModels(
+        storage.recentModels(lane.harness, lane.provider),
+        documentModels(runtime, lane)
+      );
     current.current = acknowledged.document;
     currentRevision.current = acknowledged.revision;
     setDoc(acknowledged.document);

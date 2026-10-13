@@ -20,6 +20,7 @@ import { GuardEditor } from './GuardEditor';
 import { reviewSources } from './simple-controls';
 import { ModelPicker } from './ModelPicker';
 import { modelGroups } from './models';
+import { effectiveLane } from './runtime-readiness';
 import { usePendingText } from './pending-edits';
 import { NodeDataEditor } from './NodeDataEditor';
 import { OutcomeSettings } from './OutcomeSettings';
@@ -308,6 +309,7 @@ function ActivitySettings({
   graphChange: (key: string, value: any) => void;
 }) {
   const doc = p.document;
+  const lane = effectiveLane(doc.runtime, binding);
   const [accessError, setAccessError] = useState('');
   useEffect(() => setAccessError(''), [node]);
   const bindingChange = (key: string, value: any) => {
@@ -367,12 +369,13 @@ function ActivitySettings({
             <>
               <ModelPicker
                 label="Model"
-                harness={doc.runtime.harness}
-                provider={doc.runtime.provider}
+                harness={lane.harness}
+                provider={lane.provider}
                 suggestions={modelGroups(
                   doc.runtime,
-                  p.recentModels?.(doc.runtime.harness, doc.runtime.provider) ?? [],
-                  binding.model ?? ''
+                  p.recentModels?.(lane.harness, lane.provider) ?? [],
+                  binding.model ?? '',
+                  lane
                 )}
                 value={binding.model ?? ''}
                 onChange={(value) => bindingChange('model', value)}

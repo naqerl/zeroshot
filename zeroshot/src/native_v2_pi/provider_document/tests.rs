@@ -30,6 +30,7 @@ fn resolved(fields: &[&str], values: &[(&str, &str)]) -> ResolvedEnvironment {
         .map(|name| environment_name(name))
         .collect::<Vec<_>>();
     let binding = NodeRuntimeBinding::Agent {
+        lane: None,
         model: crate::worker_catalog::ModelId::new("provider-model").unwrap(),
         effort: None,
         session_scope: crate::execution::SessionScope::Execution,

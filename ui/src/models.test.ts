@@ -129,3 +129,29 @@ test('missing runtime settings point to the Runtime dialog only when it can be o
   assert.match(hint, /aria-describedby="[^"]+-runtime-hint"/);
   assert.equal(picker('', [], { provider: '' }).includes('Runtime settings'), false);
 });
+
+test('profile suggestions isolate both harness and provider without changing opaque model IDs', () => {
+  const doc = runtime({
+    native: { kind: 'agent', model: 'native-only' },
+    routed: {
+      kind: 'agent',
+      model: 'vendor/model:opaque',
+      lane: { harness: 'codex', provider: 'openrouter' },
+    },
+    reviewed: {
+      kind: 'agent',
+      model: 'claude-only',
+      lane: { harness: 'claude', provider: 'openrouter' },
+    },
+  });
+  for (const [lane, expected] of [
+    [{ harness: 'codex', provider: 'openai' }, ['native-only']],
+    [{ harness: 'codex', provider: 'openrouter' }, ['vendor/model:opaque']],
+    [{ harness: 'claude', provider: 'openrouter' }, ['claude-only']],
+  ] as const) {
+    assert.deepEqual(documentModels(doc, lane), expected);
+    assert.deepEqual(modelGroups(doc, [], '', lane), [
+      { label: 'In this profile', models: expected },
+    ]);
+  }
+});

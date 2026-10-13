@@ -41,7 +41,8 @@ then save the workflow as a profile and reuse it.
 
 The agent that writes the code cannot approve its own work. The engine enforces the graph's review
 gates and retry limits. Think of it as CI for coding agents, starting before the code is written.
-zeroshot runs Claude Code, Codex, or Copilot as the worker and reviewers.
+zeroshot runs Pi, Claude Code, Codex, or Copilot as the worker and reviewers, with a separate harness
+and provider available for each agent.
 
 The CLI is free and MIT licensed. Run locally, [self-host](#self-hosted-run-the-docker-target), or
 use [zeroshot Cloud](https://cloud.zeroshot.sh/docs).

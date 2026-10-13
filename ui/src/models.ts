@@ -1,4 +1,5 @@
 import type { Runtime } from './domain';
+import { effectiveLane, type RuntimeLane } from './runtime-readiness';
 
 // Model IDs are opaque. Suggestions only repeat IDs the user already chose, in this document or in
 // profiles they saved earlier; they are never a catalog, an inference, or an availability check.
@@ -7,9 +8,12 @@ export type ModelGroup = { label: string; models: string[] };
 const RECENT_LIMIT = 10;
 
 /** Distinct non-empty model IDs bound in `runtime`, in binding order. */
-export function documentModels(runtime: Runtime): string[] {
+export function documentModels(runtime: Runtime, lane?: RuntimeLane): string[] {
   const models = new Set<string>();
   for (const binding of Object.values(runtime.nodes ?? {})) {
+    const effective = effectiveLane(runtime, binding);
+    if (lane && (effective.harness !== lane.harness || effective.provider !== lane.provider))
+      continue;
     const model = binding?.model;
     if (typeof model === 'string' && model.trim()) models.add(model);
   }
@@ -17,8 +21,13 @@ export function documentModels(runtime: Runtime): string[] {
 }
 
 /** Suggestions for a field showing `value`: models bound in the document, then recent choices. */
-export function modelGroups(runtime: Runtime, recent: string[], value: string): ModelGroup[] {
-  const used = documentModels(runtime);
+export function modelGroups(
+  runtime: Runtime,
+  recent: string[],
+  value: string,
+  lane?: RuntimeLane
+): ModelGroup[] {
+  const used = documentModels(runtime, lane);
   return [
     { label: 'In this profile', models: used.filter((model) => model !== value) },
     {

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::io::Write as _;
 
 use openengine_cluster_protocol::{
-    Cursor, EnumLabel, RunResumeParams, RunSize, RunStatus, RunStatusResult, RunTitle,
+    Cursor, EnumLabel, NodeName, RunResumeParams, RunSize, RunStatus, RunStatusResult, RunTitle,
     TerminalResult,
 };
 #[cfg(unix)]
@@ -366,6 +366,77 @@ fn local_recovery_contract_preserves_lineage_and_recoverability() {
         Err(NativeV2CliError::Local(message))
             if message == "workspace recovery metadata is invalid"
     ));
+}
+
+#[tokio::test]
+async fn lane_preflight_checks_the_retained_workspace_only_without_checkpoint_restore() {
+    for restoring in [false, true] {
+        // Windows also searches the parent PATH and executable directory, so an empty captured
+        // PATH cannot establish absence. Keep the checkpoint launch check portable.
+        if !restoring && cfg!(windows) {
+            continue;
+        }
+        let root = TestDirectory::new("lane-preflight");
+        let backend = LocalCliBackend::new(
+            root.path().to_owned(),
+            root.child("missing-controller"),
+            root.path().to_owned(),
+            PathBuf::from("git"),
+        )
+        .with_ready_timeout(Duration::ZERO);
+        let workspace = root.child("workspace");
+        let empty_bin = root.child("bin");
+        for directory in [&workspace, &empty_bin] {
+            std::fs::create_dir(directory).assert_value();
+        }
+        let run_id = RunId::new("0199f33f-3b44-7d21-9000-000000000061");
+        let mut submission = contract_submission("lane-preflight");
+        submission.runtime.nodes_mut().insert(
+            NodeName::new("worker").assert_value(),
+            serde_json::from_value(json!({
+                "kind": "agent",
+                "lane": { "harness": "claude", "provider": "anthropic" },
+                "model": "provider-owned-model"
+            }))
+            .assert_value(),
+        );
+        let mut prepared = prepared_local_run(run_id.clone(), submission, workspace);
+        prepared.native_environment =
+            BTreeMap::from([("PATH".to_owned(), empty_bin.to_string_lossy().into_owned())]);
+
+        let checkpoint = restoring.then(|| {
+            crate::native_v2_supervisor::checkpoints::CheckpointRestore {
+                directory: root.child("selected-snapshot"),
+                selection:
+                    crate::native_v2_supervisor::checkpoints::CheckpointRestoreSelection::Latest,
+            }
+        });
+        let error = backend
+            .start_prepared_controller_with_lineage(prepared, None, checkpoint)
+            .await
+            .unwrap_err();
+
+        if restoring {
+            assert!(matches!(error, NativeV2CliError::Local(_)), "{error}");
+            let storage = backend.run_storage(&run_id).assert_value();
+            assert!(
+                storage.exists(),
+                "checkpoint resume must reach controller launch"
+            );
+            assert!(!storage.join(BOOTSTRAP_FILE).exists());
+            continue;
+        }
+        assert!(matches!(error, NativeV2CliError::Usage(_)));
+        assert_eq!(
+            error.to_string(),
+            "lane claude/anthropic needs the `claude` executable on PATH"
+        );
+        assert_eq!(
+            serde_json::to_value(error.diagnostic()).assert_value()["code"],
+            "request.invalid"
+        );
+        assert!(!backend.run_storage(&run_id).assert_value().exists());
+    }
 }
 
 #[tokio::test]

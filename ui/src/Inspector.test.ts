@@ -225,3 +225,25 @@ test('only agent-backed Verifiers expose supported attempt choices; imported val
     );
   }
 });
+
+test('an authored node lane supplies model suggestions even when the graph defaults are empty', async (t) => {
+  const Inspector = await inspector(t);
+  const document = fixture();
+  document.runtime.harness = '';
+  document.runtime.provider = '';
+  document.runtime.nodes.reviewer.lane = { harness: 'claude', provider: 'openrouter' };
+  const queried: string[][] = [];
+  const html = renderToStaticMarkup(
+    createElement(Inspector, {
+      ...props(document, 'reviewer'),
+      openRuntime: () => {},
+      recentModels: (harness: string, provider: string) => {
+        queried.push([harness, provider]);
+        return ['caller-owned/model'];
+      },
+    })
+  );
+  assert.deepEqual(queried, [['claude', 'openrouter']]);
+  assert.doesNotMatch(html, /Choose a harness and provider in/);
+  assert.match(html, /value="custom-model"/);
+});

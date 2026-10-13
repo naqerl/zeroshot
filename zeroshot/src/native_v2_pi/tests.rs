@@ -68,6 +68,7 @@ fn agent_binding(
         .assert_value()
     };
     NodeRuntimeBinding::Agent {
+        lane: None,
         model: ModelId::new(model).assert_value(),
         effort,
         session_scope: scope,

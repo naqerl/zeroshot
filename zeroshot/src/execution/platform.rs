@@ -95,34 +95,128 @@ pub(crate) fn executable(
 ) -> std::path::PathBuf {
     #[cfg(windows)]
     {
-        let path = std::path::Path::new(program);
-        let roots = if path.components().count() > 1 {
-            vec![std::path::PathBuf::new()]
-        } else {
-            environment
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
-                .map(|(_, value)| std::env::split_paths(value).collect())
-                .unwrap_or_default()
+        windows_search(program, environment).unwrap_or_else(|| program.into())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = environment;
+        program.into()
+    }
+}
+
+/// Finds the file that spawning `program` in `working_directory` would run, without spawning it.
+/// On Windows `PATHEXT` is ignored, so this matches what [`executable`] spawns.
+/// On Unix, empty and relative `PATH` entries resolve against `working_directory`, as in the child.
+pub(crate) fn find_executable(
+    program: &str,
+    environment: &std::collections::BTreeMap<String, String>,
+    working_directory: &Path,
+) -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        let _ = working_directory;
+        windows_search(program, environment).or_else(|| windows_spawn_fallback(program))
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let runnable = |candidate: &std::path::Path| {
+            std::fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file() && (metadata.permissions().mode() & 0o111) != 0
+            })
         };
-        for root in roots {
-            let candidate = root.join(path);
-            let suffixes: &[&str] = if path.extension().is_some() {
-                &[""]
-            } else {
-                &[".exe", ".com", ".cmd", ".bat"]
-            };
-            for suffix in suffixes {
-                let mut name = candidate.as_os_str().to_owned();
-                name.push(suffix);
-                let candidate = std::path::PathBuf::from(name);
-                if candidate.is_file() {
-                    return candidate;
-                }
+        if program.contains(std::path::is_separator) {
+            let candidate = working_directory.join(program);
+            return runnable(&candidate).then_some(candidate);
+        }
+        search_directories(environment.get("PATH")?, working_directory)
+            .map(|directory| directory.join(program))
+            .find(|candidate| runnable(candidate))
+    }
+}
+
+#[cfg(windows)]
+fn windows_search(
+    program: &str,
+    environment: &std::collections::BTreeMap<String, String>,
+) -> Option<std::path::PathBuf> {
+    let path = std::path::Path::new(program);
+    let roots = if path.components().count() > 1 {
+        vec![std::path::PathBuf::new()]
+    } else {
+        environment
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+            .map(|(_, value)| std::env::split_paths(value).collect())
+            .unwrap_or_default()
+    };
+    for root in roots {
+        let candidate = root.join(path);
+        let suffixes: &[&str] = if path.extension().is_some() {
+            &[""]
+        } else {
+            &[".exe", ".com", ".cmd", ".bat"]
+        };
+        for suffix in suffixes {
+            let mut name = candidate.as_os_str().to_owned();
+            name.push(suffix);
+            let candidate = std::path::PathBuf::from(name);
+            if candidate.is_file() {
+                return Some(candidate);
             }
         }
     }
-    #[cfg(not(windows))]
-    let _ = environment;
-    program.into()
+    None
+}
+
+/// Rust's bare-program fallback after the authored PATH misses: the current executable's
+/// directory, the system and Windows directories, then the parent process PATH. Only .exe is added.
+#[cfg(windows)]
+fn windows_spawn_fallback(program: &str) -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use windows_sys::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW};
+
+    fn system_directory(
+        read: unsafe extern "system" fn(*mut u16, u32) -> u32,
+    ) -> Option<std::path::PathBuf> {
+        let mut buffer = vec![0_u16; 32_768];
+        let length = unsafe { read(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+        (length > 0 && length < buffer.len())
+            .then(|| std::ffi::OsString::from_wide(&buffer[..length]).into())
+    }
+
+    let path = Path::new(program);
+    if path.components().count() != 1 {
+        return None;
+    }
+    let mut name = path.as_os_str().to_owned();
+    if path.extension().is_none() {
+        name.push(".exe");
+    }
+    let mut directories: Vec<_> = [
+        std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf)),
+        system_directory(GetSystemDirectoryW),
+        system_directory(GetWindowsDirectoryW),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if let Some(path) = std::env::var_os("PATH") {
+        directories.extend(std::env::split_paths(&path));
+    }
+    directories
+        .into_iter()
+        .map(|directory| directory.join(&name))
+        .find(|candidate| candidate.is_file())
+}
+
+#[cfg(not(windows))]
+fn search_directories(
+    path: &str,
+    working_directory: &Path,
+) -> impl Iterator<Item = std::path::PathBuf> {
+    std::env::split_paths(path).map(move |entry| working_directory.join(entry))
 }

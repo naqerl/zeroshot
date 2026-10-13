@@ -285,3 +285,23 @@ test('unsupported contexts fail atomically without coercing workers or schemas',
     assert.deepEqual(source, before);
   }
 });
+
+test('a generated reviewer retains the authored lane without inheriting credentials or session scope', () => {
+  for (const harness of ['claude', 'codex']) {
+    const source = document();
+    source.runtime.nodes.draft.lane = { harness, provider: 'openrouter' };
+    const before = structuredClone(source);
+    const result = createReviewLoop(source, 'draft');
+    const reviewer = allNodes(result.document.graph.root).find((node) => node.kind === 'verifier')!;
+    const binding = result.document.runtime.nodes[reviewer.name];
+    assert.deepEqual(binding, {
+      kind: 'agent',
+      model: 'caller-model',
+      effort: 'high',
+      lane: { harness, provider: 'openrouter' },
+    });
+    binding.lane!.provider = 'gateway';
+    assert.deepEqual(result.document.runtime.nodes.draft, before.runtime.nodes.draft);
+    assert.deepEqual(source, before);
+  }
+});

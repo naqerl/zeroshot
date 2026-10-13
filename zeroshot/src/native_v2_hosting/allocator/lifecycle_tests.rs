@@ -1,7 +1,9 @@
 use openengine_cluster_testkit::assertions::AssertValue;
 
 use super::*;
+use crate::native_v2_candidate::NativeV2HarnessConfig;
 use crate::native_v2_candidate::test_support::TestDirectory;
+use crate::native_v2_contract::RuntimeLane;
 
 fn recovery_document(run_id: &RunId) -> HostedRecoveryDocument {
     HostedRecoveryDocument {
@@ -476,7 +478,7 @@ fn hosted_copilot_harness_and_invalid_filesystem_layout_preserve_capsule_boundar
     let allocator = test_allocator(root.path());
     let mut admitted = crate::native_v2_runner::test_support::admitted();
     let nodes = admitted.runtime.nodes().clone();
-    admitted.runtime = RuntimePlan::Copilot {
+    admitted.runtime = crate::native_v2_contract::RuntimePlan::Copilot {
         provider: crate::native_v2_contract::CopilotProvider::Github,
         size: crate::native_v2_contract::RunSize::Medium,
         nodes,
@@ -487,11 +489,11 @@ fn hosted_copilot_harness_and_invalid_filesystem_layout_preserve_capsule_boundar
     };
     let process_pool = allocator.config.process_pool;
 
-    let harness = allocator
-        .harness(&admitted, &filesystem, process_pool)
+    let lanes = allocator
+        .lanes(&admitted, &filesystem, process_pool)
         .assert_value();
-    let NativeV2HarnessConfig::Copilot(config) = harness else {
-        panic!("Copilot admission must select the Copilot harness");
+    let [NativeV2HarnessConfig::Copilot(config)] = lanes.as_slice() else {
+        panic!("Copilot admission must select only the Copilot harness");
     };
     assert_eq!(config.executable, PathBuf::from("/usr/bin/false"));
     assert_eq!(config.workspace, filesystem.workspace);
@@ -511,12 +513,85 @@ fn hosted_copilot_harness_and_invalid_filesystem_layout_preserve_capsule_boundar
 }
 
 #[test]
+fn hosted_lanes_build_one_configuration_per_effective_lane_from_shared_capsule_inputs() {
+    let root = TestDirectory::new("host-mixed-lanes");
+    let allocator = test_allocator(root.path());
+    let mut admitted = crate::native_v2_runner::test_support::admitted();
+    let claude_anthropic = RuntimeLane::Claude {
+        provider: crate::native_v2_contract::ClaudeProvider::Anthropic,
+    };
+    for (node, node_lane) in [
+        ("verify", claude_anthropic),
+        ("left", claude_anthropic),
+        (
+            "right",
+            RuntimeLane::Copilot {
+                provider: crate::native_v2_contract::CopilotProvider::Github,
+            },
+        ),
+    ] {
+        let name = openengine_cluster_protocol::NodeName::new(node).assert_value();
+        let Some(crate::native_v2_contract::NodeRuntimeBinding::Agent { lane, .. }) =
+            admitted.runtime.nodes_mut().get_mut(&name)
+        else {
+            panic!("the runner fixture binds {node} to an agent");
+        };
+        *lane = Some(node_lane);
+    }
+    let filesystem = CapsuleFilesystem {
+        workspace: root.child("workspace"),
+        runtime_home: root.child("runtime"),
+    };
+
+    let lanes = allocator
+        .lanes(&admitted, &filesystem, allocator.config.process_pool)
+        .assert_value();
+    let [
+        NativeV2HarnessConfig::Copilot(copilot),
+        NativeV2HarnessConfig::Codex(codex),
+        NativeV2HarnessConfig::Claude(claude),
+    ] = lanes.as_slice()
+    else {
+        panic!("expected exactly the Copilot, Codex, and Claude lanes in lane order");
+    };
+    assert_eq!(
+        codex.provider,
+        crate::native_v2_contract::CodexProvider::OpenAi
+    );
+    assert_eq!(
+        claude.provider,
+        crate::native_v2_contract::ClaudeProvider::Anthropic
+    );
+    for (workspace, runtime_home) in [
+        (&copilot.workspace, &copilot.runtime_home),
+        (&codex.workspace, &codex.runtime_home),
+        (&claude.workspace, &claude.runtime_home),
+    ] {
+        assert_eq!(workspace, &filesystem.workspace);
+        assert_eq!(runtime_home, &filesystem.runtime_home);
+    }
+
+    let tools = root.child("tools").to_string_lossy().into_owned();
+    let claude_environment = claude.base_environment.clone_values();
+    assert_eq!(copilot.base_environment.get("ZEROSHOT_TOOLS"), Some(&tools));
+    assert_eq!(codex.base_environment.get("ZEROSHOT_TOOLS"), Some(&tools));
+    assert_eq!(claude_environment.get("ZEROSHOT_TOOLS"), Some(&tools));
+    assert!(
+        copilot
+            .search_path
+            .starts_with(&format!("{}:", root.child("tools/bin").display()))
+    );
+    assert_eq!(codex.search_path, copilot.search_path);
+    assert_eq!(claude_environment.get("PATH"), Some(&copilot.search_path));
+}
+
+#[test]
 fn hosted_pi_harness_builds_the_contained_lane_from_the_capsule() {
     let root = TestDirectory::new("host-pi-harness");
     let allocator = test_allocator(root.path());
     let mut admitted = crate::native_v2_runner::test_support::admitted();
     let nodes = admitted.runtime.nodes().clone();
-    admitted.runtime = RuntimePlan::Pi {
+    admitted.runtime = crate::native_v2_contract::RuntimePlan::Pi {
         provider: crate::native_v2_contract::PiProvider::Anthropic,
         size: crate::native_v2_contract::RunSize::Medium,
         nodes,
@@ -525,11 +600,11 @@ fn hosted_pi_harness_builds_the_contained_lane_from_the_capsule() {
         workspace: root.child("workspace"),
         runtime_home: root.child("runtime"),
     };
-    let harness = allocator
-        .harness(&admitted, &filesystem, allocator.config.process_pool)
+    let lanes = allocator
+        .lanes(&admitted, &filesystem, allocator.config.process_pool)
         .assert_value();
-    let NativeV2HarnessConfig::Pi(config) = harness else {
-        panic!("Pi admission must select the Pi harness");
+    let [NativeV2HarnessConfig::Pi(config)] = lanes.as_slice() else {
+        panic!("Pi admission must select only the Pi harness");
     };
     assert_eq!(
         config.provider,

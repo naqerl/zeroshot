@@ -145,6 +145,7 @@ pub(super) fn runtime(environment: BTreeSet<EnvironmentVariableName>) -> Runtime
         nodes: BTreeMap::from([(
             NodeName::new("work").assert_value_with("node"),
             NodeRuntimeBinding::Agent {
+                lane: None,
                 model: worker_catalog::ModelId::new("gpt-5.6").assert_value_with("model"),
                 effort: None,
                 session_scope: SessionScope::Execution,
@@ -161,6 +162,7 @@ pub(super) fn claude_runtime() -> RuntimePlan {
         nodes: BTreeMap::from([(
             NodeName::new("work").assert_value_with("node"),
             NodeRuntimeBinding::Agent {
+                lane: None,
                 model: worker_catalog::ModelId::new("claude-sonnet-5").assert_value_with("model"),
                 effort: Some(ReasoningEffort::Max),
                 session_scope: SessionScope::Execution,

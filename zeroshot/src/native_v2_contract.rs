@@ -1,9 +1,8 @@
 //! Minimal, secret-free composition contracts for the native-v2 engine.
 //!
-//! `GraphSpec` remains the graph language. This module only binds executable graph leaves to one
-//! graph-wide harness/provider lane and defines the neutral values exchanged by admission, the
-//! reducer, the runner, and the run ledger. It deliberately contains no admission or execution
-//! policy.
+//! `GraphSpec` remains the graph language. This module only binds executable graph leaves to
+//! harness/provider lanes and defines the neutral values exchanged by admission, the reducer, the
+//! runner, and the run ledger. It deliberately contains no admission or execution policy.
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -17,7 +16,7 @@ pub use openengine_cluster_protocol::{
     ClaudeProvider, CodexProvider, CopilotProvider, ConnectionKey, DeclaredConnections,
     DeclaredEnvironment, EnvironmentVariableName, ModelId, NodeRuntimeBinding, PiProvider,
     PullRequestFeedback, ReasoningEffort, ResolvedSource, RunSize, RunSubmission, RunTitle,
-    RuntimePlan, SessionScope, SourceBranchId, SourceRepositoryId, SourceRevisionId,
+    RuntimeLane, RuntimePlan, SessionScope, SourceBranchId, SourceRepositoryId, SourceRevisionId,
     MAX_DECLARED_CONNECTIONS, MAX_DECLARED_ENVIRONMENT_NAMES,
 };
 use serde::{Deserialize, Serialize};

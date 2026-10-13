@@ -65,7 +65,7 @@ test('graph runtime configuration renders independently of the node inspector', 
         edit: () => {},
       })
     );
-    assert.match(html, /Applies to the whole graph/);
+    assert.match(html, /Defaults for agents without a harness and provider override/);
     assert.match(html, /<label for="[^"]+" class="visually-hidden">Model for worker<\/label>/);
     assert.match(html, /value="custom-model"/);
     assert.doesNotMatch(
