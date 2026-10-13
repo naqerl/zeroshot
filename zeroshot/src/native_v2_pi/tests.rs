@@ -1120,6 +1120,10 @@ fn coverage_contract_pi_native_local_lane_leaves_the_agent_directory_unset() {
 
 #[path = "tests/credentials.rs"]
 mod credentials;
+#[path = "tests/configuration.rs"]
+mod configuration;
+#[path = "tests/endpoints.rs"]
+mod endpoints;
 #[path = "tests/process.rs"]
 mod process;
 

@@ -509,3 +509,48 @@ fn hosted_copilot_harness_and_invalid_filesystem_layout_preserve_capsule_boundar
 
     assert!(production_filesystem(root.path(), root.path(), process_pool).is_err());
 }
+
+#[test]
+fn hosted_pi_harness_builds_the_contained_lane_from_the_capsule() {
+    let root = TestDirectory::new("host-pi-harness");
+    let allocator = test_allocator(root.path());
+    let mut admitted = crate::native_v2_runner::test_support::admitted();
+    let nodes = admitted.runtime.nodes().clone();
+    admitted.runtime = RuntimePlan::Pi {
+        provider: crate::native_v2_contract::PiProvider::Anthropic,
+        size: crate::native_v2_contract::RunSize::Medium,
+        nodes,
+    };
+    let filesystem = CapsuleFilesystem {
+        workspace: root.child("workspace"),
+        runtime_home: root.child("runtime"),
+    };
+    let harness = allocator
+        .harness(&admitted, &filesystem, allocator.config.process_pool)
+        .assert_value();
+    let NativeV2HarnessConfig::Pi(config) = harness else {
+        panic!("Pi admission must select the Pi harness");
+    };
+    assert_eq!(
+        config.provider,
+        crate::native_v2_contract::PiProvider::Anthropic
+    );
+    assert_eq!(config.executable, "/usr/bin/false");
+    assert_eq!(config.workspace, filesystem.workspace);
+    assert_eq!(config.runtime_home, filesystem.runtime_home);
+    // A contained lane never reuses a user home or an ambient environment.
+    assert!(config.local_user_home.is_none());
+    let values = config.base_environment.clone_values();
+    assert_eq!(
+        values.get("HOME").map(String::as_str),
+        filesystem.runtime_home.to_str()
+    );
+    // The capsule adds the run's tools directory and puts it ahead of the base search path.
+    assert_eq!(
+        values.get("ZEROSHOT_TOOLS").map(String::as_str),
+        Some(root.child("tools").to_string_lossy().as_ref())
+    );
+    assert!(values
+        .get("PATH")
+        .is_some_and(|path| path.starts_with(&format!("{}:", root.child("tools/bin").display()))));
+}

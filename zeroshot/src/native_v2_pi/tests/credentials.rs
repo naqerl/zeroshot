@@ -225,3 +225,39 @@ fn coverage_contract_pi_bedrock_lane_requires_its_own_pair() {
     });
     assert!(partial.is_err());
 }
+
+#[test]
+fn coverage_contract_pi_bedrock_lane_rejects_a_present_but_empty_pair_member() {
+    // A present-but-empty region must fail closed instead of being treated as an absent pair half.
+    let directory = TestDirectory::new("pi-bedrock-empty-region");
+    let files = files(&directory);
+    let command = super::super::command::command(PiCommandRequest {
+        provider: PiProvider::Bedrock,
+        native_local: false,
+        contained: false,
+        executable: "pi",
+        prefix_arguments: &[],
+        invocation: &invocation(
+            agent_binding(
+                "amazon-bedrock/anthropic.claude",
+                None,
+                SessionScope::Execution,
+                &["AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION"],
+            ),
+            NodeRole::Worker,
+            resolved(
+                &["AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION"],
+                &[("AWS_BEARER_TOKEN_BEDROCK", "bedrock-token"), ("AWS_REGION", "")],
+            ),
+        ),
+        files: &files,
+        local_environment: &BTreeMap::new(),
+        agent_dir: directory.path(),
+        session_dir: &directory.child("sessions"),
+        session_id: "zs-fixed",
+    });
+    assert!(
+        command.is_err(),
+        "an empty AWS_REGION must not be treated as an absent pair half"
+    );
+}

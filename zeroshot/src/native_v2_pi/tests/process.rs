@@ -69,6 +69,16 @@ async fn run_turn(
     adapter: &PiAdapter,
     cancelled_first: bool,
 ) -> (Result<WorkerOutcome, NodeRunnerError>, Vec<LiveOutput>) {
+    run_invocation(adapter, scripted_invocation(), cancelled_first).await
+}
+
+/// Runs one turn for a caller-supplied invocation. A cancelled control is signalled before the turn
+/// starts, which is how the cancellation paths are reached deterministically.
+async fn run_invocation(
+    adapter: &PiAdapter,
+    invocation: DriverInvocation,
+    cancelled_first: bool,
+) -> (Result<WorkerOutcome, NodeRunnerError>, Vec<LiveOutput>) {
     let (cancel, control, mut durable) = control();
     if cancelled_first {
         cancel.send(true).assert_value();
@@ -82,7 +92,7 @@ async fn run_turn(
     });
     let outcome = tokio::time::timeout(
         Duration::from_secs(60),
-        adapter.run(scripted_invocation(), control),
+        adapter.run(invocation, control),
     )
     .await
     .assert_value_with("a scripted Pi turn must finish");
@@ -248,5 +258,199 @@ async fn records_that_are_not_events_do_not_hide_the_terminal_message() {
     assert!(
         detail.contains("provider rejected the configured model"),
         "{detail}"
+    );
+}
+
+/// A rejected provider envelope for a contract that requires a string response.
+const REJECTED_ENVELOPE: &str = r#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"not a provider envelope"}]}}"#;
+/// The same contract answered correctly on the correction turn.
+const STRING_ENVELOPE: &str = r#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"{\"response\":\"corrected\"}"}]}}"#;
+const FOREIGN_SESSION: &str = r#"{"type":"session","id":"pi-not-the-derived-session"}"#;
+
+/// An adapter whose private provider home cannot be created, so filesystem preparation fails before
+/// any process is launched.
+fn adapter_with_unpreparable_home(directory: &TestDirectory) -> PiAdapter {
+    let executable = directory.write_executable("pi", &script(&[COMPLETED_TURN]));
+    let workspace = directory.child("workspace");
+    std::fs::create_dir_all(&workspace).assert_value();
+    let runtime_home = directory.child("runtime-is-a-file");
+    std::fs::write(&runtime_home, b"not a directory").assert_value();
+    let mut configuration = adapter_configuration(
+        PiProvider::Anthropic,
+        executable.to_str().assert_value(),
+        BTreeMap::new(),
+    );
+    configuration.workspace = workspace;
+    configuration.runtime_home = runtime_home;
+    PiAdapter::new_local(configuration).assert_value()
+}
+
+#[tokio::test]
+async fn a_provider_that_never_reads_its_stdin_reports_the_input_failure() {
+    // Pi resolves a piped prompt only at stdin EOF. A provider that closes its own stdin rejects
+    // the prompt instead of reading it, and the turn must report that input failure rather than
+    // hang or pretend the provider settled.
+    let directory = TestDirectory::new("pi-scripted-input-failure");
+    let marker = directory.child("closed-stdin");
+    let body = format!(
+        "#!/bin/sh\nexec 0<&-\n: > '{marker}'\nsleep 30\nexit 0\n",
+        marker = marker.display()
+    );
+    let adapter = scripted_adapter(&directory, &body);
+    let mut turn = scripted_invocation();
+    turn.node.input = serde_json::Value::String("x".repeat(8 * 1024 * 1024));
+    let (outcome, _seen) = run_invocation(&adapter, turn, false).await;
+    let Err(NodeRunnerError::DriverDetail(detail)) = outcome else {
+        panic!("expected an input failure detail, got {outcome:?}");
+    };
+    assert!(
+        detail.contains("provider process input failed"),
+        "{detail}"
+    );
+    assert!(
+        marker.exists(),
+        "the provider must have started before the input failed"
+    );
+}
+
+#[tokio::test]
+async fn a_completed_turn_reporting_a_foreign_session_fails_the_turn() {
+    // Pi creates the exact session ID Zeroshot derived. A different one would silently split the
+    // logical node session, so the mismatch is a failure even though the answer parsed.
+    let directory = TestDirectory::new("pi-scripted-foreign-session");
+    let adapter = scripted_adapter(&directory, &script(&[FOREIGN_SESSION, COMPLETED_TURN]));
+    let (outcome, _seen) = run_turn(&adapter, false).await;
+    let Err(NodeRunnerError::DriverDetail(detail)) = outcome else {
+        panic!("expected a session mismatch detail, got {outcome:?}");
+    };
+    assert!(detail.contains("different session"), "{detail}");
+}
+
+#[tokio::test]
+async fn a_failed_turn_reporting_a_foreign_session_fails_before_the_failure_settles() {
+    // The same identity check runs on the failure path, so a provider failure cannot hide a
+    // session split.
+    let directory = TestDirectory::new("pi-scripted-foreign-session-failed");
+    let adapter = scripted_adapter(&directory, &script(&[FOREIGN_SESSION, FAILED_TURN]));
+    let (outcome, _seen) = run_turn(&adapter, false).await;
+    let Err(NodeRunnerError::DriverDetail(detail)) = outcome else {
+        panic!("expected a session mismatch detail, got {outcome:?}");
+    };
+    assert!(detail.contains("different session"), "{detail}");
+}
+
+#[tokio::test]
+async fn a_rejected_response_is_corrected_in_the_same_session() {
+    // Pi has no response-schema flag, so a mechanically rejected answer is corrected by another
+    // turn in the same session until it parses. The correction must be observable.
+    let directory = TestDirectory::new("pi-scripted-correction");
+    let body = format!(
+        "#!/bin/sh\ncat > /dev/null\nif [ -e first ]; then\n  printf '%s\\n' '{later}'\n  exit 0\nfi\n: > first\nprintf '%s\\n' '{first}'\nexit 0\n",
+        first = REJECTED_ENVELOPE,
+        later = STRING_ENVELOPE,
+    );
+    let adapter = scripted_adapter(&directory, &body);
+    let mut turn = scripted_invocation();
+    turn.response = NodeResponseContract::Worker {
+        output: PayloadType::String,
+    };
+    let (outcome, seen) = run_invocation(&adapter, turn, false).await;
+    assert!(outcome.is_ok(), "{outcome:?}");
+    assert!(
+        seen.iter()
+            .any(|output| output.text.contains("requesting correction")),
+        "the rejected answer must be reported as a correction: {seen:?}"
+    );
+    assert!(
+        directory.child("workspace").join("first").exists(),
+        "a second provider turn must carry the correction prompt"
+    );
+}
+
+#[tokio::test]
+async fn a_filesystem_that_cannot_be_prepared_fails_before_launch() {
+    let directory = TestDirectory::new("pi-scripted-prepare-failure");
+    let adapter = adapter_with_unpreparable_home(&directory);
+    let (outcome, _seen) = run_turn(&adapter, false).await;
+    let Err(NodeRunnerError::DriverDetail(detail)) = outcome else {
+        panic!("expected a preparation failure detail, got {outcome:?}");
+    };
+    assert!(detail.contains("private home"), "{detail}");
+}
+
+#[tokio::test]
+async fn a_cancelled_turn_whose_filesystem_cannot_be_prepared_settles_as_cancelled() {
+    // Cancellation wins over a preparation failure, so an interrupted run is never reported as a
+    // provider error.
+    let directory = TestDirectory::new("pi-scripted-prepare-cancelled");
+    let adapter = adapter_with_unpreparable_home(&directory);
+    let (outcome, _seen) = run_turn(&adapter, true).await;
+    assert!(
+        matches!(outcome, Err(NodeRunnerError::Cancelled)),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_run_without_an_agent_binding_fails_before_dispatch() {
+    // Session identity is derived from the agent binding, so a delivery binding must fail before
+    // any provider process starts.
+    let directory = TestDirectory::new("pi-run-delivery-binding");
+    let adapter = scripted_adapter(&directory, &script(&[COMPLETED_TURN]));
+    let turn = invocation(delivery_binding(), NodeRole::Worker, resolved(&[], &[]));
+    let (outcome, _seen) = run_invocation(&adapter, turn, false).await;
+    assert!(
+        matches!(outcome, Err(NodeRunnerError::Driver)),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_gateway_run_requires_its_authored_wire_protocol() {
+    // The wire protocol is authored, never inferred from the opaque model identifier, so a gateway
+    // lane that omits it must fail before any provider process starts.
+    let directory = TestDirectory::new("pi-gateway-no-protocol");
+    let executable = directory.write_executable("pi", &script(&[COMPLETED_TURN]));
+    let workspace = directory.child("workspace");
+    let runtime_home = directory.child("runtime");
+    std::fs::create_dir_all(&workspace).assert_value();
+    std::fs::create_dir_all(&runtime_home).assert_value();
+    let mut configuration = adapter_configuration(
+        PiProvider::Gateway,
+        executable.to_str().assert_value(),
+        BTreeMap::new(),
+    );
+    configuration.workspace = workspace;
+    configuration.runtime_home = runtime_home;
+    let adapter = PiAdapter::new_local(configuration).assert_value();
+    let fields = ["GATEWAY_BASE_URL", "GATEWAY_API_KEY"];
+    let turn = invocation(
+        agent_binding("provider-owned-model", None, SessionScope::Execution, &fields),
+        NodeRole::Worker,
+        resolved(
+            &fields,
+            &[
+                ("GATEWAY_BASE_URL", "https://gateway.example/v1"),
+                ("GATEWAY_API_KEY", "declared"),
+            ],
+        ),
+    );
+    let (outcome, _seen) = run_invocation(&adapter, turn, false).await;
+    assert!(
+        matches!(outcome, Err(NodeRunnerError::DriverDetail(_))),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_run_without_authored_instructions_fails_before_dispatch() {
+    let directory = TestDirectory::new("pi-run-no-instructions");
+    let adapter = scripted_adapter(&directory, &script(&[COMPLETED_TURN]));
+    let mut turn = scripted_invocation();
+    turn.node.instructions = None;
+    let (outcome, _seen) = run_invocation(&adapter, turn, false).await;
+    assert!(
+        matches!(outcome, Err(NodeRunnerError::InvalidRole)),
+        "{outcome:?}"
     );
 }

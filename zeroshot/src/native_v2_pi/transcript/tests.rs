@@ -330,3 +330,245 @@ fn assistant_text_handles_string_and_block_content() {
     );
     assert_eq!(assistant_text(&json!({"content": []})), None);
 }
+
+/// The largest token count the wire contract admits. Two of these no longer fit, which is how the
+/// transcript's fail-closed accumulation is exercised.
+const SAFE_TOKEN_COUNT: u64 = 9_007_199_254_740_991;
+
+fn assistant_message_end(stop_reason: &str, usage: serde_json::Value) -> String {
+    json!({
+        "type": "message_end",
+        "message": {
+            "role": "assistant",
+            "content": [],
+            "stopReason": stop_reason,
+            "usage": usage,
+        }
+    })
+    .to_string()
+}
+
+#[test]
+fn assistant_text_requires_content_of_a_supported_shape() {
+    // A message with no content at all, a content value that is neither a string nor an array of
+    // blocks, and a text block that carries no text are all unusable as an answer.
+    assert_eq!(assistant_text(&json!({"role": "assistant"})), None);
+    assert_eq!(assistant_text(&json!({"content": 5})), None);
+    assert_eq!(assistant_text(&json!({"content": [{"type": "text"}]})), None);
+    assert_eq!(
+        assistant_text(&json!({"content": [
+            {"type": "text", "text": "ok"},
+            {"type": "text"}
+        ]}))
+        .as_deref(),
+        Some("ok")
+    );
+}
+
+#[test]
+fn ignored_record_shapes_do_not_disturb_the_authoritative_answer() {
+    // Record shapes a future Pi version may add, plus empty and non-assistant records, must all be
+    // ignored: none may set the session identity, emit a hidden fragment, or invent a usage total.
+    let mut transcript = PiTranscript::new(Vec::new());
+    let stream = [
+        "",
+        "   ",
+        r#"{"other":true}"#,
+        r#"{"type":"session"}"#,
+        r#"{"type":"message_start","message":{"role":"user"}}"#,
+        r#"{"type":"message_end"}"#,
+        r#"{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"prompt"}]}}"#,
+        r#"{"type":"message_update"}"#,
+        r#"{"type":"message_update","assistantMessageEvent":{}}"#,
+        r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":""}}"#,
+        &json!({"type": "compaction_start"}).to_string(),
+        &json!({
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "settled"}],
+                "stopReason": "stop"
+            }
+        })
+        .to_string(),
+        "",
+    ]
+    .join("\n");
+    let emissions = transcript.push(stream.as_bytes());
+    let emitted: Vec<&str> = emissions.iter().map(|e| e.text.as_str()).collect();
+    // Only the compaction notice survives: empty deltas and a text block without text do not.
+    assert_eq!(emitted, ["Pi compacted the session context"]);
+    assert!(transcript.token_usage().is_none());
+    let super::PiAttempt::Complete(result) = transcript.finish(None).unwrap() else {
+        panic!("expected the settled answer");
+    };
+    assert_eq!(result.message, "settled");
+    // A session record that carried no identifier must not invent one.
+    assert_eq!(result.session_id, None);
+}
+
+#[test]
+fn usage_that_is_not_a_complete_counted_object_is_ignored() {
+    // A usage value that is not an object, one missing a required counter, and one whose counter
+    // exceeds the wire bound must all leave the turn with no usage total rather than zero usage.
+    let mut transcript = PiTranscript::new(Vec::new());
+    let stream = [
+        json!({"type": "message_update", "usage": "not an object",
+               "assistantMessageEvent": {"type": "start"}})
+        .to_string(),
+        json!({"type": "message_update", "usage": {"input": 5},
+               "assistantMessageEvent": {"type": "start"}})
+        .to_string(),
+        json!({"type": "message_update", "usage": {"input": SAFE_TOKEN_COUNT + 1, "output": 3},
+               "assistantMessageEvent": {"type": "start"}})
+        .to_string(),
+        "",
+    ]
+    .join("\n");
+    transcript.push(stream.as_bytes());
+    assert!(transcript.token_usage().is_none());
+}
+
+#[test]
+fn usage_that_overflows_the_safe_range_keeps_the_committed_total() {
+    let mut transcript = PiTranscript::new(Vec::new());
+    transcript.push(
+        format!(
+            "{}\n",
+            assistant_message_end("toolUse", json!({"input": SAFE_TOKEN_COUNT, "output": 1}))
+        )
+        .as_bytes(),
+    );
+    transcript.push(
+        format!(
+            "{}\n",
+            json!({"type": "message_update", "usage": {"input": SAFE_TOKEN_COUNT, "output": 1},
+                   "assistantMessageEvent": {"type": "start"}})
+        )
+        .as_bytes(),
+    );
+    // The in-flight message cannot be added to the committed total, so the total stands.
+    let usage = transcript.token_usage().expect("committed usage survives");
+    assert_eq!(usage.input_tokens.get(), SAFE_TOKEN_COUNT);
+    transcript.push(
+        format!(
+            "{}\n",
+            json!({"type": "message_start", "message": {"role": "assistant"}})
+        )
+        .as_bytes(),
+    );
+    // Committing the overflowing message must also keep the earlier total.
+    let usage = transcript
+        .token_usage()
+        .expect("committed usage survives the commit");
+    assert_eq!(usage.input_tokens.get(), SAFE_TOKEN_COUNT);
+}
+
+#[test]
+fn overflowing_cache_counters_keep_the_committed_total() {
+    let mut transcript = PiTranscript::new(Vec::new());
+    transcript.push(
+        format!(
+            "{}\n",
+            assistant_message_end(
+                "toolUse",
+                json!({"input": 1, "output": 1, "cacheRead": SAFE_TOKEN_COUNT,
+                       "cacheWrite": SAFE_TOKEN_COUNT})
+            )
+        )
+        .as_bytes(),
+    );
+    transcript.push(
+        format!(
+            "{}\n",
+            json!({"type": "message_update",
+                   "usage": {"input": 1, "output": 1, "cacheRead": SAFE_TOKEN_COUNT,
+                             "cacheWrite": SAFE_TOKEN_COUNT},
+                   "assistantMessageEvent": {"type": "start"}})
+        )
+        .as_bytes(),
+    );
+    let usage = transcript.token_usage().expect("committed usage survives");
+    assert_eq!(usage.input_tokens.get(), 1);
+    assert_eq!(
+        usage.cache_read_input_tokens.map(|count| count.get()),
+        Some(SAFE_TOKEN_COUNT)
+    );
+}
+
+#[test]
+fn cache_counters_accumulate_when_every_message_reports_them() {
+    let mut transcript = PiTranscript::new(Vec::new());
+    transcript.push(
+        format!(
+            "{}\n",
+            assistant_message_end(
+                "toolUse",
+                json!({"input": 2, "output": 3, "cacheRead": 5, "cacheWrite": 7})
+            )
+        )
+        .as_bytes(),
+    );
+    transcript.push(
+        format!(
+            "{}\n",
+            json!({"type": "message_update",
+                   "usage": {"input": 11, "output": 13, "cacheRead": 17, "cacheWrite": 19},
+                   "assistantMessageEvent": {"type": "start"}})
+        )
+        .as_bytes(),
+    );
+    let usage = transcript.token_usage().expect("committed usage");
+    assert_eq!(usage.input_tokens.get(), 13);
+    assert_eq!(usage.output_tokens.get(), 16);
+    assert_eq!(
+        usage.cache_read_input_tokens.map(|count| count.get()),
+        Some(22)
+    );
+    assert_eq!(
+        usage.cache_creation_input_tokens.map(|count| count.get()),
+        Some(26)
+    );
+}
+
+#[test]
+fn one_oversized_record_is_dropped_without_losing_the_answer() {
+    // The framing guard retains at most one unfinished record. A record past its bound is dropped
+    // whole, and the following valid record must still settle the turn.
+    let mut transcript = PiTranscript::new(Vec::new());
+    let mut oversized = vec![
+        b'x';
+        crate::native_v2_capsule::provider_json_lines::MAX_PROVIDER_JSONL_RECORD_BYTES + 1
+    ];
+    oversized.push(b'\n');
+    transcript.push(&oversized);
+    transcript.push(format!("{}\n", assistant("after the drop")).as_bytes());
+    let super::PiAttempt::Complete(result) = transcript.finish(None).unwrap() else {
+        panic!("expected the surviving answer");
+    };
+    assert_eq!(result.message, "after the drop");
+}
+
+#[test]
+fn redactions_are_deduplicated_and_applied_longest_first() {
+    // Sorting matters: a short redaction applied first would leave the prefix of a longer one in
+    // the diagnostic, so the longer value has to win.
+    let mut transcript = PiTranscript::new(vec![
+        "secret".to_owned(),
+        String::new(),
+        "sk-secret".to_owned(),
+        "secret".to_owned(),
+    ]);
+    transcript.push(
+        json!({"type": "message_end",
+               "message": {"role": "assistant", "content": [], "stopReason": "error",
+                           "errorMessage": "sk-secret and secret"}})
+        .to_string()
+        .as_bytes(),
+    );
+    let super::PiAttempt::Failed(failure) = transcript.finish(None).unwrap() else {
+        panic!("expected a failure");
+    };
+    assert!(!failure.diagnostic.contains("sk-"), "{}", failure.diagnostic);
+    assert!(!failure.diagnostic.contains("secret"), "{}", failure.diagnostic);
+}
