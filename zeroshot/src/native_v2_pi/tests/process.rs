@@ -205,6 +205,26 @@ async fn a_turn_cancelled_while_the_provider_runs_settles_as_cancelled() {
 }
 
 #[tokio::test]
+async fn a_lost_output_consumer_fails_the_turn_instead_of_hanging_it() {
+    // The durable log is bounded, so a consumer that disappears must surface as a delivery failure
+    // (and as the diagnostic that path adds), never as a turn that waits forever.
+    let directory = TestDirectory::new("pi-scripted-lost-consumer");
+    let adapter = scripted_adapter(&directory, &script(&[NARRATION, COMPLETED_TURN]));
+    let (_cancel, control, durable) = control();
+    drop(durable);
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        adapter.run(scripted_invocation(), control),
+    )
+    .await
+    .assert_value_with("a turn with no output consumer must still finish");
+    assert!(
+        matches!(outcome, Err(NodeRunnerError::DurableOutputClosed)),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
 async fn records_that_are_not_events_do_not_hide_the_terminal_message() {
     let directory = TestDirectory::new("pi-scripted-malformed");
     let adapter = scripted_adapter(
