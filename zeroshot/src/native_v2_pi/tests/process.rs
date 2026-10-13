@@ -20,11 +20,15 @@ use crate::native_v2_runner::{LiveOutput, NodeDriver, NodeRunnerError};
 
 /// A `pi --mode json` turn: the prompt is consumed and each line is framed as the CLI frames it.
 fn script(lines: &[&str]) -> String {
+    script_exiting(0, lines)
+}
+
+fn script_exiting(code: u8, lines: &[&str]) -> String {
     let mut body = String::from("#!/bin/sh\ncat > /dev/null\n");
     for line in lines {
         body.push_str(&format!("printf '%s\\n' '{line}'\n"));
     }
-    body.push_str("exit 0\n");
+    body.push_str(&format!("exit {code}\n"));
     body
 }
 
@@ -138,6 +142,66 @@ async fn an_unlaunchable_provider_reports_a_start_failure() {
         panic!("expected a launch failure detail, got {outcome:?}");
     };
     assert!(!detail.is_empty(), "{detail}");
+}
+
+#[tokio::test]
+async fn a_provider_that_exits_nonzero_after_an_answer_still_fails_the_turn() {
+    // A process that failed after producing an answer must not be treated as usable.
+    let directory = TestDirectory::new("pi-scripted-late-exit");
+    let adapter = scripted_adapter(&directory, &script_exiting(9, &[COMPLETED_TURN]));
+    let (outcome, _seen) = run_turn(&adapter, false).await;
+    let Err(NodeRunnerError::DriverDetail(detail)) = outcome else {
+        panic!("expected a process failure, got {outcome:?}");
+    };
+    assert!(!detail.is_empty(), "{detail}");
+}
+
+#[tokio::test]
+async fn a_provider_that_exits_nonzero_without_a_terminal_reports_the_exit_status() {
+    // No terminal message and no provider error: the exit status is all the turn has, and reporting
+    // it is what keeps the node from silently settling on nothing.
+    let directory = TestDirectory::new("pi-scripted-no-terminal");
+    let adapter = scripted_adapter(&directory, &script_exiting(4, &[]));
+    let (outcome, _seen) = run_turn(&adapter, false).await;
+    let Err(NodeRunnerError::DriverDetail(detail)) = outcome else {
+        panic!("expected a provider failure, got {outcome:?}");
+    };
+    assert!(detail.contains("exited with status 4"), "{detail}");
+}
+
+#[tokio::test]
+async fn a_turn_cancelled_while_the_provider_runs_settles_as_cancelled() {
+    let directory = TestDirectory::new("pi-scripted-mid-turn-cancel");
+    let adapter = scripted_adapter(
+        &directory,
+        &script(&["{\"type\":\"message_update\"}"]).replace("exit 0", "sleep 15\nexit 0"),
+    );
+    let (cancel, control, mut durable) = control();
+    let drain = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        while let Ok(output) = durable.recv_output().await {
+            seen.push(output);
+        }
+        seen
+    });
+    let cancel_after_start = cancel.clone();
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = cancel_after_start.send(true);
+    });
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        adapter.run(scripted_invocation(), control),
+    )
+    .await
+    .assert_value_with("a cancelled Pi turn must still finish");
+    canceller.await.assert_value();
+    drop(cancel);
+    let _seen = drain.await.assert_value();
+    assert!(
+        matches!(outcome, Err(NodeRunnerError::Cancelled)),
+        "{outcome:?}"
+    );
 }
 
 #[tokio::test]
