@@ -42,7 +42,9 @@ export function ThemeControl() {
       className="theme-control"
       ref={control}
       onBlur={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false);
+        // Pressing a button in Safari clears focus; presses outside close via pointerdown.
+        if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget))
+          setOpen(false);
       }}
       onKeyDown={(event) => {
         if (open && event.key === 'Escape') {

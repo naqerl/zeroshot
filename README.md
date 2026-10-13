@@ -1,6 +1,7 @@
 <div align="center">
 
 <picture>
+  <source media="(max-width: 640px)" srcset="docs/brand/zeroshot-hero-mobile.png">
   <source media="(prefers-color-scheme: dark)" srcset="docs/brand/zeroshot-hero-dark.png">
   <img alt="zeroshot: the agent that wrote the code should not be the one that says it works. Independent review and repair." src="docs/brand/zeroshot-hero-light.png" width="100%">
 </picture>
@@ -29,30 +30,36 @@
 
 # zeroshot
 
-**The agent that writes the code should not be the one that decides it works.**
+**Build your own open-source software factory.**
 
-We built zeroshot because we were tired of being gaslit by agents telling us broken code was ready.
+Turn a task into a reviewed pull request through a workflow you control. Choose the agents and
+models, define what must pass, and decide where rejected work goes for repair.
 
-zeroshot runs a QA process your coding agent can't skip. You define it as a graph: which agents
-review, what must pass, where a rejection loops back. In the built-in `software-change` workflow,
-one agent implements, independent agents review, and failures go back to a bounded repair loop.
-Git delivery waits for both reviewers to accept. zeroshot doesn't replace Claude Code, Codex or
-Copilot. It runs one of them as the worker and as the reviewers.
+Start with the built-in `software-change` graph: implementation → independent review → repair →
+optional delivery. Or design your own topology. Add security reviewers, test agents, and parallel checks,
+then save the workflow as a profile and reuse it.
 
-Use the built-in graph or draw your own: code review, your own reviewers and test agents, any model
-per node. Save the setup as a profile for the next task.
+The agent that writes the code cannot approve its own work. The engine enforces the graph's review
+gates and retry limits. Think of it as CI for coding agents, starting before the code is written.
+zeroshot runs Claude Code, Codex, or Copilot as the worker and reviewers.
 
-## Skills and review graphs
+The CLI is free and MIT licensed. Run locally, [self-host](#self-hosted-run-the-docker-target), or
+use [zeroshot Cloud](https://cloud.zeroshot.sh/docs).
 
-A skill is advice: the agent still decides whether to follow its reviewer's feedback and when to
-stop. A zeroshot graph defines the required reviews and repair loop before execution; the engine
-follows it mechanically until the reviews accept or the retry limit is reached.
+<div align="center">
+  <picture>
+    <source media="(prefers-reduced-motion: reduce)" srcset="docs/assets/zeroshot-workflow.svg">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/zeroshot-demo-dark.gif">
+    <img src="docs/assets/zeroshot-demo.gif" alt="Animated zeroshot workflow: implementation, parallel acceptance and code review, repair, and optional Git delivery" width="960">
+  </picture>
+  <br>
+  <em>Workflow illustration: both reviews run again after a repair. Git delivery is optional.</em><br>
+  <a href="docs/assets/zeroshot-workflow.svg">Static diagram</a>
+</div>
 
-Add custom agent nodes: a security reviewer, a bugfinder that writes tests, or an agent that checks
-the app in a browser. Choose each node's model and instructions, which nodes run in parallel, and
-where rejected work goes for repair.
-
-The product site, [zeroshot.sh](https://zeroshot.sh/?utm_source=github&utm_medium=readme&utm_campaign=zeroshot), has the FAQ.
+We want to explore how much task decomposition and validation loops can narrow the gap between
+open models and closed frontier systems. The graph, review rules, and repair paths are open for
+anyone to inspect, change, and test on real work.
 
 **[▶ Video: a single agent vs. zeroshot](https://x.com/eivindmeyer_cv/status/2106898797771288828)** (scripted)
 
@@ -140,17 +147,6 @@ The graph defines the sequence, parallel steps, retry paths, and exit conditions
 starts. Runs are bounded, and events are recorded in a durable SQLite ledger. A passing run means
 its configured checks accepted the work; coverage depends on the requirements, reviewers, tests,
 and environment you provide.
-
-<div align="center">
-  <picture>
-    <source media="(prefers-reduced-motion: reduce)" srcset="docs/assets/zeroshot-workflow.svg">
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/zeroshot-demo-dark.gif">
-    <img src="docs/assets/zeroshot-demo.gif" alt="Animated zeroshot workflow: implementation, parallel acceptance and code review, repair, and optional Git delivery" width="960">
-  </picture>
-  <br>
-  <em>Both reviews run again after a repair. Git delivery is optional.</em><br>
-  <a href="docs/assets/zeroshot-workflow.svg">Static diagram</a>
-</div>
 
 ## Auto-research
 
