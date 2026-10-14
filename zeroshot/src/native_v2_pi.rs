@@ -562,16 +562,44 @@ pub(crate) async fn collect_transcript(
     delivery_error.map_or(Ok(()), Err)
 }
 
+/// Largest live-output part the Pi adapter publishes. Each assistant delta is a whole model
+/// fragment that can exceed the runner's live-output bound, so it is split before publishing.
+const LIVE_CHUNK_BYTES: usize = 8 * 1024;
+
+/// Publishes transcript emissions. The transcript has already redacted and cleaned each fragment,
+/// so only the runner's size and character-boundary rules remain: a large valid delta becomes
+/// several bounded outputs and a multi-byte character is never split.
 async fn emit_pi(
     control: &DriverControl,
     emissions: Vec<PiEmission>,
 ) -> Result<(), NodeRunnerError> {
     for emission in emissions {
-        control
-            .emit(LiveOutput::new(emission.stream, emission.text)?)
-            .await?;
+        for part in utf8_chunks(&emission.text, LIVE_CHUNK_BYTES) {
+            control
+                .emit(LiveOutput::new(emission.stream, part)?)
+                .await?;
+        }
     }
     Ok(())
+}
+
+/// Splits `value` into parts of at most `max` bytes on UTF-8 character boundaries. Mirrors the
+/// Claude transcript's chunker so every live-text adapter publishes the same way.
+fn utf8_chunks(value: &str, max: usize) -> Vec<String> {
+    if value.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < value.len() {
+        let mut end = value.len().min(start + max);
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        chunks.push(value[start..end].to_owned());
+        start = end;
+    }
+    chunks
 }
 
 #[cfg(test)]

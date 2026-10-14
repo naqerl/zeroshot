@@ -314,6 +314,84 @@ fn credentials_are_redacted_from_diagnostics() {
 }
 
 #[test]
+fn live_assistant_text_redacts_a_declared_credential() {
+    // Assistant text reaches durable logs and live observers through the transcript's live output,
+    // so a credential the model echoes must be removed there too, not only from diagnostics.
+    let mut transcript = PiTranscript::new(vec!["sk-live-0123456789".to_owned()]);
+    let emissions = transcript.push(
+        [
+            header("s1").as_str(),
+            &json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"token is sk-live-0123456789 ok"}}).to_string(),
+            &json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":" done"}}).to_string(),
+            &assistant("token is sk-live-0123456789 ok done").to_string(),
+            "",
+        ]
+        .join("\n")
+        .as_bytes(),
+    );
+    let streamed: String = emissions
+        .iter()
+        .filter(|emission| emission.stream == LiveOutputStream::Output)
+        .map(|emission| emission.text.as_str())
+        .collect();
+    assert!(!streamed.contains("sk-live-0123456789"), "{streamed}");
+    assert_eq!(streamed, "token is [REDACTED] ok done");
+}
+
+#[test]
+fn a_credential_split_across_live_deltas_is_never_published_in_halves() {
+    // Redacting each delta on its own would leak this credential: neither half is the whole value.
+    // The hold-back window keeps the tail that could still begin the value pending, so the split
+    // never reaches the published stream.
+    const VALUE: &str = "sk-test-0123456789abcdef";
+    let mut transcript = PiTranscript::new(vec![VALUE.to_owned()]);
+    let emissions = transcript.push(
+        [
+            header("s1").as_str(),
+            &json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"token is sk-test-01234"}}).to_string(),
+            &json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"56789abcdef ok"}}).to_string(),
+            &assistant("done").to_string(),
+            "",
+        ]
+        .join("\n")
+        .as_bytes(),
+    );
+    let parts: Vec<&str> = emissions
+        .iter()
+        .filter(|emission| emission.stream == LiveOutputStream::Output)
+        .map(|emission| emission.text.as_str())
+        .collect();
+    assert_eq!(parts.concat(), "token is [REDACTED] ok");
+    assert!(
+        parts.iter().all(|part| !part.contains("sk-test")
+            && !part.contains("01234")
+            && !part.contains("56789")),
+        "no published part may carry a fragment of the credential: {parts:?}"
+    );
+}
+
+#[test]
+fn a_live_delta_carrying_a_nul_is_published_cleaned() {
+    // The runner's live output rejects a NUL byte, so the adapter cleans it instead of failing a
+    // turn whose answer is otherwise valid.
+    let mut transcript = PiTranscript::new(Vec::new());
+    let emissions = transcript.push(
+        [
+            header("s1").as_str(),
+            &json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"before\u{0}after"}}).to_string(),
+            "",
+        ]
+        .join("\n")
+        .as_bytes(),
+    );
+    let streamed: String = emissions
+        .iter()
+        .map(|emission| emission.text.as_str())
+        .collect();
+    assert_eq!(streamed, "before\u{fffd}after");
+}
+
+#[test]
 fn assistant_text_handles_string_and_block_content() {
     assert_eq!(
         assistant_text(&json!({"content": "plain"})).as_deref(),

@@ -24,6 +24,13 @@ pub(super) struct PiResult {
     pub(super) message: String,
 }
 
+/// Streamed text not yet published. A redacted value can straddle two `text_delta` records, so the
+/// tail that could still begin one is held back until it is provably complete.
+struct PendingText {
+    stream: LiveOutputStream,
+    text: String,
+}
+
 pub(super) struct PiFailure {
     pub(super) session_id: Option<String>,
     pub(super) retryable: bool,
@@ -53,6 +60,7 @@ pub(crate) struct PiTranscript {
     current_usage: Option<TokenUsageDelta>,
     malformed: usize,
     redactions: Vec<String>,
+    pending: Option<PendingText>,
 }
 
 impl PiTranscript {
@@ -70,6 +78,7 @@ impl PiTranscript {
             current_usage: None,
             malformed: 0,
             redactions,
+            pending: None,
         }
     }
 
@@ -79,9 +88,13 @@ impl PiTranscript {
     }
 
     pub(super) fn finish_stream(&mut self) -> Vec<PiEmission> {
-        self.lines
+        let mut emissions = self
+            .lines
             .finish()
-            .map_or_else(Vec::new, |record| self.accept([record]))
+            .map_or_else(Vec::new, |record| self.accept([record]));
+        // The stream is over, so any held-back tail is now as complete as it will ever be.
+        self.flush_pending(&mut emissions);
+        emissions
     }
 
     pub(super) fn token_usage(&self) -> Option<TokenUsageDelta> {
@@ -185,6 +198,8 @@ impl PiTranscript {
                     .and_then(Value::as_str)
                     == Some("assistant")
                 {
+                    // The previous message's deltas are done, so its held-back tail is complete.
+                    self.flush_pending(emissions);
                     self.commit_usage();
                     // The last assistant message is the node's answer, so a message that starts
                     // after one already settled must not leave that earlier text in place.
@@ -194,12 +209,16 @@ impl PiTranscript {
             "message_update" => {
                 self.record_usage(value.get("usage"));
                 if let Some(text) = self.record_delta(value) {
-                    push_text(emissions, LiveOutputStream::Output, &text);
+                    self.append_live(emissions, LiveOutputStream::Output, &text);
                 }
             }
-            "message_end" => self.record_message_end(value),
+            "message_end" => {
+                // A settled message ends its delta stream, so publish whatever it held back.
+                self.flush_pending(emissions);
+                self.record_message_end(value);
+            }
             "compaction_start" => {
-                push_text(
+                self.append_live(
                     emissions,
                     LiveOutputStream::System,
                     "Pi compacted the session context",
@@ -207,7 +226,7 @@ impl PiTranscript {
             }
             "auto_retry_start" => {
                 let attempt = value.get("attempt").and_then(Value::as_i64).unwrap_or(0);
-                push_text(
+                self.append_live(
                     emissions,
                     LiveOutputStream::System,
                     &format!("Pi is retrying the model turn (attempt {attempt})"),
@@ -248,6 +267,57 @@ impl PiTranscript {
             // earlier message's text.
             _ => self.terminal = Some(Terminal::Complete(text.unwrap_or_default())),
         }
+    }
+
+    /// Queues one live fragment and publishes whatever prefix is provably complete.
+    ///
+    /// Redaction applies to the published part, and `publishable_prefix` never cuts inside a
+    /// redacted value, so a credential split across two deltas cannot be published in halves.
+    fn append_live(
+        &mut self,
+        emissions: &mut Vec<PiEmission>,
+        stream: LiveOutputStream,
+        text: &str,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.stream != stream)
+        {
+            self.flush_pending(emissions);
+        }
+        let pending = self.pending.get_or_insert_with(|| PendingText {
+            stream,
+            text: String::new(),
+        });
+        pending.text.push_str(text);
+        let cut = publishable_prefix(&pending.text, &self.redactions);
+        if cut > 0 {
+            let ready = pending.text[..cut].to_owned();
+            pending.text.drain(..cut);
+            self.emit(emissions, stream, &ready);
+        }
+    }
+
+    fn flush_pending(&mut self, emissions: &mut Vec<PiEmission>) {
+        if let Some(pending) = self.pending.take() {
+            self.emit(emissions, pending.stream, &pending.text);
+        }
+    }
+
+    /// Publishes one live fragment after removing any known credential and the NUL byte that the
+    /// runner's live output rejects.
+    fn emit(&self, emissions: &mut Vec<PiEmission>, stream: LiveOutputStream, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        emissions.push(PiEmission {
+            stream,
+            text: safe_provider_text(text, &self.redactions),
+        });
     }
 
     fn record_delta(&self, value: &Value) -> Option<String> {
@@ -323,17 +393,30 @@ fn assistant_text(message: &Value) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Emits one non-empty live fragment. Deltas are emitted verbatim: Pi, like Claude, streams a
-/// model response as many small `text_delta` events, and a fragment must never be dropped merely
-/// because its characters happen to appear earlier in the same response.
-fn push_text(emissions: &mut Vec<PiEmission>, stream: LiveOutputStream, text: &str) {
-    if text.is_empty() {
-        return;
+/// Byte length of the leading part of `text` that can be published now.
+///
+/// A redacted value can straddle two deltas, so the trailing bytes that could still begin one stay
+/// pending. No published part ever ends inside a redacted value, which is what keeps a credential
+/// split across two `text_delta` records from reaching the durable log in halves. Mirrors the hold-
+/// back in the Claude transcript's `publishable_prefix`, without its extra line grouping.
+fn publishable_prefix(text: &str, redactions: &[String]) -> usize {
+    let holdback = redactions
+        .iter()
+        .map(|value| value.len().saturating_sub(1))
+        .max()
+        .unwrap_or(0);
+    let mut cut = text.len().saturating_sub(holdback);
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
     }
-    emissions.push(PiEmission {
-        stream,
-        text: text.to_owned(),
-    });
+    while let Some(start) = redactions.iter().find_map(|value| {
+        text.match_indices(value.as_str())
+            .map(|(start, _)| start)
+            .find(|&start| start < cut && cut < start + value.len())
+    }) {
+        cut = start;
+    }
+    cut
 }
 
 /// Adds two usage deltas, failing closed if any counter would exceed its bound.

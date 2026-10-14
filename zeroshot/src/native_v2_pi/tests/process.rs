@@ -16,7 +16,7 @@ use openengine_cluster_testkit::assertions::AssertValue;
 
 use super::*;
 use crate::native_v2_runner::test_support::control;
-use crate::native_v2_runner::{LiveOutput, NodeDriver, NodeRunnerError};
+use crate::native_v2_runner::{LiveOutput, LiveOutputStream, NodeDriver, NodeRunnerError};
 
 /// A `pi --mode json` turn: the prompt is consumed and each line is framed as the CLI frames it.
 fn script(lines: &[&str]) -> String {
@@ -451,5 +451,79 @@ async fn a_run_without_authored_instructions_fails_before_dispatch() {
     assert!(
         matches!(outcome, Err(NodeRunnerError::InvalidRole)),
         "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_credential_echoed_in_live_text_is_redacted_from_the_durable_log() {
+    // The reviewer's verification path: a declared credential echoed by the model travels through
+    // the transcript, `LiveOutput`, and the durable queue. It must not arrive unchanged.
+    const KEY: &str = "sk-live-0123456789abcdef";
+    let event = serde_json::json!({
+        "type": "message_update",
+        "assistantMessageEvent": {
+            "type": "text_delta",
+            "contentIndex": 0,
+            "delta": format!("the key is {KEY} and done"),
+        }
+    })
+    .to_string();
+    let directory = TestDirectory::new("pi-scripted-echoed-credential");
+    let adapter = scripted_adapter(&directory, &script(&[&event, COMPLETED_TURN]));
+    let turn = invocation(
+        agent_binding(
+            "claude-sonnet-4-5",
+            None,
+            SessionScope::Execution,
+            &["ANTHROPIC_API_KEY"],
+        ),
+        NodeRole::Worker,
+        resolved(&["ANTHROPIC_API_KEY"], &[("ANTHROPIC_API_KEY", KEY)]),
+    );
+    let (outcome, seen) = run_invocation(&adapter, turn, false).await;
+    assert!(outcome.is_ok(), "{outcome:?}");
+    let logged: String = seen.iter().map(|output| output.text.as_str()).collect();
+    assert!(
+        !logged.contains(KEY),
+        "the echoed credential reached the durable log: {logged}"
+    );
+    assert!(logged.contains("[REDACTED]"), "{logged}");
+}
+
+#[tokio::test]
+async fn a_large_live_delta_is_published_in_bounded_utf8_parts() {
+    // A valid assistant delta can exceed the runner's live-output bound, so the adapter must split
+    // it on character boundaries instead of failing a turn with a whole oversized output. The
+    // final character is multi-byte, so a naive byte split would also corrupt it.
+    let delta = format!("{}é", "a".repeat(20 * 1024));
+    let event = serde_json::json!({
+        "type": "message_update",
+        "assistantMessageEvent": {
+            "type": "text_delta",
+            "contentIndex": 0,
+            "delta": delta,
+        }
+    })
+    .to_string();
+    let directory = TestDirectory::new("pi-scripted-large-delta");
+    let adapter = scripted_adapter(&directory, &script(&[&event, COMPLETED_TURN]));
+    let (outcome, seen) = run_turn(&adapter, false).await;
+    assert!(outcome.is_ok(), "{outcome:?}");
+    let parts: Vec<&str> = seen
+        .iter()
+        .filter(|output| output.stream == LiveOutputStream::Output)
+        .map(|output| output.text.as_str())
+        .collect();
+    assert_eq!(parts.concat(), delta);
+    assert!(
+        parts.len() > 1,
+        "the oversized delta must publish as several parts: {}",
+        parts.len()
+    );
+    assert!(
+        parts
+            .iter()
+            .all(|part| part.len() <= crate::native_v2_pi::LIVE_CHUNK_BYTES),
+        "every published part must respect the adapter's chunk bound"
     );
 }
