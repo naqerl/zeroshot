@@ -28,7 +28,7 @@ use crate::full_v1_reducer::{
 };
 use crate::native_v2_admission::{DeliveryPolicy, sole_delivery_node, writer_nodes};
 use crate::native_v2_contract::{AdmittedRun, ExecutionRef, NodeCompletion, NodeInvocation};
-use crate::native_v2_delivery::{DeliveryTarget, is_matching_success_receipt};
+use crate::native_v2_delivery::is_matching_success_receipt;
 use crate::native_v2_runner::{
     DurableNodeEvent, LiveOutputSource, LiveOutputStream, NodeHandle, NodeRunRequest, NodeRunner,
     NodeRunnerError,
@@ -400,12 +400,17 @@ impl NativeV2Supervisor {
     }
 
     /// Publishes stopped-runtime failure after confirmed cleanup, before attempting persistence.
-    /// The driving turn remains owned through both publication and the durable append.
+    /// The driving turn remains owned through both publication and the durable append. The fatal
+    /// cause is logged first, so unconfirmed cleanup or a lost terminal append cannot erase it.
     pub(crate) async fn fail_runtime(
         &self,
+        cause: &str,
         on_stopped: impl FnOnce(),
     ) -> Result<(), NativeV2SupervisorError> {
         let _turn = self.drive_turn.lock().await;
+        if let Ok(log) = logging::runtime_failure_log(cause) {
+            self.record_failure_logs(vec![log]).await;
+        }
         self.runner.close_run(&self.run_id).await;
         self.cleanup_runtime(RunRuntimeExit::RuntimeLost).await?;
         on_stopped();
@@ -474,11 +479,10 @@ fn has_required_delivery_receipt(
     let Some((node, mode)) = sole_delivery_node(admitted) else {
         return false;
     };
-    let Ok(target) = DeliveryTarget::new(
-        admitted.source.repository.as_str(),
-        admitted.source.branch.as_str(),
-        admitted.source.revision.as_str(),
-    ) else {
+    let Some(source) = &admitted.source else {
+        return false;
+    };
+    let Ok(target) = crate::native_v2_delivery::source_target(source, mode) else {
         return false;
     };
     let writers = writer_nodes(admitted);

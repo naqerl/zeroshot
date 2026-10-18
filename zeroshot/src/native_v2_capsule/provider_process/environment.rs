@@ -3,6 +3,7 @@
 //! Declared connections overlay these values. Hosted adapters never call this helper.
 
 use std::collections::BTreeMap;
+use crate::native_v2_runner::ResolvedEnvironment;
 use std::fmt;
 
 pub(crate) const CODEX_LOCAL_ENVIRONMENT: &[&str] = &[
@@ -246,3 +247,23 @@ fn private_local_value(name: &str) -> bool {
 #[cfg(test)]
 #[path = "environment/tests.rs"]
 mod tests;
+
+/// Declaring one authentication form suppresses every ambient form in that credential group.
+pub(crate) fn merge_local_environment(
+    environment: &mut BTreeMap<String, String>,
+    resolved: &ResolvedEnvironment,
+    local: &BTreeMap<String, String>,
+    credentials: &[&str],
+) {
+    let declared_auth = resolved
+        .iter()
+        .any(|(name, _)| credentials.contains(&name.as_str()));
+    for (name, value) in local {
+        if declared_auth && credentials.contains(&name.as_str()) {
+            continue;
+        }
+        environment
+            .entry(name.clone())
+            .or_insert_with(|| value.clone());
+    }
+}

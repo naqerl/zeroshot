@@ -9,7 +9,8 @@ mod provider_access;
 pub(crate) use provider_access::{ProviderAccessPlacement, materialize_provider_access};
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use openengine_cluster_protocol::GitTransportCredentials;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -22,8 +23,10 @@ use crate::native_v2_pi::{PiAdapter, PiAdapterConfigError, PiConfig};
 use crate::native_v2_contract::{
     AdmittedRun, CopilotProvider, NodeInvocation, NodeRuntimeBinding, RuntimeLane,
 };
+use crate::native_v2_delivery::validation::TrustedDeliveryValidator;
 use crate::native_v2_delivery::{
-    GitHubDeliveryAuthority, NativeV2DeliveryAdapter, NativeV2DeliveryConfig,
+    SourceDeliveryAuthority, NativeV2DeliveryAdapter, NativeV2DeliveryConfig,
+    TrustedGitHubTokenFile,
 };
 use crate::native_v2_runner::{
     DriverControl, DriverInvocation, NativeNodeRunner, NodeDriver, NodeRunnerError, NodeSession,
@@ -76,8 +79,15 @@ impl NativeV2HarnessConfig {
 
 pub struct NativeV2CandidateConfig {
     pub lanes: Vec<NativeV2HarnessConfig>,
-    pub delivery: NativeV2DeliveryConfig,
-    pub github: Arc<dyn GitHubDeliveryAuthority>,
+    pub workspace: PathBuf,
+    pub delivery: Option<NativeV2CandidateDelivery>,
+}
+
+/// All delivery authority is present together, only when the graph declares delivery.
+pub struct NativeV2CandidateDelivery {
+    pub config: NativeV2DeliveryConfig,
+    pub authority: Arc<dyn SourceDeliveryAuthority>,
+    pub git_credentials: Option<GitTransportCredentials>,
 }
 
 #[derive(Clone, Copy)]
@@ -124,7 +134,12 @@ pub fn build_native_v2_candidate(
     admitted: &AdmittedRun,
     config: NativeV2CandidateConfig,
 ) -> Result<NativeNodeRunner, NativeV2CandidateError> {
-    build_candidate(admitted, config, CandidatePlacement::Capsule, None)
+    build_candidate(
+        admitted,
+        config,
+        CandidatePlacement::Capsule,
+        TrustedDeliveryCapabilities::default(),
+    )
 }
 
 /// Hosted candidate with a trusted Git credential visible only to checkout and delivery.
@@ -133,7 +148,15 @@ pub fn build_native_v2_candidate_with_github_token(
     config: NativeV2CandidateConfig,
     github_token: Option<Arc<str>>,
 ) -> Result<NativeNodeRunner, NativeV2CandidateError> {
-    build_candidate(admitted, config, CandidatePlacement::Capsule, github_token)
+    build_candidate(
+        admitted,
+        config,
+        CandidatePlacement::Capsule,
+        TrustedDeliveryCapabilities {
+            token: github_token,
+            ..Default::default()
+        },
+    )
 }
 
 /// Builds the same candidate with child processes running as the invoking local user.
@@ -145,7 +168,7 @@ pub fn build_local_native_v2_candidate(
         admitted,
         config,
         CandidatePlacement::Local(SessionBoundary::Run),
-        None,
+        TrustedDeliveryCapabilities::default(),
     )
 }
 
@@ -159,7 +182,10 @@ pub fn build_local_native_v2_candidate_with_github_token(
         admitted,
         config,
         CandidatePlacement::Local(SessionBoundary::Run),
-        github_token,
+        TrustedDeliveryCapabilities {
+            token: github_token,
+            ..Default::default()
+        },
     )
 }
 
@@ -172,7 +198,27 @@ pub(crate) fn build_local_owner_native_v2_candidate(
         admitted,
         config,
         CandidatePlacement::Local(SessionBoundary::Owner),
-        None,
+        TrustedDeliveryCapabilities::default(),
+    )
+}
+
+#[derive(Default)]
+pub(crate) struct TrustedDeliveryCapabilities {
+    pub(crate) token: Option<Arc<str>>,
+    pub(crate) token_file: Option<TrustedGitHubTokenFile>,
+    pub(crate) validator: Option<TrustedDeliveryValidator>,
+}
+
+pub(crate) fn build_local_native_v2_candidate_with_authority(
+    admitted: &AdmittedRun,
+    config: NativeV2CandidateConfig,
+    authority: TrustedDeliveryCapabilities,
+) -> Result<NativeNodeRunner, NativeV2CandidateError> {
+    build_candidate(
+        admitted,
+        config,
+        CandidatePlacement::Local(SessionBoundary::Run),
+        authority,
     )
 }
 
@@ -180,17 +226,21 @@ fn build_candidate(
     admitted: &AdmittedRun,
     config: NativeV2CandidateConfig,
     placement: CandidatePlacement,
-    github_token: Option<Arc<str>>,
+    trusted: TrustedDeliveryCapabilities,
 ) -> Result<NativeNodeRunner, NativeV2CandidateError> {
     validate_config(admitted, &config)?;
     let NativeV2CandidateConfig {
-        lanes,
-        delivery,
-        github,
+        lanes, delivery, ..
     } = config;
-    let delivery = Arc::new(
-        NativeV2DeliveryAdapter::new(delivery, github).with_trusted_github_token(github_token),
-    );
+    let delivery = delivery.map(|delivery| {
+        Arc::new(
+            NativeV2DeliveryAdapter::new(delivery.config, delivery.authority)
+                .with_trusted_github_token(trusted.token)
+                .with_trusted_github_token_file(trusted.token_file)
+                .with_trusted_delivery_validator(trusted.validator)
+                .with_git_credentials(delivery.git_credentials),
+        )
+    });
     let agents = lane_agents(lanes, placement)?;
     assemble_runner(admitted, agents, delivery, placement)
 }
@@ -257,9 +307,21 @@ fn validate_config(
     if config
         .lanes
         .iter()
-        .any(|harness| harness.workspace() != config.delivery.workspace.as_path())
+        .any(|harness| harness.workspace() != config.workspace.as_path())
+        || config
+            .delivery
+            .as_ref()
+            .is_some_and(|delivery| delivery.config.workspace != config.workspace)
     {
         return Err(NativeV2CandidateError::WorkspaceMismatch);
+    }
+    let declares_delivery = admitted
+        .runtime
+        .nodes()
+        .values()
+        .any(|binding| matches!(binding, NodeRuntimeBinding::GitDelivery { .. }));
+    if declares_delivery != config.delivery.is_some() {
+        return Err(NativeV2CandidateError::RuntimeMismatch);
     }
     Ok(())
 }
@@ -267,7 +329,7 @@ fn validate_config(
 fn assemble_runner(
     admitted: &AdmittedRun,
     agents: BTreeMap<RuntimeLane, CandidateAgents>,
-    delivery: Arc<NativeV2DeliveryAdapter>,
+    delivery: Option<Arc<NativeV2DeliveryAdapter>>,
     placement: CandidatePlacement,
 ) -> Result<NativeNodeRunner, NativeV2CandidateError> {
     let routes = Arc::new(CandidateNodeLane {
@@ -305,7 +367,7 @@ impl CandidateAgents {
 struct CandidateNodeLane {
     default_lane: RuntimeLane,
     agents: BTreeMap<RuntimeLane, CandidateAgents>,
-    delivery: Arc<NativeV2DeliveryAdapter>,
+    delivery: Option<Arc<NativeV2DeliveryAdapter>>,
 }
 
 impl CandidateNodeLane {
@@ -338,7 +400,11 @@ impl SessionFactory for CandidateNodeLane {
                     .await
             }
             NodeRuntimeBinding::GitDelivery { .. } => {
-                self.delivery.open(invocation, environment).await
+                self.delivery
+                    .as_ref()
+                    .ok_or(NodeRunnerError::Driver)?
+                    .open(invocation, environment)
+                    .await
             }
         }
     }
@@ -356,7 +422,13 @@ impl NodeDriver for CandidateNodeLane {
                 let agents = self.agents_for(&invocation.node.binding)?;
                 agents.driver.run(invocation, control).await
             }
-            NodeRuntimeBinding::GitDelivery { .. } => self.delivery.run(invocation, control).await,
+            NodeRuntimeBinding::GitDelivery { .. } => {
+                self.delivery
+                    .as_ref()
+                    .ok_or(NodeRunnerError::Driver)?
+                    .run(invocation, control)
+                    .await
+            }
         }
     }
 }

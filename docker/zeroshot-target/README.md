@@ -5,7 +5,9 @@ contains the native `zeroshot` executable plus pinned Codex, Claude, GitHub Copi
 harness CLIs.
 The image uses Debian Trixie with package updates applied at build time. GitHub CLI is pinned
 separately to an upstream release, verified by checksum, and tested for delivery API pagination
-before publication.
+before publication. Git checkout and push support HTTPS and SSH. OpenSSH and libnss_wrapper
+provide private user/group records for the target's allocated numeric identities; Git commands
+keep their assigned UID/GID without editing the image's user database.
 
 Coding tools include Node.js 24 and npm, Python 3.12 with pip, venv and extension headers,
 Rust 1.97 with Cargo, rustfmt and Clippy, and C/C++ compilers, make, pkgconf, OpenSSL and
@@ -45,6 +47,10 @@ there is no frontend server to start. With the loopback-only host publish above,
 ```bash
 zeroshot target add local --url http://127.0.0.1:8080 --direct
 ```
+
+Runs require an exact committed Git source; local uncommitted files stay on the client.
+See [source selection and credentials](../../docs/concepts/targets.md#source-and-delivery-credentials)
+for HTTPS/SSH checkout and push, source connections, and GitHub PR/merge support.
 
 Closing the browser leaves runs active.
 Stopping the container stops its runtime; on restart, interrupted runs are reconciled as lost,

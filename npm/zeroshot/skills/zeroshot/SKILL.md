@@ -30,7 +30,10 @@ another run. A failed Cloud run does not authorize silently implementing the tas
 
 ## Choose the target
 
-- Local execution omits `--target` and is the only mode that edits the invoking worktree directly.
+- Local execution omits `--target`. `--cwd DIR` selects a folder (default: invoking folder);
+  Git worktrees use their root. File arguments stay relative to the invoking folder. Runs without
+  Git delivery need no repository. Keep workspace and active Zeroshot state disjoint; use an external
+  `ZEROSHOT_STATE_DIR` when necessary.
 - Zeroshot Cloud is built in. Sign in once with `zeroshot target login cloud`, then use
   `--target cloud` explicitly on Cloud commands. Cloud setup (organizations, GitHub App,
   connections) is documented at https://cloud.zeroshot.sh/docs.
@@ -102,7 +105,7 @@ must return exactly one required string named `response`. The runtime must use C
 every node, and every executable node must have an agent binding with `sessionScope: node_instance`.
 Maps, delivery, runtime connections, MCP servers, and session reload are unsupported.
 
-Each ACP prompt is a separate durable local run. The outer ACP session keeps the Git workspace and
+Each ACP prompt is a separate durable local run. The outer ACP session keeps the workspace and
 node provider sessions alive across prompts. Inspect the returned run ID with `zeroshot status` or
 `zeroshot logs`; `zeroshot ui` includes the run in local history.
 
@@ -123,15 +126,21 @@ zeroshot run --title "TASK" --profile org:NAME --input input.json \
 still be fetched from the target first, so this command requires Cloud access. It does not prove
 connection availability.
 
-For named targets, Zeroshot resolves source from the invoking Git worktree's attached upstream.
-Without an upstream, it requires exactly one GitHub remote. Detached worktrees require explicit
-repository and branch values. Override source only when needed:
+For named targets, `--cwd` selects the client Git checkout. Zeroshot prefers its attached upstream,
+then a unique eligible HTTPS/SSH remote. Docker and Cloud still require an exact committed Git
+source. Detached worktrees require repository and branch overrides. `--repository` accepts GitHub
+`owner/name` or a credential-free HTTPS/SSH clone URL. Override source only when needed:
 
 ```console
 --target cloud --repository OWNER/REPOSITORY --branch BRANCH --revision SHA
 ```
 
-Cloud receives the remote revision, not uncommitted files. Check relevant dirty or unpushed work and
+Git push uses shared transport and needs no GitHub API. PR and merge require a registered forge;
+GitHub is maintained today. `--source-connection KEY` authorizes source-only HTTPS
+(`GIT_USERNAME`, `GIT_PASSWORD`) or pinned SSH (`GIT_SSH_PRIVATE_KEY`, `GIT_SSH_KNOWN_HOSTS`)
+credentials. Generic forms require the target's `openengine.git-transport/v1` capability.
+
+Named targets receive the remote revision, not uncommitted files. Check dirty or unpushed work and
 never push or omit it without authorization. Confirm the exact repository, branch, revision, target,
 profile, and delivery intent reported for the run.
 

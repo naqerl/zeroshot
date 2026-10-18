@@ -23,12 +23,44 @@ mod environment;
 pub(crate) use environment::{
     CLAUDE_LOCAL_ENVIRONMENT, CODEX_LOCAL_ENVIRONMENT, COPILOT_LOCAL_ENVIRONMENT,
     PI_LOCAL_ENVIRONMENT, LocalHarnessEnvironment, current_process_environment,
-    provider_redactions,
+    provider_redactions, merge_local_environment,
 };
+pub(crate) mod text;
+pub(crate) mod turn;
+pub(crate) use crate::native_v2_runner::LiveOutput as ProviderEmission;
+
+pub(crate) struct ProviderResult {
+    pub(crate) session_id: Option<String>,
+    pub(crate) message: String,
+}
+
+pub(crate) struct ProviderTurnFailure {
+    pub(crate) session_id: Option<String>,
+    pub(crate) retryable: bool,
+    pub(crate) diagnostic: String,
+}
+
+pub(crate) enum ProviderAttempt {
+    Complete(ProviderResult),
+    Failed(ProviderTurnFailure),
+}
+
+impl ProviderAttempt {
+    pub(crate) fn process_failure(diagnostic: impl Into<String>) -> Self {
+        Self::Failed(ProviderTurnFailure {
+            session_id: None,
+            retryable: false,
+            diagnostic: diagnostic.into(),
+        })
+    }
+}
+
 mod configuration;
 pub(crate) use configuration::{ConfigurationRequest, PermissionPolicy, inspect_configuration};
 mod contained;
 mod filesystem;
+mod provider_file;
+pub(crate) use provider_file::write_provider_file;
 
 pub(crate) use contained::ProviderProcess;
 pub(crate) use filesystem::{

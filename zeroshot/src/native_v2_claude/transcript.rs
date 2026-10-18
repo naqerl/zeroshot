@@ -1,7 +1,8 @@
+use crate::native_v2_capsule::provider_process::turn::ProviderTranscript;
 use serde_json::Value;
 
 use crate::native_v2_capsule::provider_json_lines::{ProviderJsonLine, ProviderJsonLines};
-use crate::native_v2_capsule::provider_process::safe_provider_text;
+use crate::native_v2_capsule::provider_process::text::ProviderText;
 use crate::native_v2_contract::TokenUsageDelta;
 use crate::native_v2_runner::{LiveOutputStream, NodeRunnerError};
 
@@ -19,52 +20,17 @@ use usage::{
     parse_usage_snapshot,
 };
 
-const LIVE_CHUNK_BYTES: usize = 8 * 1024;
-/// Streamed text without a line break is published once it reaches this size.
-const LIVE_LINE_BYTES: usize = 1024;
+#[cfg(test)]
+use crate::native_v2_capsule::provider_process::text::{LIVE_CHUNK_BYTES, LIVE_LINE_BYTES, utf8_chunks};
 
-pub(super) struct ClaudeResult {
-    pub(super) session_id: Option<String>,
-    pub(super) message: String,
-}
-
-pub(super) struct ClaudeFailure {
-    pub(super) session_id: Option<String>,
-    pub(super) retryable: bool,
-    pub(super) diagnostic: String,
-}
-
-pub(super) enum ClaudeAttempt {
-    Complete(ClaudeResult),
-    Failed(ClaudeFailure),
-}
-
-impl ClaudeAttempt {
-    pub(super) fn process_failure(diagnostic: impl Into<String>) -> Self {
-        Self::Failed(ClaudeFailure {
-            session_id: None,
-            retryable: false,
-            diagnostic: diagnostic.into(),
-        })
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub(super) struct ClaudeEmission {
-    pub(super) stream: LiveOutputStream,
-    pub(super) text: String,
-}
+pub(super) use crate::native_v2_capsule::provider_process::{
+    ProviderResult as ClaudeResult, ProviderTurnFailure as ClaudeFailure,
+    ProviderAttempt as ClaudeAttempt, ProviderEmission as ClaudeEmission,
+};
 
 enum ClaudeTerminal {
     Complete(Value),
     Failed(String),
-}
-
-/// Streamed deltas not yet published. Deltas are a few tokens each, so they are collected and
-/// published as whole lines or blocks instead of one live output record per delta.
-struct PendingText {
-    stream: LiveOutputStream,
-    text: String,
 }
 
 pub(super) struct ClaudeTranscript {
@@ -79,16 +45,11 @@ pub(super) struct ClaudeTranscript {
     active_stream_message: Option<String>,
     malformed_records: usize,
     oversized_records: usize,
-    redactions: Vec<String>,
-    pending: Option<PendingText>,
+    pending: ProviderText,
 }
 
 impl ClaudeTranscript {
-    pub(super) fn new(mut redactions: Vec<String>) -> Self {
-        redactions.retain(|value| !value.is_empty());
-        redactions
-            .sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
-        redactions.dedup();
+    pub(super) fn new(redactions: Vec<String>) -> Self {
         Self {
             lines: ProviderJsonLines::new(),
             session_id: None,
@@ -101,12 +62,13 @@ impl ClaudeTranscript {
             active_stream_message: None,
             malformed_records: 0,
             oversized_records: 0,
-            redactions,
-            pending: None,
+            pending: ProviderText::new(&redactions),
         }
     }
+}
 
-    pub(super) fn push(&mut self, chunk: &[u8]) -> Vec<ClaudeEmission> {
+impl ProviderTranscript for ClaudeTranscript {
+    fn push(&mut self, chunk: &[u8]) -> Vec<ClaudeEmission> {
         if self.terminal.is_some() {
             self.lines.discard();
             return Vec::new();
@@ -115,7 +77,7 @@ impl ClaudeTranscript {
         self.accept_records(records)
     }
 
-    pub(super) fn finish_stream(&mut self) -> Vec<ClaudeEmission> {
+    fn finish_stream(&mut self) -> Vec<ClaudeEmission> {
         if self.terminal.is_some() {
             self.lines.discard();
             return Vec::new();
@@ -124,23 +86,20 @@ impl ClaudeTranscript {
             .lines
             .finish()
             .map_or_else(Vec::new, |record| self.accept_records([record]));
-        self.flush_pending(&mut emissions);
+        self.pending.finish(&mut emissions);
         emissions
     }
 
-    pub(super) fn token_usage(&self) -> Option<TokenUsageDelta> {
+    fn token_usage(&self) -> Option<TokenUsageDelta> {
         self.terminal_usage
             .unwrap_or_else(|| self.provisional_usage.total())
     }
 
-    pub(super) fn is_success(&self) -> bool {
+    fn is_success(&self) -> bool {
         self.session_failure.is_none() && matches!(self.terminal, Some(ClaudeTerminal::Complete(_)))
     }
 
-    pub(super) fn finish(
-        mut self,
-        process_failure: Option<&str>,
-    ) -> Result<ClaudeAttempt, NodeRunnerError> {
+    fn finish(mut self, process_failure: Option<&str>) -> Result<ClaudeAttempt, NodeRunnerError> {
         let process_failure = process_failure.filter(|detail| !detail.trim().is_empty());
         let missing_terminal = self.missing_terminal_detail();
         let terminal = self
@@ -154,7 +113,9 @@ impl ClaudeTranscript {
             }
         }
     }
+}
 
+impl ClaudeTranscript {
     fn finish_complete(
         self,
         result: Value,
@@ -253,8 +214,10 @@ impl ClaudeTranscript {
         object: &serde_json::Map<String, Value>,
         emissions: &mut Vec<ClaudeEmission>,
     ) {
-        if event_type != "stream_event" {
-            self.flush_pending(emissions);
+        if event_type == "result" {
+            self.pending.finish(emissions);
+        } else if event_type != "stream_event" {
+            self.pending.boundary(emissions);
         }
         match event_type {
             "system" => self.parse_system(object, emissions),
@@ -284,7 +247,7 @@ impl ClaudeTranscript {
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        self.emit(
+        self.pending.emit(
             emissions,
             LiveOutputStream::System,
             &format!("Claude API retry {attempt}/{maximum}: {error}"),
@@ -327,7 +290,7 @@ impl ClaudeTranscript {
             }
         }
         if !fields.is_empty() {
-            self.emit(
+            self.pending.emit(
                 emissions,
                 LiveOutputStream::System,
                 &format!("Claude rate limit: {}", fields.join(", ")),
@@ -345,15 +308,15 @@ impl ClaudeTranscript {
         };
         match inner.get("type").and_then(Value::as_str) {
             Some("message_start") => {
-                self.flush_pending(emissions);
+                self.pending.boundary(emissions);
                 self.parse_message_start(inner);
             }
             Some("message_delta") => self.parse_message_delta(inner),
             Some("message_stop") => {
-                self.flush_pending(emissions);
+                self.pending.boundary(emissions);
                 self.active_stream_message = None;
             }
-            Some("content_block_stop") => self.flush_pending(emissions),
+            Some("content_block_stop") => self.pending.boundary(emissions),
             Some("content_block_delta") => self.parse_content_delta(inner, emissions),
             _ => {}
         }
@@ -376,39 +339,7 @@ impl ClaudeTranscript {
             if field == "text" {
                 self.visible_text_emitted = true;
             }
-            self.append_pending(emissions, stream, text);
-        }
-    }
-
-    fn append_pending(
-        &mut self,
-        emissions: &mut Vec<ClaudeEmission>,
-        stream: LiveOutputStream,
-        text: &str,
-    ) {
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.stream != stream)
-        {
-            self.flush_pending(emissions);
-        }
-        let pending = self.pending.get_or_insert_with(|| PendingText {
-            stream,
-            text: String::new(),
-        });
-        pending.text.push_str(text);
-        let cut = publishable_prefix(&pending.text, &self.redactions);
-        if cut > 0 {
-            let ready = pending.text[..cut].to_owned();
-            pending.text.drain(..cut);
-            self.emit(emissions, stream, &ready);
-        }
-    }
-
-    fn flush_pending(&mut self, emissions: &mut Vec<ClaudeEmission>) {
-        if let Some(pending) = self.pending.take() {
-            self.emit(emissions, pending.stream, &pending.text);
+            self.pending.push(emissions, stream, text);
         }
     }
 
@@ -467,7 +398,8 @@ impl ClaudeTranscript {
             };
             if block.get("type").and_then(Value::as_str) == Some("text") {
                 if let Some(text) = block.get("text").and_then(Value::as_str) {
-                    self.emit(emissions, LiveOutputStream::Output, text);
+                    self.pending.push(emissions, LiveOutputStream::Output, text);
+                    self.pending.boundary(emissions);
                     self.visible_text_emitted = true;
                 }
             }
@@ -536,16 +468,6 @@ impl ClaudeTranscript {
         ));
     }
 
-    fn emit(&self, emissions: &mut Vec<ClaudeEmission>, stream: LiveOutputStream, text: &str) {
-        let safe = safe_provider_text(text, &self.redactions);
-        for chunk in utf8_chunks(&safe, LIVE_CHUNK_BYTES) {
-            emissions.push(ClaudeEmission {
-                stream,
-                text: chunk,
-            });
-        }
-    }
-
     fn missing_terminal_detail(&self) -> String {
         let mut diagnostic = if self.retryable_failure_seen {
             "Claude execution ended after a retryable API error without a terminal result"
@@ -607,56 +529,6 @@ fn format_resets_at(value: f64) -> String {
             )
         })
         .unwrap_or_else(|_| format_decimal(value))
-}
-
-/// Byte length of the leading part of `text` to publish now: whole lines, or the text up to a word
-/// break once it exceeds `LIVE_LINE_BYTES`. Redaction applies per published part, so the tail that
-/// could still begin a redacted value stays pending, and no part ends inside one.
-fn publishable_prefix(text: &str, redactions: &[String]) -> usize {
-    let holdback = redactions
-        .iter()
-        .map(|value| value.len().saturating_sub(1))
-        .max()
-        .unwrap_or(0);
-    let mut limit = text.len().saturating_sub(holdback);
-    while !text.is_char_boundary(limit) {
-        limit -= 1;
-    }
-    let candidate = &text[..limit];
-    let mut cut = match candidate.rfind('\n') {
-        Some(index) => index + 1,
-        None if limit >= LIVE_LINE_BYTES => candidate
-            .char_indices()
-            .rev()
-            .find(|(_, character)| character.is_whitespace())
-            .map_or(limit, |(index, character)| index + character.len_utf8()),
-        None => 0,
-    };
-    while let Some(start) = redactions.iter().find_map(|value| {
-        text.match_indices(value.as_str())
-            .map(|(start, _)| start)
-            .find(|&start| start < cut && cut < start + value.len())
-    }) {
-        cut = start;
-    }
-    cut
-}
-
-fn utf8_chunks(value: &str, max: usize) -> Vec<String> {
-    if value.is_empty() {
-        return Vec::new();
-    }
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    while start < value.len() {
-        let mut end = value.len().min(start + max);
-        while !value.is_char_boundary(end) {
-            end -= 1;
-        }
-        chunks.push(value[start..end].to_owned());
-        start = end;
-    }
-    chunks
 }
 
 #[cfg(test)]

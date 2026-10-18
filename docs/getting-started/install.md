@@ -96,7 +96,8 @@ can leave the `ui` feature disabled.
 
 ## Prepare a local run
 
-Run Zeroshot from a Git worktree, and install each agent harness named by the runtime plan:
+Choose an existing working folder with `--cwd FOLDER`, or use the invoking folder. Local runs without
+Git delivery do not need a repository. Install each agent harness named by the runtime plan:
 
 - install and sign in to Codex for `"harness": "codex"`;
 - install and sign in to Claude Code for `"harness": "claude"`;
@@ -124,10 +125,11 @@ the canonical `zeroshot-skill.md`, and `SHA256SUMS`; archive names contain the r
 target triple.
 
 The Python SDK requires Python 3.11 or newer and ships the matching executable inside each platform
-wheel:
+wheel. Download the wheel for your [OS and CPU](../guides/python-sdk.md#install-and-run) from [Python SDK releases](https://github.com/the-open-engine/zeroshot/releases?q=zeroshot-python-v).
+Replace `WHEEL_FILE` with its local path:
 
 ```console
-python -m pip install the-open-engine-zeroshot
+python -m pip install WHEEL_FILE
 ```
 
 For a long-running target, use `ghcr.io/the-open-engine/zeroshot-target`. See the

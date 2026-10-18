@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use openengine_cluster_protocol::MergePlanState;
 use openengine_cluster_testkit::assertions::{AssertError, AssertValue};
 use serde_json::json;
@@ -25,11 +27,93 @@ async fn foreground_run_reports_a_terminal_failure_after_printing_it() {
     let error = execute_native_v2_cli(command, &backend, &mut NeverDetach, &mut output)
         .await
         .assert_error();
-    assert!(matches!(error, NativeV2CliError::RunFailed));
+    assert!(matches!(error, NativeV2CliError::RunFailed(_)));
+    assert_eq!(
+        error.to_string(),
+        "run finished unsuccessfully\nFull run log: zeroshot logs run-public --target prod"
+    );
     assert!(
         String::from_utf8(output)
             .assert_value()
             .contains("\"reason\":\"worker_failed\"")
+    );
+}
+
+#[tokio::test]
+async fn foreground_run_failure_names_its_latest_error_logs() {
+    let backend = FakeBackend::with_failed_watch_and_error_logs(7);
+    let mut output = Vec::new();
+
+    let error = execute_run_task("fail", &backend, &mut NeverDetach, &mut output)
+        .await
+        .assert_error();
+
+    assert_eq!(
+        error.to_string(),
+        "run finished unsuccessfully\nLatest 5 of 7 error logs:\n  error 3\n  error 4\n  \
+         error 5\n  error 6\n  error 7\nFull run log: zeroshot logs run-public --target prod"
+    );
+    let logs_cursors = backend
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::Logs { from_cursor, .. } => Some(from_cursor),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(logs_cursors, [None, Some("v2:8".to_owned())]);
+    let output = String::from_utf8(output).assert_value();
+    assert!(output.contains("\"reason\":\"worker_failed\""));
+    assert!(!output.contains("error 7"));
+}
+
+#[tokio::test]
+async fn foreground_run_settles_a_watch_closed_before_the_terminal_snapshot() {
+    let backend = FakeBackend::with_runtime_failure_before_terminal();
+    let mut output = Vec::new();
+
+    let error = execute_run_task("runtime failure", &backend, &mut NeverDetach, &mut output)
+        .await
+        .assert_error();
+
+    assert!(matches!(error, NativeV2CliError::RunFailed(_)));
+    assert!(backend.calls().contains(&Call::Status {
+        target: Some("prod".to_owned()),
+        run_id: "run-public".to_owned(),
+    }));
+    let output = String::from_utf8(output).assert_value();
+    assert!(output.contains("\"phase\":\"running\""));
+    assert!(!output.contains("\"phase\":\"finished\""));
+
+    let (outcome, _) = execute_durable_command("watch", &backend).await;
+    assert_eq!(outcome, CliOutcome::Completed);
+}
+
+#[tokio::test]
+async fn ctrl_c_detaches_while_settling_a_watch_closed_before_the_terminal_snapshot() {
+    let (notification, _) = tokio::sync::watch::channel(());
+    let backend = FakeBackend::with_unanswered_status_after_early_close(notification.clone());
+    let mut signal = EdgeDetachSignal { notification };
+    let mut output = Vec::new();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        execute_run_task("runtime failure", &backend, &mut signal, &mut output),
+    )
+    .await
+    .assert_value_with("Ctrl-C ends the status read")
+    .assert_value();
+
+    assert_eq!(outcome, CliOutcome::Detached);
+    let calls = backend.calls();
+    assert!(calls.contains(&Call::Status {
+        target: Some("prod".to_owned()),
+        run_id: "run-public".to_owned(),
+    }));
+    assert!(
+        !calls
+            .iter()
+            .any(|call| matches!(call, Call::Logs { .. } | Call::Force { .. }))
     );
 }
 

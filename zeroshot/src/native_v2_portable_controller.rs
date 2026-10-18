@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use openengine_cluster_protocol::{RunId, RunSubmission};
+use openengine_cluster_protocol::{GitTransportCredentials, RunId, RunSubmission};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -25,6 +25,7 @@ pub use controller::PortableRunController;
 pub(crate) use controller::WorkspaceIdentity;
 pub use engine::{PortableRunEngine, PortableRunEngineBootstrap, PortableRuntime};
 pub use lease::{ControllerLease, ControllerLeaseError};
+pub(crate) use lease::workspace_lease_path;
 pub use process::{load_bootstrap_file, read_ready, wait_ready, write_bootstrap_file};
 pub use process::{
     PortableControllerServer, PortableControllerTransport, connect_transport,
@@ -116,6 +117,9 @@ pub struct PortableControllerBootstrap {
     pub environment: RunEnvironment,
     pub native_environment: BTreeMap<String, String>,
     pub github_token: Option<String>,
+    pub github_token_file: Option<crate::native_v2_delivery::TrustedGitHubTokenFile>,
+    pub delivery_validator: Option<crate::native_v2_delivery::validation::TrustedDeliveryValidator>,
+    pub git_credentials: Option<GitTransportCredentials>,
     pub workspace: PathBuf,
     pub workspace_lease: PathBuf,
     pub checkpoint_repository: PathBuf,
@@ -136,6 +140,9 @@ impl fmt::Debug for PortableControllerBootstrap {
                 "github_token",
                 &self.github_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("github_token_file", &self.github_token_file)
+            .field("delivery_validator", &self.delivery_validator)
+            .field("git_credentials", &self.git_credentials)
             .field("workspace", &self.workspace)
             .field("workspace_lease", &self.workspace_lease)
             .field("checkpoint_repository", &self.checkpoint_repository)

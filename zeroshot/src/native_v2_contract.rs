@@ -14,10 +14,11 @@ use openengine_cluster_protocol::{
 };
 pub use openengine_cluster_protocol::{
     ClaudeProvider, CodexProvider, CopilotProvider, ConnectionKey, DeclaredConnections,
-    DeclaredEnvironment, EnvironmentVariableName, ModelId, NodeRuntimeBinding, PiProvider,
-    PullRequestFeedback, ReasoningEffort, ResolvedSource, RunSize, RunSubmission, RunTitle,
-    RuntimeLane, RuntimePlan, SessionScope, SourceBranchId, SourceRepositoryId, SourceRevisionId,
-    MAX_DECLARED_CONNECTIONS, MAX_DECLARED_ENVIRONMENT_NAMES,
+    DeclaredEnvironment, EnvironmentVariableName, GitRemoteUrl, GitTransportCredentials, ModelId,
+    NodeRuntimeBinding, PiProvider, PullRequestFeedback, ReasoningEffort, ResolvedGitRemote,
+    ResolvedSource, RunSize, RunSubmission, RunTitle, RuntimeLane, RuntimePlan, SessionScope,
+    SourceBranchId, SourceForgeIdentity, SourceForgeProviderId, SourceRepositoryId,
+    SourceRevisionId, MAX_DECLARED_CONNECTIONS, MAX_DECLARED_ENVIRONMENT_NAMES,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -78,7 +79,25 @@ pub struct AdmittedRun {
     pub runtime: RuntimePlan,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<openengine_cluster_protocol::RuntimeEnvironment>,
-    pub source: ResolvedSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ResolvedSource>,
+}
+
+impl AdmittedRun {
+    /// Immutable requirements retained for recovery, including private source transport access.
+    #[must_use]
+    pub fn connection_requirements(
+        &self,
+    ) -> std::collections::BTreeMap<
+        ConnectionKey,
+        std::collections::BTreeSet<EnvironmentVariableName>,
+    > {
+        openengine_cluster_protocol::run_connection_requirements_with_source(
+            &self.runtime,
+            self.environment.as_ref(),
+            self.source.as_ref(),
+        )
+    }
 }
 
 impl RunSubmissionIntent {
@@ -182,6 +201,34 @@ pub struct TokenUsageDelta {
     pub output_tokens: TokenCount,
     pub cache_read_input_tokens: Option<TokenCount>,
     pub cache_creation_input_tokens: Option<TokenCount>,
+}
+
+impl TokenUsageDelta {
+    /// Checked sum of invocation usage; optional counters require a value on both sides.
+    pub(crate) fn checked_add(self, right: Self) -> Option<Self> {
+        Some(TokenUsageDelta {
+            input_tokens: self.input_tokens.checked_add(right.input_tokens)?,
+            output_tokens: self.output_tokens.checked_add(right.output_tokens)?,
+            cache_read_input_tokens: add_optional_tokens(
+                self.cache_read_input_tokens,
+                right.cache_read_input_tokens,
+            )?,
+            cache_creation_input_tokens: add_optional_tokens(
+                self.cache_creation_input_tokens,
+                right.cache_creation_input_tokens,
+            )?,
+        })
+    }
+}
+
+fn add_optional_tokens(
+    left: Option<TokenCount>,
+    right: Option<TokenCount>,
+) -> Option<Option<TokenCount>> {
+    match (left, right) {
+        (Some(left), Some(right)) => left.checked_add(right).map(Some),
+        _ => Some(None),
+    }
 }
 
 pub(crate) fn parse_token_usage_delta(

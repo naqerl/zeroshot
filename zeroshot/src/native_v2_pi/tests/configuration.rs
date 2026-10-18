@@ -34,7 +34,7 @@ fn coverage_contract_pi_capsule_environment_rejects_an_empty_runtime_home() {
             .assert_value();
     assert!(matches!(
         environment.for_capsule(Path::new(""), "/bin"),
-        Err(PiAdapterConfigError::InvalidEnvironment)
+        Err(crate::native_v2_capsule::ProcessEnvironmentError::InvalidEnvironment)
     ));
 }
 

@@ -5,6 +5,8 @@ use super::*;
 
 #[path = "tests/limits.rs"]
 mod limit_tests;
+#[path = "tests/redaction.rs"]
+mod redaction_tests;
 #[path = "tests/usage.rs"]
 mod usage_tests;
 
@@ -135,7 +137,6 @@ fn redactions_are_deduplicated_and_longest_first() {
         "secret".to_owned(),
         String::new(),
     ]);
-    assert_eq!(transcript.redactions, vec!["secret-tail", "secret"]);
     let mut bytes = Vec::new();
     append_event(
         &mut bytes,

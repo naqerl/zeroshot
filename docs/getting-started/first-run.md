@@ -1,12 +1,11 @@
 # Run a first task
 
-This example runs the built-in `software-change` graph in the current Git worktree, with pull-request
-and merge delivery disabled.
+This example runs the built-in `software-change` graph in a local folder, with Git delivery disabled.
+Git is optional. Add `--cwd FOLDER` to select another folder; input files stay relative to the invoking folder.
 
-!!! warning "The worker edits the current worktree"
+!!! warning "The worker edits the selected folder"
 
-    Commit or stash work you want to protect, and run the command from the repository you intend to
-    change.
+    Back up work you want to protect, or commit or stash it in a Git checkout.
 
 ## 1. Write the input
 
@@ -81,7 +80,9 @@ and select the run in **Runs**.
 
 Normal completion happens when the graph reaches a terminal node. An explicit
 `zeroshot force-stop RUN_ID` also closes the run, while engine or target failures can produce a
-terminal failure result.
+terminal failure result. `zeroshot logs RUN_ID` keeps the error records that explain a failure,
+such as a failed node's error or the runtime cause. A failed foreground run exits with status 1 and
+its error lists the latest of those records, followed by the `zeroshot logs` command for the rest.
 
 ## Try the smaller template
 

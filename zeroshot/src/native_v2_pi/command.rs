@@ -12,6 +12,7 @@ use crate::execution::process::ProcessSessionCommand;
 use crate::native_v2_capsule::gateway;
 use crate::native_v2_capsule::provider_process::{
     ProviderExecutionFiles, agent_workspace_access, effort_token, with_driver_detail,
+    merge_local_environment,
 };
 use crate::native_v2_contract::{NodeRuntimeBinding, PiProvider};
 use crate::native_v2_runner::{DriverInvocation, NodeRunnerError, ResolvedEnvironment};
@@ -258,15 +259,12 @@ impl EnvironmentRequest<'_> {
             environment.insert(PI_OFFLINE.to_owned(), "1".to_owned());
         }
         extend_declared(&mut environment, resolved)?;
-        // Ambient shell values fill only what the adapter and the declared connections left
-        // unset, so an authored value always wins. They are merged before credential validation
-        // so a credential belonging to another lane is refused rather than smuggled into the
-        // selected provider's process.
-        for (name, value) in local_environment {
-            environment
-                .entry(name.clone())
-                .or_insert_with(|| value.clone());
-        }
+        merge_local_environment(
+            &mut environment,
+            resolved,
+            local_environment,
+            native_local_credentials(provider),
+        );
         configure_provider(&mut environment, provider, native_local)?;
         Ok(environment)
     }
@@ -279,7 +277,8 @@ impl EnvironmentRequest<'_> {
 fn validate_reserved(resolved: &ResolvedEnvironment) -> Result<(), NodeRunnerError> {
     for (name, _) in resolved.iter() {
         if RESERVED.contains(&name.as_str())
-            || super::MINIMAL_ENVIRONMENT_NAMES.contains(&name.as_str())
+            || crate::native_v2_capsule::process_environment::MINIMAL_ENVIRONMENT_NAMES
+                .contains(&name.as_str())
         {
             return Err(NodeRunnerError::DriverDetail(format!(
                 "Pi declared environment conflicts with reserved process configuration {name}"

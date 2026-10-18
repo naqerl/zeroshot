@@ -6,7 +6,7 @@ use tokio::process::Command;
 use super::{command, valid_revision, GitCommandFailure};
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-pub(super) enum GitError {
+pub(crate) enum GitError {
     #[error("workspace has no deliverable mutation relative to the requested base revision")]
     NoMutation,
     #[error("Git returned an invalid HEAD revision")]
@@ -26,20 +26,20 @@ impl From<GitCommandFailure> for GitError {
 }
 
 #[derive(Clone)]
-pub(super) struct SystemGit {
+pub(crate) struct SystemGit {
     program: PathBuf,
     identity: Option<crate::execution::process::HostedProcessIdentity>,
 }
 
 impl SystemGit {
-    pub(super) fn new(program: PathBuf) -> Self {
+    pub(crate) fn new(program: PathBuf) -> Self {
         Self {
             program,
             identity: None,
         }
     }
 
-    pub(super) fn with_identity(
+    pub(crate) fn with_identity(
         mut self,
         identity: Option<crate::execution::process::HostedProcessIdentity>,
     ) -> Self {
@@ -47,7 +47,7 @@ impl SystemGit {
         self
     }
 
-    pub(super) async fn prepare_revision(
+    pub(crate) async fn prepare_revision(
         &self,
         workspace: &Path,
         base_revision: &str,
@@ -123,7 +123,7 @@ impl SystemGit {
         Ok(())
     }
 
-    pub(super) async fn workspace_state(
+    pub(crate) async fn workspace_state(
         &self,
         workspace: &Path,
     ) -> Result<(String, bool), GitError> {
@@ -149,6 +149,21 @@ impl SystemGit {
         ))
     }
 
+    pub(crate) async fn revision_tree(
+        &self,
+        workspace: &Path,
+        revision: &str,
+    ) -> Result<String, GitError> {
+        let tree = self
+            .require_success(workspace, &["rev-parse", &format!("{revision}^{{tree}}")])
+            .await?;
+        let value = tree.stdout.trim().to_owned();
+        if tree.stdout_truncated || !valid_revision(&value) {
+            return Err(GitError::InvalidRevision);
+        }
+        Ok(value)
+    }
+
     async fn commit_pending(&self, workspace: &Path) -> Result<bool, GitError> {
         let staged = self
             .execute(workspace, &["diff", "--cached", "--quiet", "--exit-code"])
@@ -171,7 +186,7 @@ impl SystemGit {
         }
     }
 
-    pub(super) async fn deliverable_revision(
+    pub(crate) async fn deliverable_revision(
         &self,
         workspace: &Path,
         base_revision: &str,

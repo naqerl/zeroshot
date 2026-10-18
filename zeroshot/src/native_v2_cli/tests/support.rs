@@ -24,6 +24,9 @@ use attach::{attach_event, AttachBehavior};
 #[path = "support/cursor.rs"]
 mod cursor;
 use cursor::{record_cursor_call, CursorCallArgs};
+#[path = "support/failure.rs"]
+mod failure;
+use failure::{error_logs, runtime_failure_status, runtime_failure_watch};
 #[path = "support/lifecycle.rs"]
 mod lifecycle;
 use lifecycle::{permanent_reopen_watch, queued_watch};
@@ -207,6 +210,10 @@ pub(in crate::native_v2_cli) struct FakeBackend {
     reconnect_logs: bool,
     attach_behavior: AttachBehavior,
     failed_watch: bool,
+    runtime_failure_before_terminal: bool,
+    unanswered_status: Option<tokio::sync::watch::Sender<()>>,
+    error_logs: usize,
+    pending_logs: bool,
     queued_lifecycle: bool,
     terminal_plan_state: Option<MergePlanState>,
     resume_requirements: Option<RunConnectionRequirements>,
@@ -363,8 +370,6 @@ fn merge_plan_profile() -> RunProfile {
                 "worker":{"kind":"agent","model":"gpt-5.6-sol"},
                 "acceptance":{"kind":"agent","model":"gpt-5.6-sol"},
                 "code":{"kind":"agent","model":"gpt-5.6-sol"},
-                "review_repair":{"kind":"agent","model":"gpt-5.6-sol"},
-                "delivery_repair":{"kind":"agent","model":"gpt-5.6-sol"},
                 "deliver":{"kind":"git_delivery","connections":{"github":["GH_TOKEN"]}}
             }
         }"#,
@@ -617,6 +622,9 @@ impl NativeV2CliBackend for FakeBackend {
             run_id: _,
             source: _,
             profile: _,
+            git_credentials: _,
+            cwd: _,
+            source_connection: _,
         } = request;
         self.calls.lock().assert_value().push(Call::Submit {
             target: target.map(str::to_owned),
@@ -666,6 +674,13 @@ impl NativeV2CliBackend for FakeBackend {
             target: target.map(str::to_owned),
             run_id: params.run_id.as_str().to_owned(),
         });
+        if let Some(started) = &self.unanswered_status {
+            let _ = started.send(());
+            return std::future::pending().await;
+        }
+        if self.runtime_failure_before_terminal {
+            return Ok(runtime_failure_status(&params.run_id));
+        }
         if let Some(requirements) = &self.resume_requirements {
             return serde_json::from_value(json!({
                 "runId":params.run_id,
@@ -712,6 +727,9 @@ impl NativeV2CliBackend for FakeBackend {
         );
         if self.pending_watch {
             return Ok(FakeSubscription::pending());
+        }
+        if self.runtime_failure_before_terminal {
+            return Ok(runtime_failure_watch(&params));
         }
         if let Some(result) = permanent_reopen_watch(self, &params, attempt) {
             return result;
@@ -772,6 +790,12 @@ impl NativeV2CliBackend for FakeBackend {
                 execution: params.execution.as_ref(),
             },
         );
+        if self.pending_logs {
+            return Ok(FakeSubscription::pending());
+        }
+        if self.error_logs > 0 {
+            return Ok(error_logs(&params, self.error_logs));
+        }
         if self.reconnect_logs {
             let (cursor, message) = if attempt == 1 {
                 ("v2:4", "before disconnect")

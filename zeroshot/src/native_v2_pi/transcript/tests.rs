@@ -3,7 +3,7 @@
 //! Kept outside the production-named source file so production coverage totals exclude them
 //! (`AGENTS.md`, `COVERAGE_IGNORE_REGEX` in `.github/workflows/coverage.yml`).
 
-use super::{PiTranscript, assistant_text};
+use super::{PiTranscript, ProviderTranscript, assistant_text};
 use crate::native_v2_runner::LiveOutputStream;
 use serde_json::json;
 
@@ -35,9 +35,9 @@ fn the_final_assistant_message_is_the_response() {
 }
 
 #[test]
-fn deltas_stream_live_but_never_replace_the_authoritative_message() {
+fn batched_deltas_never_replace_the_authoritative_message() {
     let mut transcript = PiTranscript::new(Vec::new());
-    let emissions = transcript.push(
+    let mut emissions = transcript.push(
         [
             header("s1").as_str(),
             &json!({"type": "message_update", "assistantMessageEvent": {"type": "text_start", "contentIndex": 0}}).to_string(),
@@ -48,6 +48,7 @@ fn deltas_stream_live_but_never_replace_the_authoritative_message() {
         .join("\n")
         .as_bytes(),
     );
+    emissions.extend(transcript.finish_stream());
     let streamed: String = emissions
         .iter()
         .filter(|e| e.stream == LiveOutputStream::Output)
@@ -67,7 +68,7 @@ fn a_delta_repeating_earlier_text_is_still_emitted() {
     // A fragment must not be dropped just because its characters appeared earlier: a model
     // repeats words constantly, and dropping them renders the live transcript as word salad.
     let mut transcript = PiTranscript::new(Vec::new());
-    let emissions = transcript.push(
+    let mut emissions = transcript.push(
         [
             header("s1").as_str(),
             &json!({"type": "message_update", "assistantMessageEvent": {"type": "text_start", "contentIndex": 0}}).to_string(),
@@ -80,6 +81,7 @@ fn a_delta_repeating_earlier_text_is_still_emitted() {
         .join("\n")
         .as_bytes(),
     );
+    emissions.extend(transcript.finish_stream());
     let streamed: String = emissions
         .iter()
         .filter(|e| e.stream == LiveOutputStream::Output)

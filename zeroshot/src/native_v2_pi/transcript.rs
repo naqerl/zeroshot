@@ -4,36 +4,20 @@
 //! response value itself is taken from the authoritative final assistant message. Only the last
 //! assistant message is the node's response: Pi can emit several per run.
 
+use crate::native_v2_capsule::provider_process::turn::ProviderTranscript;
 use serde_json::Value;
 
 use crate::native_v2_capsule::provider_json_lines::{ProviderJsonLine, ProviderJsonLines};
-use crate::native_v2_capsule::provider_process::safe_provider_text;
+use crate::native_v2_capsule::provider_process::text::ProviderText;
 use openengine_cluster_protocol::TokenCount;
 
 use crate::native_v2_contract::TokenUsageDelta;
 use crate::native_v2_runner::{LiveOutputStream, NodeRunnerError};
 
-/// One readable piece of a turn, already mapped to its output stream.
-pub(super) struct PiEmission {
-    pub(super) stream: LiveOutputStream,
-    pub(super) text: String,
-}
-
-pub(super) struct PiResult {
-    pub(super) session_id: Option<String>,
-    pub(super) message: String,
-}
-
-pub(super) struct PiFailure {
-    pub(super) session_id: Option<String>,
-    pub(super) retryable: bool,
-    pub(super) diagnostic: String,
-}
-
-pub(super) enum PiAttempt {
-    Complete(PiResult),
-    Failed(PiFailure),
-}
+pub(super) use crate::native_v2_capsule::provider_process::{
+    ProviderResult as PiResult, ProviderTurnFailure as PiFailure, ProviderAttempt as PiAttempt,
+    ProviderEmission as PiEmission,
+};
 
 enum Terminal {
     Complete(String),
@@ -52,16 +36,11 @@ pub(crate) struct PiTranscript {
     /// the running total of its message, so each update replaces this rather than adding to it.
     current_usage: Option<TokenUsageDelta>,
     malformed: usize,
-    redactions: Vec<String>,
+    output: ProviderText,
 }
 
 impl PiTranscript {
-    pub(super) fn new(mut redactions: Vec<String>) -> Self {
-        redactions.retain(|value| !value.is_empty());
-        // Longest first, so a redaction that contains another is applied before its substring.
-        redactions
-            .sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
-        redactions.dedup();
+    pub(super) fn new(redactions: Vec<String>) -> Self {
         Self {
             lines: ProviderJsonLines::new(),
             session_id: None,
@@ -69,24 +48,31 @@ impl PiTranscript {
             usage: None,
             current_usage: None,
             malformed: 0,
-            redactions,
+            output: ProviderText::new(&redactions),
         }
     }
+}
 
-    pub(super) fn push(&mut self, chunk: &[u8]) -> Vec<PiEmission> {
+impl ProviderTranscript for PiTranscript {
+    fn push(&mut self, chunk: &[u8]) -> Vec<PiEmission> {
         let records = self.lines.push(chunk);
         self.accept(records)
     }
 
-    pub(super) fn finish_stream(&mut self) -> Vec<PiEmission> {
-        self.lines
+    fn finish_stream(&mut self) -> Vec<PiEmission> {
+        let mut emissions = self
+            .lines
             .finish()
-            .map_or_else(Vec::new, |record| self.accept([record]))
+            .map_or_else(Vec::new, |record| self.accept([record]));
+        self.output.finish(&mut emissions);
+        emissions
     }
 
-    pub(super) fn token_usage(&self) -> Option<TokenUsageDelta> {
+    fn token_usage(&self) -> Option<TokenUsageDelta> {
         match (self.usage, self.current_usage) {
-            (Some(total), Some(current)) => add_usage(total, current).or(Some(total)),
+            (Some(total), Some(current)) => {
+                TokenUsageDelta::checked_add(total, current).or(Some(total))
+            }
             (Some(total), None) => Some(total),
             (None, current) => current,
         }
@@ -94,17 +80,14 @@ impl PiTranscript {
 
     /// True only when the provider reported a usable answer. A failed or aborted model response is
     /// reported in the event stream while Pi still exits zero, so exit status alone is insufficient.
-    pub(super) fn is_success(&self) -> bool {
+    fn is_success(&self) -> bool {
         matches!(self.terminal, Some(Terminal::Complete(_)))
     }
 
     /// Settles the attempt from the last assistant message. A recovered retry is a success, and a
     /// failure reported after the final answer is a failure, because the last message is
     /// authoritative.
-    pub(super) fn finish(
-        mut self,
-        process_failure: Option<&str>,
-    ) -> Result<PiAttempt, NodeRunnerError> {
+    fn finish(mut self, process_failure: Option<&str>) -> Result<PiAttempt, NodeRunnerError> {
         let process_failure = process_failure.filter(|detail| !detail.trim().is_empty());
         // A final record may arrive without its newline when the process exits, so drain the
         // pending record before settling.
@@ -142,7 +125,9 @@ impl PiTranscript {
             })),
         }
     }
+}
 
+impl PiTranscript {
     fn accept(&mut self, records: impl IntoIterator<Item = ProviderJsonLine>) -> Vec<PiEmission> {
         let mut emissions = Vec::new();
         for record in records {
@@ -194,12 +179,15 @@ impl PiTranscript {
             "message_update" => {
                 self.record_usage(value.get("usage"));
                 if let Some(text) = self.record_delta(value) {
-                    push_text(emissions, LiveOutputStream::Output, &text);
+                    self.output.push(emissions, LiveOutputStream::Output, &text);
                 }
             }
-            "message_end" => self.record_message_end(value),
+            "message_end" => {
+                self.output.boundary(emissions);
+                self.record_message_end(value);
+            }
             "compaction_start" => {
-                push_text(
+                self.output.emit(
                     emissions,
                     LiveOutputStream::System,
                     "Pi compacted the session context",
@@ -207,7 +195,7 @@ impl PiTranscript {
             }
             "auto_retry_start" => {
                 let attempt = value.get("attempt").and_then(Value::as_i64).unwrap_or(0);
-                push_text(
+                self.output.emit(
                     emissions,
                     LiveOutputStream::System,
                     &format!("Pi is retrying the model turn (attempt {attempt})"),
@@ -292,14 +280,14 @@ impl PiTranscript {
     fn commit_usage(&mut self) {
         if let Some(current) = self.current_usage.take() {
             self.usage = Some(match self.usage {
-                Some(total) => add_usage(total, current).unwrap_or(total),
+                Some(total) => TokenUsageDelta::checked_add(total, current).unwrap_or(total),
                 None => current,
             });
         }
     }
 
     fn safe(&self, text: &str) -> String {
-        safe_provider_text(text, &self.redactions)
+        self.output.redact(text)
     }
 }
 
@@ -321,47 +309,6 @@ fn assistant_text(message: &Value) -> Option<String> {
         }
     }
     (!text.is_empty()).then_some(text)
-}
-
-/// Emits one non-empty live fragment. Deltas are emitted verbatim: Pi, like Claude, streams a
-/// model response as many small `text_delta` events, and a fragment must never be dropped merely
-/// because its characters happen to appear earlier in the same response.
-fn push_text(emissions: &mut Vec<PiEmission>, stream: LiveOutputStream, text: &str) {
-    if text.is_empty() {
-        return;
-    }
-    emissions.push(PiEmission {
-        stream,
-        text: text.to_owned(),
-    });
-}
-
-/// Adds two usage deltas, failing closed if any counter would exceed its bound.
-fn add_usage(left: TokenUsageDelta, right: TokenUsageDelta) -> Option<TokenUsageDelta> {
-    Some(TokenUsageDelta {
-        input_tokens: left.input_tokens.checked_add(right.input_tokens)?,
-        output_tokens: left.output_tokens.checked_add(right.output_tokens)?,
-        cache_read_input_tokens: add_optional_usage(
-            left.cache_read_input_tokens,
-            right.cache_read_input_tokens,
-        )?,
-        cache_creation_input_tokens: add_optional_usage(
-            left.cache_creation_input_tokens,
-            right.cache_creation_input_tokens,
-        )?,
-    })
-}
-
-/// Cache counters are reported only when every message reported them, so a partial pair stays
-/// absent rather than inventing a total for the turn.
-fn add_optional_usage(
-    left: Option<TokenCount>,
-    right: Option<TokenCount>,
-) -> Option<Option<TokenCount>> {
-    match (left, right) {
-        (Some(left), Some(right)) => left.checked_add(right).map(Some),
-        _ => Some(None),
-    }
 }
 
 #[cfg(test)]

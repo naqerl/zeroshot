@@ -19,7 +19,7 @@ use crate::native_v2_runner::test_support::control;
 use crate::native_v2_runner::{LiveOutput, NodeDriver, NodeRunnerError};
 
 /// A `pi --mode json` turn: the prompt is consumed and each line is framed as the CLI frames it.
-fn script(lines: &[&str]) -> String {
+pub(super) fn script(lines: &[&str]) -> String {
     script_exiting(0, lines)
 }
 
@@ -47,7 +47,7 @@ fn scripted_invocation() -> DriverInvocation {
 }
 
 /// A local adapter whose Pi executable is the supplied script, over real temporary directories.
-fn scripted_adapter(directory: &TestDirectory, body: &str) -> PiAdapter {
+pub(super) fn scripted_adapter(directory: &TestDirectory, body: &str) -> PiAdapter {
     let executable = directory.write_executable("pi", body);
     adapter_for_executable(directory, executable.to_str().assert_value())
 }
@@ -65,7 +65,7 @@ fn adapter_for_executable(directory: &TestDirectory, executable: &str) -> PiAdap
 }
 
 /// Runs one turn, draining the durable output as it arrives so the bounded channel cannot block.
-async fn run_turn(
+pub(super) async fn run_turn(
     adapter: &PiAdapter,
     cancelled_first: bool,
 ) -> (Result<WorkerOutcome, NodeRunnerError>, Vec<LiveOutput>) {
@@ -74,7 +74,7 @@ async fn run_turn(
 
 /// Runs one turn for a caller-supplied invocation. A cancelled control is signalled before the turn
 /// starts, which is how the cancellation paths are reached deterministically.
-async fn run_invocation(
+pub(super) async fn run_invocation(
     adapter: &PiAdapter,
     invocation: DriverInvocation,
     cancelled_first: bool,

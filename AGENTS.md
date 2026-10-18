@@ -54,7 +54,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   `protocol/openengine-cluster/v1/` must be regenerated through the Rust testkit, not hand-edited.
 - Initial input remains caller-owned and is validated unchanged. A root group may add required
   state fields only when their payload types have deterministic implicit empty values; verification
-  proves this and reduction materializes missing null, string, and recursively empty record values.
+  proves this and reduction materializes missing null, string, array, and recursively empty record values.
 - Map reduction collects a promoted field only when every item wrote it in that item scope. A worker
   error leaves an incomplete collection unchanged while its controls remain available to authored
   guards; never substitute inherited arrays, null placeholders, or shorter partial collections.
@@ -101,8 +101,8 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   lanes do, merging those values only into names the adapter and the declared connections left
   unset, and merging them before credential validation so a key belonging to another lane is refused
   rather than smuggled into the selected provider. Pi resolves credentials from its agent directory
-  before the process environment, so a stored login wins and a declared value suppresses an ambient
-  one.
+  before the process environment, so a stored login wins when no credentials are declared.
+  A declared credential suppresses all ambient authentication forms for that lane.
 - Local runs preserve shell endpoint settings, Claude configuration directories and permission controls;
   declared connection values take precedence. Hosted adapters do not inherit ambient settings.
   Endpoint and Claude control variables in declared connections are passed to the harness; active
@@ -110,10 +110,12 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 - Provider access defaults are materialized from the authored runtime at the execution-placement
   boundary. Omitted connections remain omitted in author-owned local profiles. Local Codex/OpenAI,
   Claude/Anthropic, Copilot/GitHub, Pi/Anthropic, and Pi/OpenAI lanes reuse native login state
-  without inventing a connection requirement; contained placements and non-native lanes add only
-  their canonical missing requirements. Explicit
-  compatible authored fields always win. Remote profiles materialize contained requirements before
-  storage, and the effective runtime drives the existing connection resolver and recovery contracts.
+  without inventing a connection requirement; contained placements and non-native lanes add only their canonical
+  missing requirements. Explicit
+  compatible authored fields always win. Hosts use
+  `native_v2_hosting::materialize_contained_provider_access` before remote profile storage or
+  credential resolution. The effective runtime drives the existing connection resolver and
+  recovery contracts.
   The local CLI captures the invoking shell in its private one-shot bootstrap, consumes and deletes
   that file before controller effects, and keeps the detached controller's OS environment minimal.
   A later local CLI startup scavenges orphaned bootstrap files after the bounded controller handoff
@@ -146,7 +148,32 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   configured, and unavailable inspection results. Codex browser/computer access controls and explicit
   approval-review features count as authored policy.
 - The local target registry initializes `cloud` at `https://api.cloud.zeroshot.sh` with a persistent hosted device identity.
-- Named targets store only endpoint, access mode, and login identity. Named runs resolve repository, branch, exact remote revision, and worktree dirtiness client-side from the invoking Git worktree plus per-run overrides; target records never bind repositories.
+- Local runs select an optional `--cwd` workspace, defaulting to the invoking folder. File arguments
+  stay relative to the invoking folder. A Git checkout uses its canonical root; plain, unborn, and
+  detached folders are allowed when the graph has no Git delivery. Workspace and active Zeroshot
+  state roots must be disjoint, including symlink aliases and missing state suffixes. Recovery
+  reuses the stored workspace; local idempotency cannot return a run from a different folder.
+  Workspace leases hold shared ancestor locks and an exclusive selected-root lock, so overlapping
+  folders exclude each other while sibling folders remain concurrent. Lease guards explicitly
+  unlock on drop so fork-before-exec children cannot retain released ownership. Git metadata and
+  transport commands discard ambient repository-selection variables before inspecting the selected folder.
+- Git checkout and push use credential-free HTTPS or SSH locators independently of a forge.
+  The target image includes OpenSSH and a fixed root-owned libnss_wrapper for pinned SSH
+  transport. Contained SSH Git uses private per-command user/group records for allocated numeric
+  identities; local Git keeps native identity lookup. Contained runs still require an
+  exact committed Git source. Explicit source connections
+  authorize only transport fields; these values never enter agent environments or durable source
+  records. Source-less local candidates construct no delivery adapter.
+- `source_code_provider` owns effect-free source and delivery contracts and one provider registry.
+  Maintained implementations live in `source_code/adapters/core`; contributed implementations
+  live in `source_code/adapters/contributed`. Git is shared transport; forge adapters supply review,
+  checks, and merge behavior through the existing delivery nodes and opaque repository/review IDs.
+  GitHub remains the maintained forge; its review and merge identity must match the Git remote.
+  Capability admission rejects unsupported operations before credential resolution or workspace
+  mutation. Pure remote identification uses each registered
+  provider's `repository_from_remote` hook; CLI source selection has no separate forge catalog and
+  rejects ambiguous matches and unsupported provider versions.
+- Named targets store only endpoint, access mode, and login identity. Named runs resolve repository, branch, exact remote revision, and worktree dirtiness client-side from the selected Git worktree plus per-run overrides; target records never bind repositories.
 - Hosted HTTP authority clones share one bounded in-memory OAuth access-token slot across all
   hosted operations, including merge-plan discovery routes. Reuse requires the same target, login,
   OAuth endpoints/client, and audience with more than thirty seconds of token lifetime remaining.
@@ -162,6 +189,16 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   keep an external binding catalog. `openengine.worker.builtin/v1` is reserved for native
   in-process workers. No portable external binding currently ships; do not reintroduce retired
   worker profiles.
+- Shared provider process code owns streamed-turn exchange and settlement for Claude and Pi,
+  including cancellation, token usage, and confirmed cleanup. Native transcripts own event parsing
+  and final-answer semantics. Shared provider text publication batches deltas, redacts credentials
+  across event/stream boundaries, and emits bounded UTF-8 records. `HarnessProcessEnvironment`
+  owns the minimal nonsecret environment for Claude and Pi in local and hosted composition.
+  `TokenUsageDelta::checked_add` owns bounded provider-neutral usage arithmetic. Native
+  authentication merges suppress all ambient forms of a credential group when a connection
+  declares one form. Provider
+  documents use atomic private-file replacement with descriptor-based ownership; Linux pins the
+  private home before publication and never follows a worker-created destination link.
 - Structured-output correction runs in the same provider session under the node's existing
   execution policy; local response validation remains authoritative.
 - Provider continuation is bounded: Claude continues once after `system/api_retry`; Codex continues
@@ -232,6 +269,9 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   must retain more than one hour. Present but empty or malformed declared credentials fail closed
   instead of falling back to native login.
   Copilot RPC bounds each message to 64 MiB and bounds pending requests and output queues.
+  After an accepted answer, a valid `session.detach` refusal or peer EOF is logged and keeps the
+  outcome, including a closed stdin pipe during that request. Malformed RPC replies/events, other
+  RPC writes, cancellation, durable output and cleanup failures still fail closed.
 - Provider JSONL readers do not cap cumulative output. They share only the 64 MiB unfinished-record
   guard, accept a complete final record without a newline, ignore unknown future event types before
   validating provider-owned fields, and continue draining after the first valid terminal event.
@@ -308,6 +348,8 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   and returned error context; provider adapters redact credentials before returning details. Runtime failure,
   runtime loss/restart reconciliation, and force-stop use the same completion/log transaction for
   every active node. Failed runs also retain a run-wide error log, including before graph dispatch.
+  A fatal supervisor error logs its typed cause, never a panic payload, before runtime cleanup, so
+  unconfirmed cleanup or a lost terminal append keeps it.
   An actual node error remains logged if a parallel winner voids that execution; intentional
   cancellation is not presented as a new crash. Unconfirmed cleanup preserves a bounded best-effort
   error log without completing the still-active execution or masking the primary failure.
@@ -354,6 +396,18 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   Allocation retains cleanup authority before checkout starts, including through startup errors and
   cancellation. Controllers confirm destruction before recording an allocation failure as terminal.
   Local Git retains the caller identity.
+- Local controllers may use `ZEROSHOT_GITHUB_TOKEN_FILE` for renewable trusted GitHub delivery
+  authority. The private file stays outside the checkout and is reopened at delivery entry and after
+  authentication rejection. Explicit `GH_TOKEN` wins and invalid explicit values fail closed. The
+  host rotates the file atomically; unchanged rejected issuances wait for rotation. The file setting
+  is removed from provider context, travels only through the consumed private bootstrap, and is
+  freshly selected on resume, never persisted in recovery or run history.
+- `ZEROSHOT_DELIVERY_CHECK_COMMAND` selects one private absolute executable outside the checkout
+  for trusted local publication, review observation and merge validation. Its capability travels only through the consumed
+  private bootstrap, never provider context or recovery metadata; resume selects it freshly. The
+  controller owns process cleanup and passes public candidate facts without ambient credentials.
+  Authoritative merged/closed observations settle before hooks or late feedback; a completed remote
+  merge cannot become a new repair merely because main now contains the fix.
 - Before first publication, delivery captures and fetches the exact current target revision and
   merges it while preserving candidate history and dirty work. Any changed candidate returns through
   the authored repair/review loop before push. Delivery feedback distinguishes immutable
@@ -364,7 +418,10 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   resolution retries with backoff; confirmed refusal and malformed responses stop. Initial
   resolution belongs to each supervised execution, so it observes the authored deadline and does
   not block parallel dispatch. Pending authorized head adoption survives repair.
-- Git diagnostics retain bounded, credential-redacted command/status/stdout/stderr details;
+- Git diagnostics retain bounded, credential-redacted command/status/stdout/stderr details.
+  Private Git protocol stdout stays separate from printable diagnostics; parsing and failure
+  classification must preserve raw evidence before credential redaction. Final delivery feedback
+  also redacts the invocation's source credentials and its current refreshed issuance;
   unfamiliar failures use the existing optional `repair_required` signal. Only successful receipts
   require complete remote identity. Live output splits large UTF-8 diagnostics into bounded records.
   Delivery checks unresolved index entries before `git add --all` and completes resolved merges even
@@ -377,7 +434,14 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   overrides a stricter restriction. Direct merge submission reads all rule pages with an independent
   cursor; PR observation and queues do not require direct-method discovery. Incomplete rule reads and
   empty method intersections stop merge submission with policy diagnostics. Merge queues choose their
-  own method. Merge commands retain contained process cleanup and use the GitHub API error boundary,
+  own method. Queue admission uses explicit `enqueuePullRequest` with the validated PR node ID and
+  exact `expectedHeadOid`; enabling auto-merge alone is not enqueue confirmation. Completed transient
+  submissions retry after fresh exact-head policy checks; retries retain earlier uncertainty so an
+  empty snapshot cannot authorize repair. Before a merge
+  delivery returns repair, refusal, error, or cancellation, trusted authority confirms withdrawal
+  of queued/auto-merge effects or the exact already-merged revision. Failed withdrawal never
+  authorizes agent repair. Authorities that schedule deferred merges must override
+  `withdraw_merge_request`; its default is valid only when no autonomous merge effects exist. Merge commands retain contained process cleanup and use the GitHub API error boundary,
   never Git repair; changed gates cannot mask a permanent rejection. Configured
   branch-protection contexts remain pending until they appear on the exact PR head, preventing a
   newly opened PR from looking ready before its required workflow registers. Missing or stale human
@@ -400,6 +464,14 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   explicitly transient failures and bounded visibility races; an ordinary statusless failure or HTTP
   403 is not presumed transient. Only typed CI/feedback/conflict outcomes, Git command failures, or
   verified repository/workspace reconciliation may request an agent repair.
+- The built-in `software-change` graph has one `worker` inside its ten-round loop for initial
+  implementation, review repairs, and Git/CI repairs. Graph-owned `phase.after` identifies the
+  latest feedback source; the empty initial phase and continuation array are implicit state, not
+  caller input. Empty maps continue a rejected round without another agent execution. Every repair
+  returns through both existing reviewers before delivery. CLI uniform runtimes without an explicit
+  session scope and new UI templates use `node_instance` for this worker and `execution` for
+  reviewers; exact runtime plans and explicit session scopes remain caller-owned. Saved graphs are
+  unchanged. The final rejected round fails without starting an unreviewable extra repair.
 - Delivery-enabled software-change templates make the acceptance verifier the sole author of the
   current change title and description after every review pass. Git delivery uses that manifest for
   commits and reviews, refreshes only its marker-delimited body section while preserving surrounding
@@ -525,6 +597,9 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   cleanup uses session group markers so it cannot terminate a peer or a startup service. Workspace
   roots are run-owner `0700`, runtime roots supervisor-owned `0711`, and production ledgers `0600`.
   Session homes disappear only after confirmed cleanup; node-instance homes survive loop revisits.
+  On Linux, provider `TMPDIR` is a supervisor-owned `/tmp/zs-<16 random hex>` symlink to the
+  execution scratch, so project Unix sockets fit `sun_path`. Files stay in the execution root and
+  the link is removed with it; an untrusted `/tmp` or any link failure keeps the full path.
 - An optional top-level run `environment` carries public setup/startup scripts, nonsecret variables,
   and explicit hook connection references. Profiles and runtime plans have no environment field.
   The CLI accepts `--environment FILE` or `--no-environment`; hosts may resolve an omitted definition
@@ -580,6 +655,10 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   entering the backend. Once polled, that future is preserved through its receipt or error because
   it may cross an irreversible admission boundary before yielding. A successful receipt is emitted
   before detaching without opening observation. Ctrl-C never force-stops a run.
+- A foreground run whose watch closes without a terminal snapshot settles from run status, which
+  Ctrl-C detaches like observation. A failed foreground run's process error carries its latest
+  bounded, control-safe error-log records and the `zeroshot logs` command. That read is best
+  effort, deadline- and Ctrl-C-bounded, and never replaces the failure.
 - Graph verification errors display their first safe diagnostic through the shared verifier error,
   so local validation and hosted rejection report the same cause.
 - Do not hand-edit `docs/zeroshot-cli.md` or `docs/zeroshot-cli.html`; regenerate with

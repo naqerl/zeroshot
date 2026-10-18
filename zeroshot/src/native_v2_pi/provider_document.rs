@@ -194,34 +194,8 @@ pub(super) fn write_endpoint(
 
 fn write_document(agent_dir: &Path, document: Value) -> Result<PathBuf, PiProviderDocumentError> {
     let bytes = serde_json::to_vec_pretty(&document).map_err(PiProviderDocumentError::Serialize)?;
-    let path = agent_dir.join(MODELS_FILE);
-    std::fs::create_dir_all(agent_dir).map_err(PiProviderDocumentError::Write)?;
-    // The agent directory is provider-private and mode 0700, so this caller-owned base URL is
-    // visible only to that child. The file is created owner-only as well, matching the discipline
-    // for every other provider-owned artifact.
-    write_private(&path, &bytes).map_err(PiProviderDocumentError::Write)?;
-    Ok(path)
-}
-
-/// Writes bytes with owner-only permissions on Unix. The agent directory already restricts access,
-/// but the file holds a caller-owned endpoint and gets the same mode as other provider state.
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(bytes)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)
-    }
+    crate::native_v2_capsule::provider_process::write_provider_file(agent_dir, MODELS_FILE, &bytes)
+        .map_err(PiProviderDocumentError::Write)
 }
 
 /// Resolves the gateway base URL from the declared connection, so a missing or invalid connection

@@ -1,5 +1,9 @@
 #![cfg(unix)]
 
+#[path = "tests/output.rs"]
+mod output;
+
+use crate::native_v2_capsule::provider_process::turn::ProviderTranscript;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -346,14 +350,14 @@ fn coverage_contract_pi_process_environment_is_minimal_and_redacted_in_debug() {
             "SECRET".to_owned(),
             "value".to_owned()
         )])),
-        Err(PiAdapterConfigError::NonMinimalEnvironment(name)) if name == "SECRET"
+        Err(crate::native_v2_capsule::ProcessEnvironmentError::NonMinimalEnvironment(name)) if name == "SECRET"
     ));
     assert!(matches!(
         PiProcessEnvironment::new(BTreeMap::from([(
             "PATH".to_owned(),
             "bad\0value".to_owned()
         )])),
-        Err(PiAdapterConfigError::InvalidEnvironment)
+        Err(crate::native_v2_capsule::ProcessEnvironmentError::InvalidEnvironment)
     ));
     let environment = PiProcessEnvironment::new(BTreeMap::from([(
         "PATH".to_owned(),

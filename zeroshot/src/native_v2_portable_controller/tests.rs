@@ -137,13 +137,15 @@ fn submission(key: &str) -> RunSubmission {
         graph: full_graph(vec![success_node()]),
         initial_input: Value::Null,
         runtime: crate::native_v2_candidate::test_support::codex_runtime(BTreeMap::new()),
-        source: ResolvedSource {
+        source: Some(ResolvedSource {
+            remote: None,
+
             repository: SourceRepositoryId::new("open-engine/zeroshot")
                 .assert_value_with("repository"),
             branch: SourceBranchId::new("main").assert_value_with("branch"),
             revision: SourceRevisionId::new("0123456789abcdef0123456789abcdef01234567")
                 .assert_value_with("revision"),
-        },
+        }),
         submission_key: IdempotencyKey::new(key).assert_value_with("submission key"),
     }
 }
@@ -161,6 +163,8 @@ fn bootstrap(
     )
     .assert_value_with("exact empty environment");
     PortableControllerBootstrap {
+        git_credentials: None,
+
         checkpoint: None,
         delivery_run_id: run_id.clone(),
         adopt_existing_delivery: false,
@@ -169,6 +173,8 @@ fn bootstrap(
         environment,
         native_environment: BTreeMap::new(),
         github_token: None,
+        github_token_file: None,
+        delivery_validator: None,
         workspace,
         workspace_lease: storage.join("workspace.lock"),
         checkpoint_repository: storage.join("checkpoint-repository"),
@@ -472,4 +478,65 @@ fn bootstrap_is_private_bounded_consumed_and_exact() {
     assert_eq!(loaded.run_id, run_id);
     assert_eq!(loaded.native_environment, bootstrap.native_environment);
     assert!(!path.exists(), "bootstrap must be consumed exactly once");
+}
+
+#[test]
+fn token_file_bootstrap_keeps_credentials_out_of_submission_and_consumes_private_path() {
+    let root = TestDirectory::new("token-file-bootstrap");
+    let workspace = root.child("checkout");
+    std::fs::create_dir(&workspace).unwrap();
+    let storage = root.child("state");
+    let mut prepared = bootstrap(
+        RunId::new("token-file-bootstrap"),
+        submission("token-file-bootstrap"),
+        workspace.clone(),
+        storage,
+    );
+    let token_path = root.0.canonicalize().unwrap().join("private-token");
+    prepared.github_token_file = Some(
+        crate::native_v2_delivery::TrustedGitHubTokenFile::new(token_path.clone(), &workspace)
+            .unwrap(),
+    );
+    #[cfg(unix)]
+    let validator_path = {
+        let executable = root.child("private-validator");
+        openengine_cluster_testkit::fixture::write_executable(
+            &executable,
+            "#!/bin/sh\nexit 0\n",
+            0o700,
+        )
+        .unwrap();
+        prepared.delivery_validator = Some(
+            crate::native_v2_delivery::validation::TrustedDeliveryValidator::new(
+                executable.clone(),
+                &workspace,
+            )
+            .unwrap(),
+        );
+        executable
+    };
+    let path = root.child("bootstrap.json");
+    write_bootstrap_file(&path, &prepared).unwrap();
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(document["githubTokenFile"], token_path.to_str().unwrap());
+    let submission = serde_json::to_string(&document["submission"]).unwrap();
+    assert!(!submission.contains("githubTokenFile"));
+    assert!(!submission.contains(token_path.to_str().unwrap()));
+    assert!(!format!("{prepared:?}").contains(token_path.to_str().unwrap()));
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            document["deliveryValidator"],
+            validator_path.to_str().unwrap()
+        );
+        assert!(!submission.contains(validator_path.to_str().unwrap()));
+        assert!(!format!("{prepared:?}").contains(validator_path.to_str().unwrap()));
+    }
+    let restored = load_bootstrap_file(&path).unwrap();
+    assert_eq!(restored.github_token_file.unwrap().path(), token_path);
+    #[cfg(unix)]
+    assert_eq!(restored.delivery_validator.unwrap().path(), validator_path);
+    assert!(restored.native_environment.is_empty());
+    assert!(!path.exists());
 }

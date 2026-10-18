@@ -1,6 +1,6 @@
 //! Pi CLI adapter for native-v2 graph nodes.
 //!
-//! One adapter serves the graph-wide Pi provider lane. Admission has already selected the model,
+//! One adapter serves the effective Pi provider lane. Admission has already selected the model,
 //! effort, session scope, and declared environment for each node. Pi exposes no permission
 //! control of its own, so the adapter appends no permission argument and a contained run is bounded
 //! by the disposable capsule; the shared prompt renderer carries the rest.
@@ -19,13 +19,12 @@ mod session;
 mod session_id;
 #[path = "native_v2_pi/transcript.rs"]
 mod transcript;
-#[path = "native_v2_pi/turn_process.rs"]
-mod turn_process;
+use crate::native_v2_capsule::provider_process::turn as turn_process;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::execution::process::{HostedProcessPool, ProcessSessionCommand, ProcessStdout};
+use crate::execution::process::{HostedProcessPool, ProcessSessionCommand};
 use crate::native_v2_capsule::provider_process::{
     ClosedSessionFailure, LocalHarnessEnvironment, PI_LOCAL_ENVIRONMENT, ProviderExecution,
     ProviderExecutionFiles, ProviderProcessRunners, provider_redactions, report_provider_error,
@@ -43,8 +42,8 @@ use provider_document::{
 };
 use session::{PiRunState, PiSession, PiTurnAdvance};
 use session_id::{agent_directory, observe_session, session_directory};
-use transcript::{PiAttempt, PiEmission, PiResult, PiTranscript};
-use turn_process::PiProcessStart;
+use transcript::{PiAttempt, PiResult, PiTranscript};
+use turn_process::ProviderProcessStart as PiProcessStart;
 
 /// The provider schema dialect that matches the wire protocol a lane actually speaks.
 ///
@@ -86,76 +85,12 @@ fn prompt(
     .map_err(|error| with_driver_detail(error, "Pi prompt could not be serialized"))
 }
 
-/// Minimal environment every Pi child needs to launch and run its own tools.
-const MINIMAL_ENVIRONMENT_NAMES: [&str; 7] = [
-    "HOME",
-    "LANG",
-    "LC_ALL",
-    "PATH",
-    "TERM",
-    "TMPDIR",
-    "ZEROSHOT_TOOLS",
-];
+pub use crate::native_v2_capsule::HarnessProcessEnvironment as PiProcessEnvironment;
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum PiAdapterConfigError {
     #[error("Pi executable must not be empty")]
     EmptyExecutable,
-    #[error("base process environment contains non-minimal name {0}")]
-    NonMinimalEnvironment(String),
-    #[error("base process environment contains an invalid value")]
-    InvalidEnvironment,
-}
-
-/// Explicit non-secret environment needed to launch the CLI and its tools.
-///
-/// The controller supplies this value. It is deliberately not populated from the ambient process,
-/// and only a small allowlist can cross this boundary.
-#[derive(Clone, Default, Eq, PartialEq)]
-pub struct PiProcessEnvironment(BTreeMap<String, String>);
-
-impl PiProcessEnvironment {
-    pub fn new(values: BTreeMap<String, String>) -> Result<Self, PiAdapterConfigError> {
-        for (name, value) in &values {
-            if !MINIMAL_ENVIRONMENT_NAMES.contains(&name.as_str()) {
-                return Err(PiAdapterConfigError::NonMinimalEnvironment(name.clone()));
-            }
-            if value.contains('\0') {
-                return Err(PiAdapterConfigError::InvalidEnvironment);
-            }
-        }
-        Ok(Self(values))
-    }
-
-    pub(crate) fn clone_values(&self) -> BTreeMap<String, String> {
-        self.0.clone()
-    }
-
-    pub(crate) fn for_capsule(
-        &self,
-        runtime_home: &Path,
-        default_path: &str,
-    ) -> Result<Self, PiAdapterConfigError> {
-        let runtime_home = runtime_home
-            .to_str()
-            .filter(|value| !value.is_empty())
-            .ok_or(PiAdapterConfigError::InvalidEnvironment)?;
-        let mut values = self.clone_values();
-        values.insert("HOME".to_owned(), runtime_home.to_owned());
-        values
-            .entry("PATH".to_owned())
-            .or_insert_with(|| default_path.to_owned());
-        Self::new(values)
-    }
-}
-
-impl std::fmt::Debug for PiProcessEnvironment {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_tuple("PiProcessEnvironment")
-            .field(&self.0.keys().collect::<Vec<_>>())
-            .finish()
-    }
 }
 
 /// Runtime capabilities required to launch Pi. None of these paths are durable run data.
@@ -174,7 +109,7 @@ pub struct PiConfig {
     pub process_pool: HostedProcessPool,
 }
 
-/// One graph-wide Pi provider lane.
+/// One effective Pi provider lane.
 pub struct PiAdapter {
     provider: PiProvider,
     executable: String,
@@ -336,15 +271,8 @@ impl PiAdapter {
             && document.is_none()
             && !command::credential_declared(self.provider, &invocation.environment);
         if let Some(document) = document {
-            let path = document.map_err(|error| {
+            document.map_err(|error| {
                 NodeRunnerError::DriverDetail(format!("Pi provider configuration failed: {error}"))
-            })?;
-            // The controller writes this file into a home that already belongs to the provider
-            // identity, and a hosted child cannot read a document the controller still owns.
-            files.own_provider_file(&path).map_err(|error| {
-                NodeRunnerError::DriverDetail(format!(
-                    "Pi provider configuration ownership failed: {error}"
-                ))
             })?;
         }
         let mut command = command(PiCommandRequest {
@@ -541,37 +469,6 @@ pub(crate) struct PiTurn<'a> {
     pub(super) session: &'a PiSession,
     pub(super) control: &'a DriverControl,
     pub(super) execution: &'a ProviderExecution<'a>,
-}
-
-pub(crate) async fn collect_transcript(
-    mut stdout: ProcessStdout,
-    transcript: &mut PiTranscript,
-    control: &DriverControl,
-) -> Result<(), NodeRunnerError> {
-    let mut delivery_error = None;
-    while let Some(chunk) = stdout.recv().await {
-        let emissions = transcript.push(chunk.as_slice());
-        if delivery_error.is_none() {
-            delivery_error = emit_pi(control, emissions).await.err();
-        }
-    }
-    let emissions = transcript.finish_stream();
-    if delivery_error.is_none() {
-        delivery_error = emit_pi(control, emissions).await.err();
-    }
-    delivery_error.map_or(Ok(()), Err)
-}
-
-async fn emit_pi(
-    control: &DriverControl,
-    emissions: Vec<PiEmission>,
-) -> Result<(), NodeRunnerError> {
-    for emission in emissions {
-        control
-            .emit(LiveOutput::new(emission.stream, emission.text)?)
-            .await?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

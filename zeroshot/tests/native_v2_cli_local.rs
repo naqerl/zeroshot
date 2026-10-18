@@ -11,6 +11,32 @@ use fixture::*;
 
 const TITLE: &str = "Local no-delivery acceptance";
 
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn runtime_failure_cause_survives_cli_log_replay() {
+    let fixture = LocalFixture::new();
+    fs::write(fixture.repository.join(".gitignore"), "dev-server.sock\n")
+        .assert_value_with("ignore the development server socket");
+    git(&fixture.repository, &["add", ".gitignore"]);
+    git(
+        &fixture.repository,
+        &["commit", "-m", "ignore the development server socket"],
+    );
+    let _socket =
+        std::os::unix::net::UnixListener::bind(fixture.repository.join("dev-server.sock"))
+            .assert_value_with("bind leftover development server socket");
+
+    let run_id = fixture.submit_detached("finish").await;
+    wait_for_exit(fixture.ready_pid(&run_id)).await;
+    // Logs emit JSONL; require the complete serialized cause in durable replay.
+    let expected = serde_json::to_string(
+        "Runtime failed: workspace checkpoint is unavailable: candidate contains an \
+         unsupported filesystem entry \"dev-server.sock\"",
+    )
+    .assert_value_with("serialize the complete cause");
+    fixture.assert_replay("logs", &run_id, &expected).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn local_connection_crud_supplies_declared_fields_only() {
     let fixture = LocalFixture::new();
@@ -251,6 +277,15 @@ async fn dead_controller_reconciles_runtime_loss_and_keeps_durable_observation()
     fixture
         .assert_replay("logs", &run_id, "Codex turn started")
         .await;
+
+    // Like its retained scratch, the killed run keeps its provider's short Linux `TMPDIR` link.
+    let storage = fixture.run_storage(&run_id);
+    for entry in fs::read_dir("/tmp").assert_value_with("list /tmp") {
+        let link = entry.assert_value_with("read /tmp entry").path();
+        if fs::read_link(&link).is_ok_and(|target| target.starts_with(&storage)) {
+            fs::remove_file(link).assert_value_with("remove the killed run's scratch link");
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

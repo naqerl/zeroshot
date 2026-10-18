@@ -10,17 +10,17 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use openengine_cluster_protocol::{
-    CheckpointId, RunCheckpointsParams, RunCheckpointsResult, RunResumeFrom,
-    ConnectionDeleteRequest, ConnectionDeleteResult, ConnectionKey, ConnectionListRequest,
-    ConnectionListResult, ConnectionMutationResult, ConnectionScope, ConnectionSetRequest, Cursor,
-    EnvironmentVariableName, ExecutionRef, IdempotencyKey, MergePlan, MergePlanId,
-    MergePlanRunRequest, MergePlanSource, RunAttachEventNotification, RunAttachParams,
-    RunConnectionRequirements, RunConnectionValues, RunForceParams, RunId, RunListParams,
-    RunLogEventNotification, RunLogsParams, RunProfile, RunProfileDefaultRequest,
-    RunProfileDefaultResult, RunProfileDeleteResult, RunProfileListRequest, RunProfileListResult,
-    RunProfileMutationResult, RunProfileName, RunProfileSelector, RunProfileSetRequest,
-    RunStatusParams, RunTitle, RunWatchParams, ResolvedSource, SourceBranchId, SourceRepositoryId,
-    SourceRevisionId, SubscriptionCloseReason,
+    GitRemoteUrl, GitTransportCredentials, CheckpointId, RunCheckpointsParams,
+    RunCheckpointsResult, RunResumeFrom, ConnectionDeleteRequest, ConnectionDeleteResult,
+    ConnectionKey, ConnectionListRequest, ConnectionListResult, ConnectionMutationResult,
+    ConnectionScope, ConnectionSetRequest, Cursor, EnvironmentVariableName, ExecutionRef,
+    IdempotencyKey, MergePlan, MergePlanId, MergePlanRunRequest, MergePlanSource,
+    RunAttachEventNotification, RunAttachParams, RunConnectionRequirements, RunConnectionValues,
+    RunForceParams, RunId, RunListParams, RunLogEventNotification, RunLogsParams, RunProfile,
+    RunProfileDefaultRequest, RunProfileDefaultResult, RunProfileDeleteResult,
+    RunProfileListRequest, RunProfileListResult, RunProfileMutationResult, RunProfileName,
+    RunProfileSelector, RunProfileSetRequest, RunStatusParams, RunTitle, RunWatchParams,
+    ResolvedSource, SourceBranchId, SourceRepositoryId, SourceRevisionId, SubscriptionCloseReason,
 };
 use thiserror::Error;
 
@@ -72,7 +72,8 @@ pub use support::VERSION;
 mod update;
 
 pub use execution::{
-    execute_native_v2_cli, try_execute_native_v2_preflight, try_execute_native_v2_static,
+    RunFailure, execute_native_v2_cli, try_execute_native_v2_preflight,
+    try_execute_native_v2_static,
 };
 pub use parser::{Cli, parse_native_v2_args};
 
@@ -121,16 +122,35 @@ pub struct ConnectionSetCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunCommand {
     pub target: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub source_connection: Option<ConnectionKey>,
     pub title: RunTitle,
     pub selection: RunSelection,
     pub environment: Option<RunEnvironmentInput>,
     pub input: PathBuf,
-    pub repository: Option<SourceRepositoryId>,
+    pub repository: Option<RunRepository>,
     pub branch: Option<SourceBranchId>,
     pub revision: Option<SourceRevisionId>,
     pub detach: bool,
     pub validate_only: bool,
     pub submission_key: Option<IdempotencyKey>,
+}
+
+/// An explicit CLI source locator, before assigning a bounded repository identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RunRepository {
+    GitHub(SourceRepositoryId),
+    Git(GitRemoteUrl),
+}
+
+impl RunRepository {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::GitHub(repository) => repository.as_str(),
+            Self::Git(remote) => remote.as_str(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -155,6 +175,9 @@ pub struct PreparedRunRequest {
     pub intent: TargetRunIntent,
     pub connections: RunConnectionValues,
     pub github_token: Option<String>,
+    pub git_credentials: Option<GitTransportCredentials>,
+    pub cwd: Option<PathBuf>,
+    pub source_connection: Option<ConnectionKey>,
     pub source: Option<NamedRunSource>,
     /// Remote selector retained so the hosted target can resolve the profile atomically.
     pub profile: Option<RunProfileSelector>,
@@ -172,6 +195,9 @@ impl fmt::Debug for PreparedRunRequest {
                 "github_token",
                 &self.github_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("git_credentials", &self.git_credentials)
+            .field("cwd", &self.cwd)
+            .field("source_connection", &self.source_connection)
             .field("source", &self.source)
             .field("profile", &self.profile)
             .finish()
@@ -303,7 +329,7 @@ pub enum NativeV2CliCommand {
     PlanStatus(MergePlanSelector),
     PlanWatch(MergePlanSelector),
     PlanForceStop(MergePlanSelector),
-    Run(RunCommand),
+    Run(Box<RunCommand>),
     List {
         target: Option<String>,
     },
@@ -433,8 +459,8 @@ pub enum NativeV2CliError {
         origin: String,
         message: String,
     },
-    #[error("run finished unsuccessfully")]
-    RunFailed,
+    #[error("{0}")]
+    RunFailed(RunFailure),
     #[error("merge plan finished unsuccessfully")]
     MergePlanFailed,
     #[error("could not write CLI output: {0}")]
