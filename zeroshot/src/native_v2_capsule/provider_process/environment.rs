@@ -3,7 +3,7 @@
 //! Declared connections overlay these values. Hosted adapters never call this helper.
 
 use std::collections::BTreeMap;
-use crate::native_v2_runner::ResolvedEnvironment;
+use crate::native_v2_runner::{NodeRunnerError, ResolvedEnvironment};
 use std::fmt;
 
 pub(crate) const CODEX_LOCAL_ENVIRONMENT: &[&str] = &[
@@ -244,10 +244,6 @@ fn private_local_value(name: &str) -> bool {
     PRIVATE_SUFFIXES.iter().any(|suffix| name.ends_with(suffix)) || PRIVATE_NAMES.contains(&name)
 }
 
-#[cfg(test)]
-#[path = "environment/tests.rs"]
-mod tests;
-
 /// Declaring one authentication form suppresses every ambient form in that credential group.
 pub(crate) fn merge_local_environment(
     environment: &mut BTreeMap<String, String>,
@@ -267,3 +263,21 @@ pub(crate) fn merge_local_environment(
             .or_insert_with(|| value.clone());
     }
 }
+
+/// Overlay declared connections without replacing harness-owned launch settings.
+pub(crate) fn extend_declared_environment(
+    environment: &mut BTreeMap<String, String>,
+    resolved: &ResolvedEnvironment,
+) -> Result<(), NodeRunnerError> {
+    for (name, value) in resolved.iter() {
+        if value.contains('\0') || environment.contains_key(name.as_str()) {
+            return Err(NodeRunnerError::Driver);
+        }
+        environment.insert(name.as_str().to_owned(), value.to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "environment/tests.rs"]
+mod tests;

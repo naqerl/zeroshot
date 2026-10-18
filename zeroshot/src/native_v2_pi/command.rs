@@ -12,7 +12,7 @@ use crate::execution::process::ProcessSessionCommand;
 use crate::native_v2_capsule::gateway;
 use crate::native_v2_capsule::provider_process::{
     ProviderExecutionFiles, agent_workspace_access, effort_token, with_driver_detail,
-    merge_local_environment,
+    merge_local_environment, extend_declared_environment,
 };
 use crate::native_v2_contract::{NodeRuntimeBinding, PiProvider};
 use crate::native_v2_runner::{DriverInvocation, NodeRunnerError, ResolvedEnvironment};
@@ -258,7 +258,7 @@ impl EnvironmentRequest<'_> {
             // traffic, so a contained run stays deterministic without affecting provider requests.
             environment.insert(PI_OFFLINE.to_owned(), "1".to_owned());
         }
-        extend_declared(&mut environment, resolved)?;
+        extend_declared_environment(&mut environment, resolved)?;
         merge_local_environment(
             &mut environment,
             resolved,
@@ -284,19 +284,6 @@ fn validate_reserved(resolved: &ResolvedEnvironment) -> Result<(), NodeRunnerErr
                 "Pi declared environment conflicts with reserved process configuration {name}"
             )));
         }
-    }
-    Ok(())
-}
-
-fn extend_declared(
-    environment: &mut BTreeMap<String, String>,
-    resolved: &ResolvedEnvironment,
-) -> Result<(), NodeRunnerError> {
-    for (name, value) in resolved.iter() {
-        if value.contains('\0') || environment.contains_key(name.as_str()) {
-            return Err(NodeRunnerError::Driver);
-        }
-        environment.insert(name.as_str().to_owned(), value.to_owned());
     }
     Ok(())
 }
