@@ -118,8 +118,6 @@ pub struct PiAdapter {
     runtime_home: PathBuf,
     /// Current-user home for the built-in local target; `None` for hosted placements.
     local_user_home: Option<PathBuf>,
-    contained: bool,
-    native_local: bool,
     base_environment: PiProcessEnvironment,
     runners: ProviderProcessRunners,
     local_environment: BTreeMap<String, String>,
@@ -131,18 +129,17 @@ impl PiAdapter {
         configuration.local_user_home = None;
         configuration.native_environment = LocalHarnessEnvironment::default();
         let runners = ProviderProcessRunners::hosted(configuration.process_pool);
-        Self::configured(configuration, runners, true)
+        Self::configured(configuration, runners)
     }
 
     /// Local adapter. A native-local lane reuses the user's stored Pi login; every other lane
     /// receives a private agent directory and drops the ambient credentials of its lane.
     pub fn new_local(configuration: PiConfig) -> Result<Self, PiAdapterConfigError> {
         let provider = configuration.provider;
-        let native_local = provider.natively_authenticated();
         let local_environment = configuration
             .native_environment
             .selected(PI_LOCAL_ENVIRONMENT);
-        let mut adapter = Self::configured(configuration, ProviderProcessRunners::local(), false)?;
+        let mut adapter = Self::configured(configuration, ProviderProcessRunners::local())?;
         adapter.local_environment = local_environment;
         // A Bedrock region is foreign to every lane but Bedrock. Forwarding it would make the
         // credential boundary reject an otherwise valid non-bedrock turn, while the bedrock lane
@@ -152,7 +149,7 @@ impl PiAdapter {
             is_pi_credential(name)
                 || (provider != PiProvider::Bedrock && name == command::AWS_REGION)
         };
-        if native_local {
+        if adapter.native_local() {
             // Keep the selected lane's own credential so a user who exports a key instead of
             // storing one still authenticates, but drop every other lane's.
             let own = command::native_local_credentials(provider);
@@ -168,9 +165,7 @@ impl PiAdapter {
     fn configured(
         configuration: PiConfig,
         runners: ProviderProcessRunners,
-        contained: bool,
     ) -> Result<Self, PiAdapterConfigError> {
-        let provider = configuration.provider;
         if configuration.executable.is_empty() {
             return Err(PiAdapterConfigError::EmptyExecutable);
         }
@@ -181,8 +176,6 @@ impl PiAdapter {
             workspace: configuration.workspace,
             runtime_home: configuration.runtime_home,
             local_user_home: configuration.local_user_home,
-            contained,
-            native_local: !contained && provider.natively_authenticated(),
             base_environment: configuration.base_environment,
             runners,
             local_environment: BTreeMap::new(),
@@ -278,7 +271,7 @@ impl PiAdapter {
         let mut command = command(PiCommandRequest {
             provider: self.provider,
             native_local,
-            contained: self.contained,
+            contained: self.runners.is_hosted(),
             executable: &self.executable,
             prefix_arguments: &self.prefix_arguments,
             invocation,
@@ -346,7 +339,7 @@ impl PiAdapter {
     /// before the process environment and would otherwise outrank both.
     #[must_use]
     pub(super) fn native_local(&self) -> bool {
-        self.native_local
+        !self.runners.is_hosted() && self.provider.natively_authenticated()
     }
 }
 

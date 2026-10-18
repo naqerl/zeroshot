@@ -6,7 +6,8 @@ use futures_util::FutureExt;
 use crate::execution::process::{ProcessRunnerError, ProcessSessionCommand, ProcessSessionOutput};
 use crate::native_v2_capsule::provider_process::{
     ProcessExchange, ProcessInputFailure, ProviderExecutionFiles, ProviderProcess,
-    exchange_process_io, open_provider_process, process_failure_detail, require_process_cleanup,
+    ProviderProcessFailure, ProviderProcessFailureKind, exchange_process_io, open_provider_process,
+    process_failure_context, process_failure_detail, require_process_cleanup,
 };
 use crate::native_v2_runner::{DriverControl, LiveOutput, NodeRunnerError};
 
@@ -20,7 +21,10 @@ pub(crate) trait ProviderTranscript: Send {
     fn finish_stream(&mut self) -> Vec<ProviderEmission>;
     fn token_usage(&self) -> Option<TokenUsageDelta>;
     fn is_success(&self) -> bool;
-    fn finish(self, process_failure: Option<&str>) -> Result<ProviderAttempt, NodeRunnerError>;
+    fn finish(
+        self,
+        process_failure: Option<ProviderProcessFailure>,
+    ) -> Result<ProviderAttempt, NodeRunnerError>;
 }
 
 pub(crate) enum ProviderProcessStart {
@@ -121,7 +125,10 @@ async fn finish_input_failure<T: ProviderTranscript>(
     }
     append_completion_detail(&mut diagnostic, completion)?;
     usage?;
-    transcript.finish(Some(&diagnostic))
+    transcript.finish(Some(ProviderProcessFailure {
+        kind: ProviderProcessFailureKind::IncompleteInput,
+        detail: diagnostic,
+    }))
 }
 
 fn input_failure_cancelled(
@@ -180,8 +187,8 @@ fn resolve_process_completion<T: ProviderTranscript>(
     cancelled: bool,
 ) -> Result<ProviderAttempt, NodeRunnerError> {
     let output = require_process_cleanup(&completion)?;
-    let failure = process_failure_detail(output, cancelled, !transcript.is_success())?;
-    transcript.finish(failure.as_deref())
+    let failure = process_failure_context(output, cancelled, !transcript.is_success())?;
+    transcript.finish(failure)
 }
 
 fn failed_completion(

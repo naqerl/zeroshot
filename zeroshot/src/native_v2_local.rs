@@ -231,6 +231,7 @@ fn resolve_relative_home_overrides(
     environment: &mut LocalHarnessEnvironment,
     invoking_directory: &Path,
 ) -> Result<(), LocalCompositionError> {
+    let user_home = current_user_home(environment);
     for name in [
         "CODEX_HOME",
         "CLAUDE_CONFIG_DIR",
@@ -241,16 +242,47 @@ fn resolve_relative_home_overrides(
         let Some(value) = environment.get_mut(name) else {
             continue;
         };
-        let path = PathBuf::from(&*value);
-        if path.is_relative() {
-            *value = invoking_directory
-                .join(path)
-                .into_os_string()
-                .into_string()
-                .map_err(|_| LocalCompositionError::NativeEnvironment)?;
+        // Pi owns file-URL decoding, including platform rules and percent escapes.
+        if name == "PI_CODING_AGENT_DIR" && value.starts_with("file://") {
+            continue;
         }
+        let path = if name == "PI_CODING_AGENT_DIR" {
+            pi_agent_directory_path(value, user_home.as_deref())?
+        } else {
+            PathBuf::from(&*value)
+        };
+        let path = if path.is_relative() {
+            invoking_directory.join(path)
+        } else {
+            path
+        };
+        *value = path
+            .into_os_string()
+            .into_string()
+            .map_err(|_| LocalCompositionError::NativeEnvironment)?;
     }
     Ok(())
+}
+
+/// Pi expands a leading home shorthand before resolving its agent directory. Resolve it against
+/// the captured user's home before detachment instead of treating the tilde as a workspace name.
+fn pi_agent_directory_path(
+    value: &str,
+    user_home: Option<&Path>,
+) -> Result<PathBuf, LocalCompositionError> {
+    let relative = if value == "~" {
+        Some("")
+    } else {
+        value
+            .strip_prefix("~/")
+            .or_else(|| value.strip_prefix("~\\").filter(|_| cfg!(windows)))
+    };
+    match relative {
+        Some(relative) => Ok(user_home
+            .ok_or(LocalCompositionError::NativeEnvironment)?
+            .join(relative)),
+        None => Ok(PathBuf::from(value)),
+    }
 }
 
 pub(crate) fn local_resolved_source(

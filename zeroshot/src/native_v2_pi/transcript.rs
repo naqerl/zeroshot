@@ -4,11 +4,15 @@
 //! response value itself is taken from the authoritative final assistant message. Only the last
 //! assistant message is the node's response: Pi can emit several per run.
 
-use crate::native_v2_capsule::provider_process::turn::ProviderTranscript;
+use crate::native_v2_capsule::{
+    provider_json_lines::{ProviderJsonLine, ProviderJsonLines},
+    provider_process::{
+        text::ProviderText, turn::ProviderTranscript, ProviderProcessFailure,
+        ProviderProcessFailureKind,
+    },
+};
 use serde_json::Value;
 
-use crate::native_v2_capsule::provider_json_lines::{ProviderJsonLine, ProviderJsonLines};
-use crate::native_v2_capsule::provider_process::text::ProviderText;
 use openengine_cluster_protocol::TokenCount;
 
 use crate::native_v2_contract::TokenUsageDelta;
@@ -35,7 +39,8 @@ pub(crate) struct PiTranscript {
     /// Latest cumulative usage for the assistant message currently streaming. Pi reports usage as
     /// the running total of its message, so each update replaces this rather than adding to it.
     current_usage: Option<TokenUsageDelta>,
-    malformed: usize,
+    /// Malformed counts or overflow make the turn total permanently incomplete.
+    usage_invalid: bool,
     output: ProviderText,
 }
 
@@ -47,7 +52,7 @@ impl PiTranscript {
             terminal: None,
             usage: None,
             current_usage: None,
-            malformed: 0,
+            usage_invalid: false,
             output: ProviderText::new(&redactions),
         }
     }
@@ -69,10 +74,11 @@ impl ProviderTranscript for PiTranscript {
     }
 
     fn token_usage(&self) -> Option<TokenUsageDelta> {
+        if self.usage_invalid {
+            return None;
+        }
         match (self.usage, self.current_usage) {
-            (Some(total), Some(current)) => {
-                TokenUsageDelta::checked_add(total, current).or(Some(total))
-            }
+            (Some(total), Some(current)) => TokenUsageDelta::checked_add(total, current),
             (Some(total), None) => Some(total),
             (None, current) => current,
         }
@@ -87,29 +93,45 @@ impl ProviderTranscript for PiTranscript {
     /// Settles the attempt from the last assistant message. A recovered retry is a success, and a
     /// failure reported after the final answer is a failure, because the last message is
     /// authoritative.
-    fn finish(mut self, process_failure: Option<&str>) -> Result<PiAttempt, NodeRunnerError> {
-        let process_failure = process_failure.filter(|detail| !detail.trim().is_empty());
+    fn finish(
+        mut self,
+        process_failure: Option<ProviderProcessFailure>,
+    ) -> Result<PiAttempt, NodeRunnerError> {
+        let process_failure = process_failure
+            .as_ref()
+            .filter(|failure| !failure.detail.trim().is_empty());
         // A final record may arrive without its newline when the process exits, so drain the
         // pending record before settling.
         let _ = self.finish_stream();
         let terminal = self.terminal.take();
         let session_id = self.session_id.clone();
         match terminal {
-            // A provider-reported failure carries the real explanation, such as the upstream HTTP
-            // error that survived Pi's own retries. Prefer it over the process tail, which for a
-            // zero-exit Pi holds only startup noise.
-            Some(Terminal::Failed(detail)) => Ok(PiAttempt::Failed(PiFailure {
-                session_id,
-                retryable: true,
-                diagnostic: self.safe(&detail),
-            })),
+            // Stderr alone may be startup noise, but failed input or completion must remain visible
+            // alongside the native error. Incomplete input cannot be continued in the session.
+            Some(Terminal::Failed(mut detail)) => {
+                if let Some(failure) = process_failure
+                    .filter(|failure| failure.kind != ProviderProcessFailureKind::Stderr)
+                {
+                    if !detail.trim().is_empty() {
+                        detail.push_str("; ");
+                    }
+                    detail.push_str(failure.detail.trim());
+                }
+                Ok(PiAttempt::Failed(PiFailure {
+                    session_id,
+                    retryable: !process_failure.is_some_and(|failure| {
+                        failure.kind == ProviderProcessFailureKind::IncompleteInput
+                    }),
+                    diagnostic: self.safe(&detail),
+                }))
+            }
             Some(Terminal::Complete(message)) => {
                 // A process that failed after producing an answer must not be treated as usable.
                 if let Some(detail) = process_failure {
                     return Ok(PiAttempt::Failed(PiFailure {
                         session_id,
                         retryable: false,
-                        diagnostic: self.safe(detail),
+                        diagnostic: self.safe(&detail.detail),
                     }));
                 }
                 Ok(PiAttempt::Complete(PiResult {
@@ -120,8 +142,11 @@ impl ProviderTranscript for PiTranscript {
             None => Ok(PiAttempt::Failed(PiFailure {
                 session_id,
                 retryable: false,
-                diagnostic: self
-                    .safe(process_failure.unwrap_or("Pi ended without a settled answer")),
+                diagnostic: self.safe(
+                    process_failure.map_or("Pi ended without a settled answer", |failure| {
+                        failure.detail.as_str()
+                    }),
+                ),
             })),
         }
     }
@@ -132,8 +157,7 @@ impl PiTranscript {
         let mut emissions = Vec::new();
         for record in records {
             let ProviderJsonLine::Record(bytes) = record else {
-                // One oversized record is dropped; the turn continues and ends as a failure.
-                self.malformed = self.malformed.saturating_add(1);
+                // Drop the oversized record; a later valid terminal message can still settle the turn.
                 continue;
             };
             if bytes.iter().all(u8::is_ascii_whitespace) {
@@ -142,7 +166,6 @@ impl PiTranscript {
             let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
                 // A malformed record never fails the turn on its own: Pi may interleave records a
                 // future version adds. A turn with no terminal event still settles as a failure.
-                self.malformed = self.malformed.saturating_add(1);
                 continue;
             };
             self.accept_record(&value, &mut emissions);
@@ -252,43 +275,55 @@ impl PiTranscript {
     }
 
     fn record_usage(&mut self, usage: Option<&Value>) {
-        let Some(usage) = usage.filter(|usage| usage.is_object()) else {
+        let Some(usage) = usage else {
             return;
         };
-        // Pi reports provider-native key names, so they are mapped into the protocol shape rather
-        // than parsed through the wire helper.
-        let count = |name: &str| {
-            usage
-                .get(name)
-                .and_then(Value::as_u64)
-                .and_then(|value| TokenCount::new(value).ok())
-        };
-        // A record that omits the required counters is ignored rather than treated as zero usage,
-        // so a future partial usage shape cannot invent a settled total.
-        let (Some(input), Some(output)) = (count("input"), count("output")) else {
+        let Some(current) = parse_usage(usage) else {
+            self.usage_invalid = true;
             return;
         };
-        self.current_usage = Some(TokenUsageDelta {
-            input_tokens: input,
-            output_tokens: output,
-            cache_read_input_tokens: count("cacheRead"),
-            cache_creation_input_tokens: count("cacheWrite"),
-        });
+        self.current_usage = Some(current);
+        if let Some(total) = self.usage {
+            self.usage_invalid |= TokenUsageDelta::checked_add(total, current).is_none();
+        }
     }
 
     /// Folds the in-flight assistant message's usage into the turn total.
     fn commit_usage(&mut self) {
         if let Some(current) = self.current_usage.take() {
-            self.usage = Some(match self.usage {
-                Some(total) => TokenUsageDelta::checked_add(total, current).unwrap_or(total),
-                None => current,
-            });
+            self.usage = match self.usage {
+                Some(total) => TokenUsageDelta::checked_add(total, current),
+                None => Some(current),
+            };
+            self.usage_invalid |= self.usage.is_none();
         }
     }
 
     fn safe(&self, text: &str) -> String {
         self.output.redact(text)
     }
+}
+
+/// Pi usage records are complete cumulative snapshots in provider-native field names.
+fn parse_usage(value: &Value) -> Option<TokenUsageDelta> {
+    let usage = value.as_object()?;
+    let count = |name: &str| {
+        usage
+            .get(name)
+            .and_then(Value::as_u64)
+            .and_then(|value| TokenCount::new(value).ok())
+    };
+    let optional = |name: &str| {
+        usage
+            .get(name)
+            .map_or(Some(None), |_| count(name).map(Some))
+    };
+    Some(TokenUsageDelta {
+        input_tokens: count("input")?,
+        output_tokens: count("output")?,
+        cache_read_input_tokens: optional("cacheRead")?,
+        cache_creation_input_tokens: optional("cacheWrite")?,
+    })
 }
 
 /// Live assistant text of one message, concatenated in content order.

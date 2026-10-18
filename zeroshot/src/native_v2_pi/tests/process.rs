@@ -284,27 +284,41 @@ fn adapter_with_unpreparable_home(directory: &TestDirectory) -> PiAdapter {
 
 #[tokio::test]
 async fn a_provider_that_never_reads_its_stdin_reports_the_input_failure() {
-    // Pi resolves a piped prompt only at stdin EOF. A provider that closes its own stdin rejects
-    // the prompt instead of reading it, and the turn must report that input failure rather than
-    // hang or pretend the provider settled.
-    let directory = TestDirectory::new("pi-scripted-input-failure");
-    let marker = directory.child("closed-stdin");
-    let body = format!(
-        "#!/bin/sh\n: > '{marker}'\nexec 0<&-\nsleep 30\nexit 0\n",
-        marker = marker.display()
-    );
-    let adapter = scripted_adapter(&directory, &body);
-    let mut turn = scripted_invocation();
-    turn.node.input = serde_json::Value::String("x".repeat(8 * 1024 * 1024));
-    let (outcome, _seen) = run_invocation(&adapter, turn, false).await;
-    let Err(NodeRunnerError::DriverDetail(detail)) = outcome else {
-        panic!("expected an input failure detail, got {outcome:?}");
-    };
-    assert!(detail.contains("provider process input failed"), "{detail}");
-    assert!(
-        marker.exists(),
-        "the provider must have started before the input failed"
-    );
+    // A native error must not hide an incomplete prompt or authorize continuation.
+    for native_failure in ["", FAILED_TURN] {
+        let directory = TestDirectory::new("pi-scripted-input-failure");
+        let marker = directory.child("starts");
+        let body = format!(
+            "#!/bin/sh\nprintf 'started\n' >> '{marker}'\nprintf '%s\n' '{native_failure}'\nexec 0<&-\nsleep 30\n",
+            marker = marker.display()
+        );
+        let adapter = scripted_adapter(&directory, &body);
+        let mut turn = scripted_invocation();
+        turn.node.input = serde_json::Value::String("x".repeat(8 * 1024 * 1024));
+        let (outcome, seen) = run_invocation(&adapter, turn, false).await;
+        let Err(NodeRunnerError::DriverDetail(detail)) = outcome else {
+            panic!("expected an input failure detail, got {outcome:?}");
+        };
+        assert!(detail.contains("provider process input failed"), "{detail}");
+        if !native_failure.is_empty() {
+            assert!(
+                detail.contains("provider rejected the configured model"),
+                "{detail}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(marker)
+                .assert_value()
+                .lines()
+                .count(),
+            1
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|output| output.text.contains("continuing once"))
+        );
+    }
 }
 
 #[tokio::test]

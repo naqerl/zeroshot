@@ -5,6 +5,7 @@
 
 use super::{PiTranscript, ProviderTranscript, assistant_text};
 use crate::native_v2_runner::LiveOutputStream;
+use crate::native_v2_capsule::provider_process::{ProviderProcessFailure, ProviderProcessFailureKind};
 use serde_json::json;
 
 fn header(id: &str) -> String {
@@ -192,9 +193,10 @@ fn a_zero_exit_provider_failure_reports_the_provider_detail() {
         .as_bytes(),
     );
     let super::PiAttempt::Failed(failure) = transcript
-        .finish(Some(
-            "stderr: Warning: No project session found with id 'zs-x'",
-        ))
+        .finish(Some(ProviderProcessFailure {
+            kind: ProviderProcessFailureKind::Stderr,
+            detail: "stderr: Warning: No project session found with id 'zs-x'".to_owned(),
+        }))
         .unwrap()
     else {
         panic!("expected a failure");
@@ -207,12 +209,51 @@ fn a_zero_exit_provider_failure_reports_the_provider_detail() {
 fn a_process_failure_wins_over_a_complete_message() {
     let mut transcript = PiTranscript::new(Vec::new());
     transcript.push(assistant("done").to_string().as_bytes());
-    let super::PiAttempt::Failed(failure) = transcript.finish(Some("pi exited with 1")).unwrap()
+    let super::PiAttempt::Failed(failure) = transcript
+        .finish(Some(ProviderProcessFailure {
+            kind: ProviderProcessFailureKind::Completion,
+            detail: "pi exited with 1".to_owned(),
+        }))
+        .unwrap()
     else {
         panic!("expected a failure");
     };
     assert!(!failure.retryable);
     assert!(failure.diagnostic.contains("exited with 1"));
+}
+
+#[test]
+fn failed_native_messages_preserve_process_evidence_and_input_retry_policy() {
+    for (kind, retryable) in [
+        (ProviderProcessFailureKind::Completion, true),
+        (ProviderProcessFailureKind::IncompleteInput, false),
+    ] {
+        let mut transcript = PiTranscript::new(vec!["private-key".to_owned()]);
+        transcript.push(
+            format!(
+                "{}\n{}\n",
+                header("session-1"),
+                json!({"type": "message_end", "message": {"role": "assistant", "content": [],
+                       "stopReason": "error", "errorMessage": "native failure with private-key"}})
+            )
+            .as_bytes(),
+        );
+        let super::PiAttempt::Failed(failure) = transcript
+            .finish(Some(ProviderProcessFailure {
+                kind,
+                detail: "process failure with private-key".to_owned(),
+            }))
+            .unwrap()
+        else {
+            panic!("expected failed attempt");
+        };
+        assert_eq!(failure.retryable, retryable);
+        assert_eq!(failure.session_id.as_deref(), Some("session-1"));
+        assert_eq!(
+            failure.diagnostic,
+            "native failure with [REDACTED]; process failure with [REDACTED]"
+        );
+    }
 }
 
 #[test]
@@ -413,7 +454,7 @@ fn ignored_record_shapes_do_not_disturb_the_authoritative_answer() {
 }
 
 #[test]
-fn usage_that_is_not_a_complete_counted_object_is_ignored() {
+fn malformed_usage_snapshots_leave_usage_incomplete() {
     // A usage value that is not an object, one missing a required counter, and one whose counter
     // exceeds the wire bound must all leave the turn with no usage total rather than zero usage.
     let mut transcript = PiTranscript::new(Vec::new());
@@ -435,70 +476,151 @@ fn usage_that_is_not_a_complete_counted_object_is_ignored() {
 }
 
 #[test]
-fn usage_that_overflows_the_safe_range_keeps_the_committed_total() {
-    let mut transcript = PiTranscript::new(Vec::new());
-    transcript.push(
-        format!(
-            "{}\n",
-            assistant_message_end("toolUse", json!({"input": SAFE_TOKEN_COUNT, "output": 1}))
-        )
-        .as_bytes(),
-    );
-    transcript.push(
-        format!(
-            "{}\n",
-            json!({"type": "message_update", "usage": {"input": SAFE_TOKEN_COUNT, "output": 1},
-                   "assistantMessageEvent": {"type": "start"}})
-        )
-        .as_bytes(),
-    );
-    // The in-flight message cannot be added to the committed total, so the total stands.
-    let usage = transcript.token_usage().expect("committed usage survives");
-    assert_eq!(usage.input_tokens.get(), SAFE_TOKEN_COUNT);
-    transcript.push(
-        format!(
-            "{}\n",
-            json!({"type": "message_start", "message": {"role": "assistant"}})
-        )
-        .as_bytes(),
-    );
-    // Committing the overflowing message must also keep the earlier total.
-    let usage = transcript
-        .token_usage()
-        .expect("committed usage survives the commit");
-    assert_eq!(usage.input_tokens.get(), SAFE_TOKEN_COUNT);
+fn malformed_usage_snapshots_make_prior_totals_stickily_incomplete() {
+    let valid = json!({"input": 2, "output": 3, "cacheRead": 5, "cacheWrite": 7});
+    let mut invalid_snapshots = vec![json!("not an object"), json!({"input": 5})];
+    for field in ["input", "output", "cacheRead", "cacheWrite"] {
+        for invalid in [
+            json!(null),
+            json!(-1),
+            json!(1.5),
+            json!("5"),
+            json!(SAFE_TOKEN_COUNT + 1),
+        ] {
+            let mut snapshot = valid.clone();
+            snapshot[field] = invalid;
+            invalid_snapshots.push(snapshot);
+        }
+    }
+    for invalid in invalid_snapshots {
+        let mut transcript = PiTranscript::new(Vec::new());
+        transcript
+            .push(format!("{}\n", assistant_message_end("toolUse", valid.clone())).as_bytes());
+        transcript.push(
+            format!(
+                "{}\n{}\n",
+                json!({"type": "message_update", "usage": valid}),
+                json!({"type": "message_update", "usage": invalid})
+            )
+            .as_bytes(),
+        );
+        assert!(
+            transcript.token_usage().is_none(),
+            "invalid snapshot: {invalid}"
+        );
+        transcript.push(format!("{}\n", assistant_message_end("stop", valid.clone())).as_bytes());
+        assert!(
+            transcript.token_usage().is_none(),
+            "later valid snapshot: {invalid}"
+        );
+    }
 }
 
 #[test]
-fn overflowing_cache_counters_keep_the_committed_total() {
+fn absent_usage_and_unknown_events_preserve_known_counts() {
     let mut transcript = PiTranscript::new(Vec::new());
     transcript.push(
         format!(
-            "{}\n",
-            assistant_message_end(
-                "toolUse",
-                json!({"input": 1, "output": 1, "cacheRead": SAFE_TOKEN_COUNT,
-                       "cacheWrite": SAFE_TOKEN_COUNT})
+            "{}\n{}\n{}\n",
+            assistant_message_end("toolUse", json!({"input": 2, "output": 3})),
+            json!({"type": "message_update"}),
+            json!({"type": "future_event", "usage": {"input": "invalid"}})
+        )
+        .as_bytes(),
+    );
+    let usage = transcript.token_usage().expect("unchanged known counts");
+    assert_eq!(usage.input_tokens.get(), 2);
+    assert_eq!(usage.output_tokens.get(), 3);
+}
+
+#[test]
+fn overflowing_required_counters_make_usage_stickily_incomplete() {
+    for field in ["input", "output"] {
+        let mut transcript = PiTranscript::new(Vec::new());
+        let mut first = json!({"input": 1, "output": 1});
+        first[field] = json!(SAFE_TOKEN_COUNT);
+        transcript.push(format!("{}\n", assistant_message_end("toolUse", first)).as_bytes());
+        transcript.push(
+            format!(
+                "{}\n",
+                json!({"type": "message_update", "usage": {"input": 1, "output": 1},
+                       "assistantMessageEvent": {"type": "start"}})
             )
-        )
-        .as_bytes(),
-    );
-    transcript.push(
-        format!(
-            "{}\n",
-            json!({"type": "message_update",
-                   "usage": {"input": 1, "output": 1, "cacheRead": SAFE_TOKEN_COUNT,
-                             "cacheWrite": SAFE_TOKEN_COUNT},
-                   "assistantMessageEvent": {"type": "start"}})
-        )
-        .as_bytes(),
-    );
-    let usage = transcript.token_usage().expect("committed usage survives");
-    assert_eq!(usage.input_tokens.get(), 1);
-    assert_eq!(
-        usage.cache_read_input_tokens.map(|count| count.get()),
-        Some(SAFE_TOKEN_COUNT)
-    );
+            .as_bytes(),
+        );
+        assert!(transcript.token_usage().is_none(), "overflowing {field}");
+        // Even a smaller replacement snapshot cannot hide the observed overflow.
+        transcript.push(
+            format!(
+                "{}\n",
+                json!({"type": "message_update", "usage": {"input": 0, "output": 0},
+                       "assistantMessageEvent": {"type": "start"}})
+            )
+            .as_bytes(),
+        );
+        assert!(
+            transcript.token_usage().is_none(),
+            "replacement after {field}"
+        );
+        transcript.push(
+            format!(
+                "{}\n",
+                json!({"type": "message_start", "message": {"role": "assistant"}})
+            )
+            .as_bytes(),
+        );
+        assert!(transcript.token_usage().is_none(), "commit after {field}");
+        transcript.push(
+            format!(
+                "{}\n",
+                assistant_message_end("stop", json!({"input": 0, "output": 0}))
+            )
+            .as_bytes(),
+        );
+        assert!(
+            transcript.token_usage().is_none(),
+            "later message after {field}"
+        );
+    }
+}
+
+#[test]
+fn overflowing_cache_counters_make_usage_stickily_incomplete() {
+    for field in ["cacheRead", "cacheWrite"] {
+        let mut transcript = PiTranscript::new(Vec::new());
+        let mut usage = json!({"input": 1, "output": 1, "cacheRead": 1, "cacheWrite": 1});
+        usage[field] = json!(SAFE_TOKEN_COUNT);
+        transcript.push(format!("{}\n", assistant_message_end("toolUse", usage)).as_bytes());
+        transcript.push(
+            format!(
+                "{}\n",
+                assistant_message_end(
+                    "toolUse",
+                    json!({"input": 1, "output": 1, "cacheRead": 1, "cacheWrite": 1})
+                )
+            )
+            .as_bytes(),
+        );
+        assert!(
+            transcript.token_usage().is_none(),
+            "committed {field} overflow"
+        );
+        // New well-formed messages cannot restore an aggregate that dropped counts.
+        transcript.push(
+            format!(
+                "{}\n",
+                assistant_message_end(
+                    "stop",
+                    json!({"input": 1, "output": 1, "cacheRead": 1, "cacheWrite": 1})
+                )
+            )
+            .as_bytes(),
+        );
+        assert!(
+            transcript.token_usage().is_none(),
+            "later message after {field}"
+        );
+    }
 }
 
 #[test]

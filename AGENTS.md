@@ -190,11 +190,15 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   in-process workers. No portable external binding currently ships; do not reintroduce retired
   worker profiles.
 - Shared provider process code owns streamed-turn exchange and settlement for Claude and Pi,
-  including cancellation, token usage, and confirmed cleanup. Native transcripts own event parsing
-  and final-answer semantics. Shared provider text publication batches deltas, redacts credentials
+  including cancellation, token usage, and confirmed cleanup. Process evidence distinguishes
+  incomplete input, failed completion, and stderr-only diagnostics. Incomplete input fails that
+  attempt and cannot itself authorize continuation; each native transcript retains its documented
+  retry policy, event parsing, and final-answer semantics. Shared provider text publication batches deltas, redacts credentials
   across event/stream boundaries, and emits bounded UTF-8 records. `HarnessProcessEnvironment`
   owns the minimal nonsecret environment for Claude and Pi in local and hosted composition.
-  `TokenUsageDelta::checked_add` owns bounded provider-neutral usage arithmetic. Native
+  `TokenUsageDelta::checked_add` owns bounded provider-neutral usage arithmetic. Overflow or
+  malformed claimed Pi usage makes the turn total incomplete permanently rather than publishing
+  an earlier partial total. Native
   authentication merges suppress all ambient forms of a credential group when a connection
   declares one form. Provider
   documents use atomic private-file replacement with descriptor-based ownership; Linux pins the
@@ -227,7 +231,8 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   never outranks the declared one. An endpoint override interpolates the lane's key field only when
   the connection supplies it; the anthropic override omits `apiKey` when `ANTHROPIC_API_KEY` is
   absent so Pi's own `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_OAUTH_TOKEN` environment auth still resolves.
-  A native-local lane reuses
+  Pi home overrides resolve native tilde shorthand against the captured user's home before
+  detachment and leave `file://` decoding to Pi. A native-local lane reuses
   the user's stored Pi login from its agent directory; every other lane receives a private agent
   directory so no ambient configuration, catalog, or credential is inherited. Session identity is a
   bounded SHA-256 of the node-instance or execution identity, because Pi accepts
@@ -829,6 +834,16 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   structural visits/decisions with source cursors and stable identities; JavaScript never evaluates
   guards or invents worker executions. Keep loop visits, retries, and Map items distinct. Projection
   failure leaves recorded worker history readable; verifier rejection is a decision, not a crash.
+- Profile and run inspectors share `InspectorPanel`, pointer/keyboard resizing, and one client-only
+  width preference. Viewport clamping preserves the preferred width when the available space shrinks.
+- Run navigation retains tab-scoped view preferences (node/inspector, execution, cursor, graph
+  expansion and viewport) under the workspace identity and run/source identity. History and
+  definitions are always fetched anew; unmount cancels polling, reads, streams and replay timers.
+  Standalone tab navigation remembers its last run route only for the mounted workspace shell;
+  explicit run hashes take precedence. Standalone snapshots use a fresh shell namespace on reload
+  so local/target history cannot inherit prior-page preferences. Hosted shells own restoring their
+  selected run identity. A saved cursor beyond the bounded batch remains pending through explicit
+  Load more; intermediate pages cannot replace it.
 - Read-only history reuses `WorkflowCanvas`; groups start collapsed and scrubbing preserves expansion.
   Seek pauses following; transcript scrolling stays live and follows only at the bottom. Keep the
   execution pinned while reading. Node timelines use the shared cursor; transcripts remain bounded.

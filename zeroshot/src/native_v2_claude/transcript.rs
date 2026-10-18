@@ -1,8 +1,9 @@
-use crate::native_v2_capsule::provider_process::turn::ProviderTranscript;
+use crate::native_v2_capsule::{
+    provider_json_lines::{ProviderJsonLine, ProviderJsonLines},
+    provider_process::{text::ProviderText, turn::ProviderTranscript, ProviderProcessFailure},
+};
 use serde_json::Value;
 
-use crate::native_v2_capsule::provider_json_lines::{ProviderJsonLine, ProviderJsonLines};
-use crate::native_v2_capsule::provider_process::text::ProviderText;
 use crate::native_v2_contract::TokenUsageDelta;
 use crate::native_v2_runner::{LiveOutputStream, NodeRunnerError};
 
@@ -99,8 +100,14 @@ impl ProviderTranscript for ClaudeTranscript {
         self.session_failure.is_none() && matches!(self.terminal, Some(ClaudeTerminal::Complete(_)))
     }
 
-    fn finish(mut self, process_failure: Option<&str>) -> Result<ClaudeAttempt, NodeRunnerError> {
-        let process_failure = process_failure.filter(|detail| !detail.trim().is_empty());
+    fn finish(
+        mut self,
+        process_failure: Option<ProviderProcessFailure>,
+    ) -> Result<ClaudeAttempt, NodeRunnerError> {
+        let process_failure = process_failure
+            .as_ref()
+            .map(|failure| failure.detail.as_str())
+            .filter(|detail| !detail.trim().is_empty());
         let missing_terminal = self.missing_terminal_detail();
         let terminal = self
             .terminal
