@@ -163,15 +163,15 @@ pub(super) struct HubInstallArgs {
     docker: bool,
 
     /// systemd: install a system unit running as this user (needs root).
-    #[arg(long, requires = "systemd")]
+    #[arg(long, conflicts_with = "docker")]
     system: bool,
 
     /// docker: image with a zeroshot binary that includes `hub`.
-    #[arg(long, value_name = "IMAGE", requires = "docker")]
+    #[arg(long, value_name = "IMAGE", conflicts_with = "systemd")]
     image: Option<String>,
 
     /// docker: also mount this host folder at the same path, such as a job's working folder.
-    #[arg(long, value_name = "PATH", requires = "docker", action = clap::ArgAction::Append)]
+    #[arg(long, value_name = "PATH", conflicts_with = "systemd", action = clap::ArgAction::Append)]
     volume: Vec<std::path::PathBuf>,
 
     /// Pause between dispatcher passes.
@@ -195,7 +195,7 @@ pub(super) struct HubUninstallArgs {
     docker: bool,
 
     /// systemd: remove the system unit instead of the user unit.
-    #[arg(long, requires = "systemd")]
+    #[arg(long, conflicts_with = "docker")]
     system: bool,
 
     /// Print the steps without applying them.
