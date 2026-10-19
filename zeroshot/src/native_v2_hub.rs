@@ -1,7 +1,10 @@
-//! Client-side `zeroshot hub`: a pool of registered targets with placement, a durable queue,
-//! and usage accounting.
+//! `zeroshot hub`: a pool of registered targets with placement, a durable queue, recurring
+//! schedules, and usage accounting.
 //!
-//! The hub never changes run contracts. It chooses one member per job and delegates every
+//! One daemon per hub folder (`hub daemon run`, supervised by systemd or Docker through
+//! `hub install`) dispatches continuously. Every other command checks that exactly one such
+//! daemon is active, then reads or changes `state.json` under the same advisory lock the
+//! daemon holds for each pass, so no IPC protocol is needed. The hub never changes run contracts. It chooses one member per job and delegates every
 //! target operation to the same CLI commands a user would run (`run --detach`, `list`,
 //! `status`, `watch`, `logs`, `attach`, `force-stop`), so registry, authentication, admission,
 //! and observation behave exactly as they do without the hub.
@@ -20,8 +23,10 @@ use crate::native_v2_target::{
 
 mod clock;
 mod cron;
+mod daemon;
 mod driver;
 mod error;
+mod install;
 mod jobs;
 mod model;
 mod placement;
@@ -54,14 +59,32 @@ pub(crate) async fn execute_hub(
     command: HubCommand,
     output: &mut impl Write,
 ) -> Result<i32, HubError> {
+    let probe = daemon::production_probe();
+    if daemon::requires_daemon(&command) {
+        daemon::guard(probe.as_ref()).await?;
+    }
     let registry_path = default_target_registry_path()
         .map_err(|error| HubError::storage("target registry path is unavailable", error))?;
     let context = HubContext {
         store: HubStore::new(HubStore::default_directory(&registry_path)),
         driver: Box::new(ProcessDriver::production(registry_path.clone())?),
-        registry: FileTargetRegistry::new(registry_path),
+        registry: FileTargetRegistry::new(registry_path.clone()),
     };
     match command {
+        HubCommand::Daemon { interval } => {
+            daemon::run(&context, &interval, output).await.map(|()| 0)
+        }
+        HubCommand::DaemonStatus => daemon::status(&context, probe.as_ref(), output).await,
+        HubCommand::Install(request) => {
+            let env = install::InstallEnv::detect(&registry_path, context.store.directory())?;
+            install::install(&env, request, probe.as_ref(), output)
+                .await
+                .map(|()| 0)
+        }
+        HubCommand::Uninstall(request) => {
+            let env = install::InstallEnv::detect(&registry_path, context.store.directory())?;
+            install::uninstall(&env, request, output).await.map(|()| 0)
+        }
         HubCommand::Add(request) => add(&context, request, output).await.map(|()| 0),
         HubCommand::Update(request) => update(&context, request, output).map(|()| 0),
         HubCommand::Remove { name } => remove(&context, &name, output).map(|()| 0),
@@ -71,10 +94,9 @@ pub(crate) async fn execute_hub(
         HubCommand::Ps(request) => ps(&context, request, output).await.map(|()| 0),
         HubCommand::Status { job } => status(&context, &job, output).await.map(|()| 0),
         HubCommand::Dequeue { job } => dequeue(&context, &job, output).map(|()| 0),
-        HubCommand::Dispatch { repeat, interval } => {
-            dispatch_loop(&context, repeat, &interval, output)
-                .await
-                .map(|()| 0)
+        HubCommand::Dispatch => {
+            let (_, view) = daemon::pass(&context).await?;
+            write_json(output, &view).map(|()| 0)
         }
         HubCommand::Stats(request) => stats(&context, request, output).map(|()| 0),
         observation => observe(&context, observation).await,
@@ -649,33 +671,6 @@ fn dequeue(context: &HubContext, job_id: &str, output: &mut impl Write) -> Resul
     let document = job_document(job, now);
     context.store.save(&lock, &state)?;
     write_json(output, &document)
-}
-
-async fn dispatch_loop(
-    context: &HubContext,
-    repeat: bool,
-    interval: &str,
-    output: &mut impl Write,
-) -> Result<(), HubError> {
-    let pause = Duration::from_millis(parse_duration_ms(interval)?);
-    loop {
-        let summary = {
-            let lock = context.store.lock()?;
-            let mut state = context.store.load(&lock)?;
-            let now = now_ms();
-            let report = schedule::tick(&mut state, context.driver.as_ref(), now).await;
-            context.store.save(&lock, &state)?;
-            report.view(&state, now)
-        };
-        write_json(output, &summary)?;
-        if !repeat {
-            return Ok(());
-        }
-        tokio::select! {
-            () = tokio::time::sleep(pause) => {}
-            _ = tokio::signal::ctrl_c() => return Ok(()),
-        }
-    }
 }
 
 fn stats(context: &HubContext, request: HubStats, output: &mut impl Write) -> Result<(), HubError> {

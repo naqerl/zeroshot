@@ -9,6 +9,8 @@ use super::model::HubState;
 
 const STATE_FILE: &str = "state.json";
 const LOCK_FILE: &str = "hub.lock";
+const DAEMON_LOCK_FILE: &str = "daemon.lock";
+const HEARTBEAT_FILE: &str = "daemon.json";
 
 /// Private hub directory holding members and jobs, guarded by one advisory lock.
 #[derive(Clone, Debug)]
@@ -38,6 +40,38 @@ impl HubStore {
             .map_or_else(|| PathBuf::from("hub"), |parent| parent.join("hub"))
     }
 
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// Claim the daemon role for this hub folder; `None` when another daemon holds it.
+    pub(crate) fn try_daemon_lock(&self) -> Result<Option<HubLock>, HubError> {
+        create_private_directory(&self.directory)?;
+        let file = private_options()
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(self.directory.join(DAEMON_LOCK_FILE))
+            .map_err(|error| HubError::storage("daemon lock could not be opened", error))?;
+        Ok(file
+            .try_lock_exclusive()
+            .ok()
+            .map(|()| HubLock { _file: file }))
+    }
+
+    /// Replace the daemon heartbeat document.
+    pub(crate) fn write_heartbeat(&self, heartbeat: &serde_json::Value) -> Result<(), HubError> {
+        let bytes = serde_json::to_vec_pretty(heartbeat)
+            .map_err(|error| HubError::storage("heartbeat could not be encoded", error))?;
+        self.replace(HEARTBEAT_FILE, &bytes)
+    }
+
+    /// The last daemon heartbeat, if any daemon ever ran on this hub folder.
+    pub(crate) fn heartbeat(&self) -> Option<serde_json::Value> {
+        let bytes = std::fs::read(self.directory.join(HEARTBEAT_FILE)).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
     pub(crate) fn lock(&self) -> Result<HubLock, HubError> {
         create_private_directory(&self.directory)?;
         let file = private_options()
@@ -65,16 +99,21 @@ impl HubStore {
     pub(crate) fn save(&self, _lock: &HubLock, state: &HubState) -> Result<(), HubError> {
         let bytes = serde_json::to_vec_pretty(state)
             .map_err(|error| HubError::storage("state could not be encoded", error))?;
-        let staged = self.directory.join(format!("{STATE_FILE}.tmp"));
+        self.replace(STATE_FILE, &bytes)
+    }
+
+    fn replace(&self, name: &str, bytes: &[u8]) -> Result<(), HubError> {
+        create_private_directory(&self.directory)?;
+        let staged = self.directory.join(format!("{name}.tmp"));
         let mut file = private_options()
             .write(true)
             .truncate(true)
             .open(&staged)
             .map_err(|error| HubError::storage("state could not be staged", error))?;
-        file.write_all(&bytes)
+        file.write_all(bytes)
             .and_then(|()| file.sync_all())
             .map_err(|error| HubError::storage("state could not be written", error))?;
-        std::fs::rename(&staged, self.directory.join(STATE_FILE))
+        std::fs::rename(&staged, self.directory.join(name))
             .map_err(|error| HubError::storage("state could not be replaced", error))
     }
 }

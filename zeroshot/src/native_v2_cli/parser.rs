@@ -83,8 +83,8 @@ enum CliCommand {
 
     /// Pool named targets and place, queue, and account for runs across them.
     ///
-    /// The hub is client-side. Members are targets registered with `zeroshot target add`, plus
-    /// `local`. Each placed job is an ordinary run on one target.
+    /// A daemon installed with `zeroshot hub install` dispatches. Members are targets registered
+    /// with `zeroshot target add`, plus `local`. Each placed job is an ordinary run on one target.
     Hub {
         #[command(subcommand)]
         command: hub::HubCliCommand,

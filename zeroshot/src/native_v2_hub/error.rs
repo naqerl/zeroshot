@@ -7,6 +7,10 @@ use super::placement::Rejection;
 pub(crate) const EXIT_NO_CAPACITY: i32 = 3;
 /// Exit code when no active member matches the placement at all.
 pub(crate) const EXIT_NO_ELIGIBLE_TARGET: i32 = 4;
+/// Exit code when no hub daemon is active under systemd or Docker.
+pub(crate) const EXIT_DAEMON_NOT_RUNNING: i32 = 5;
+/// Exit code when hub daemons are active under both systemd and Docker.
+pub(crate) const EXIT_DAEMON_CONFLICT: i32 = 6;
 
 #[derive(Debug, Error)]
 pub(crate) enum HubError {
@@ -32,6 +36,10 @@ pub(crate) enum HubError {
     #[error("hub storage {0}")]
     Storage(String),
     #[error("{message}")]
+    DaemonNotRunning { message: String, detection: Value },
+    #[error("{message}")]
+    DaemonConflict { message: String, detection: Value },
+    #[error("{message}")]
     Target {
         message: String,
         diagnostic: Option<Value>,
@@ -43,6 +51,8 @@ impl HubError {
         match self {
             Self::NoCapacity(_) | Self::WaitTimeout(_) => EXIT_NO_CAPACITY,
             Self::NoEligibleTarget { .. } => EXIT_NO_ELIGIBLE_TARGET,
+            Self::DaemonNotRunning { .. } => EXIT_DAEMON_NOT_RUNNING,
+            Self::DaemonConflict { .. } => EXIT_DAEMON_CONFLICT,
             _ => 1,
         }
     }
@@ -58,6 +68,8 @@ impl HubError {
             Self::InvalidState(_) => ("invalid_request", "hub.invalid_state"),
             Self::Conflict(_) => ("invalid_request", "hub.conflict"),
             Self::Storage(_) => ("target", "hub.storage"),
+            Self::DaemonNotRunning { .. } => ("target", "hub.daemon_not_running"),
+            Self::DaemonConflict { .. } => ("target", "hub.daemon_conflict"),
             Self::Target { .. } => ("target", "hub.target"),
         }
     }
@@ -70,6 +82,9 @@ impl HubError {
                 diagnostic: Some(diagnostic),
                 ..
             } => json!({ "target": diagnostic }),
+            Self::DaemonNotRunning { detection, .. } | Self::DaemonConflict { detection, .. } => {
+                json!({ "daemon": detection })
+            }
             Self::NoEligibleTarget { rejected, .. } => json!({
                 "rejected": rejected
                     .iter()

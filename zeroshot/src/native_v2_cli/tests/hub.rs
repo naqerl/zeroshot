@@ -1,6 +1,8 @@
 use std::ffi::OsString;
 
-use crate::native_v2_cli::hub::{HubCommand, HubMemberState, HubStrategy};
+use crate::native_v2_cli::hub::{
+    HubCommand, HubInstall, HubManager, HubMemberState, HubStrategy, HubUninstall,
+};
 use crate::native_v2_cli::{NativeV2CliCommand, NativeV2CliError, parse_native_v2_args};
 
 fn parse(values: &[&str]) -> Result<HubCommand, NativeV2CliError> {
@@ -215,11 +217,12 @@ fn observation_and_dispatch_commands_parse() {
         })
     );
     assert_eq!(
-        parse(&["hub", "dispatch", "--loop", "--interval", "30s"]).expect("dispatch"),
-        HubCommand::Dispatch {
-            repeat: true,
-            interval: "30s".to_owned()
-        }
+        parse(&["hub", "dispatch"]).expect("dispatch"),
+        HubCommand::Dispatch
+    );
+    assert!(
+        parse(&["hub", "dispatch", "--loop"]).is_err(),
+        "the daemon replaces --loop"
     );
     let HubCommand::Stats(stats) = parse(&[
         "hub",
@@ -258,4 +261,63 @@ fn enqueue_cron_parses_with_zone_and_conflicts_with_at() {
         with(&["--cron-tz", "UTC"]).is_err(),
         "--cron-tz requires --cron"
     );
+}
+
+#[test]
+fn daemon_and_service_commands_parse() {
+    assert_eq!(
+        parse(&["hub", "daemon", "run", "--interval", "3s"]).expect("daemon run"),
+        HubCommand::Daemon {
+            interval: "3s".to_owned()
+        }
+    );
+    assert_eq!(
+        parse(&["hub", "daemon", "status"]).expect("daemon status"),
+        HubCommand::DaemonStatus
+    );
+    assert_eq!(
+        parse(&["hub", "install", "--systemd", "--system", "--dry-run"]).expect("systemd"),
+        HubCommand::Install(HubInstall {
+            manager: HubManager::Systemd,
+            system: true,
+            image: None,
+            volumes: Vec::new(),
+            interval: "10s".to_owned(),
+            dry_run: true,
+        })
+    );
+    let HubCommand::Install(docker) = parse(&[
+        "hub",
+        "install",
+        "--docker",
+        "--image",
+        "zs:dev",
+        "--volume",
+        "/src",
+        "--interval",
+        "5s",
+    ])
+    .expect("docker") else {
+        panic!("expected install");
+    };
+    assert_eq!(docker.manager, HubManager::Docker);
+    assert_eq!(docker.image.as_deref(), Some("zs:dev"));
+    assert_eq!(docker.volumes, [std::path::PathBuf::from("/src")]);
+    assert_eq!(
+        parse(&["hub", "uninstall", "--docker"]).expect("uninstall"),
+        HubCommand::Uninstall(HubUninstall {
+            manager: HubManager::Docker,
+            system: false,
+            dry_run: false,
+        })
+    );
+    for invalid in [
+        &["hub", "install"][..],
+        &["hub", "install", "--systemd", "--docker"],
+        &["hub", "install", "--docker", "--system"],
+        &["hub", "install", "--systemd", "--image", "x"],
+        &["hub", "uninstall"],
+    ] {
+        assert!(parse(invalid).is_err(), "{invalid:?} must be rejected");
+    }
 }

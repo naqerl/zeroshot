@@ -754,7 +754,7 @@ Commands:
 ```text
 Pool named targets and place, queue, and account for runs across them.
 
-The hub is client-side. Members are targets registered with `zeroshot target add`, plus `local`. Each placed job is an ordinary run on one target.
+A daemon installed with `zeroshot hub install` dispatches. Members are targets registered with `zeroshot target add`, plus `local`. Each placed job is an ordinary run on one target.
 
 Usage: zeroshot hub <COMMAND>
 
@@ -772,8 +772,11 @@ Commands:
   attach      Attach to an execution of a placed job as NDJSON
   force-stop  Force a placed job's run to stop
   dequeue     Remove a queued or scheduled job before it is placed, or a recurring schedule (`hs_…`)
-  dispatch    Refresh running jobs, expire stale ones, and place due queued jobs
+  dispatch    Run one dispatcher pass now and print its summary, for debugging
   stats       Aggregate job outcomes and provider-reported tokens as JSON
+  daemon      Run or inspect the hub daemon
+  install     Install the hub daemon as a systemd unit or a Docker container and start it
+  uninstall   Stop and remove the hub daemon service. Hub state is kept
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -782,9 +785,17 @@ Options:
 
 HUB
 A hub pools targets registered with `zeroshot target add`, plus the built-in `local` controller.
-It picks a target for each run and keeps queued and scheduled runs client-side. Every placed
-job is one ordinary run on exactly one target, so `zeroshot status RUN_ID --target NAME` keeps
-working.
+It picks a target for each run and keeps queued, scheduled, and recurring runs in shared state
+beside the target registry. Every placed job is one ordinary run on exactly one target, so
+`zeroshot status RUN_ID --target NAME` keeps working.
+
+DAEMON
+A hub daemon dispatches continuously: it fires cron schedules, places due jobs, polls running
+jobs to completion, and records token usage. Install it once with `zeroshot hub install
+--systemd` (user unit; --system for a system unit) or `--docker` (restarting container). Every
+other hub command first checks that exactly one daemon is active under systemd or Docker, and
+fails with hub.daemon_not_running or hub.daemon_conflict otherwise. `hub daemon status` shows
+what was detected; `hub daemon run` is the foreground entrypoint the services start.
 
 Placement: --target pins one member; each --tag must match (AND). Members must be active, and
 a probe must reach them. Members must also support the run: --repository, --branch, --revision,
@@ -800,8 +811,11 @@ EXIT CODES
   3  no capacity: matching members are busy or unreachable, or --wait timed out (retryable)
   4  no eligible target: no active member matches the placement, or none supports the run
      (not retryable; details.rejected lists each member's reason)
+  5  hub.daemon_not_running: no hub daemon is active under systemd or Docker
+  6  hub.daemon_conflict: hub daemons are active under both systemd and Docker
 
 EXAMPLES
+  zeroshot hub install --systemd
   zeroshot hub add box-1 --tag gpu --slots 2
   zeroshot hub list
   zeroshot hub submit --tag gpu --title Fix --template single-worker --input in.json -d
@@ -1445,21 +1459,13 @@ Options:
 #### `zeroshot hub dispatch`
 
 ```text
-Refresh running jobs, expire stale ones, and place due queued jobs.
+Run one dispatcher pass now and print its summary, for debugging.
 
-Writes one NDJSON tick summary per pass. --loop repeats until Ctrl-C.
+The daemon runs the same pass continuously; a manual pass is safe beside it because both hold the hub lock.
 
-Usage: zeroshot hub dispatch [OPTIONS]
+Usage: zeroshot hub dispatch
 
 Options:
-      --loop
-          Repeat until Ctrl-C
-
-      --interval <DURATION>
-          Pause between passes with --loop
-
-          [default: 10s]
-
   -h, --help
           Print help (see a summary with '-h')
 ```
@@ -1490,6 +1496,130 @@ Options:
           Print help (see a summary with '-h')
 ```
 
+#### `zeroshot hub daemon`
+
+```text
+Run or inspect the hub daemon
+
+Usage: zeroshot hub daemon <COMMAND>
+
+Commands:
+  run     Dispatch in the foreground until SIGTERM or Ctrl-C; the entrypoint of installed services
+  status  Report the detected systemd and Docker daemons and the last heartbeat as JSON
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help
+```
+
+##### `zeroshot hub daemon run`
+
+```text
+Dispatch in the foreground until SIGTERM or Ctrl-C; the entrypoint of installed services.
+
+Each pass fires due cron schedules, refreshes capabilities and running jobs, expires stale jobs, and places due ones. Passes with activity are written as NDJSON. Only one daemon may own a hub folder at a time.
+
+Usage: zeroshot hub daemon run [OPTIONS]
+
+Options:
+      --interval <DURATION>
+          Pause between dispatcher passes
+
+          [default: 10s]
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+##### `zeroshot hub daemon status`
+
+```text
+Report the detected systemd and Docker daemons and the last heartbeat as JSON.
+
+Exits 0 when exactly one daemon is active, 5 when none is, and 6 when both are.
+
+Usage: zeroshot hub daemon status
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+##### `zeroshot hub daemon help`
+
+```text
+Print this message or the help of the given subcommand(s)
+
+Usage: zeroshot hub daemon help [COMMAND]
+
+Commands:
+  run     Dispatch in the foreground until SIGTERM or Ctrl-C; the entrypoint of installed services
+  status  Report the detected systemd and Docker daemons and the last heartbeat as JSON
+  help    Print this message or the help of the given subcommand(s)
+```
+
+#### `zeroshot hub install`
+
+```text
+Install the hub daemon as a systemd unit or a Docker container and start it.
+
+The service runs `zeroshot hub daemon run` with this shell's config, hub, and state folders pinned, so it sees the same targets and queue. --dry-run prints the generated unit or container command and the steps without changing anything.
+
+Usage: zeroshot hub install [OPTIONS] <--systemd|--docker>
+
+Options:
+      --systemd
+          Install a systemd unit (user unit unless --system) and enable it now
+
+      --docker
+          Run a Docker container with a restart policy and the hub folders mounted
+
+      --system
+          systemd: install a system unit running as this user (needs root)
+
+      --image <IMAGE>
+          docker: image with a zeroshot binary that includes `hub`
+
+      --volume <PATH>
+          docker: also mount this host folder at the same path, such as a job's working folder
+
+      --interval <DURATION>
+          Pause between dispatcher passes
+
+          [default: 10s]
+
+      --dry-run
+          Print the generated service definition and steps without applying them
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+#### `zeroshot hub uninstall`
+
+```text
+Stop and remove the hub daemon service. Hub state is kept
+
+Usage: zeroshot hub uninstall [OPTIONS] <--systemd|--docker>
+
+Options:
+      --systemd
+          Remove the systemd unit
+
+      --docker
+          Remove the Docker container
+
+      --system
+          systemd: remove the system unit instead of the user unit
+
+      --dry-run
+          Print the steps without applying them
+
+  -h, --help
+          Print help
+```
+
 #### `zeroshot hub help`
 
 ```text
@@ -1511,8 +1641,11 @@ Commands:
   attach      Attach to an execution of a placed job as NDJSON
   force-stop  Force a placed job's run to stop
   dequeue     Remove a queued or scheduled job before it is placed, or a recurring schedule (`hs_…`)
-  dispatch    Refresh running jobs, expire stale ones, and place due queued jobs
+  dispatch    Run one dispatcher pass now and print its summary, for debugging
   stats       Aggregate job outcomes and provider-reported tokens as JSON
+  daemon      Run or inspect the hub daemon
+  install     Install the hub daemon as a systemd unit or a Docker container and start it
+  uninstall   Stop and remove the hub daemon service. Hub state is kept
   help        Print this message or the help of the given subcommand(s)
 ```
 

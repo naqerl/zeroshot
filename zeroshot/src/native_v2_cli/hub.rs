@@ -1,8 +1,9 @@
 //! Parsed `zeroshot hub` requests.
 //!
-//! The hub is a client-side pool of registered targets. Parsing only checks syntax and keeps
-//! the run arguments in the exact `zeroshot run` form; the shipped binary owns placement, queue
-//! state, and the delegated target calls.
+//! The hub pools registered targets behind one queue. A daemon (`hub daemon run`, installed with
+//! `hub install`) owns dispatch; other hub commands read and change the shared state under its
+//! lock. Parsing only checks syntax and keeps the run arguments in the exact `zeroshot run`
+//! form; the shipped binary owns placement, queue state, and the delegated target calls.
 
 use std::path::PathBuf;
 
@@ -40,11 +41,46 @@ pub enum HubCommand {
     Dequeue {
         job: String,
     },
-    Dispatch {
-        repeat: bool,
+    /// One dispatcher pass, for debugging; the daemon runs these continuously.
+    Dispatch,
+    Stats(HubStats),
+    /// Foreground daemon: dispatch every `interval` until SIGTERM or Ctrl-C.
+    Daemon {
         interval: String,
     },
-    Stats(HubStats),
+    /// Report which service manager runs the daemon and its heartbeat.
+    DaemonStatus,
+    Install(HubInstall),
+    Uninstall(HubUninstall),
+}
+
+/// Service manager that supervises the hub daemon.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HubManager {
+    Systemd,
+    Docker,
+}
+
+/// `hub install`: generate and apply a service definition for the daemon.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HubInstall {
+    pub manager: HubManager,
+    /// systemd only: a system unit instead of a user unit.
+    pub system: bool,
+    /// docker only: image containing a zeroshot binary with `hub`.
+    pub image: Option<String>,
+    /// docker only: extra host folders mounted at the same path, such as job working folders.
+    pub volumes: Vec<PathBuf>,
+    pub interval: String,
+    pub dry_run: bool,
+}
+
+/// `hub uninstall`: stop and remove the daemon service.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HubUninstall {
+    pub manager: HubManager,
+    pub system: bool,
+    pub dry_run: bool,
 }
 
 /// Registration of an existing named target, or the built-in `local` controller.

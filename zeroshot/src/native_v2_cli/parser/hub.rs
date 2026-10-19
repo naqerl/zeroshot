@@ -3,16 +3,24 @@ use clap::{Args, Subcommand, ValueEnum};
 use super::RunArgs;
 use crate::native_v2_cli::NativeV2CliError;
 use crate::native_v2_cli::hub::{
-    HubCommand, HubEnqueue, HubJobSpec, HubLogs, HubMemberAdd, HubMemberState, HubMemberUpdate,
-    HubPs, HubStats, HubStrategy, HubSubmit,
+    HubCommand, HubEnqueue, HubInstall, HubJobSpec, HubLogs, HubManager, HubMemberAdd,
+    HubMemberState, HubMemberUpdate, HubPs, HubStats, HubStrategy, HubSubmit, HubUninstall,
 };
 
 #[derive(Debug, Subcommand)]
 #[command(after_long_help = r#"HUB
 A hub pools targets registered with `zeroshot target add`, plus the built-in `local` controller.
-It picks a target for each run and keeps queued and scheduled runs client-side. Every placed
-job is one ordinary run on exactly one target, so `zeroshot status RUN_ID --target NAME` keeps
-working.
+It picks a target for each run and keeps queued, scheduled, and recurring runs in shared state
+beside the target registry. Every placed job is one ordinary run on exactly one target, so
+`zeroshot status RUN_ID --target NAME` keeps working.
+
+DAEMON
+A hub daemon dispatches continuously: it fires cron schedules, places due jobs, polls running
+jobs to completion, and records token usage. Install it once with `zeroshot hub install
+--systemd` (user unit; --system for a system unit) or `--docker` (restarting container). Every
+other hub command first checks that exactly one daemon is active under systemd or Docker, and
+fails with hub.daemon_not_running or hub.daemon_conflict otherwise. `hub daemon status` shows
+what was detected; `hub daemon run` is the foreground entrypoint the services start.
 
 Placement: --target pins one member; each --tag must match (AND). Members must be active, and
 a probe must reach them. Members must also support the run: --repository, --branch, --revision,
@@ -28,8 +36,11 @@ EXIT CODES
   3  no capacity: matching members are busy or unreachable, or --wait timed out (retryable)
   4  no eligible target: no active member matches the placement, or none supports the run
      (not retryable; details.rejected lists each member's reason)
+  5  hub.daemon_not_running: no hub daemon is active under systemd or Docker
+  6  hub.daemon_conflict: hub daemons are active under both systemd and Docker
 
 EXAMPLES
+  zeroshot hub install --systemd
   zeroshot hub add box-1 --tag gpu --slots 2
   zeroshot hub list
   zeroshot hub submit --tag gpu --title Fix --template single-worker --input in.json -d
@@ -91,16 +102,105 @@ pub(super) enum HubCliCommand {
     /// Removing a schedule keeps the jobs it already queued.
     Dequeue(HubJobArgs),
 
-    /// Refresh running jobs, expire stale ones, and place due queued jobs.
+    /// Run one dispatcher pass now and print its summary, for debugging.
     ///
-    /// Writes one NDJSON tick summary per pass. --loop repeats until Ctrl-C.
-    Dispatch(HubDispatchArgs),
+    /// The daemon runs the same pass continuously; a manual pass is safe beside it because both
+    /// hold the hub lock.
+    Dispatch,
 
     /// Aggregate job outcomes and provider-reported tokens as JSON.
     ///
     /// A job is attributed to one model only when its runtime files name exactly one model;
     /// otherwise its model is `mixed` or `unknown`. Costs appear only with --prices.
     Stats(HubStatsArgs),
+
+    /// Run or inspect the hub daemon.
+    #[command(subcommand)]
+    Daemon(HubDaemonCommand),
+
+    /// Install the hub daemon as a systemd unit or a Docker container and start it.
+    ///
+    /// The service runs `zeroshot hub daemon run` with this shell's config, hub, and state
+    /// folders pinned, so it sees the same targets and queue. --dry-run prints the generated
+    /// unit or container command and the steps without changing anything.
+    Install(HubInstallArgs),
+
+    /// Stop and remove the hub daemon service. Hub state is kept.
+    Uninstall(HubUninstallArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum HubDaemonCommand {
+    /// Dispatch in the foreground until SIGTERM or Ctrl-C; the entrypoint of installed services.
+    ///
+    /// Each pass fires due cron schedules, refreshes capabilities and running jobs, expires stale
+    /// jobs, and places due ones. Passes with activity are written as NDJSON. Only one daemon may
+    /// own a hub folder at a time.
+    Run(HubDaemonRunArgs),
+
+    /// Report the detected systemd and Docker daemons and the last heartbeat as JSON.
+    ///
+    /// Exits 0 when exactly one daemon is active, 5 when none is, and 6 when both are.
+    Status,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubDaemonRunArgs {
+    /// Pause between dispatcher passes.
+    #[arg(long, value_name = "DURATION", default_value = "10s")]
+    interval: String,
+}
+
+#[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("manager").required(true).args(["systemd", "docker"])))]
+pub(super) struct HubInstallArgs {
+    /// Install a systemd unit (user unit unless --system) and enable it now.
+    #[arg(long)]
+    systemd: bool,
+
+    /// Run a Docker container with a restart policy and the hub folders mounted.
+    #[arg(long)]
+    docker: bool,
+
+    /// systemd: install a system unit running as this user (needs root).
+    #[arg(long, requires = "systemd")]
+    system: bool,
+
+    /// docker: image with a zeroshot binary that includes `hub`.
+    #[arg(long, value_name = "IMAGE", requires = "docker")]
+    image: Option<String>,
+
+    /// docker: also mount this host folder at the same path, such as a job's working folder.
+    #[arg(long, value_name = "PATH", requires = "docker", action = clap::ArgAction::Append)]
+    volume: Vec<std::path::PathBuf>,
+
+    /// Pause between dispatcher passes.
+    #[arg(long, value_name = "DURATION", default_value = "10s")]
+    interval: String,
+
+    /// Print the generated service definition and steps without applying them.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("manager").required(true).args(["systemd", "docker"])))]
+pub(super) struct HubUninstallArgs {
+    /// Remove the systemd unit.
+    #[arg(long)]
+    systemd: bool,
+
+    /// Remove the Docker container.
+    #[arg(long)]
+    docker: bool,
+
+    /// systemd: remove the system unit instead of the user unit.
+    #[arg(long, requires = "systemd")]
+    system: bool,
+
+    /// Print the steps without applying them.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -336,17 +436,6 @@ pub(super) struct HubAttachArgs {
 }
 
 #[derive(Debug, Args)]
-pub(super) struct HubDispatchArgs {
-    /// Repeat until Ctrl-C.
-    #[arg(long = "loop")]
-    repeat: bool,
-
-    /// Pause between passes with --loop.
-    #[arg(long, value_name = "DURATION", default_value = "10s")]
-    interval: String,
-}
-
-#[derive(Debug, Args)]
 pub(super) struct HubStatsArgs {
     /// Group by target, model, project, day, or label:KEY. Repeat to combine.
     #[arg(long, value_name = "DIMENSION", action = clap::ArgAction::Append)]
@@ -414,17 +503,39 @@ impl HubCliCommand {
             },
             Self::ForceStop(args) => HubCommand::ForceStop { job: args.job },
             Self::Dequeue(args) => HubCommand::Dequeue { job: args.job },
-            Self::Dispatch(args) => HubCommand::Dispatch {
-                repeat: args.repeat,
-                interval: args.interval,
-            },
+            Self::Dispatch => HubCommand::Dispatch,
             Self::Stats(args) => HubCommand::Stats(HubStats {
                 by: args.by,
                 since: args.since,
                 until: args.until,
                 prices: args.prices,
             }),
+            Self::Daemon(HubDaemonCommand::Run(args)) => HubCommand::Daemon {
+                interval: args.interval,
+            },
+            Self::Daemon(HubDaemonCommand::Status) => HubCommand::DaemonStatus,
+            Self::Install(args) => HubCommand::Install(HubInstall {
+                manager: manager(args.systemd),
+                system: args.system,
+                image: args.image,
+                volumes: args.volume,
+                interval: args.interval,
+                dry_run: args.dry_run,
+            }),
+            Self::Uninstall(args) => HubCommand::Uninstall(HubUninstall {
+                manager: manager(args.systemd),
+                system: args.system,
+                dry_run: args.dry_run,
+            }),
         })
+    }
+}
+
+const fn manager(systemd: bool) -> HubManager {
+    if systemd {
+        HubManager::Systemd
+    } else {
+        HubManager::Docker
     }
 }
 
