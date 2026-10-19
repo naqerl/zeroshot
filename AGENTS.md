@@ -733,7 +733,16 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   plans have static inputs, no cross-node dataflow, and no retry-in-place. Agent runtime bindings
   cannot declare `GH_TOKEN`; the sole merge-delivery binding owns the GitHub write credential. A
   node's queue deadline is the earlier of plan expiry and seven days after readiness.
-- Read-only safe commands include `zeroshot list`, `zeroshot status`, and `zeroshot logs`.
+- `zeroshot hub` is a client-side pool of registered targets plus `local`. Hub state (members and
+  jobs) lives in `hub/state.json` beside `targets.json` (or `ZEROSHOT_HUB_DIR`) under one advisory
+  lock; `targets.json` stays unchanged. Every target operation is delegated to this executable's own
+  `run --detach`, `list`, `status`, `watch`, `logs`, `attach`, and `force-stop` in a child process
+  (`ZEROSHOT_HUB_EXECUTABLE` overrides it for tests and demos), so the hub never bypasses admission,
+  authentication, or observation contracts. Member capacity is hub-declared `slots`; load is the
+  observed nonterminal runs. Dispatch submission keys are `hub-JOB_ID-ATTEMPT`. Exit code 3 means
+  no capacity or an expired wait, and 4 means that no active member matches.
+- Read-only safe commands include `zeroshot list`, `zeroshot status`, `zeroshot logs`,
+  `zeroshot hub list`, `zeroshot hub ps`, and `zeroshot hub stats`.
 - Destructive commands such as `zeroshot force-stop` require explicit user intent.
 
 ## Where to look
@@ -751,6 +760,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 | Portable controller           | `zeroshot/src/native_v2_portable_controller.rs`, `zeroshot/src/native_v2_portable_controller/`                                                                                                    |
 | Provider/delivery composition | `zeroshot/src/native_v2_candidate.rs`, `zeroshot/src/native_v2_candidate/`                                                                                                                        |
 | Target server                 | `zeroshot/src/native_v2_target.rs`, `zeroshot/src/native_v2_target/`                                                                                                                              |
+| Hub (target pool and queue)   | `zeroshot/src/native_v2_cli/hub.rs`, `zeroshot/src/native_v2_cli/parser/hub.rs`, `zeroshot/src/native_v2_hub.rs`, `zeroshot/src/native_v2_hub/`                                                   |
 | Target authority/auth         | `zeroshot/src/native_v2_target_authority.rs`, `zeroshot/src/native_v2_target_authority/`                                                                                                          |
 | Contained execution           | `zeroshot/src/execution.rs`, `zeroshot/src/execution/`                                                                                                                                            |
 | Faults and redaction          | `zeroshot/src/fault.rs`, `zeroshot/src/fault/`                                                                                                                                                    |
