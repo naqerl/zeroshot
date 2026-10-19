@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use super::model::{Member, MemberState, PlacementSpec, Strategy};
+use super::model::{LOCAL_MEMBER, Member, MemberState, PlacementSpec, Requirements, Strategy};
 
 /// Observed reachability and active runs of one member.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -14,10 +14,28 @@ pub(crate) struct Load {
 pub(crate) enum Placement {
     /// Place on this member.
     Place(String),
-    /// Members match, but none is reachable with a free slot.
+    /// Members match and can run the job, but none is reachable with a free slot, or a
+    /// matching member's capabilities are not discovered yet.
     Busy { matching: Vec<String> },
-    /// No active member matches the target and tags.
-    NoEligible,
+    /// No active member matches the target and tags, or every matching member is known not to
+    /// support the job. `rejected` names each such member with its reason.
+    NoEligible { rejected: Vec<Rejection> },
+}
+
+/// A selector-matching member that cannot run a job, with the reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Rejection {
+    pub member: String,
+    pub reason: String,
+}
+
+/// Whether one member can run a job with these requirements.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Fit {
+    Supported,
+    /// The target has not been discovered yet; retry after discovery.
+    Unknown,
+    Unsupported(String),
 }
 
 /// Active members that satisfy the pinned target and every required tag, in registration order.
@@ -34,19 +52,75 @@ pub(crate) fn matching_members<'a>(members: &'a [Member], spec: &PlacementSpec) 
         .collect()
 }
 
-/// Pick a free member. Members absent from `loads` are treated as unreachable.
+/// Capability match of one member. The local controller runs in-process and is not gated on
+/// discovery markers; named targets must advertise every required discovery kind.
+pub(crate) fn fit(member: &Member, requirements: &Requirements) -> Fit {
+    if member.name == LOCAL_MEMBER {
+        return requirements
+            .local_unsupported
+            .clone()
+            .map_or(Fit::Supported, Fit::Unsupported);
+    }
+    if let Some(reason) = &requirements.remote_unsupported {
+        return Fit::Unsupported(reason.clone());
+    }
+    if requirements.capabilities.is_empty() {
+        return Fit::Supported;
+    }
+    let Some(advertised) = &member.capabilities else {
+        return Fit::Unknown;
+    };
+    let missing = requirements
+        .capabilities
+        .iter()
+        .filter(|kind| !advertised.contains(kind))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Fit::Supported
+    } else {
+        Fit::Unsupported(format!("target does not advertise {}", missing.join(", ")))
+    }
+}
+
+/// Members matching the selector that are known not to support the job. `None` when at least
+/// one matching member supports it or might once discovered.
+pub(crate) fn rejections(
+    members: &[Member],
+    spec: &PlacementSpec,
+    requirements: &Requirements,
+) -> Option<Vec<Rejection>> {
+    let mut rejected = Vec::new();
+    for member in matching_members(members, spec) {
+        match fit(member, requirements) {
+            Fit::Unsupported(reason) => rejected.push(Rejection {
+                member: member.name.clone(),
+                reason,
+            }),
+            Fit::Supported | Fit::Unknown => return None,
+        }
+    }
+    Some(rejected)
+}
+
+/// Pick a free supported member. Members absent from `loads` are treated as unreachable.
 pub(crate) fn place(
     members: &[Member],
     spec: &PlacementSpec,
+    requirements: &Requirements,
     loads: &BTreeMap<String, Load>,
 ) -> Placement {
-    let matching = matching_members(members, spec);
-    if matching.is_empty() {
-        return Placement::NoEligible;
+    if let Some(rejected) = rejections(members, spec, requirements) {
+        return Placement::NoEligible { rejected };
     }
+    let matching = matching_members(members, spec)
+        .into_iter()
+        .filter(|member| !matches!(fit(member, requirements), Fit::Unsupported(_)))
+        .collect::<Vec<_>>();
     let mut free = matching
         .iter()
         .enumerate()
+        .filter(|(_, member)| fit(member, requirements) == Fit::Supported)
         .filter_map(|(order, member)| {
             let load = loads.get(&member.name)?;
             (load.reachable && load.active < member.slots).then_some((order, *member, load.active))

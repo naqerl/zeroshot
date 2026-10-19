@@ -51,9 +51,31 @@ pub(crate) struct Member {
     pub priority: i32,
     pub state: MemberState,
     pub added_at_ms: u64,
+    /// Discovery capability kinds last advertised by the target; `None` until first discovered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_error: Option<String>,
 }
 
 impl Member {
+    /// An active, untagged, single-slot member; callers set tags, slots, and priority.
+    pub(crate) const fn new(name: String, now_ms: u64) -> Self {
+        Self {
+            name,
+            tags: Vec::new(),
+            slots: 1,
+            priority: 0,
+            state: MemberState::Active,
+            added_at_ms: now_ms,
+            capabilities: None,
+            capabilities_at_ms: None,
+            capability_error: None,
+        }
+    }
+
     pub(crate) fn view(&self) -> Value {
         json!({
             "name": self.name,
@@ -62,8 +84,26 @@ impl Member {
             "priority": self.priority,
             "state": self.state,
             "addedAt": rfc3339(self.added_at_ms),
+            "capabilities": self.capabilities,
+            "capabilitiesAt": self.capabilities_at_ms.map(rfc3339),
+            "capabilityError": self.capability_error,
         })
     }
+}
+
+/// What a job needs from the member that runs it, resolved once at acceptance.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct Requirements {
+    /// Discovery capability kinds a named target must advertise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    /// Why the local controller cannot run this job, if it cannot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_unsupported: Option<String>,
+    /// Why named targets cannot run this job, if they cannot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_unsupported: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -156,6 +196,8 @@ pub(crate) struct Job {
     pub pinned_revision: Option<String>,
     pub placement: PlacementSpec,
     #[serde(default)]
+    pub requirements: Requirements,
+    #[serde(default)]
     pub priority: i32,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
@@ -186,6 +228,9 @@ pub(crate) struct Job {
     pub token_usage: Option<TokenUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Recurring schedule that created this job, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_id: Option<String>,
 }
 
 impl Job {
@@ -220,6 +265,8 @@ impl Job {
             "target": self.target,
             "runId": self.run_id,
             "placement": self.placement,
+            "requirements": self.requirements,
+            "scheduleId": self.schedule_id,
             "priority": self.priority,
             "labels": self.labels,
             "project": self.project,

@@ -7,8 +7,11 @@ use serde_json::Value;
 use tokio::process::Command;
 use zeroshot_engine::native_v2_cli::{ERROR_FORMAT_ENV, JSON_ERROR_FORMAT};
 
+use openengine_cluster_protocol::TARGET_DISCOVERY_PATH;
+
 use super::error::HubError;
 use super::model::{Job, LOCAL_MEMBER};
+use crate::native_v2_target::{FileTargetRegistry, TargetRegistry};
 
 /// One placement attempt of a job on a member.
 pub(crate) struct SubmitRequest<'a> {
@@ -26,6 +29,8 @@ pub(crate) trait HubDriver: Send + Sync {
     async fn submit(&self, request: SubmitRequest<'_>) -> Result<String, HubError>;
     /// `zeroshot status` of one run.
     async fn status(&self, member: &str, run_id: &str) -> Result<Value, HubError>;
+    /// Capability kinds advertised by a named target's discovery document.
+    async fn capabilities(&self, member: &str) -> Result<Vec<String>, HubError>;
 }
 
 /// Delegates to this executable (or `ZEROSHOT_HUB_EXECUTABLE`) in a child process, so every hub
@@ -33,13 +38,24 @@ pub(crate) trait HubDriver: Send + Sync {
 pub(crate) struct ProcessDriver {
     executable: PathBuf,
     timeout: Duration,
+    registry: FileTargetRegistry,
+    client: reqwest::Client,
 }
 
 impl ProcessDriver {
-    pub(crate) fn production() -> Result<Self, HubError> {
+    pub(crate) fn production(registry_path: PathBuf) -> Result<Self, HubError> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(concat!("zeroshot-hub/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|error| HubError::storage("HTTP client could not be initialized", error))?;
         Ok(Self {
             executable: hub_executable()?,
             timeout: Duration::from_secs(60),
+            registry: FileTargetRegistry::new(registry_path),
+            client,
         })
     }
 
@@ -140,6 +156,53 @@ impl HubDriver for ProcessDriver {
         last_json(&stdout)
             .ok_or_else(|| target_error("zeroshot status returned no JSON".to_owned(), None))
     }
+
+    async fn capabilities(&self, member: &str) -> Result<Vec<String>, HubError> {
+        let record = self
+            .registry
+            .get(member)
+            .map_err(|error| target_error(format!("{member}: {error}"), None))?;
+        let url = format!(
+            "{}{TARGET_DISCOVERY_PATH}",
+            record.origin.trim_end_matches('/')
+        );
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|error| target_error(format!("discovery {url} failed: {error}"), None))?;
+        if !response.status().is_success() {
+            return Err(target_error(
+                format!(
+                    "discovery {url} returned HTTP {}",
+                    response.status().as_u16()
+                ),
+                None,
+            ));
+        }
+        let document = response
+            .json::<Value>()
+            .await
+            .map_err(|error| target_error(format!("discovery {url} is not JSON: {error}"), None))?;
+        Ok(discovery_capabilities(&document))
+    }
+}
+
+/// Every advertised `kind`: the document kind and each extension marker's kind.
+pub(crate) fn discovery_capabilities(document: &Value) -> Vec<String> {
+    let mut kinds = document
+        .get("extensions")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|extensions| extensions.values())
+        .chain(std::iter::once(document))
+        .filter_map(|value| value.get("kind").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    kinds.sort();
+    kinds.dedup();
+    kinds
 }
 
 /// `--target NAME` for named members; nothing for the local controller.

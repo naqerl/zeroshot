@@ -36,7 +36,7 @@ use clock::{now_ms, parse_duration_ms, parse_future_ms, parse_past_ms};
 use driver::{HubDriver, ProcessDriver, passthrough, route};
 pub(crate) use error::HubError;
 use model::{HubState, Job, JobState, LOCAL_MEMBER, Member, MemberState};
-use placement::{Placement, describe, matching_members, place};
+use placement::{Fit, Placement, describe, fit, matching_members, place, rejections};
 use store::HubStore;
 
 const WAIT_POLL: Duration = Duration::from_secs(5);
@@ -57,11 +57,11 @@ pub(crate) async fn execute_hub(
         .map_err(|error| HubError::storage("target registry path is unavailable", error))?;
     let context = HubContext {
         store: HubStore::new(HubStore::default_directory(&registry_path)),
-        driver: Box::new(ProcessDriver::production()?),
+        driver: Box::new(ProcessDriver::production(registry_path.clone())?),
         registry: FileTargetRegistry::new(registry_path),
     };
     match command {
-        HubCommand::Add(request) => add(&context, request, output).map(|()| 0),
+        HubCommand::Add(request) => add(&context, request, output).await.map(|()| 0),
         HubCommand::Update(request) => update(&context, request, output).map(|()| 0),
         HubCommand::Remove { name } => remove(&context, &name, output).map(|()| 0),
         HubCommand::List { tags, probe } => list(&context, &tags, probe, output).await.map(|()| 0),
@@ -96,7 +96,7 @@ fn job_document(job: &Job, now: u64) -> Value {
     json!({ "schema": "zeroshot.hub.job/v1", "job": job.view(now) })
 }
 
-fn add(
+async fn add(
     context: &HubContext,
     request: HubMemberAdd,
     output: &mut impl Write,
@@ -109,22 +109,27 @@ fn add(
             ))
         })?;
     }
-    let lock = context.store.lock()?;
-    let mut state = context.store.load(&lock)?;
-    if state.member(&request.name).is_some() {
-        return Err(HubError::Conflict(format!(
-            "{} is already a hub member; use `zeroshot hub update`",
-            request.name
-        )));
-    }
-    let member = Member {
-        name: request.name,
+    let mut member = Member {
         tags: request.tags,
         slots: request.slots,
         priority: request.priority,
-        state: MemberState::Active,
-        added_at_ms: now_ms(),
+        ..Member::new(request.name, now_ms())
     };
+    schedule::discover(
+        std::slice::from_mut(&mut member),
+        context.driver.as_ref(),
+        now_ms(),
+        0,
+    )
+    .await;
+    let lock = context.store.lock()?;
+    let mut state = context.store.load(&lock)?;
+    if state.member(&member.name).is_some() {
+        return Err(HubError::Conflict(format!(
+            "{} is already a hub member; use `zeroshot hub update`",
+            member.name
+        )));
+    }
     state.members.push(member.clone());
     context.store.save(&lock, &state)?;
     write_json(output, &member_document(&member))
@@ -204,7 +209,12 @@ async fn list(
 ) -> Result<(), HubError> {
     let state = {
         let lock = context.store.lock()?;
-        context.store.load(&lock)?
+        let mut state = context.store.load(&lock)?;
+        if probe {
+            schedule::discover(&mut state.members, context.driver.as_ref(), now_ms(), 0).await;
+            context.store.save(&lock, &state)?;
+        }
+        state
     };
     let members = state
         .members
@@ -231,8 +241,21 @@ async fn list(
             view["origin"] = origin;
             view["hubRunning"] = json!(count_jobs(&state, |job| job.state == JobState::Running
                 && job.target.as_deref() == Some(member.name.as_str())));
-            view["queuedMatching"] = json!(count_jobs(&state, |job| job.state == JobState::Queued
-                && matching_members(std::slice::from_ref(member), &job.placement).len() == 1));
+            let queued = state.jobs.iter().filter(|job| {
+                job.state == JobState::Queued
+                    && matching_members(std::slice::from_ref(member), &job.placement).len() == 1
+            });
+            let (mut matching, mut rejects) = (0, Vec::new());
+            for job in queued {
+                match fit(member, &job.requirements) {
+                    Fit::Unsupported(reason) => {
+                        rejects.push(json!({ "jobId": job.job_id, "reason": reason }));
+                    }
+                    Fit::Supported | Fit::Unknown => matching += 1,
+                }
+            }
+            view["queuedMatching"] = json!(matching);
+            view["rejects"] = json!(rejects);
             if let Some(load) = loads.as_ref().and_then(|loads| loads.get(&member.name)) {
                 view["health"] = json!(if load.reachable {
                     "ready"
@@ -285,10 +308,18 @@ async fn submit(
             write_json(output, &job_document(existing, now_ms()))?;
             return Ok(0);
         }
-        if matching_members(&state.members, &job.placement).is_empty() {
-            return Err(HubError::NoEligibleTarget(describe(&job.placement)));
-        }
         let now = now_ms();
+        schedule::discover(
+            &mut state.members,
+            context.driver.as_ref(),
+            now,
+            schedule::CAPABILITY_TTL_MS,
+        )
+        .await;
+        if let Some(rejected) = rejections(&state.members, &job.placement, &job.requirements) {
+            context.store.save(&lock, &state)?;
+            return Err(HubError::no_eligible(describe(&job.placement), rejected));
+        }
         let report = schedule::tick(&mut state, context.driver.as_ref(), now).await;
         let loads = match report.loads {
             Some(loads) => loads,
@@ -297,7 +328,7 @@ async fn submit(
                 schedule::probe(&members, &state.jobs, context.driver.as_ref()).await
             }
         };
-        match place(&state.members, &job.placement, &loads) {
+        match place(&state.members, &job.placement, &job.requirements, &loads) {
             Placement::Place(member) => {
                 let placed =
                     schedule::dispatch(&mut job, &member, context.driver.as_ref(), now).await;
@@ -311,9 +342,9 @@ async fn submit(
                 }
                 return follow(&job).await;
             }
-            Placement::NoEligible => {
+            Placement::NoEligible { rejected } => {
                 context.store.save(&lock, &state)?;
-                return Err(HubError::NoEligibleTarget(describe(&job.placement)));
+                return Err(HubError::no_eligible(describe(&job.placement), rejected));
             }
             Placement::Busy { .. } if request.queue => {
                 state.jobs.push(job.clone());
@@ -371,8 +402,8 @@ async fn enqueue(
     if let Some(existing) = idempotent(&state, &job) {
         return write_json(output, &job_document(existing, now));
     }
-    if matching_members(&state.members, &job.placement).is_empty() {
-        return Err(HubError::NoEligibleTarget(describe(&job.placement)));
+    if let Some(rejected) = rejections(&state.members, &job.placement, &job.requirements) {
+        return Err(HubError::no_eligible(describe(&job.placement), rejected));
     }
     let job_id = job.job_id.clone();
     state.jobs.push(job);

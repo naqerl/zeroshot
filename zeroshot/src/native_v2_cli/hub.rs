@@ -80,7 +80,11 @@ pub struct HubJobSpec {
     /// Runtime files used to attribute token usage to a model.
     pub runtime_files: Vec<PathBuf>,
     pub repository: Option<String>,
+    pub branch: Option<String>,
     pub revision: Option<String>,
+    pub source_connection: Option<String>,
+    /// An `--environment` file was given; local runs reject environment hooks.
+    pub environment: bool,
     pub cwd: Option<PathBuf>,
     pub submission_key: Option<String>,
 }

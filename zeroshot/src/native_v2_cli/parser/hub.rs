@@ -15,14 +15,19 @@ job is one ordinary run on exactly one target, so `zeroshot status RUN_ID --targ
 working.
 
 Placement: --target pins one member; each --tag must match (AND). Members must be active, and
-a probe must reach them. Free members (active runs < slots) are ranked by --strategy. Hub
-documents carry a `schema` field.
+a probe must reach them. Members must also support the run: --repository, --branch, --revision,
+and --environment hooks exclude `local`; named targets need a pushed revision, and generic Git
+transport or per-node runtime lanes need the matching discovery marker
+(openengine.git-transport/v1, openengine.node-runtime-lanes/v1). `hub list` shows each member's
+discovered capabilities and the queued jobs it rejects. Free members (active runs < slots) are
+ranked by --strategy. Hub documents carry a `schema` field.
 
 EXIT CODES
   0  success
   1  error (ZEROSHOT_ERROR_FORMAT=json writes a zeroshot.error/v1 diagnostic)
   3  no capacity: matching members are busy or unreachable, or --wait timed out (retryable)
-  4  no eligible target: no active member matches the placement (not retryable)
+  4  no eligible target: no active member matches the placement, or none supports the run
+     (not retryable; details.rejected lists each member's reason)
 
 EXAMPLES
   zeroshot hub add box-1 --tag gpu --slots 2
@@ -468,7 +473,10 @@ fn job_spec(run: RunArgs, placement: HubPlacementArgs) -> Result<HubJobSpec, Nat
         labels: labels(placement.label)?,
         runtime_files,
         repository: run.repository.clone(),
+        branch: run.branch.clone(),
         revision: run.revision.clone(),
+        source_connection: run.source_connection.clone(),
+        environment: run.environment.is_some(),
         cwd: run.cwd.clone(),
         submission_key: run.submission_key.clone(),
     })

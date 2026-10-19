@@ -2,11 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use openengine_cluster_protocol::{GIT_TRANSPORT_KIND, NODE_RUNTIME_LANES_KIND};
 use serde_json::Value;
 use zeroshot_engine::native_v2_cli::hub::HubJobSpec;
 
 use super::error::HubError;
-use super::model::{Job, JobState, PlacementSpec};
+use super::model::{Job, JobState, PlacementSpec, Requirements};
 
 /// Build a queued job from parsed arguments, resolving everything that must not change between
 /// acceptance and placement: the invoking folder, the source revision, and attribution.
@@ -42,6 +43,19 @@ pub(crate) fn new_job(spec: &HubJobSpec, now_ms: u64) -> Result<Job, HubError> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    let lanes = spec
+        .runtime_files
+        .iter()
+        .any(|path| runtime_has_lanes(&invoking.join(path)));
+    let unpushed = pinned_revision
+        .as_deref()
+        .filter(|revision| !on_remote_branch(&workdir, revision));
+    let source = SourceFacts {
+        pinned_revision: pinned_revision.as_deref(),
+        unpushed,
+        lanes,
+    };
+    let requirements = requirements(spec, &source);
     Ok(Job {
         job_id: format!("hj_{}", uuid::Uuid::now_v7().simple()),
         state: JobState::Queued,
@@ -54,6 +68,7 @@ pub(crate) fn new_job(spec: &HubJobSpec, now_ms: u64) -> Result<Job, HubError> {
             tags: spec.tags.clone(),
             strategy: spec.strategy.into(),
         },
+        requirements,
         priority: 0,
         labels,
         project,
@@ -70,7 +85,83 @@ pub(crate) fn new_job(spec: &HubJobSpec, now_ms: u64) -> Result<Job, HubError> {
         failure_reason: None,
         token_usage: None,
         error: None,
+        schedule_id: None,
     })
+}
+
+/// Source and runtime facts resolved from the invoking folder.
+pub(crate) struct SourceFacts<'a> {
+    /// `HEAD` of the working folder when no explicit source was given.
+    pub pinned_revision: Option<&'a str>,
+    /// The pinned revision when no remote-tracking branch contains it.
+    pub unpushed: Option<&'a str>,
+    /// A runtime file binds an agent to a non-default lane.
+    pub lanes: bool,
+}
+
+/// Placement requirements, mirroring what `zeroshot run` and target admission enforce:
+/// explicit sources and hooks need a named target, named targets need a pushed revision, and
+/// generic Git transport or per-node lanes need the matching discovery marker.
+pub(crate) fn requirements(spec: &HubJobSpec, source: &SourceFacts<'_>) -> Requirements {
+    let explicit_source =
+        spec.repository.is_some() || spec.branch.is_some() || spec.revision.is_some();
+    let local_unsupported = if explicit_source {
+        Some("--repository, --branch, and --revision need a named target".to_owned())
+    } else if spec.environment {
+        Some("local runs reject --environment hooks".to_owned())
+    } else {
+        None
+    };
+    let remote_unsupported = if explicit_source {
+        None
+    } else if let Some(revision) = source.unpushed {
+        Some(format!(
+            "HEAD {} is on no remote-tracking branch; push it for named targets",
+            &revision[..revision.len().min(12)]
+        ))
+    } else if source.pinned_revision.is_none() {
+        Some("the working folder has no committed Git revision; named targets need one".to_owned())
+    } else {
+        None
+    };
+    let generic_repository = spec
+        .repository
+        .as_deref()
+        .is_some_and(|repository| repository.contains(':') || repository.starts_with('/'));
+    let sha256 = spec
+        .revision
+        .as_deref()
+        .or(source.pinned_revision)
+        .is_some_and(|revision| revision.len() == 64);
+    let mut capabilities = Vec::new();
+    if spec.source_connection.is_some() || generic_repository || sha256 {
+        capabilities.push(GIT_TRANSPORT_KIND.to_owned());
+    }
+    if source.lanes {
+        capabilities.push(NODE_RUNTIME_LANES_KIND.to_owned());
+    }
+    Requirements {
+        capabilities,
+        local_unsupported,
+        remote_unsupported,
+    }
+}
+
+fn on_remote_branch(workdir: &PathBuf, revision: &str) -> bool {
+    git(workdir, &["branch", "--remotes", "--contains", revision]).is_some()
+}
+
+/// True when a runtime file binds any node to an explicit `lane`.
+pub(crate) fn runtime_has_lanes(path: &Path) -> bool {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|document| document.get("nodes").and_then(Value::as_object).cloned())
+        .is_some_and(|nodes| {
+            nodes
+                .values()
+                .any(|node| node.get("lane").is_some_and(|lane| !lane.is_null()))
+        })
 }
 
 fn git(workdir: &PathBuf, arguments: &[&str]) -> Option<String> {

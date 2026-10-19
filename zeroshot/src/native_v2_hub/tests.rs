@@ -8,23 +8,26 @@ use super::clock::{parse_duration_ms, parse_future_ms, parse_past_ms, rfc3339, u
 use super::driver::{HubDriver, SubmitRequest};
 use super::error::{EXIT_NO_CAPACITY, EXIT_NO_ELIGIBLE_TARGET, HubError};
 use super::jobs::{repository_name, runtime_models};
-use super::model::{HubState, Job, JobState, Member, MemberState, PlacementSpec, Strategy, TokenUsage};
+use super::model::{
+    HubState, Job, JobState, Member, MemberState, PlacementSpec, Requirements, Strategy, TokenUsage,
+};
 use super::placement::{Load, Placement, describe, place};
 use super::schedule::{active_runs, apply_status, due_jobs, expire, tick};
 use super::stats::{Dimension, ModelPrice, StatsQuery, aggregate, percentiles};
 
-fn member(name: &str, tags: &[&str], slots: u32, priority: i32) -> Member {
+#[path = "tests/capabilities.rs"]
+mod capabilities;
+
+pub(super) fn member(name: &str, tags: &[&str], slots: u32, priority: i32) -> Member {
     Member {
-        name: name.to_owned(),
         tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
         slots,
         priority,
-        state: MemberState::Active,
-        added_at_ms: 1,
+        ..Member::new(name.to_owned(), 1)
     }
 }
 
-fn job(id: &str, submitted_at_ms: u64) -> Job {
+pub(super) fn job(id: &str, submitted_at_ms: u64) -> Job {
     Job {
         job_id: id.to_owned(),
         state: JobState::Queued,
@@ -33,6 +36,7 @@ fn job(id: &str, submitted_at_ms: u64) -> Job {
         cwd: std::path::PathBuf::from("/"),
         pinned_revision: None,
         placement: PlacementSpec::default(),
+        requirements: Requirements::default(),
         priority: 0,
         labels: BTreeMap::new(),
         project: None,
@@ -49,10 +53,11 @@ fn job(id: &str, submitted_at_ms: u64) -> Job {
         failure_reason: None,
         token_usage: None,
         error: None,
+        schedule_id: None,
     }
 }
 
-fn spec(target: Option<&str>, tags: &[&str], strategy: Strategy) -> PlacementSpec {
+pub(super) fn spec(target: Option<&str>, tags: &[&str], strategy: Strategy) -> PlacementSpec {
     PlacementSpec {
         target: target.map(str::to_owned),
         tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
@@ -60,7 +65,7 @@ fn spec(target: Option<&str>, tags: &[&str], strategy: Strategy) -> PlacementSpe
     }
 }
 
-fn loads(entries: &[(&str, bool, u32)]) -> BTreeMap<String, Load> {
+pub(super) fn loads(entries: &[(&str, bool, u32)]) -> BTreeMap<String, Load> {
     entries
         .iter()
         .map(|(name, reachable, active)| {
@@ -86,12 +91,12 @@ fn first_free_prefers_priority_then_registration_order() {
     let all_free = loads(&[("a", true, 0), ("b", true, 0), ("c", true, 0)]);
     let request = spec(None, &["linux"], Strategy::FirstFree);
     assert_eq!(
-        place(&members, &request, &all_free),
+        place(&members, &request, &Requirements::default(), &all_free),
         Placement::Place("b".to_owned())
     );
     let b_busy = loads(&[("a", true, 0), ("b", true, 1), ("c", true, 0)]);
     assert_eq!(
-        place(&members, &request, &b_busy),
+        place(&members, &request, &Requirements::default(), &b_busy),
         Placement::Place("c".to_owned())
     );
 }
@@ -103,13 +108,13 @@ fn least_loaded_compares_active_to_slots_ratio() {
     // a: 3/4 busy, b: 1/2 busy, so b is less loaded despite lower priority.
     let observed = loads(&[("a", true, 3), ("b", true, 1)]);
     assert_eq!(
-        place(&members, &request, &observed),
+        place(&members, &request, &Requirements::default(), &observed),
         Placement::Place("b".to_owned())
     );
     // Equal ratios fall back to priority.
     let equal = loads(&[("a", true, 2), ("b", true, 1)]);
     assert_eq!(
-        place(&members, &request, &equal),
+        place(&members, &request, &Requirements::default(), &equal),
         Placement::Place("a".to_owned())
     );
 }
@@ -125,13 +130,23 @@ fn placement_distinguishes_busy_from_no_eligible_member() {
     ];
     let gpu = spec(None, &["gpu"], Strategy::FirstFree);
     assert_eq!(
-        place(&members, &gpu, &loads(&[("a", true, 1), ("d", true, 0)])),
+        place(
+            &members,
+            &gpu,
+            &Requirements::default(),
+            &loads(&[("a", true, 1), ("d", true, 0)])
+        ),
         Placement::Busy {
             matching: vec!["a".to_owned()]
         }
     );
     assert_eq!(
-        place(&members, &gpu, &loads(&[("a", false, 0)])),
+        place(
+            &members,
+            &gpu,
+            &Requirements::default(),
+            &loads(&[("a", false, 0)])
+        ),
         Placement::Busy {
             matching: vec!["a".to_owned()]
         },
@@ -139,13 +154,22 @@ fn placement_distinguishes_busy_from_no_eligible_member() {
     );
     let tpu = spec(None, &["tpu"], Strategy::FirstFree);
     assert_eq!(
-        place(&members, &tpu, &BTreeMap::new()),
-        Placement::NoEligible
+        place(&members, &tpu, &Requirements::default(), &BTreeMap::new()),
+        Placement::NoEligible {
+            rejected: Vec::new()
+        }
     );
     let pinned = spec(Some("b"), &["gpu"], Strategy::FirstFree);
     assert_eq!(
-        place(&members, &pinned, &BTreeMap::new()),
-        Placement::NoEligible
+        place(
+            &members,
+            &pinned,
+            &Requirements::default(),
+            &BTreeMap::new()
+        ),
+        Placement::NoEligible {
+            rejected: Vec::new()
+        }
     );
     assert_eq!(describe(&pinned), "target b and tags [gpu]");
     assert_eq!(describe(&PlacementSpec::default()), "any member");
@@ -227,11 +251,13 @@ fn active_runs_count_nonterminal_phases() {
 
 /// In-memory targets: each member has slots of fake runs that finish when told to.
 #[derive(Default)]
-struct FakeDriver {
-    runs: Mutex<BTreeMap<String, Vec<(String, &'static str)>>>,
-    unreachable: Vec<String>,
-    rejecting: Vec<String>,
-    submissions: Mutex<Vec<(String, String)>>,
+pub(super) struct FakeDriver {
+    pub runs: Mutex<BTreeMap<String, Vec<(String, &'static str)>>>,
+    pub unreachable: Vec<String>,
+    pub rejecting: Vec<String>,
+    pub submissions: Mutex<Vec<(String, String)>>,
+    /// Advertised discovery kinds per member; absent members fail discovery.
+    pub capabilities: BTreeMap<String, Vec<String>>,
 }
 
 impl FakeDriver {
@@ -297,6 +323,16 @@ impl HubDriver for FakeDriver {
         } else {
             json!({"status": {"phase": "running", "activeExecutions": []}})
         })
+    }
+
+    async fn capabilities(&self, member: &str) -> Result<Vec<String>, HubError> {
+        self.capabilities
+            .get(member)
+            .cloned()
+            .ok_or_else(|| HubError::Target {
+                message: format!("{member} discovery failed"),
+                diagnostic: None,
+            })
     }
 }
 
@@ -530,7 +566,7 @@ fn job_attribution_helpers() {
 fn placement_errors_have_distinct_exit_codes_and_json_codes() {
     let no_capacity = HubError::NoCapacity("any member".to_owned());
     let timeout = HubError::WaitTimeout("any member".to_owned());
-    let ineligible = HubError::NoEligibleTarget("tags [gpu]".to_owned());
+    let ineligible = HubError::no_eligible("tags [gpu]".to_owned(), Vec::new());
     assert_eq!(no_capacity.exit_code(), EXIT_NO_CAPACITY);
     assert_eq!(timeout.exit_code(), EXIT_NO_CAPACITY);
     assert_eq!(ineligible.exit_code(), EXIT_NO_ELIGIBLE_TARGET);

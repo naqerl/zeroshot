@@ -6,10 +6,12 @@ use serde_json::{Value, json};
 
 use super::driver::{HubDriver, SubmitRequest};
 use super::error::HubError;
-use super::model::{HubState, Job, JobState, Member, MemberState, TokenUsage};
+use super::model::{HubState, Job, JobState, LOCAL_MEMBER, Member, MemberState, TokenUsage};
 use super::placement::{Load, Placement, place};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Discovered capabilities are refreshed after this age by placement passes.
+pub(crate) const CAPABILITY_TTL_MS: u64 = 5 * 60 * 1000;
 
 /// Outcome of one dispatcher pass.
 #[derive(Debug, Default)]
@@ -103,6 +105,44 @@ pub(crate) async fn probe(
         }
     }
     loads
+}
+
+/// Refresh discovery capabilities of named, non-disabled members older than `max_age_ms`.
+/// A failed discovery keeps the last known capabilities and records the error.
+pub(crate) async fn discover(
+    members: &mut [Member],
+    driver: &dyn HubDriver,
+    now_ms: u64,
+    max_age_ms: u64,
+) {
+    let stale = members
+        .iter()
+        .enumerate()
+        .filter(|(_, member)| member.name != LOCAL_MEMBER && member.state != MemberState::Disabled)
+        .filter(|(_, member)| {
+            member
+                .capabilities_at_ms
+                .is_none_or(|at| now_ms.saturating_sub(at) >= max_age_ms)
+        })
+        .map(|(index, member)| (index, member.name.clone()))
+        .collect::<Vec<_>>();
+    let results = join_all(stale.into_iter().map(|(index, name)| async move {
+        let result = tokio::time::timeout(PROBE_TIMEOUT, driver.capabilities(&name)).await;
+        (index, result)
+    }))
+    .await;
+    for (index, result) in results {
+        let member = &mut members[index];
+        match result {
+            Ok(Ok(capabilities)) => {
+                member.capabilities = Some(capabilities);
+                member.capabilities_at_ms = Some(now_ms);
+                member.capability_error = None;
+            }
+            Ok(Err(error)) => member.capability_error = Some(error.to_string()),
+            Err(_) => member.capability_error = Some("discovery timed out".to_owned()),
+        }
+    }
 }
 
 /// Place one job on `member`. A failed submission marks the job failed and returns the error.
@@ -243,6 +283,7 @@ pub(crate) async fn tick(state: &mut HubState, driver: &dyn HubDriver, now_ms: u
     if due.is_empty() {
         return report;
     }
+    discover(&mut state.members, driver, now_ms, CAPABILITY_TTL_MS).await;
     let active = state
         .members
         .iter()
@@ -250,7 +291,9 @@ pub(crate) async fn tick(state: &mut HubState, driver: &dyn HubDriver, now_ms: u
         .collect::<Vec<_>>();
     let mut loads = probe(&active, &state.jobs, driver).await;
     for index in due {
-        let Placement::Place(member) = place(&state.members, &state.jobs[index].placement, &loads)
+        let job = &state.jobs[index];
+        let Placement::Place(member) =
+            place(&state.members, &job.placement, &job.requirements, &loads)
         else {
             continue;
         };
