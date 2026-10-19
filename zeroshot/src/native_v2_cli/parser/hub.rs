@@ -1,0 +1,577 @@
+use clap::{Args, Subcommand, ValueEnum};
+
+use super::RunArgs;
+use crate::native_v2_cli::NativeV2CliError;
+use crate::native_v2_cli::hub::{
+    HubCommand, HubEnqueue, HubJobSpec, HubLogs, HubMemberAdd, HubMemberState, HubMemberUpdate,
+    HubPs, HubStats, HubStrategy, HubSubmit,
+};
+
+#[derive(Debug, Subcommand)]
+#[command(after_long_help = r#"HUB
+A hub pools targets registered with `zeroshot target add`, plus the built-in `local` controller.
+It picks a target for each run and keeps queued and scheduled runs client-side. Every placed
+job is one ordinary run on exactly one target, so `zeroshot status RUN_ID --target NAME` keeps
+working.
+
+Placement: --target pins one member; each --tag must match (AND). Members must be active, and
+a probe must reach them. Free members (active runs < slots) are ranked by --strategy. Hub
+documents carry a `schema` field.
+
+EXIT CODES
+  0  success
+  1  error (ZEROSHOT_ERROR_FORMAT=json writes a zeroshot.error/v1 diagnostic)
+  3  no capacity: matching members are busy or unreachable, or --wait timed out (retryable)
+  4  no eligible target: no active member matches the placement (not retryable)
+
+EXAMPLES
+  zeroshot hub add box-1 --tag gpu --slots 2
+  zeroshot hub list
+  zeroshot hub submit --tag gpu --title Fix --template single-worker --input in.json -d
+  zeroshot hub enqueue --at +2h --priority 5 --title Nightly --profile nightly --input in.json
+  zeroshot hub ps
+  zeroshot hub stats --by target --by model --since 7d"#)]
+pub(super) enum HubCliCommand {
+    /// Add a registered target, or `local`, to the hub.
+    Add(HubAddArgs),
+
+    /// Change a member's tags, slots, priority, or placement state.
+    Update(HubUpdateArgs),
+
+    /// Remove a member from the hub. Its target registration is unchanged.
+    #[command(visible_alias = "rm")]
+    Remove(HubNameArgs),
+
+    /// List members with health and load as JSON.
+    #[command(visible_alias = "ls")]
+    List(HubListArgs),
+
+    /// Place a run on a free member now.
+    ///
+    /// Fails with exit code 3 when every matching member is busy, unless --wait or --queue is
+    /// given. Without --detach, follows the placed run's events as NDJSON.
+    Submit(Box<HubSubmitArgs>),
+
+    /// Accept a run into the hub queue for later placement.
+    ///
+    /// Due jobs are placed by `zeroshot hub dispatch`, and opportunistically by every submit
+    /// and enqueue.
+    Enqueue(Box<HubEnqueueArgs>),
+
+    /// List hub jobs as JSON.
+    #[command(name = "ps")]
+    Ps(HubPsArgs),
+
+    /// Read one hub job with its run status as JSON.
+    Status(HubJobArgs),
+
+    /// Follow a placed job's run events as NDJSON.
+    Watch(HubWatchArgs),
+
+    /// Follow a placed job's run logs as NDJSON.
+    Logs(HubLogsArgs),
+
+    /// Attach to an execution of a placed job as NDJSON.
+    Attach(HubAttachArgs),
+
+    /// Force a placed job's run to stop.
+    ForceStop(HubJobArgs),
+
+    /// Remove a queued or scheduled job before it is placed.
+    Dequeue(HubJobArgs),
+
+    /// Refresh running jobs, expire stale ones, and place due queued jobs.
+    ///
+    /// Writes one NDJSON tick summary per pass. --loop repeats until Ctrl-C.
+    Dispatch(HubDispatchArgs),
+
+    /// Aggregate job outcomes and provider-reported tokens as JSON.
+    ///
+    /// A job is attributed to one model only when its runtime files name exactly one model;
+    /// otherwise its model is `mixed` or `unknown`. Costs appear only with --prices.
+    Stats(HubStatsArgs),
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum HubStrategyArg {
+    /// Highest member priority, then registration order.
+    FirstFree,
+    /// Lowest active-runs-to-slots ratio.
+    LeastLoaded,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum HubStateArg {
+    Active,
+    Drain,
+    Disabled,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubNameArgs {
+    /// Member name: a registered target name or `local`.
+    #[arg(value_name = "NAME")]
+    name: String,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubAddArgs {
+    /// Registered target name, or `local` for the local controller.
+    #[arg(value_name = "NAME")]
+    name: String,
+
+    /// Placement tag, such as gpu or project=citydiff. Repeat for several.
+    #[arg(long, value_name = "TAG", action = clap::ArgAction::Append)]
+    tag: Vec<String>,
+
+    /// Concurrent runs the hub places on this member.
+    #[arg(long, value_name = "N", default_value_t = 1,
+          value_parser = clap::value_parser!(u32).range(1..=1024))]
+    slots: u32,
+
+    /// Higher priority members are preferred by first-free placement.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 0,
+        allow_negative_numbers = true
+    )]
+    priority: i32,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubUpdateArgs {
+    /// Member name.
+    #[arg(value_name = "NAME")]
+    name: String,
+
+    /// Add this tag. Repeat for several.
+    #[arg(long, value_name = "TAG", action = clap::ArgAction::Append)]
+    add_tag: Vec<String>,
+
+    /// Remove this tag. Repeat for several.
+    #[arg(long, value_name = "TAG", action = clap::ArgAction::Append)]
+    remove_tag: Vec<String>,
+
+    /// Concurrent runs the hub places on this member.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=1024))]
+    slots: Option<u32>,
+
+    /// Placement priority.
+    #[arg(long, value_name = "N", allow_negative_numbers = true)]
+    priority: Option<i32>,
+
+    /// active accepts placements; drain keeps running jobs but takes no new ones; disabled is ignored.
+    #[arg(long, value_enum, value_name = "STATE")]
+    state: Option<HubStateArg>,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubListArgs {
+    /// Only list members carrying this tag. Repeat for several.
+    #[arg(long, value_name = "TAG", action = clap::ArgAction::Append)]
+    tag: Vec<String>,
+
+    /// Report stored members without contacting targets.
+    #[arg(long)]
+    no_probe: bool,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubPlacementArgs {
+    /// Require this member tag. Repeat for several; all must match.
+    #[arg(long, value_name = "TAG", action = clap::ArgAction::Append)]
+    tag: Vec<String>,
+
+    /// Choice among free matching members.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "STRATEGY",
+        default_value = "first-free"
+    )]
+    strategy: HubStrategyArg,
+
+    /// Job label for ps filters and stats, such as task=parser. Repeat for several.
+    #[arg(long, value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
+    label: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    mut_arg("target", |arg| arg.help("Pin placement to this hub member")),
+    mut_arg("validate_only", |arg| arg.hide(true))
+)]
+pub(super) struct HubSubmitArgs {
+    #[command(flatten)]
+    placement: HubPlacementArgs,
+
+    /// Wait for a free member, optionally up to DURATION such as 10m.
+    #[arg(long, value_name = "DURATION", num_args = 0..=1, conflicts_with = "queue")]
+    wait: Option<Option<String>>,
+
+    /// Queue the job when every matching member is busy instead of failing.
+    #[arg(long)]
+    queue: bool,
+
+    #[command(flatten)]
+    run: RunArgs,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    mut_arg("target", |arg| arg.help("Pin placement to this hub member")),
+    mut_arg("validate_only", |arg| arg.hide(true)),
+    mut_arg("detach", |arg| arg.hide(true))
+)]
+pub(super) struct HubEnqueueArgs {
+    #[command(flatten)]
+    placement: HubPlacementArgs,
+
+    /// Not before this RFC 3339 time or relative +DURATION, such as +2h.
+    #[arg(long, value_name = "TIME")]
+    at: Option<String>,
+
+    /// Higher priority jobs are placed first.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 0,
+        allow_negative_numbers = true
+    )]
+    priority: i32,
+
+    /// Expire the job if it is still queued after DURATION or at an RFC 3339 time.
+    #[arg(long, value_name = "DURATION|TIME")]
+    expires: Option<String>,
+
+    #[command(flatten)]
+    run: RunArgs,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubPsArgs {
+    /// Job state filter: active (queued, scheduled, running), queued, scheduled, running,
+    /// succeeded, failed, dequeued, expired, or all.
+    #[arg(long, value_name = "STATE", default_value = "active")]
+    state: String,
+
+    /// Only jobs placed on this member.
+    #[arg(long, value_name = "NAME")]
+    target: Option<String>,
+
+    /// Only jobs carrying this label. Repeat for several.
+    #[arg(long, value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
+    label: Vec<String>,
+
+    /// Return at most this many of the newest matching jobs.
+    #[arg(long, value_name = "N")]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubJobArgs {
+    /// Hub job ID.
+    #[arg(value_name = "JOB_ID")]
+    job: String,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubWatchArgs {
+    /// Hub job ID.
+    #[arg(value_name = "JOB_ID")]
+    job: String,
+
+    /// Resume strictly after this durable cursor.
+    #[arg(long, value_name = "CURSOR")]
+    after: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubLogsArgs {
+    /// Hub job ID.
+    #[arg(value_name = "JOB_ID")]
+    job: String,
+
+    /// Resume strictly after this durable cursor.
+    #[arg(long, value_name = "CURSOR")]
+    after: Option<String>,
+
+    /// Return records only for this opaque execution selector.
+    #[arg(long, value_name = "EXECUTION_REF")]
+    execution: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubAttachArgs {
+    /// Hub job ID.
+    #[arg(value_name = "JOB_ID")]
+    job: String,
+
+    /// Execution reference emitted by the run.
+    #[arg(value_name = "EXECUTION_REF")]
+    execution: String,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubDispatchArgs {
+    /// Repeat until Ctrl-C.
+    #[arg(long = "loop")]
+    repeat: bool,
+
+    /// Pause between passes with --loop.
+    #[arg(long, value_name = "DURATION", default_value = "10s")]
+    interval: String,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubStatsArgs {
+    /// Group by target, model, project, day, or label:KEY. Repeat to combine.
+    #[arg(long, value_name = "DIMENSION", action = clap::ArgAction::Append)]
+    by: Vec<String>,
+
+    /// Only jobs submitted at or after this RFC 3339 time or DURATION ago, such as 7d.
+    #[arg(long, value_name = "TIME")]
+    since: Option<String>,
+
+    /// Only jobs submitted before this RFC 3339 time or DURATION ago.
+    #[arg(long, value_name = "TIME")]
+    until: Option<String>,
+
+    /// JSON price table: {"MODEL": {"input": USD, "output": USD, "cacheRead": USD,
+    /// "cacheCreation": USD}} per million tokens.
+    #[arg(long, value_name = "FILE")]
+    prices: Option<std::path::PathBuf>,
+}
+
+impl HubCliCommand {
+    pub(super) fn into_command(self) -> Result<HubCommand, NativeV2CliError> {
+        Ok(match self {
+            Self::Add(args) => HubCommand::Add(HubMemberAdd {
+                name: member_name(args.name)?,
+                tags: tags(args.tag)?,
+                slots: args.slots,
+                priority: args.priority,
+            }),
+            Self::Update(args) => HubCommand::Update(HubMemberUpdate {
+                name: member_name(args.name)?,
+                add_tags: tags(args.add_tag)?,
+                remove_tags: tags(args.remove_tag)?,
+                slots: args.slots,
+                priority: args.priority,
+                state: args.state.map(HubStateArg::into_state),
+            }),
+            Self::Remove(args) => HubCommand::Remove {
+                name: member_name(args.name)?,
+            },
+            Self::List(args) => HubCommand::List {
+                tags: tags(args.tag)?,
+                probe: !args.no_probe,
+            },
+            Self::Submit(args) => HubCommand::Submit(Box::new(args.into_submit()?)),
+            Self::Enqueue(args) => HubCommand::Enqueue(Box::new(args.into_enqueue()?)),
+            Self::Ps(args) => HubCommand::Ps(HubPs {
+                state: args.state,
+                target: args.target,
+                labels: labels(args.label)?,
+                limit: args.limit,
+            }),
+            Self::Status(args) => HubCommand::Status { job: args.job },
+            Self::Watch(args) => HubCommand::Watch {
+                job: args.job,
+                after: args.after,
+            },
+            Self::Logs(args) => HubCommand::Logs(HubLogs {
+                job: args.job,
+                after: args.after,
+                execution: args.execution,
+            }),
+            Self::Attach(args) => HubCommand::Attach {
+                job: args.job,
+                execution: args.execution,
+            },
+            Self::ForceStop(args) => HubCommand::ForceStop { job: args.job },
+            Self::Dequeue(args) => HubCommand::Dequeue { job: args.job },
+            Self::Dispatch(args) => HubCommand::Dispatch {
+                repeat: args.repeat,
+                interval: args.interval,
+            },
+            Self::Stats(args) => HubCommand::Stats(HubStats {
+                by: args.by,
+                since: args.since,
+                until: args.until,
+                prices: args.prices,
+            }),
+        })
+    }
+}
+
+impl HubStateArg {
+    const fn into_state(self) -> HubMemberState {
+        match self {
+            Self::Active => HubMemberState::Active,
+            Self::Drain => HubMemberState::Drain,
+            Self::Disabled => HubMemberState::Disabled,
+        }
+    }
+}
+
+impl HubSubmitArgs {
+    fn into_submit(self) -> Result<HubSubmit, NativeV2CliError> {
+        let detach = self.run.detach;
+        Ok(HubSubmit {
+            job: job_spec(self.run, self.placement)?,
+            detach,
+            wait: self.wait,
+            queue: self.queue,
+        })
+    }
+}
+
+impl HubEnqueueArgs {
+    fn into_enqueue(self) -> Result<HubEnqueue, NativeV2CliError> {
+        if self.run.detach {
+            return Err(usage(
+                "hub enqueue always returns after acceptance; omit --detach",
+            ));
+        }
+        Ok(HubEnqueue {
+            job: job_spec(self.run, self.placement)?,
+            at: self.at,
+            priority: self.priority,
+            expires: self.expires,
+        })
+    }
+}
+
+fn job_spec(run: RunArgs, placement: HubPlacementArgs) -> Result<HubJobSpec, NativeV2CliError> {
+    if run.validate_only {
+        return Err(usage(
+            "hub jobs cannot use --validate-only; validate with `zeroshot run --validate-only`",
+        ));
+    }
+    let target = run.target.clone().map(member_name).transpose()?;
+    let runtime_files = [&run.runtime_config, &run.uniform_runtime_config]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect();
+    Ok(HubJobSpec {
+        title: run.title.clone(),
+        run_args: run_arguments(&run)?,
+        target,
+        tags: tags(placement.tag)?,
+        strategy: match placement.strategy {
+            HubStrategyArg::FirstFree => HubStrategy::FirstFree,
+            HubStrategyArg::LeastLoaded => HubStrategy::LeastLoaded,
+        },
+        labels: labels(placement.label)?,
+        runtime_files,
+        repository: run.repository.clone(),
+        revision: run.revision.clone(),
+        cwd: run.cwd.clone(),
+        submission_key: run.submission_key.clone(),
+    })
+}
+
+/// Rebuild the `zeroshot run` arguments that do not depend on placement.
+fn run_arguments(run: &RunArgs) -> Result<Vec<String>, NativeV2CliError> {
+    let mut arguments = vec!["--title".to_owned(), run.title.clone()];
+    arguments.extend(path_argument("--input", Some(&run.input))?);
+    for (flag, path) in [
+        ("--graph", &run.graph),
+        ("--runtime-config", &run.runtime_config),
+        ("--uniform-runtime-config", &run.uniform_runtime_config),
+        ("--environment", &run.environment),
+        ("--cwd", &run.cwd),
+    ] {
+        arguments.extend(path_argument(flag, path.as_ref())?);
+    }
+    if let Some(template) = run
+        .template
+        .and_then(|template| template.to_possible_value())
+    {
+        arguments.extend(["--template".to_owned(), template.get_name().to_owned()]);
+    }
+    for (flag, value) in [
+        ("--profile", &run.profile),
+        ("--source-connection", &run.source_connection),
+        ("--repository", &run.repository),
+        ("--branch", &run.branch),
+        ("--revision", &run.revision),
+        ("--delivery", &run.delivery.delivery),
+    ] {
+        if let Some(value) = value {
+            arguments.extend([flag.to_owned(), value.clone()]);
+        }
+    }
+    for (flag, enabled) in [
+        ("--no-environment", run.no_environment),
+        ("--push", run.delivery.push),
+        ("--pr", run.delivery.pr),
+        ("--ship", run.delivery.ship),
+        ("--no-pr-feedback", run.delivery.no_pr_feedback),
+    ] {
+        if enabled {
+            arguments.push(flag.to_owned());
+        }
+    }
+    Ok(arguments)
+}
+
+fn path_argument(
+    flag: &str,
+    path: Option<&std::path::PathBuf>,
+) -> Result<Vec<String>, NativeV2CliError> {
+    let Some(path) = path else {
+        return Ok(Vec::new());
+    };
+    let text = path
+        .to_str()
+        .ok_or_else(|| usage(format!("{flag} must be valid UTF-8 for hub jobs")))?;
+    Ok(vec![flag.to_owned(), text.to_owned()])
+}
+
+fn member_name(name: String) -> Result<String, NativeV2CliError> {
+    if name.is_empty() || name.chars().count() > 256 || name.chars().any(char::is_control) {
+        return Err(usage(
+            "hub member name must be 1..=256 non-control characters",
+        ));
+    }
+    Ok(name)
+}
+
+fn tags(values: Vec<String>) -> Result<Vec<String>, NativeV2CliError> {
+    for value in &values {
+        if value.is_empty()
+            || value.len() > 128
+            || value
+                .chars()
+                .any(|character| character.is_whitespace() || character == ',')
+        {
+            return Err(usage(format!(
+                "invalid tag {value:?}: use 1-128 characters without whitespace or commas"
+            )));
+        }
+    }
+    let mut unique = values;
+    unique.sort();
+    unique.dedup();
+    Ok(unique)
+}
+
+fn labels(values: Vec<String>) -> Result<Vec<(String, String)>, NativeV2CliError> {
+    values
+        .into_iter()
+        .map(|value| match value.split_once('=') {
+            Some((key, label)) if !key.is_empty() && !key.contains(char::is_whitespace) => {
+                Ok((key.to_owned(), label.to_owned()))
+            }
+            _ => Err(usage(format!("invalid label {value:?}: use KEY=VALUE"))),
+        })
+        .collect()
+}
+
+fn usage(message: impl Into<String>) -> NativeV2CliError {
+    NativeV2CliError::Usage(message.into())
+}

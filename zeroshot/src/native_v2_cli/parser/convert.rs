@@ -68,6 +68,7 @@ impl CliCommand {
             Self::Profile { command } => command.into_command(),
             Self::Template { command } => command.into_command(),
             Self::Plan { command } => command.into_command(),
+            Self::Hub { command } => command.into_command().map(NativeV2CliCommand::Hub),
             Self::Run(args) => args.into_command(),
             Self::Utility(command) => command.into_command(),
         }

@@ -55,6 +55,9 @@ pub use diagnostic::{ERROR_FORMAT_ENV, JSON_ERROR_FORMAT, NativeV2CliDiagnostic}
 #[path = "native_v2_cli/parser.rs"]
 mod parser;
 
+#[path = "native_v2_cli/hub.rs"]
+pub mod hub;
+
 mod profiles;
 pub(crate) use profiles::LocalRunProfileStore;
 #[cfg(feature = "ui")]
@@ -344,6 +347,7 @@ pub enum NativeV2CliCommand {
     Resume(RunResumeCommand),
     Checkpoints(RunCheckpointsCommand),
     DiscardWorkspace(RunSelector),
+    Hub(hub::HubCommand),
 }
 
 impl NativeV2CliCommand {

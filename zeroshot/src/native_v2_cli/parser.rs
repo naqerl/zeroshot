@@ -81,6 +81,15 @@ enum CliCommand {
         command: PlanCommand,
     },
 
+    /// Pool named targets and place, queue, and account for runs across them.
+    ///
+    /// The hub is client-side. Members are targets registered with `zeroshot target add`, plus
+    /// `local`. Each placed job is an ordinary run on one target.
+    Hub {
+        #[command(subcommand)]
+        command: hub::HubCliCommand,
+    },
+
     /// Submit a graph run locally or to a named target.
     ///
     /// Local runs use --cwd or the invoking folder; Git worktrees use their root. Local Git delivery
@@ -707,6 +716,8 @@ struct AttachArgs {
 
 #[path = "parser/convert.rs"]
 mod convert;
+#[path = "parser/hub.rs"]
+mod hub;
 #[path = "parser/profiles.rs"]
 mod profiles;
 use profiles::{ProfileCommand, ProfileNameArgs, ProfileScopeArg};
