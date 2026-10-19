@@ -49,7 +49,7 @@ pub(crate) fn new_job(spec: &HubJobSpec, now_ms: u64) -> Result<Job, HubError> {
         .any(|path| runtime_has_lanes(&invoking.join(path)));
     let unpushed = pinned_revision
         .as_deref()
-        .filter(|revision| !on_remote_branch(&workdir, revision));
+        .filter(|revision| !on_remote_branch(workdir.as_path(), revision));
     let source = SourceFacts {
         pinned_revision: pinned_revision.as_deref(),
         unpushed,
@@ -114,15 +114,8 @@ pub(crate) fn requirements(spec: &HubJobSpec, source: &SourceFacts<'_>) -> Requi
     };
     let remote_unsupported = if explicit_source {
         None
-    } else if let Some(revision) = source.unpushed {
-        Some(format!(
-            "HEAD {} is on no remote-tracking branch; push it for named targets",
-            &revision[..revision.len().min(12)]
-        ))
-    } else if source.pinned_revision.is_none() {
-        Some("the working folder has no committed Git revision; named targets need one".to_owned())
     } else {
-        None
+        remote_reason(source)
     };
     let generic_repository = spec
         .repository
@@ -147,7 +140,40 @@ pub(crate) fn requirements(spec: &HubJobSpec, source: &SourceFacts<'_>) -> Requi
     }
 }
 
-fn on_remote_branch(workdir: &PathBuf, revision: &str) -> bool {
+/// Why named targets cannot run the working folder's source, if they cannot.
+pub(crate) fn remote_reason(source: &SourceFacts<'_>) -> Option<String> {
+    if let Some(revision) = source.unpushed {
+        Some(format!(
+            "HEAD {} is on no remote-tracking branch; push it for named targets",
+            &revision[..revision.len().min(12)]
+        ))
+    } else if source.pinned_revision.is_none() {
+        Some("the working folder has no committed Git revision; named targets need one".to_owned())
+    } else {
+        None
+    }
+}
+
+/// The folder's `HEAD`, and that revision again when no remote-tracking branch contains it.
+pub(crate) fn source_facts(folder: &Path) -> (Option<String>, Option<String>) {
+    let revision = git(folder, &["rev-parse", "HEAD"]);
+    let unpushed = revision
+        .clone()
+        .filter(|revision| !on_remote_branch(folder, revision));
+    (revision, unpushed)
+}
+
+/// The folder a job's source resolves from: `--cwd` joined to the invoking folder.
+pub(crate) fn working_folder(spec: &HubJobSpec) -> Result<PathBuf, HubError> {
+    let invoking = std::env::current_dir()
+        .map_err(|error| HubError::Usage(format!("the invoking folder is unavailable: {error}")))?;
+    Ok(spec
+        .cwd
+        .as_ref()
+        .map_or_else(|| invoking.clone(), |cwd| invoking.join(cwd)))
+}
+
+fn on_remote_branch(workdir: &Path, revision: &str) -> bool {
     git(workdir, &["branch", "--remotes", "--contains", revision]).is_some()
 }
 
@@ -164,7 +190,7 @@ pub(crate) fn runtime_has_lanes(path: &Path) -> bool {
         })
 }
 
-fn git(workdir: &PathBuf, arguments: &[&str]) -> Option<String> {
+fn git(workdir: &Path, arguments: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(workdir)

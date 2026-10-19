@@ -19,6 +19,7 @@ use crate::native_v2_target::{
 };
 
 mod clock;
+mod cron;
 mod driver;
 mod error;
 mod jobs;
@@ -35,7 +36,7 @@ mod tests;
 use clock::{now_ms, parse_duration_ms, parse_future_ms, parse_past_ms};
 use driver::{HubDriver, ProcessDriver, passthrough, route};
 pub(crate) use error::HubError;
-use model::{HubState, Job, JobState, LOCAL_MEMBER, Member, MemberState};
+use model::{HubState, Job, JobState, LOCAL_MEMBER, Member, MemberState, Schedule, ScheduleState};
 use placement::{Fit, Placement, describe, fit, matching_members, place, rejections};
 use store::HubStore;
 
@@ -66,7 +67,7 @@ pub(crate) async fn execute_hub(
         HubCommand::Remove { name } => remove(&context, &name, output).map(|()| 0),
         HubCommand::List { tags, probe } => list(&context, &tags, probe, output).await.map(|()| 0),
         HubCommand::Submit(request) => submit(&context, *request, output).await,
-        HubCommand::Enqueue(request) => enqueue(&context, *request, output).await.map(|()| 0),
+        HubCommand::Enqueue(request) => enqueue(&context, *request, output).map(|()| 0),
         HubCommand::Ps(request) => ps(&context, request, output).await.map(|()| 0),
         HubCommand::Status { job } => status(&context, &job, output).await.map(|()| 0),
         HubCommand::Dequeue { job } => dequeue(&context, &job, output).map(|()| 0),
@@ -379,11 +380,14 @@ async fn follow(job: &Job) -> Result<i32, HubError> {
     passthrough(arguments).await
 }
 
-async fn enqueue(
+fn enqueue(
     context: &HubContext,
     request: HubEnqueue,
     output: &mut impl Write,
 ) -> Result<(), HubError> {
+    if request.cron.is_some() {
+        return enqueue_schedule(context, request, output);
+    }
     let now = now_ms();
     let mut job = jobs::new_job(&request.job, now)?;
     job.priority = request.priority;
@@ -405,14 +409,85 @@ async fn enqueue(
     if let Some(rejected) = rejections(&state.members, &job.placement, &job.requirements) {
         return Err(HubError::no_eligible(describe(&job.placement), rejected));
     }
-    let job_id = job.job_id.clone();
+    let document = job_document(&job, now);
     state.jobs.push(job);
-    schedule::tick(&mut state, context.driver.as_ref(), now).await;
     context.store.save(&lock, &state)?;
-    let index = state
-        .job_index(&job_id)
-        .ok_or_else(|| HubError::JobNotFound(job_id.clone()))?;
-    write_json(output, &job_document(&state.jobs[index], now))
+    write_json(output, &document)
+}
+
+fn schedule_document(schedule: &Schedule) -> Value {
+    json!({ "schema": "zeroshot.hub.schedule/v1", "schedule": schedule.view() })
+}
+
+/// Store a recurring schedule; the daemon queues one job per fire.
+fn enqueue_schedule(
+    context: &HubContext,
+    request: HubEnqueue,
+    output: &mut impl Write,
+) -> Result<(), HubError> {
+    let now = now_ms();
+    let expression = request.cron.unwrap_or_default();
+    let cron = cron::parse(&expression)?;
+    let (timezone, zone) = cron::timezone(request.cron_timezone.as_deref())?;
+    let next_fire_ms = cron::next_fire(&cron, &zone, now)?;
+    let expires_after_ms = request
+        .expires
+        .as_deref()
+        .map(|expires| {
+            parse_duration_ms(expires).map_err(|_| {
+                HubError::Usage(format!(
+                    "--expires {expires:?} with --cron must be a DURATION such as 2h"
+                ))
+            })
+        })
+        .transpose()?;
+    let mut template = jobs::new_job(&request.job, now)?;
+    template.priority = request.priority;
+    let repin_from = (request.job.repository.is_none() && request.job.revision.is_none())
+        .then(|| jobs::working_folder(&request.job))
+        .transpose()?;
+    let schedule_id = format!("hs_{}", uuid::Uuid::now_v7().simple());
+    template.job_id.clone_from(&schedule_id);
+    let schedule = Schedule {
+        schedule_id,
+        state: ScheduleState::Active,
+        cron: expression,
+        timezone,
+        submission_key: template.submission_key.take(),
+        template,
+        repin_from,
+        expires_after_ms,
+        created_at_ms: now,
+        next_fire_ms: Some(next_fire_ms),
+        last_fired_ms: None,
+        last_job_id: None,
+        fired: 0,
+        skipped: 0,
+        removed_at_ms: None,
+        error: None,
+    };
+    let lock = context.store.lock()?;
+    let mut state = context.store.load(&lock)?;
+    if let Some(existing) = schedule.submission_key.as_ref().and_then(|key| {
+        state
+            .schedules
+            .iter()
+            .find(|existing| existing.submission_key.as_ref() == Some(key))
+    }) {
+        return write_json(output, &schedule_document(existing));
+    }
+    let template = &schedule.template;
+    if let Some(rejected) = rejections(&state.members, &template.placement, &template.requirements)
+    {
+        return Err(HubError::no_eligible(
+            describe(&template.placement),
+            rejected,
+        ));
+    }
+    let document = schedule_document(&schedule);
+    state.schedules.push(schedule);
+    context.store.save(&lock, &state)?;
+    write_json(output, &document)
 }
 
 fn state_matches(job: &Job, filter: &str, now: u64) -> bool {
@@ -425,9 +500,10 @@ fn state_matches(job: &Job, filter: &str, now: u64) -> bool {
 }
 
 async fn ps(context: &HubContext, request: HubPs, output: &mut impl Write) -> Result<(), HubError> {
-    const STATES: [&str; 9] = [
+    const STATES: [&str; 10] = [
         "active",
         "all",
+        "recurring",
         "queued",
         "scheduled",
         "running",
@@ -471,10 +547,32 @@ async fn ps(context: &HubContext, request: HubPs, output: &mut impl Write) -> Re
         let skip = selected.len().saturating_sub(limit);
         selected.drain(..skip);
     }
+    if request.state == "recurring" {
+        selected.clear();
+    }
     let views = selected.iter().map(|job| job.view(now)).collect::<Vec<_>>();
+    let schedules = state
+        .schedules
+        .iter()
+        .filter(|schedule| match request.state.as_str() {
+            "all" => true,
+            "active" | "recurring" => schedule.state == ScheduleState::Active,
+            _ => false,
+        })
+        .filter(|schedule| {
+            request.target.is_none() || schedule.template.placement.target == request.target
+        })
+        .filter(|schedule| {
+            request
+                .labels
+                .iter()
+                .all(|(key, value)| schedule.template.labels.get(key) == Some(value))
+        })
+        .map(Schedule::view)
+        .collect::<Vec<_>>();
     write_json(
         output,
-        &json!({ "schema": "zeroshot.hub.jobs/v1", "jobs": views }),
+        &json!({ "schema": "zeroshot.hub.jobs/v1", "jobs": views, "schedules": schedules }),
     )
 }
 
@@ -513,6 +611,23 @@ async fn status(
 fn dequeue(context: &HubContext, job_id: &str, output: &mut impl Write) -> Result<(), HubError> {
     let lock = context.store.lock()?;
     let mut state = context.store.load(&lock)?;
+    if let Some(schedule) = state
+        .schedules
+        .iter_mut()
+        .find(|schedule| schedule.schedule_id == job_id)
+    {
+        if schedule.state == ScheduleState::Removed {
+            return Err(HubError::InvalidState(format!(
+                "hub schedule {job_id} is already removed"
+            )));
+        }
+        schedule.state = ScheduleState::Removed;
+        schedule.removed_at_ms = Some(now_ms());
+        schedule.next_fire_ms = None;
+        let document = schedule_document(schedule);
+        context.store.save(&lock, &state)?;
+        return write_json(output, &document);
+    }
     let index = state
         .job_index(job_id)
         .ok_or_else(|| HubError::JobNotFound(job_id.to_owned()))?;

@@ -33,7 +33,9 @@ EXAMPLES
   zeroshot hub add box-1 --tag gpu --slots 2
   zeroshot hub list
   zeroshot hub submit --tag gpu --title Fix --template single-worker --input in.json -d
-  zeroshot hub enqueue --at +2h --priority 5 --title Nightly --profile nightly --input in.json
+  zeroshot hub enqueue --at +2h --priority 5 --title Later --profile nightly --input in.json
+  zeroshot hub enqueue --cron "0 3 * * *" --cron-tz Europe/Belgrade --title Nightly \
+    --profile nightly --input in.json
   zeroshot hub ps
   zeroshot hub stats --by target --by model --since 7d"#)]
 pub(super) enum HubCliCommand {
@@ -57,10 +59,12 @@ pub(super) enum HubCliCommand {
     /// given. Without --detach, follows the placed run's events as NDJSON.
     Submit(Box<HubSubmitArgs>),
 
-    /// Accept a run into the hub queue for later placement.
+    /// Accept a run into the hub queue for later placement, once or on a cron schedule.
     ///
-    /// Due jobs are placed by `zeroshot hub dispatch`, and opportunistically by every submit
-    /// and enqueue.
+    /// --cron creates a recurring schedule (`hs_…`); the hub daemon queues one job per fire.
+    /// Cron fields use the --cron-tz zone, stored with the schedule, so daylight-saving changes
+    /// follow that zone wherever the daemon runs. Missed fires collapse into one catch-up fire,
+    /// and a fire is skipped while the schedule's previous job is still queued.
     Enqueue(Box<HubEnqueueArgs>),
 
     /// List hub jobs as JSON.
@@ -82,7 +86,9 @@ pub(super) enum HubCliCommand {
     /// Force a placed job's run to stop.
     ForceStop(HubJobArgs),
 
-    /// Remove a queued or scheduled job before it is placed.
+    /// Remove a queued or scheduled job before it is placed, or a recurring schedule (`hs_…`).
+    ///
+    /// Removing a schedule keeps the jobs it already queued.
     Dequeue(HubJobArgs),
 
     /// Refresh running jobs, expire stale ones, and place due queued jobs.
@@ -234,8 +240,17 @@ pub(super) struct HubEnqueueArgs {
     placement: HubPlacementArgs,
 
     /// Not before this RFC 3339 time or relative +DURATION, such as +2h.
-    #[arg(long, value_name = "TIME")]
+    #[arg(long, value_name = "TIME", conflicts_with = "cron")]
     at: Option<String>,
+
+    /// Recur on this five-field cron expression (minute hour day-of-month month day-of-week),
+    /// such as "0 3 * * 1-5". Each fire queues one job.
+    #[arg(long, value_name = "EXPR")]
+    cron: Option<String>,
+
+    /// IANA time zone for --cron, such as Europe/Belgrade or UTC [default: this machine's zone].
+    #[arg(long, value_name = "ZONE", requires = "cron")]
+    cron_tz: Option<String>,
 
     /// Higher priority jobs are placed first.
     #[arg(
@@ -246,7 +261,8 @@ pub(super) struct HubEnqueueArgs {
     )]
     priority: i32,
 
-    /// Expire the job if it is still queued after DURATION or at an RFC 3339 time.
+    /// Expire the job if it is still queued after DURATION or at an RFC 3339 time. With --cron,
+    /// each fired job expires DURATION after its fire time.
     #[arg(long, value_name = "DURATION|TIME")]
     expires: Option<String>,
 
@@ -257,7 +273,8 @@ pub(super) struct HubEnqueueArgs {
 #[derive(Debug, Args)]
 pub(super) struct HubPsArgs {
     /// Job state filter: active (queued, scheduled, running), queued, scheduled, running,
-    /// succeeded, failed, dequeued, expired, or all.
+    /// succeeded, failed, dequeued, expired, recurring (schedules only), or all. Active
+    /// schedules are listed with active and recurring; all schedules with all.
     #[arg(long, value_name = "STATE", default_value = "active")]
     state: String,
 
@@ -443,6 +460,8 @@ impl HubEnqueueArgs {
         Ok(HubEnqueue {
             job: job_spec(self.run, self.placement)?,
             at: self.at,
+            cron: self.cron,
+            cron_timezone: self.cron_tz,
             priority: self.priority,
             expires: self.expires,
         })

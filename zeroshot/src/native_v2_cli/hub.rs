@@ -11,18 +11,39 @@ use std::path::PathBuf;
 pub enum HubCommand {
     Add(HubMemberAdd),
     Update(HubMemberUpdate),
-    Remove { name: String },
-    List { tags: Vec<String>, probe: bool },
+    Remove {
+        name: String,
+    },
+    List {
+        tags: Vec<String>,
+        probe: bool,
+    },
     Submit(Box<HubSubmit>),
     Enqueue(Box<HubEnqueue>),
     Ps(HubPs),
-    Status { job: String },
-    Watch { job: String, after: Option<String> },
+    Status {
+        job: String,
+    },
+    Watch {
+        job: String,
+        after: Option<String>,
+    },
     Logs(HubLogs),
-    Attach { job: String, execution: String },
-    ForceStop { job: String },
-    Dequeue { job: String },
-    Dispatch { repeat: bool, interval: String },
+    Attach {
+        job: String,
+        execution: String,
+    },
+    ForceStop {
+        job: String,
+    },
+    /// Remove a queued job (`hj_…`) or a recurring schedule (`hs_…`).
+    Dequeue {
+        job: String,
+    },
+    Dispatch {
+        repeat: bool,
+        interval: String,
+    },
     Stats(HubStats),
 }
 
@@ -98,11 +119,15 @@ pub struct HubSubmit {
     pub queue: bool,
 }
 
-/// Deferred placement.
+/// Deferred placement: once (`at`) or recurring (`cron`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HubEnqueue {
     pub job: HubJobSpec,
     pub at: Option<String>,
+    /// Five-field cron expression; each fire queues one job.
+    pub cron: Option<String>,
+    /// IANA time zone for `cron`; `None` uses the enqueuing machine's zone.
+    pub cron_timezone: Option<String>,
     pub priority: i32,
     pub expires: Option<String>,
 }

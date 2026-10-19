@@ -16,6 +16,7 @@ pub(crate) const CAPABILITY_TTL_MS: u64 = 5 * 60 * 1000;
 /// Outcome of one dispatcher pass.
 #[derive(Debug, Default)]
 pub(crate) struct TickReport {
+    pub fired: Vec<Value>,
     pub dispatched: Vec<Value>,
     pub finished: Vec<Value>,
     pub expired: Vec<String>,
@@ -35,9 +36,16 @@ impl TickReport {
             .iter()
             .filter(|job| job.state == JobState::Running)
             .count();
+        let schedules = state
+            .schedules
+            .iter()
+            .filter(|schedule| schedule.state == super::model::ScheduleState::Active)
+            .count();
         json!({
             "schema": "zeroshot.hub.tick/v1",
+            "schedules": schedules,
             "at": super::clock::rfc3339(now_ms),
+            "fired": self.fired,
             "dispatched": self.dispatched,
             "finished": self.finished,
             "expired": self.expired,
@@ -259,10 +267,14 @@ pub(crate) fn due_jobs(jobs: &[Job], now_ms: u64) -> Vec<usize> {
     due
 }
 
-/// One dispatcher pass: refresh running jobs, expire stale ones, then place due jobs. Jobs that
-/// cannot be placed stay queued; a lower-priority job may still use a member the head cannot.
+/// One dispatcher pass: fire due cron schedules, refresh running jobs, expire stale ones, then
+/// place due jobs. Jobs that cannot be placed stay queued; a lower-priority job may still use a
+/// member the head cannot.
 pub(crate) async fn tick(state: &mut HubState, driver: &dyn HubDriver, now_ms: u64) -> TickReport {
-    let mut report = TickReport::default();
+    let mut report = TickReport {
+        fired: super::cron::fire_due(state, now_ms),
+        ..TickReport::default()
+    };
     for job in state
         .jobs
         .iter_mut()

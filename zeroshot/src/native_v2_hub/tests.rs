@@ -17,6 +17,8 @@ use super::stats::{Dimension, ModelPrice, StatsQuery, aggregate, percentiles};
 
 #[path = "tests/capabilities.rs"]
 mod capabilities;
+#[path = "tests/cron.rs"]
+mod cron;
 
 pub(super) fn member(name: &str, tags: &[&str], slots: u32, priority: i32) -> Member {
     Member {

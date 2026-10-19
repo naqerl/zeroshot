@@ -236,3 +236,26 @@ fn observation_and_dispatch_commands_parse() {
     };
     assert_eq!(stats.by, ["target", "label:task"]);
 }
+
+#[test]
+fn enqueue_cron_parses_with_zone_and_conflicts_with_at() {
+    let base = ["hub", "enqueue", "--title", "T", "--input", "in.json"];
+    let with = |extra: &[&'static str]| {
+        let mut values = base.to_vec();
+        values.extend_from_slice(extra);
+        parse(&values)
+    };
+    let HubCommand::Enqueue(enqueue) =
+        with(&["--cron", "0 3 * * 1-5", "--cron-tz", "Europe/Belgrade"]).expect("cron parses")
+    else {
+        panic!("expected enqueue");
+    };
+    assert_eq!(enqueue.cron.as_deref(), Some("0 3 * * 1-5"));
+    assert_eq!(enqueue.cron_timezone.as_deref(), Some("Europe/Belgrade"));
+    assert_eq!(enqueue.at, None);
+    assert!(with(&["--cron", "@daily", "--at", "+1h"]).is_err());
+    assert!(
+        with(&["--cron-tz", "UTC"]).is_err(),
+        "--cron-tz requires --cron"
+    );
+}

@@ -764,14 +764,14 @@ Commands:
   remove      Remove a member from the hub. Its target registration is unchanged [alias: rm]
   list        List members with health and load as JSON [alias: ls]
   submit      Place a run on a free member now
-  enqueue     Accept a run into the hub queue for later placement
+  enqueue     Accept a run into the hub queue for later placement, once or on a cron schedule
   ps          List hub jobs as JSON
   status      Read one hub job with its run status as JSON
   watch       Follow a placed job's run events as NDJSON
   logs        Follow a placed job's run logs as NDJSON
   attach      Attach to an execution of a placed job as NDJSON
   force-stop  Force a placed job's run to stop
-  dequeue     Remove a queued or scheduled job before it is placed
+  dequeue     Remove a queued or scheduled job before it is placed, or a recurring schedule (`hs_…`)
   dispatch    Refresh running jobs, expire stale ones, and place due queued jobs
   stats       Aggregate job outcomes and provider-reported tokens as JSON
   help        Print this message or the help of the given subcommand(s)
@@ -805,7 +805,9 @@ EXAMPLES
   zeroshot hub add box-1 --tag gpu --slots 2
   zeroshot hub list
   zeroshot hub submit --tag gpu --title Fix --template single-worker --input in.json -d
-  zeroshot hub enqueue --at +2h --priority 5 --title Nightly --profile nightly --input in.json
+  zeroshot hub enqueue --at +2h --priority 5 --title Later --profile nightly --input in.json
+  zeroshot hub enqueue --cron "0 3 * * *" --cron-tz Europe/Belgrade --title Nightly \
+    --profile nightly --input in.json
   zeroshot hub ps
   zeroshot hub stats --by target --by model --since 7d
 ```
@@ -1104,9 +1106,9 @@ ENVIRONMENT PREPARATION
 #### `zeroshot hub enqueue`
 
 ```text
-Accept a run into the hub queue for later placement.
+Accept a run into the hub queue for later placement, once or on a cron schedule.
 
-Due jobs are placed by `zeroshot hub dispatch`, and opportunistically by every submit and enqueue.
+--cron creates a recurring schedule (`hs_…`); the hub daemon queues one job per fire. Cron fields use the --cron-tz zone, stored with the schedule, so daylight-saving changes follow that zone wherever the daemon runs. Missed fires collapse into one catch-up fire, and a fire is skipped while the schedule's previous job is still queued.
 
 Usage: zeroshot hub enqueue [OPTIONS] --title <TITLE> --input <FILE>
 
@@ -1129,13 +1131,19 @@ Options:
       --at <TIME>
           Not before this RFC 3339 time or relative +DURATION, such as +2h
 
+      --cron <EXPR>
+          Recur on this five-field cron expression (minute hour day-of-month month day-of-week), such as "0 3 * * 1-5". Each fire queues one job
+
+      --cron-tz <ZONE>
+          IANA time zone for --cron, such as Europe/Belgrade or UTC [default: this machine's zone]
+
       --priority <N>
           Higher priority jobs are placed first
 
           [default: 0]
 
       --expires <DURATION|TIME>
-          Expire the job if it is still queued after DURATION or at an RFC 3339 time
+          Expire the job if it is still queued after DURATION or at an RFC 3339 time. With --cron, each fired job expires DURATION after its fire time
 
       --title <TITLE>
           Human-readable title recorded with the run
@@ -1307,7 +1315,7 @@ Usage: zeroshot hub ps [OPTIONS]
 
 Options:
       --state <STATE>
-          Job state filter: active (queued, scheduled, running), queued, scheduled, running, succeeded, failed, dequeued, expired, or all
+          Job state filter: active (queued, scheduled, running), queued, scheduled, running, succeeded, failed, dequeued, expired, recurring (schedules only), or all. Active schedules are listed with active and recurring; all schedules with all
 
           [default: active]
 
@@ -1419,7 +1427,9 @@ Options:
 #### `zeroshot hub dequeue`
 
 ```text
-Remove a queued or scheduled job before it is placed
+Remove a queued or scheduled job before it is placed, or a recurring schedule (`hs_…`).
+
+Removing a schedule keeps the jobs it already queued.
 
 Usage: zeroshot hub dequeue <JOB_ID>
 
@@ -1429,7 +1439,7 @@ Arguments:
 
 Options:
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 #### `zeroshot hub dispatch`
@@ -1493,14 +1503,14 @@ Commands:
   remove      Remove a member from the hub. Its target registration is unchanged
   list        List members with health and load as JSON
   submit      Place a run on a free member now
-  enqueue     Accept a run into the hub queue for later placement
+  enqueue     Accept a run into the hub queue for later placement, once or on a cron schedule
   ps          List hub jobs as JSON
   status      Read one hub job with its run status as JSON
   watch       Follow a placed job's run events as NDJSON
   logs        Follow a placed job's run logs as NDJSON
   attach      Attach to an execution of a placed job as NDJSON
   force-stop  Force a placed job's run to stop
-  dequeue     Remove a queued or scheduled job before it is placed
+  dequeue     Remove a queued or scheduled job before it is placed, or a recurring schedule (`hs_…`)
   dispatch    Refresh running jobs, expire stale ones, and place due queued jobs
   stats       Aggregate job outcomes and provider-reported tokens as JSON
   help        Print this message or the help of the given subcommand(s)

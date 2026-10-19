@@ -30,11 +30,13 @@ include_dir = { version = "0.7", optional = true }
 schemars = { workspace = true, optional = true }
 async-trait.workspace = true
 clap.workspace = true
+croner.workspace = true
 flate2.workspace = true
 fs2.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 httparse.workspace = true
+jiff.workspace = true
 libc.workspace = true
 keyring = { workspace = true, features = [
   "apple-native",

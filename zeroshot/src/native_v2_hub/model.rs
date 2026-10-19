@@ -18,6 +18,8 @@ pub(crate) struct HubState {
     pub members: Vec<Member>,
     #[serde(default)]
     pub jobs: Vec<Job>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schedules: Vec<Schedule>,
 }
 
 impl Default for HubState {
@@ -26,6 +28,7 @@ impl Default for HubState {
             version: 1,
             members: Vec::new(),
             jobs: Vec::new(),
+            schedules: Vec::new(),
         }
     }
 }
@@ -89,6 +92,47 @@ impl Member {
             "capabilityError": self.capability_error,
         })
     }
+}
+
+/// A recurring `enqueue --cron`: each fire queues a copy of `template`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct Schedule {
+    pub schedule_id: String,
+    pub state: ScheduleState,
+    pub cron: String,
+    /// IANA zone the cron fields are evaluated in.
+    pub timezone: String,
+    pub template: Job,
+    /// Folder whose `HEAD` is re-pinned at each fire, when no explicit source was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repin_from: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_after_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_key: Option<String>,
+    pub created_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_fire_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fired_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_job_id: Option<String>,
+    #[serde(default)]
+    pub fired: u64,
+    #[serde(default)]
+    pub skipped: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ScheduleState {
+    Active,
+    Removed,
 }
 
 /// What a job needs from the member that runs it, resolved once at acceptance.
