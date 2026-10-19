@@ -1,0 +1,198 @@
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use serde_json::Value;
+use tokio::process::Command;
+use zeroshot_engine::native_v2_cli::{ERROR_FORMAT_ENV, JSON_ERROR_FORMAT};
+
+use super::error::HubError;
+use super::model::{Job, LOCAL_MEMBER};
+
+/// One placement attempt of a job on a member.
+pub(crate) struct SubmitRequest<'a> {
+    pub member: &'a str,
+    pub job: &'a Job,
+    pub submission_key: String,
+}
+
+/// Target operations the hub delegates to the existing CLI contract.
+#[async_trait]
+pub(crate) trait HubDriver: Send + Sync {
+    /// Runs reported by `zeroshot list` for one member.
+    async fn list_runs(&self, member: &str) -> Result<Vec<Value>, HubError>;
+    /// Detached `zeroshot run`; returns the run ID from its receipt.
+    async fn submit(&self, request: SubmitRequest<'_>) -> Result<String, HubError>;
+    /// `zeroshot status` of one run.
+    async fn status(&self, member: &str, run_id: &str) -> Result<Value, HubError>;
+}
+
+/// Delegates to this executable (or `ZEROSHOT_HUB_EXECUTABLE`) in a child process, so every hub
+/// operation uses exactly the same target registry, authentication, and admission as the CLI.
+pub(crate) struct ProcessDriver {
+    executable: PathBuf,
+    timeout: Duration,
+}
+
+impl ProcessDriver {
+    pub(crate) fn production() -> Result<Self, HubError> {
+        Ok(Self {
+            executable: hub_executable()?,
+            timeout: Duration::from_secs(60),
+        })
+    }
+
+    async fn call(
+        &self,
+        arguments: Vec<String>,
+        cwd: Option<&PathBuf>,
+    ) -> Result<String, HubError> {
+        let mut command = Command::new(&self.executable);
+        command
+            .args(&arguments)
+            .env(ERROR_FORMAT_ENV, JSON_ERROR_FORMAT)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        let operation = arguments.first().cloned().unwrap_or_default();
+        let output = tokio::time::timeout(self.timeout, command.output())
+            .await
+            .map_err(|_| target_error(format!("zeroshot {operation} timed out"), None))?
+            .map_err(|error| {
+                target_error(
+                    format!("zeroshot {operation} could not start: {error}"),
+                    None,
+                )
+            })?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        if output.status.success() {
+            return Ok(stdout);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let diagnostic = stderr
+            .lines()
+            .rev()
+            .find_map(|line| serde_json::from_str::<Value>(line).ok());
+        let message = diagnostic
+            .as_ref()
+            .and_then(|value| value.get("message"))
+            .and_then(Value::as_str)
+            .map_or_else(|| stderr.trim().to_owned(), str::to_owned);
+        Err(target_error(
+            format!("zeroshot {operation}: {message}"),
+            diagnostic,
+        ))
+    }
+}
+
+#[async_trait]
+impl HubDriver for ProcessDriver {
+    async fn list_runs(&self, member: &str) -> Result<Vec<Value>, HubError> {
+        let mut arguments = vec!["list".to_owned()];
+        arguments.extend(route(member));
+        let stdout = self.call(arguments, None).await?;
+        let document = last_json(&stdout)
+            .ok_or_else(|| target_error("zeroshot list returned no JSON".to_owned(), None))?;
+        Ok(document
+            .get("runs")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn submit(&self, request: SubmitRequest<'_>) -> Result<String, HubError> {
+        let mut arguments = vec!["run".to_owned()];
+        arguments.extend(request.job.run_args.iter().cloned());
+        arguments.extend(route(request.member));
+        if request.member != LOCAL_MEMBER {
+            if let Some(revision) = &request.job.pinned_revision {
+                arguments.extend(["--revision".to_owned(), revision.clone()]);
+            }
+        }
+        arguments.extend([
+            "--submission-key".to_owned(),
+            request.submission_key,
+            "--detach".to_owned(),
+        ]);
+        let stdout = self.call(arguments, Some(&request.job.cwd)).await?;
+        stdout
+            .lines()
+            .rev()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find_map(|value| {
+                value
+                    .get("runId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .ok_or_else(|| target_error("zeroshot run returned no run receipt".to_owned(), None))
+    }
+
+    async fn status(&self, member: &str, run_id: &str) -> Result<Value, HubError> {
+        let mut arguments = vec!["status".to_owned(), run_id.to_owned()];
+        arguments.extend(route(member));
+        let stdout = self.call(arguments, None).await?;
+        last_json(&stdout)
+            .ok_or_else(|| target_error("zeroshot status returned no JSON".to_owned(), None))
+    }
+}
+
+/// `--target NAME` for named members; nothing for the local controller.
+pub(crate) fn route(member: &str) -> Vec<String> {
+    if member == LOCAL_MEMBER {
+        Vec::new()
+    } else {
+        vec!["--target".to_owned(), member.to_owned()]
+    }
+}
+
+pub(crate) fn hub_executable() -> Result<PathBuf, HubError> {
+    if let Some(path) =
+        std::env::var_os("ZEROSHOT_HUB_EXECUTABLE").filter(|value| !value.is_empty())
+    {
+        return Ok(PathBuf::from(path));
+    }
+    std::env::current_exe()
+        .map_err(|error| HubError::storage("executable path is unavailable", error))
+}
+
+/// Run an observation command with inherited streams and return its exit code.
+///
+/// Ctrl-C is left to the child, which detaches observation without stopping the run.
+pub(crate) async fn passthrough(arguments: Vec<String>) -> Result<i32, HubError> {
+    let mut child = Command::new(hub_executable()?)
+        .args(&arguments)
+        .spawn()
+        .map_err(|error| target_error(format!("zeroshot could not start: {error}"), None))?;
+    let wait = child.wait();
+    tokio::pin!(wait);
+    loop {
+        tokio::select! {
+            status = &mut wait => {
+                let status = status
+                    .map_err(|error| target_error(format!("zeroshot did not finish: {error}"), None))?;
+                return Ok(status.code().unwrap_or(1));
+            }
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+}
+
+fn last_json(stdout: &str) -> Option<Value> {
+    stdout
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+}
+
+const fn target_error(message: String, diagnostic: Option<Value>) -> HubError {
+    HubError::Target {
+        message,
+        diagnostic,
+    }
+}

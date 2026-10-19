@@ -1,5 +1,6 @@
 //! Shipped CLI entrypoint.
 
+mod native_v2_hub;
 mod native_v2_target;
 
 use std::io::Write;
@@ -28,6 +29,8 @@ use native_v2_target::{TargetRecord, TargetRegistry, TargetRunHistoryTransport};
 
 #[derive(Debug, Error)]
 enum ProcessError {
+    #[error(transparent)]
+    Hub(#[from] native_v2_hub::HubError),
     #[error(transparent)]
     Acp(#[from] AcpServeError),
     #[error(transparent)]
@@ -59,8 +62,23 @@ async fn dispatch(command: NativeV2CliCommand) -> Result<(), ProcessError> {
         NativeV2CliCommand::TargetServe(config) => serve_direct_target(config)
             .await
             .map_err(ProcessError::from),
+        NativeV2CliCommand::Hub(command) => run_hub_command(command).await,
         command => run_public_command(command).await,
     }
+}
+
+async fn run_hub_command(
+    command: zeroshot_engine::native_v2_cli::hub::HubCommand,
+) -> Result<(), ProcessError> {
+    let code = {
+        let stdout = std::io::stdout();
+        let mut output = stdout.lock();
+        native_v2_hub::execute_hub(command, &mut output).await?
+    };
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 async fn run_private_controller(arguments: &[std::ffi::OsString]) -> Result<bool, ProcessError> {
@@ -195,14 +213,24 @@ fn private_controller_bootstrap(
 async fn main() {
     if let Err(error) = run().await {
         write_process_error(&error);
-        std::process::exit(1);
+        std::process::exit(process_exit_code(&error));
+    }
+}
+
+const fn process_exit_code(error: &ProcessError) -> i32 {
+    match error {
+        ProcessError::Hub(error) => error.exit_code(),
+        _ => 1,
     }
 }
 
 fn write_process_error(error: &ProcessError) {
     if std::env::var(ERROR_FORMAT_ENV).as_deref() == Ok(JSON_ERROR_FORMAT) {
-        let diagnostic = process_error_diagnostic(error);
-        match serde_json::to_string(&diagnostic) {
+        let encoded = match error {
+            ProcessError::Hub(error) => serde_json::to_string(&error.diagnostic()),
+            error => serde_json::to_string(&process_error_diagnostic(error)),
+        };
+        match encoded {
             Ok(encoded) => eprintln!("{encoded}"),
             Err(_) => eprintln!("zeroshot: {error}"),
         }

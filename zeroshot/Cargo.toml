@@ -56,7 +56,7 @@ sha2.workspace = true
 tar.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
-time = { workspace = true, features = ["parsing"] }
+time = { workspace = true, features = ["formatting", "parsing"] }
 tokio.workspace = true
 tokio-util = { workspace = true, features = ["compat"] }
 tokio-tungstenite.workspace = true
