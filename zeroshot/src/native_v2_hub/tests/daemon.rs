@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::json;
+use zeroshot_engine::native_v2_cli::hub::HubApiOptions;
 
 use super::super::daemon::{client_url, load_or_create_token};
 use super::super::install::{
@@ -31,19 +32,35 @@ fn env() -> InstallEnv {
 }
 
 fn daemon(interval: &str) -> Vec<String> {
-    daemon_arguments(interval, None, None)
+    daemon_arguments(interval, &HubApiOptions::default())
 }
 
 #[test]
 fn installed_daemons_pass_listen_and_token_file_through() {
     let arguments = daemon_arguments(
         "5s",
-        Some("0.0.0.0:7383"),
-        Some(std::path::Path::new("/srv/hub/token")),
+        &HubApiOptions {
+            listen: Some("0.0.0.0:7383".to_owned()),
+            token_file: Some("/srv/hub/token".into()),
+            ..HubApiOptions::default()
+        },
     );
     assert_eq!(
         arguments.join(" "),
         "hub daemon run --interval 5s --listen 0.0.0.0:7383 --token-file /srv/hub/token"
+    );
+    let with_metrics = daemon_arguments(
+        "5s",
+        &HubApiOptions {
+            metrics_listen: Some("127.0.0.1:9383".to_owned()),
+            metrics_labels: vec!["task".to_owned(), "eval.variant".to_owned()],
+            ..HubApiOptions::default()
+        },
+    );
+    assert_eq!(
+        with_metrics.join(" "),
+        "hub daemon run --interval 5s --metrics-listen 127.0.0.1:9383 --metrics-label task \
+         --metrics-label eval.variant"
     );
     let unit = systemd_unit(&env(), false, &arguments);
     assert!(unit.contains("\"--listen\" \"0.0.0.0:7383\" \"--token-file\" \"/srv/hub/token\""));

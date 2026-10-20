@@ -17,6 +17,7 @@ use super::clock::{self, now_ms};
 use super::cron;
 use super::driver::{HubDriver, route};
 use super::error::HubError;
+use super::metrics::Metrics;
 use super::model::{
     HubState, Job, JobState, LOCAL_MEMBER, Member, MemberState, Schedule, ScheduleState,
 };
@@ -44,6 +45,7 @@ pub(crate) struct HubService {
     registry: FileTargetRegistry,
     state: Mutex<HubState>,
     placement: Mutex<()>,
+    metrics: Metrics,
 }
 
 pub(crate) fn member_document(member: &Member) -> Value {
@@ -79,7 +81,25 @@ impl HubService {
             registry,
             state: Mutex::new(state),
             placement: Mutex::new(()),
+            metrics: Metrics::default(),
         })
+    }
+
+    /// Export token counters for these job label keys as well.
+    #[must_use]
+    pub(crate) fn with_metric_labels(mut self, keys: Vec<String>) -> Self {
+        self.metrics = Metrics::new(keys);
+        self
+    }
+
+    pub(crate) fn metrics(&self) -> &Metrics {
+        &self.metrics
+    }
+
+    /// The Prometheus exposition document of this hub.
+    pub(crate) async fn render_metrics(&self) -> String {
+        let state = self.snapshot().await;
+        self.metrics.render(&state, now_ms())
     }
 
     pub(crate) fn store(&self) -> &HubStore {
@@ -228,7 +248,9 @@ impl HubService {
                 .filter(|member| query.tags.iter().all(|tag| member.tags.contains(tag)))
                 .filter(|member| member.state != MemberState::Disabled)
                 .collect::<Vec<_>>();
-            Some(schedule::probe(&probed, &state.jobs, self.driver()).await)
+            let loads = schedule::probe(&probed, &state.jobs, self.driver()).await;
+            self.metrics.record_loads(&loads);
+            Some(loads)
         } else {
             None
         };
@@ -349,10 +371,12 @@ impl HubService {
             })
             .await?;
         if let Some(rejected) = rejections(&state.members, &job.placement, &job.requirements) {
+            self.metrics.record_rejection(Some(&rejected));
             return Err(HubError::no_eligible(describe(&job.placement), rejected));
         }
         let matching = matching_members(&state.members, &job.placement);
         let loads = schedule::probe(&matching, &state.jobs, self.driver()).await;
+        self.metrics.record_loads(&loads);
         let now = now_ms();
         match place(&state.members, &job.placement, &job.requirements, &loads) {
             Placement::Place(member) => {
@@ -369,6 +393,7 @@ impl HubService {
                 Ok(job_document(&job, now))
             }
             Placement::NoEligible { rejected } => {
+                self.metrics.record_rejection(Some(&rejected));
                 Err(HubError::no_eligible(describe(&job.placement), rejected))
             }
             Placement::Busy { .. } if queue => {
@@ -379,7 +404,10 @@ impl HubService {
                 .await?;
                 Ok(job_document(&job, now))
             }
-            Placement::Busy { .. } => Err(HubError::NoCapacity(describe(&job.placement))),
+            Placement::Busy { .. } => {
+                self.metrics.record_rejection(None);
+                Err(HubError::NoCapacity(describe(&job.placement)))
+            }
         }
     }
 
@@ -401,6 +429,7 @@ impl HubService {
             return Err(HubError::JobNotFound(job_id.to_owned()));
         };
         let result = schedule::dispatch(&mut job, member, self.driver(), now).await;
+        self.metrics.record_placement(member, result.is_ok());
         self.mutate(|state| {
             if let Some(slot) = state.jobs.iter_mut().find(|slot| slot.job_id == job.job_id) {
                 *slot = job.clone();
@@ -426,6 +455,7 @@ impl HubService {
                 return Ok(job_document(&existing, now));
             }
             if let Some(rejected) = rejections(&state.members, &job.placement, &job.requirements) {
+                self.metrics.record_rejection(Some(&rejected));
                 return Err(HubError::no_eligible(describe(&job.placement), rejected));
             }
             let document = job_document(&job, now);
@@ -465,6 +495,7 @@ impl HubService {
             if let Some(rejected) =
                 rejections(&state.members, &template.placement, &template.requirements)
             {
+                self.metrics.record_rejection(Some(&rejected));
                 return Err(HubError::no_eligible(
                     describe(&template.placement),
                     rejected,
@@ -709,6 +740,14 @@ impl HubService {
     /// One dispatcher pass. Each phase holds the state lock only to read or merge; polls,
     /// discovery, probes, and submissions run between phases.
     pub(crate) async fn pass(&self) -> Result<(TickReport, Value), HubError> {
+        let started = std::time::Instant::now();
+        let result = self.pass_phases().await;
+        self.metrics
+            .record_pass(started.elapsed().as_secs_f64(), result.is_err());
+        result
+    }
+
+    async fn pass_phases(&self) -> Result<(TickReport, Value), HubError> {
         let _placing = self.placement.lock().await;
         let now = now_ms();
         let (fired, polls) = self
@@ -752,6 +791,7 @@ impl HubService {
                 .collect::<Vec<_>>();
             let mut loads: BTreeMap<_, _> =
                 schedule::probe(&active, &state.jobs, self.driver()).await;
+            self.metrics.record_loads(&loads);
             let now = now_ms();
             let chosen = self
                 .mutate(|state| Ok(schedule::choose(state, now, &mut loads)))

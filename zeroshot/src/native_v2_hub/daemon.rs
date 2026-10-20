@@ -9,7 +9,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use zeroshot_engine::native_v2_cli::hub::HubDaemonRun;
 
-use super::api::{ApiState, router};
+use super::api::{ApiState, metrics_router, router};
 use super::clock::{now_ms, parse_duration_ms, rfc3339};
 use super::error::HubError;
 use super::service::{HubService, write_private};
@@ -88,21 +88,22 @@ pub(crate) async fn run(
         )));
     };
     let token_file = options
+        .api
         .token_file
         .clone()
         .unwrap_or_else(|| store.directory().join(TOKEN_FILE));
     let token_file = absolute(token_file);
     let token = load_or_create_token(&token_file)?;
-    let listen = options.listen.as_deref().unwrap_or(DEFAULT_LISTEN);
-    let listener = tokio::net::TcpListener::bind(listen)
-        .await
-        .map_err(|error| {
-            HubError::Usage(format!("hub API could not listen on {listen}: {error}"))
-        })?;
+    let listen = options.api.listen.as_deref().unwrap_or(DEFAULT_LISTEN);
+    let listener = bind(listen, "hub API").await?;
     let address = listener
         .local_addr()
         .map_err(|error| HubError::storage("hub API address is unavailable", error))?;
-    let service = Arc::new(open(store)?);
+    let metrics_listener = match options.api.metrics_listen.as_deref() {
+        Some(listen) => Some(bind_loopback_metrics(listen).await?),
+        None => None,
+    };
+    let service = Arc::new(open(store)?.with_metric_labels(options.api.metrics_labels.clone()));
     let manager = std::env::var(MANAGER_ENV).unwrap_or_else(|_| "foreground".to_owned());
     let mut heartbeat = json!({
         "schema": "zeroshot.hub.daemon/v1",
@@ -113,6 +114,10 @@ pub(crate) async fn run(
         "listen": address.to_string(),
         "url": client_url(address),
         "tokenFile": token_file,
+        "metricsListen": metrics_listener
+            .as_ref()
+            .and_then(|listener| listener.local_addr().ok())
+            .map(|address| address.to_string()),
         "intervalMs": pause.as_millis(),
         "startedAt": rfc3339(now_ms()),
         "lastPassAt": null,
@@ -127,6 +132,17 @@ pub(crate) async fn run(
         heartbeat: shared.clone(),
     });
     let (stop, stopped) = tokio::sync::watch::channel(false);
+    if let Some(metrics_listener) = metrics_listener {
+        let mut stopped = stopped.clone();
+        let metrics = metrics_router(api.clone());
+        tokio::spawn(async move {
+            axum::serve(metrics_listener, metrics)
+                .with_graceful_shutdown(async move {
+                    let _ = stopped.changed().await;
+                })
+                .await
+        });
+    }
     let server = tokio::spawn(async move {
         let mut stopped = stopped;
         axum::serve(listener, router(api))
@@ -170,6 +186,31 @@ pub(crate) async fn run(
     let mut event = heartbeat;
     event["event"] = json!("stopped");
     write_json(output, &event)
+}
+
+async fn bind(listen: &str, what: &str) -> Result<tokio::net::TcpListener, HubError> {
+    tokio::net::TcpListener::bind(listen)
+        .await
+        .map_err(|error| HubError::Usage(format!("{what} could not listen on {listen}: {error}")))
+}
+
+/// Bind the unauthenticated metrics listener, refusing any address that is not loopback:
+/// remote scrapers use `/metrics` on the API address with the bearer token.
+pub(crate) async fn bind_loopback_metrics(
+    listen: &str,
+) -> Result<tokio::net::TcpListener, HubError> {
+    let listener = bind(listen, "metrics").await?;
+    let loopback = listener
+        .local_addr()
+        .is_ok_and(|address| address.ip().is_loopback());
+    if !loopback {
+        return Err(HubError::Usage(format!(
+            "--metrics-listen {listen} is not a loopback address; it serves /metrics without a \
+             token, so remote Prometheus servers should scrape /metrics on the API address with \
+             the bearer token instead"
+        )));
+    }
+    Ok(listener)
 }
 
 fn publish(service: &HubService, shared: &Mutex<Value>, heartbeat: &Value) -> Result<(), HubError> {

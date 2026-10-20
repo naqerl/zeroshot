@@ -3,9 +3,9 @@ use clap::{Args, Subcommand, ValueEnum};
 use super::RunArgs;
 use crate::native_v2_cli::NativeV2CliError;
 use crate::native_v2_cli::hub::{
-    HubCommand, HubContextCommand, HubDaemonRun, HubEnqueue, HubInstall, HubJobSpec, HubLogs,
-    HubManager, HubMemberAdd, HubMemberState, HubMemberUpdate, HubPs, HubStats, HubStrategy,
-    HubSubmit, HubTokenSource, HubUninstall,
+    HubApiOptions, HubCommand, HubContextCommand, HubDaemonRun, HubEnqueue, HubInstall, HubJobSpec,
+    HubLogs, HubManager, HubMemberAdd, HubMemberState, HubMemberUpdate, HubPs, HubStats,
+    HubStrategy, HubSubmit, HubTokenSource, HubUninstall,
 };
 
 #[derive(Debug, Subcommand)]
@@ -180,6 +180,34 @@ pub(super) struct HubApiArgs {
     /// a random token when missing].
     #[arg(long, value_name = "FILE")]
     token_file: Option<std::path::PathBuf>,
+
+    /// Also serve only GET /metrics on this loopback ADDR:PORT without a token, for a local
+    /// Prometheus or agent. /metrics on the API address always needs the bearer token.
+    #[arg(long, value_name = "ADDR:PORT")]
+    metrics_listen: Option<String>,
+
+    /// Export token counters by this job label key, such as task. Repeat for several; values
+    /// beyond the first 50 collapse into _other.
+    #[arg(long = "metrics-label", value_name = "KEY", action = clap::ArgAction::Append)]
+    metrics_labels: Vec<String>,
+}
+
+impl HubApiArgs {
+    fn into_options(self) -> Result<HubApiOptions, NativeV2CliError> {
+        for key in &self.metrics_labels {
+            if key.is_empty() || key.contains(char::is_whitespace) {
+                return Err(usage(format!(
+                    "invalid --metrics-label {key:?}: use a job label key"
+                )));
+            }
+        }
+        Ok(HubApiOptions {
+            listen: self.listen,
+            token_file: self.token_file,
+            metrics_listen: self.metrics_listen,
+            metrics_labels: self.metrics_labels,
+        })
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -591,8 +619,7 @@ impl HubCliCommand {
             }),
             Self::Daemon(HubDaemonCommand::Run(args)) => HubCommand::Daemon(HubDaemonRun {
                 interval: args.interval,
-                listen: args.api.listen,
-                token_file: args.api.token_file,
+                api: args.api.into_options()?,
             }),
             Self::Daemon(HubDaemonCommand::Status) => HubCommand::DaemonStatus,
             Self::Context(command) => HubCommand::Context(command.into_command()?),
@@ -602,8 +629,7 @@ impl HubCliCommand {
                 image: args.image,
                 volumes: args.volume,
                 interval: args.interval,
-                listen: args.api.listen,
-                token_file: args.api.token_file,
+                api: args.api.into_options()?,
                 dry_run: args.dry_run,
             }),
             Self::Uninstall(args) => HubCommand::Uninstall(HubUninstall {

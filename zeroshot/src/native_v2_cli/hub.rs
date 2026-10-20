@@ -68,10 +68,20 @@ pub enum HubCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HubDaemonRun {
     pub interval: String,
+    pub api: HubApiOptions,
+}
+
+/// Hub API listener options of `hub daemon run`, passed through by `hub install`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HubApiOptions {
     /// `ADDR:PORT` for the hub API; `None` uses the loopback default.
     pub listen: Option<String>,
     /// Bearer token file; `None` uses `api-token` in the hub folder, created when missing.
     pub token_file: Option<PathBuf>,
+    /// Loopback `ADDR:PORT` serving only `/metrics` without a token.
+    pub metrics_listen: Option<String>,
+    /// Job label keys whose values are exported with token counters.
+    pub metrics_labels: Vec<String>,
 }
 
 /// `hub context`: named hub endpoints, docker-context style.
@@ -117,10 +127,8 @@ pub struct HubInstall {
     /// docker only: extra host folders mounted at the same path, such as job working folders.
     pub volumes: Vec<PathBuf>,
     pub interval: String,
-    /// Passed to `hub daemon run --listen`.
-    pub listen: Option<String>,
-    /// Passed to `hub daemon run --token-file`.
-    pub token_file: Option<PathBuf>,
+    /// Passed through to `hub daemon run`.
+    pub api: HubApiOptions,
     pub dry_run: bool,
 }
 

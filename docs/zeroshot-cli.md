@@ -1597,6 +1597,12 @@ Options:
       --token-file <FILE>
           Bearer token file for the hub API [default: api-token in the hub folder, created with a random token when missing]
 
+      --metrics-listen <ADDR:PORT>
+          Also serve only GET /metrics on this loopback ADDR:PORT without a token, for a local Prometheus or agent. /metrics on the API address always needs the bearer token
+
+      --metrics-label <KEY>
+          Export token counters by this job label key, such as task. Repeat for several; values beyond the first 50 collapse into _other
+
   -h, --help
           Print help (see a summary with '-h')
 ```
@@ -1787,6 +1793,12 @@ Options:
 
       --token-file <FILE>
           Bearer token file for the hub API [default: api-token in the hub folder, created with a random token when missing]
+
+      --metrics-listen <ADDR:PORT>
+          Also serve only GET /metrics on this loopback ADDR:PORT without a token, for a local Prometheus or agent. /metrics on the API address always needs the bearer token
+
+      --metrics-label <KEY>
+          Export token counters by this job label key, such as task. Repeat for several; values beyond the first 50 collapse into _other
 
       --dry-run
           Print the generated service definition and steps without applying them

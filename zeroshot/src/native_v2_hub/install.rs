@@ -8,7 +8,7 @@ use std::process::Stdio;
 
 use serde_json::{Value, json};
 use tokio::process::Command;
-use zeroshot_engine::native_v2_cli::hub::{HubInstall, HubManager, HubUninstall};
+use zeroshot_engine::native_v2_cli::hub::{HubApiOptions, HubInstall, HubManager, HubUninstall};
 
 use super::daemon::{MANAGER_ENV, SERVICE_NAME};
 use super::error::HubError;
@@ -35,21 +35,23 @@ pub(crate) struct InstallEnv {
     pub credential_store: Option<String>,
 }
 
-/// `hub daemon run` arguments the service starts with: the interval plus any --listen and
-/// --token-file given to `hub install`.
-pub(crate) fn daemon_arguments(
-    interval: &str,
-    listen: Option<&str>,
-    token_file: Option<&Path>,
-) -> Vec<String> {
+/// `hub daemon run` arguments the service starts with: the interval plus the API options
+/// given to `hub install` (--listen, --token-file, --metrics-listen, --metrics-label).
+pub(crate) fn daemon_arguments(interval: &str, api: &HubApiOptions) -> Vec<String> {
     let mut arguments = ["hub", "daemon", "run", "--interval", interval]
         .map(str::to_owned)
         .to_vec();
-    if let Some(listen) = listen {
-        arguments.extend(["--listen".to_owned(), listen.to_owned()]);
+    if let Some(listen) = &api.listen {
+        arguments.extend(["--listen".to_owned(), listen.clone()]);
     }
-    if let Some(token_file) = token_file {
+    if let Some(token_file) = &api.token_file {
         arguments.extend(["--token-file".to_owned(), display(token_file)]);
+    }
+    if let Some(listen) = &api.metrics_listen {
+        arguments.extend(["--metrics-listen".to_owned(), listen.clone()]);
+    }
+    for key in &api.metrics_labels {
+        arguments.extend(["--metrics-label".to_owned(), key.clone()]);
     }
     arguments
 }
@@ -499,12 +501,16 @@ pub(crate) async fn install(
     store: &HubStore,
     output: &mut impl Write,
 ) -> Result<(), HubError> {
-    let token_file = request.token_file.as_deref().map(absolute).transpose()?;
-    let daemon = daemon_arguments(
-        &request.interval,
-        request.listen.as_deref(),
-        token_file.as_deref(),
-    );
+    let api = HubApiOptions {
+        token_file: request
+            .api
+            .token_file
+            .as_deref()
+            .map(absolute)
+            .transpose()?,
+        ..request.api.clone()
+    };
+    let daemon = daemon_arguments(&request.interval, &api);
     let plan = match request.manager {
         HubManager::Systemd => systemd_install_plan(env, request.system, &daemon),
         HubManager::Docker => docker_install_plan(

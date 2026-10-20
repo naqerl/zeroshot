@@ -23,6 +23,8 @@ mod capabilities;
 mod cron;
 #[path = "tests/daemon.rs"]
 mod daemon;
+#[path = "tests/metrics.rs"]
+mod metrics;
 
 pub(super) fn member(name: &str, tags: &[&str], slots: u32, priority: i32) -> Member {
     Member {

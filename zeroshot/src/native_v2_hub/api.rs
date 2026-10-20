@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, Request, State};
+use axum::extract::{MatchedPath, Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -58,13 +58,50 @@ pub(crate) fn router(state: Arc<ApiState>) -> Router {
         .route("/v1/hub/schedules", post(create_schedule))
         .route("/v1/hub/dispatch", post(dispatch))
         .route("/v1/hub/stats", post(stats))
+        .route("/metrics", get(metrics))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
     Router::new()
         .route("/v1/hub/health", get(health))
         .merge(protected)
         .fallback(delete(not_found).get(not_found).post(not_found))
+        .layer(middleware::from_fn_with_state(state.clone(), observe))
         .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(state)
+}
+
+/// The unauthenticated loopback listener of `--metrics-listen`: only `GET /metrics`.
+pub(crate) fn metrics_router(state: Arc<ApiState>) -> Router {
+    Router::new()
+        .route("/metrics", get(metrics))
+        .fallback(get(not_found))
+        .layer(middleware::from_fn_with_state(state.clone(), observe))
+        .with_state(state)
+}
+
+/// Count every request by route template (never the concrete path), method, and status.
+async fn observe(State(state): State<Arc<ApiState>>, request: Request, next: Next) -> Response {
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or_else(|| "unmatched".to_owned(), |path| path.as_str().to_owned());
+    let method = match request.method().as_str() {
+        method @ ("GET" | "POST" | "PATCH" | "DELETE" | "PUT" | "HEAD") => method,
+        _ => "other",
+    }
+    .to_owned();
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    state.service.metrics().record_request(
+        (&route, &method),
+        response.status().as_u16(),
+        started.elapsed().as_secs_f64(),
+    );
+    response
+}
+
+async fn metrics(State(state): State<Arc<ApiState>>) -> Response {
+    let text = state.service.render_metrics().await;
+    ([(header::CONTENT_TYPE, super::metrics::CONTENT_TYPE)], text).into_response()
 }
 
 /// Constant-time comparison, so response timing does not reveal how much of a token matched.

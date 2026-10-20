@@ -28,6 +28,7 @@ mod driver;
 mod error;
 mod install;
 mod jobs;
+mod metrics;
 mod model;
 mod placement;
 mod schedule;

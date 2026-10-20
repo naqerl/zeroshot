@@ -1,8 +1,8 @@
 use std::ffi::OsString;
 
 use crate::native_v2_cli::hub::{
-    HubCommand, HubContextCommand, HubDaemonRun, HubInstall, HubManager, HubMemberState,
-    HubRequest, HubStrategy, HubTokenSource, HubUninstall,
+    HubApiOptions, HubCommand, HubContextCommand, HubDaemonRun, HubInstall, HubManager,
+    HubMemberState, HubRequest, HubStrategy, HubTokenSource, HubUninstall,
 };
 use crate::native_v2_cli::{NativeV2CliCommand, NativeV2CliError, parse_native_v2_args};
 
@@ -274,8 +274,7 @@ fn daemon_and_service_commands_parse() {
         parse(&["hub", "daemon", "run", "--interval", "3s"]).expect("daemon run"),
         HubCommand::Daemon(HubDaemonRun {
             interval: "3s".to_owned(),
-            listen: None,
-            token_file: None,
+            api: HubApiOptions::default(),
         })
     );
     assert_eq!(
@@ -287,12 +286,20 @@ fn daemon_and_service_commands_parse() {
             "0.0.0.0:7383",
             "--token-file",
             "/srv/token",
+            "--metrics-listen",
+            "127.0.0.1:9383",
+            "--metrics-label",
+            "task",
         ])
         .expect("daemon run with API options"),
         HubCommand::Daemon(HubDaemonRun {
             interval: "10s".to_owned(),
-            listen: Some("0.0.0.0:7383".to_owned()),
-            token_file: Some("/srv/token".into()),
+            api: HubApiOptions {
+                listen: Some("0.0.0.0:7383".to_owned()),
+                token_file: Some("/srv/token".into()),
+                metrics_listen: Some("127.0.0.1:9383".to_owned()),
+                metrics_labels: vec!["task".to_owned()],
+            },
         })
     );
     assert_eq!(
@@ -307,8 +314,7 @@ fn daemon_and_service_commands_parse() {
             image: None,
             volumes: Vec::new(),
             interval: "10s".to_owned(),
-            listen: None,
-            token_file: None,
+            api: HubApiOptions::default(),
             dry_run: true,
         })
     );

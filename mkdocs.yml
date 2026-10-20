@@ -57,6 +57,7 @@ nav:
       - Prepare a runtime environment: guides/runtime-environments.md
       - Build a review loop: guides/review-loop.md
       - Observe and control runs: guides/observe-and-control.md
+      - Operate a hub: guides/hub-operations.md
       - Use a local graph as an ACP agent: guides/acp.md
       - Python SDK: guides/python-sdk.md
   - Reference:
