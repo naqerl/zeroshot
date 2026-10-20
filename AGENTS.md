@@ -760,9 +760,28 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   bundled tzdb). Member capacity is hub-declared `slots`; load is the observed nonterminal runs.
   Dispatch submission keys are `hub-JOB_ID-ATTEMPT`. Exit code 3 means no capacity or an expired
   wait, and 4 means that no active member matches or supports the job.
+- Hub metrics: `GET /metrics` (Prometheus text 0.0.4, hand-rolled in `native_v2_hub/metrics.rs`)
+  needs the API token; `--metrics-listen` adds a token-free listener that must be loopback, and
+  `--metrics-label KEY` opts job label keys into token counters. State-derived series are
+  recomputed per scrape; pass, placement, and API series count since daemon start. Never label by
+  job, run, schedule, or eval ID; label values cap at 50 distinct (`_other`), removed members are
+  `_removed`, and routes use axum templates.
+- Hub evals (`hub eval`, `native_v2_hub/eval*`) store suites, cases, and runs in
+  `HubState.evals` and file contents in `hub/eval/blobs/SHA256`. Case IDs (`ec_`) hash the
+  captured request, run IDs (`er_`) hash the request plus `--key`, and sample job IDs hash run,
+  case, variant, and repeat, so retries never duplicate work. Samples are ordinary queued hub jobs
+  labeled `eval.*`. Variant overrides are a pure merge in `eval/variant.rs` (graph/template and the
+  two runtime flags replace each other; model/harness/provider/runtime-patch edit the runtime file).
+  The daemon's eval worker (claimed work spawned beside dispatch) measures finished samples, runs
+  checks with `sh -c` in `hub/eval/work/...`, and runs `cmd:` judges on the hub host or
+  `zeroshot:` judges as `eval.role=judge` hub jobs whose terminal output (`Job.output`, kept only
+  for judge jobs) is the verdict. Reports are pure (`eval/report.rs`); `--fail-on-regression`
+  exits 6 on a regression and 3 while incomplete. Judge and report schemas are documented in
+  `docs/guides/hub-operations.md`; keep them in sync.
 - Read-only safe commands include `zeroshot list`, `zeroshot status`, `zeroshot logs`,
-  `zeroshot hub list`, `zeroshot hub ps`, `zeroshot hub stats`, `zeroshot hub daemon status`, and
-  `zeroshot hub context list`.
+  `zeroshot hub list`, `zeroshot hub ps`, `zeroshot hub stats`, `zeroshot hub daemon status`,
+  `zeroshot hub eval report|status|list`, and `zeroshot hub context list`. `zeroshot hub eval run`
+  enqueues real runs.
   `zeroshot hub install` and `zeroshot hub uninstall` change system services and need explicit
   user intent; prefer `--dry-run` first.
 - Destructive commands such as `zeroshot force-stop` require explicit user intent.
