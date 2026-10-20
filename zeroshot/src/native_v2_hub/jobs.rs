@@ -86,6 +86,7 @@ pub(crate) fn new_job(spec: &HubJobSpec, now_ms: u64) -> Result<Job, HubError> {
         token_usage: None,
         error: None,
         schedule_id: None,
+        output: None,
     })
 }
 

@@ -26,6 +26,7 @@ mod cron;
 mod daemon;
 mod driver;
 mod error;
+mod eval;
 mod install;
 mod jobs;
 mod metrics;

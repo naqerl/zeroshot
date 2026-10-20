@@ -171,6 +171,24 @@ pub(crate) async fn run(
                 write_json(output, &error.diagnostic())?;
             }
         }
+        // Eval work (measuring finished samples, checks, judges) runs beside the dispatcher:
+        // a slow check or judge never delays placement.
+        match service.eval_claim().await {
+            Ok(work) => {
+                for item in work {
+                    let service = service.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = service.eval_execute(item).await {
+                            eprintln!("zeroshot hub eval: {error}");
+                        }
+                    });
+                }
+            }
+            Err(error) => {
+                heartbeat["lastError"] = json!(error.to_string());
+                write_json(output, &error.diagnostic())?;
+            }
+        }
         heartbeat["passes"] = json!(passes);
         heartbeat["lastPassAt"] = json!(rfc3339(now_ms()));
         publish(&service, &shared, &heartbeat)?;

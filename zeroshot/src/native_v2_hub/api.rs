@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 
 use super::driver::hub_executable;
 use super::error::HubError;
+use super::eval::{AddCase, AddSuite, CaseQuery, CreateRun, ReportRequest, RunQuery};
 use super::service::HubService;
 use super::wire::{
     AddMember, CreateSchedule, EnqueueJob, JobQuery, MemberQuery, StatsRequest, StreamFrame,
@@ -58,6 +59,14 @@ pub(crate) fn router(state: Arc<ApiState>) -> Router {
         .route("/v1/hub/schedules", post(create_schedule))
         .route("/v1/hub/dispatch", post(dispatch))
         .route("/v1/hub/stats", post(stats))
+        .route("/v1/hub/eval/suites", post(eval_suite_add).get(eval_suites))
+        .route("/v1/hub/eval/cases", post(eval_case_add))
+        .route("/v1/hub/eval/cases/query", post(eval_cases))
+        .route("/v1/hub/eval/cases/{id}", get(eval_case))
+        .route("/v1/hub/eval/runs", post(eval_run_create))
+        .route("/v1/hub/eval/runs/query", post(eval_runs))
+        .route("/v1/hub/eval/runs/{id}", get(eval_run))
+        .route("/v1/hub/eval/runs/{id}/report", post(eval_report))
         .route("/metrics", get(metrics))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
     Router::new()
@@ -281,6 +290,70 @@ async fn dispatch(State(state): State<Arc<ApiState>>) -> Response {
 
 async fn stats(State(state): State<Arc<ApiState>>, bytes: Bytes) -> Response {
     let result = async { state.service.stats(body::<StatsRequest>(&bytes)?).await }.await;
+    reply(result)
+}
+
+async fn eval_suite_add(State(state): State<Arc<ApiState>>, bytes: Bytes) -> Response {
+    let result = async {
+        state
+            .service
+            .eval_suite_add(body::<AddSuite>(&bytes)?)
+            .await
+    }
+    .await;
+    reply(result)
+}
+
+async fn eval_suites(State(state): State<Arc<ApiState>>) -> Response {
+    reply(state.service.eval_suites().await)
+}
+
+async fn eval_case_add(State(state): State<Arc<ApiState>>, bytes: Bytes) -> Response {
+    let result = async { state.service.eval_case_add(body::<AddCase>(&bytes)?).await }.await;
+    reply(result)
+}
+
+async fn eval_cases(State(state): State<Arc<ApiState>>, bytes: Bytes) -> Response {
+    let result = async { state.service.eval_cases(body::<CaseQuery>(&bytes)?).await }.await;
+    reply(result)
+}
+
+async fn eval_case(State(state): State<Arc<ApiState>>, Path(id): Path<String>) -> Response {
+    reply(state.service.eval_case(&id).await)
+}
+
+async fn eval_run_create(State(state): State<Arc<ApiState>>, bytes: Bytes) -> Response {
+    let result = async {
+        state
+            .service
+            .eval_run_create(body::<CreateRun>(&bytes)?)
+            .await
+    }
+    .await;
+    reply(result)
+}
+
+async fn eval_runs(State(state): State<Arc<ApiState>>, bytes: Bytes) -> Response {
+    let result = async { state.service.eval_runs(body::<RunQuery>(&bytes)?).await }.await;
+    reply(result)
+}
+
+async fn eval_run(State(state): State<Arc<ApiState>>, Path(id): Path<String>) -> Response {
+    reply(state.service.eval_run(&id).await)
+}
+
+async fn eval_report(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    bytes: Bytes,
+) -> Response {
+    let result = async {
+        state
+            .service
+            .eval_report(&id, body::<ReportRequest>(&bytes)?)
+            .await
+    }
+    .await;
     reply(result)
 }
 

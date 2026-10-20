@@ -9,6 +9,8 @@ pub(crate) const EXIT_NO_CAPACITY: i32 = 3;
 pub(crate) const EXIT_NO_ELIGIBLE_TARGET: i32 = 4;
 /// Exit code when the selected hub context does not answer.
 pub(crate) const EXIT_UNREACHABLE: i32 = 5;
+/// Exit code of `hub eval report --fail-on-regression` when a variant regressed.
+pub(crate) const EXIT_REGRESSION: i32 = 6;
 
 #[derive(Debug, Error)]
 pub(crate) enum HubError {
@@ -27,6 +29,8 @@ pub(crate) enum HubError {
     JobNotFound(String),
     #[error("{0}")]
     MemberNotFound(String),
+    #[error("{0}")]
+    EvalNotFound(String),
     #[error("{0}")]
     InvalidState(String),
     #[error("{0}")]
@@ -79,7 +83,7 @@ impl HubError {
     pub(crate) const fn http_status(&self) -> u16 {
         match self {
             Self::Usage(_) => 400,
-            Self::JobNotFound(_) | Self::MemberNotFound(_) => 404,
+            Self::JobNotFound(_) | Self::MemberNotFound(_) | Self::EvalNotFound(_) => 404,
             Self::InvalidState(_) | Self::Conflict(_) | Self::DaemonRunning(_) => 409,
             Self::NoEligibleTarget { .. } => 422,
             Self::NoCapacity(_) | Self::WaitTimeout(_) => 503,
@@ -97,6 +101,7 @@ impl HubError {
             Self::WaitTimeout(_) => ("target", "hub.wait_timeout"),
             Self::JobNotFound(_) => ("invalid_request", "hub.job_not_found"),
             Self::MemberNotFound(_) => ("invalid_request", "hub.member_not_found"),
+            Self::EvalNotFound(_) => ("invalid_request", "hub.eval_not_found"),
             Self::InvalidState(_) => ("invalid_request", "hub.invalid_state"),
             Self::Conflict(_) => ("invalid_request", "hub.conflict"),
             Self::Storage(_) => ("target", "hub.storage"),

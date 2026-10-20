@@ -1,6 +1,9 @@
 use clap::{Args, Subcommand, ValueEnum};
 
 use super::RunArgs;
+
+#[path = "hub/eval.rs"]
+mod eval;
 use crate::native_v2_cli::NativeV2CliError;
 use crate::native_v2_cli::hub::{
     HubApiOptions, HubCommand, HubContextCommand, HubDaemonRun, HubEnqueue, HubInstall, HubJobSpec,
@@ -140,6 +143,10 @@ pub(super) enum HubCliCommand {
 
     /// Stop and remove the hub daemon service. Hub state is kept.
     Uninstall(HubUninstallArgs),
+
+    /// Capture tasks as eval cases, rerun them under variants, judge, and compare.
+    #[command(subcommand)]
+    Eval(eval::HubEvalCliCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -637,6 +644,7 @@ impl HubCliCommand {
                 system: args.system,
                 dry_run: args.dry_run,
             }),
+            Self::Eval(command) => HubCommand::Eval(command.into_command()?),
         })
     }
 }

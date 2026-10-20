@@ -175,11 +175,11 @@ impl HubClient {
             })
     }
 
-    async fn get(&self, segments: &[&str]) -> Result<Value, HubError> {
+    pub(crate) async fn get(&self, segments: &[&str]) -> Result<Value, HubError> {
         self.call(Method::GET, segments, None::<&Value>).await
     }
 
-    async fn post(
+    pub(crate) async fn post(
         &self,
         segments: &[&str],
         body: &(impl Serialize + Sync),
@@ -336,6 +336,9 @@ pub(crate) async fn execute(
         }
         HubCommand::ForceStop { job } => {
             return client.stream(&job, &StreamRequest::ForceStop).await;
+        }
+        HubCommand::Eval(command) => {
+            return super::eval::client::execute(client, command, output).await;
         }
         HubCommand::Daemon(_)
         | HubCommand::Install(_)

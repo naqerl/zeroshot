@@ -778,6 +778,7 @@ Commands:
   context     Manage named hub endpoints this machine can address
   install     Install the hub daemon as a systemd unit or a Docker container and start it
   uninstall   Stop and remove the hub daemon service. Hub state is kept
+  eval        Capture tasks as eval cases, rerun them under variants, judge, and compare
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1834,6 +1835,576 @@ Options:
           Print help
 ```
 
+#### `zeroshot hub eval`
+
+```text
+Capture tasks as eval cases, rerun them under variants, judge, and compare
+
+Usage: zeroshot hub eval [OPTIONS] <COMMAND>
+
+Commands:
+  suite   Create or describe an eval suite
+  case    Capture, list, or show eval cases
+  run     Enqueue an eval run: every case x variant x repeat through hub placement
+  list    List eval runs as JSON [alias: ls]
+  status  Show one eval run with every sample's measurement and verdict as JSON
+  report  Compare variants with the baseline per case and in aggregate
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+EVALS
+A case snapshots one task: its run request (input, graph or template, runtime config, profile,
+environment), the pinned source revision, placement, and labels. File contents are stored on the
+hub by SHA-256, so a case ID (ec_...) is the hash of the snapshot and adding the same task twice
+returns the same case. Suites group cases by name.
+
+`hub eval run` enqueues every case x variant x repeat as an ordinary hub job, labeled eval.run,
+eval.case, eval.variant, and eval.repeat, so placement, metrics, ps, and logs work unchanged. A
+variant overrides parts of the case:
+  --variant NAME=KEY=VALUE[,KEY=VALUE...]
+  graph=FILE  template=NAME  profile=NAME  runtime-config=FILE  uniform-runtime-config=FILE
+  environment=FILE  model=MODEL  harness=NAME  provider=NAME  runtime-patch=FILE
+File overrides replace the case's file (graph and template replace each other, as do the two
+runtime flags); model, harness, provider, and runtime-patch (a JSON merge patch) edit the
+case's runtime file. The baseline is the variant named by --baseline: by default `baseline`,
+the case exactly as captured. Use --baseline hj_JOB to reuse an existing job's result, or none.
+`NAME=` with no overrides replays the case unchanged (an A/A control for noise).
+
+The hub daemon measures each finished sample (outcome, duration, tokens, estimated cost),
+runs --check commands, and calls the judge. Checks run with `sh -c` on the hub host in the
+sample's work folder (status.json, job.json, case.json, outcome.json) with ZEROSHOT_EVAL_RUN,
+_CASE, _VARIANT, _REPEAT, _JOB, _OUTCOME, _TARGET, _RUN_ID, _STATUS, _INPUTS, and _WORKDIR set;
+exit 0 passes. Target workspaces stay on their targets: a check that needs the result checks
+out the delivered branch or calls `zeroshot` (ZEROSHOT_HUB_EXECUTABLE) itself. Judges:
+  cmd:SCRIPT      SCRIPT is uploaded and run on the hub host. stdin: a
+                  zeroshot.hub.eval.judge-request/v1 document; stdout: {"score": N,
+                  "verdict": "...", "rationale": "..."}. Absolute scores are 0..1; pairwise
+                  scores are -1..1, positive when the variant beats the baseline.
+  zeroshot:GRAPH  the judge itself runs as a hub job with GRAPH and the request as --input;
+                  its terminal output must carry the same fields.
+
+`hub eval report` compares each variant with the baseline per case and in aggregate: pass rate,
+judge score mean with a 95% normal-approximation interval, tokens, cost, and duration. Deltas
+past a threshold are flagged as improvements or regressions.
+
+EXIT CODES (report)
+  0  report written; no regression, or --fail-on-regression not given
+  3  --fail-on-regression and the run is not finished yet (retryable)
+  6  --fail-on-regression and a variant regressed
+
+EXAMPLES
+  zeroshot hub eval suite add parser --description "Parser fixes"
+  zeroshot hub eval case add --suite parser --from-job hj_0123
+  zeroshot hub eval run --suite parser --repeat 3 --variant fast=model=gpt-5-mini \
+    --judge cmd:judge.py --check tests="cargo test" --prices prices.json --key nightly-42
+  zeroshot hub eval report er_0123 --fail-on-regression --table
+```
+
+##### `zeroshot hub eval suite`
+
+```text
+Create or describe an eval suite
+
+Usage: zeroshot hub eval suite [OPTIONS] <COMMAND>
+
+Commands:
+  add   Create a suite, or change its description
+  list  List suites with their case counts as JSON [alias: ls]
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help
+```
+
+###### `zeroshot hub eval suite add`
+
+```text
+Create a suite, or change its description
+
+Usage: zeroshot hub eval suite add [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>
+          Suite name: 1-64 ASCII letters, digits, '-', '_', or '.'
+
+Options:
+      --description <TEXT>
+          Free-form description
+
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help
+```
+
+###### `zeroshot hub eval suite list`
+
+```text
+List suites with their case counts as JSON
+
+Usage: zeroshot hub eval suite list [OPTIONS]
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help
+```
+
+###### `zeroshot hub eval suite help`
+
+```text
+Print this message or the help of the given subcommand(s)
+
+Usage: zeroshot hub eval suite help [COMMAND]
+
+Commands:
+  add   Create a suite, or change its description
+  list  List suites with their case counts as JSON
+  help  Print this message or the help of the given subcommand(s)
+```
+
+##### `zeroshot hub eval case`
+
+```text
+Capture, list, or show eval cases
+
+Usage: zeroshot hub eval case [OPTIONS] <COMMAND>
+
+Commands:
+  add   Snapshot a task as a case, from a hub job (--from-job) or from run flags
+  list  List cases as JSON [alias: ls]
+  show  Show one case with its run request and stored files as JSON
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help
+```
+
+###### `zeroshot hub eval case add`
+
+```text
+Snapshot a task as a case, from a hub job (--from-job) or from run flags
+
+Usage: zeroshot hub eval case add [OPTIONS]
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+      --title <TITLE>
+          Human-readable title recorded with the run
+
+      --graph <FILE>
+          Load a custom graph specification from this JSON file
+
+      --template <TEMPLATE>
+          Materialize and run this built-in graph template
+
+          Possible values:
+          - single-worker:   A single general-purpose worker
+          - software-change: A review, validation, and optional delivery workflow for code changes
+          - auto-research:   Research with ten iterations by default and independent evidence gates
+
+      --input <FILE>
+          Load the graph's initial input from this JSON file
+
+      --runtime-config <FILE>
+          Load an exact secret-free runtime plan from this JSON file
+
+      --uniform-runtime-config <FILE>
+          Expand one secret-free agent runtime across every executable graph node
+
+      --environment <FILE>
+          Load a JSON environment definition: setup, startup, public variables, and hook connections
+
+      --no-environment
+          Send an empty environment ({}) to bypass the target's configured default
+
+      --profile <[SCOPE:]NAME>
+          Use a profile: NAME, local:NAME, user:NAME, or org:NAME.
+
+          When no profile or inline graph/runtime is supplied, scoped defaults are checked.
+
+      --target <NAME>
+          Default placement: pin to this hub member
+
+      --cwd <FOLDER>
+          Working folder (default: invoking folder). File arguments stay relative to the invoking folder
+
+      --source-connection <KEY>
+          Named connection for Git checkout and push.
+
+          HTTPS uses GIT_USERNAME and GIT_PASSWORD; SSH uses GIT_SSH_PRIVATE_KEY and GIT_SSH_KNOWN_HOSTS.
+
+      --repository <REPOSITORY>
+          Repository in GitHub owner/name form or a credential-free HTTPS/SSH Git URL. Requires --target
+
+      --branch <BRANCH>
+          Source branch to resolve for the named run. Requires --target
+
+      --revision <SHA>
+          Exact source commit SHA. Requires --target
+
+      --submission-key <KEY>
+          Stable idempotency key for safely retrying submission
+
+      --delivery <MODE>
+          Materialize this template-owned delivery mode
+
+      --push
+          Commit and push the managed run branch without opening a pull request
+
+      --pr
+          Materialize pull-request delivery for the software-change template
+
+      --ship
+          Materialize merge delivery for the software-change template
+
+      --no-pr-feedback
+          Do not route visible pull-request feedback through the autonomous repair loop
+
+      --from-job <JOB_ID>
+          Hub job whose run request, files, source pin, placement, and labels become the case
+
+      --suite <NAME>
+          Add the case to this suite. Repeat for several
+
+      --name <NAME>
+          Short case name for reports
+
+      --tag <TAG>
+          Require this member tag. Repeat for several; all must match
+
+      --strategy <STRATEGY>
+          Choice among free matching members
+
+          Possible values:
+          - first-free:   Highest member priority, then registration order
+          - least-loaded: Lowest active-runs-to-slots ratio
+
+          [default: first-free]
+
+      --label <KEY=VALUE>
+          Job label for ps filters and stats, such as task=parser. Repeat for several
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+RUNTIME CONFIGURATION
+    The file is secret-free JSON. For example:
+
+      {
+        "harness": "codex",
+        "provider": "openrouter",
+        "size": "medium",
+        "nodes": {
+          "worker": {
+            "kind": "agent",
+            "model": "provider-model-id",
+            "connections": {"openrouter": ["OPENROUTER_API_KEY"]}
+          }
+        }
+      }
+
+    Provider choices are codex/openai, codex/openrouter, codex/bedrock, claude/anthropic,
+    claude/openrouter, claude/bedrock, codex/gateway, claude/gateway, copilot/github,
+    pi/anthropic, pi/openai, pi/openrouter, pi/bedrock, and pi/gateway. Gateway connections
+    require GATEWAY_BASE_URL and GATEWAY_API_KEY. Codex uses Responses and Claude uses Messages.
+    The pi/gateway lane also carries GATEWAY_API, which names the wire protocol as one of
+    openai-responses, openai-completions, or anthropic-messages.
+    Declaring ANTHROPIC_BASE_URL with ANTHROPIC_API_KEY sends the pi/anthropic lane to a
+    caller-owned Anthropic Messages endpoint.
+    Known-incompatible harness/provider pairs include
+    codex/anthropic, claude/openai, and pi/github. Local Copilot reuses its native user login;
+    contained
+    Copilot uses a user-backed GitHub connection with COPILOT_GITHUB_TOKEN. Pi has no permission
+    control of its own, so its contained runs rely on the disposable capsule rather than a bypass
+    argument. Model IDs are passed
+    unchanged to the selected harness and
+    provider; Zeroshot does not maintain or validate provider model catalogs.
+
+    Sizes are small, medium, and large.
+
+    Every executable graph node needs a same-named binding. Agent bindings require kind and model.
+    Optional fields are effort (low, medium, high, xhigh, or max when supported), sessionScope
+    (execution or node_instance), and connections. Each connection key maps to the exact
+    environment variable names required by that node; never put values in this file.
+
+    The run-level harness and provider are the default lane. An agent binding may add
+    "lane": {"harness": "claude", "provider": "anthropic"} to run that node on another accepted
+    pair; git_delivery bindings cannot. --uniform-runtime-config applies one lane to every agent
+    node. Named targets must advertise per-node lane support (openengine.node-runtime-lanes/v1), and
+    a local run first checks that each lane's executable (codex, claude, or copilot) is on PATH.
+
+    Use `zeroshot template show TEMPLATE` to inspect node names. With --push, --pr, or --ship, omit the
+    template-owned delivery binding.
+
+    --uniform-runtime-config requires harness, provider, and model. It accepts optional size,
+    effort, sessionScope, and connections fields without nodes. Zeroshot expands that agent binding
+    across every executable graph node and supplies graph-visible Git delivery bindings itself.
+    Omitted connections reuse native local login for codex/openai, claude/anthropic,
+    copilot/github, pi/anthropic, and pi/openai; other local lanes and contained targets derive
+    their canonical connection requirements.
+
+ENVIRONMENT PREPARATION
+    For Docker or Cloud targets, pass --environment environment.json with a separate, flat JSON
+    definition (not a profile field or an "environment" wrapper):
+
+      {
+        "setup": "apt-get update && apt-get install -y jq",
+        "startup": "npm ci",
+        "variables": {"CI": "true"}
+      }
+
+    Setup runs as root before checkout or workspace restore. Startup runs as the non-root
+    workspace owner in the checkout before any agent starts. Workers and reviewers share the
+    prepared workspace. Both hooks rerun on resume; startup must tolerate existing files.
+
+    Install OS packages in setup, project dependencies in startup, and shared executable tools
+    under $ZEROSHOT_TOOLS/bin (already on every hook and agent's PATH). Shell exports last only
+    for that hook; use variables for public values shared with agents. Scripts and variables
+    are public. If hooks need secrets, add e.g. "connections": {"package-registry": ["NPM_TOKEN"]}.
+    Hook connections are separate from node connections.
+
+    Hook failures stop the run before agents start and use no graph retry attempts.
+    Inspect `zeroshot logs RUN_ID --target NAME` for preparation output.
+    Omit both flags to allow host defaults; direct Docker defaults to the base environment.
+    --no-environment sends {} to bypass host defaults. Local runs use the invoking machine and
+    reject hooks and hook connections.
+
+    Installation, services, limits, and recovery:
+    https://the-open-engine.github.io/zeroshot/current/guides/runtime-environments/
+```
+
+###### `zeroshot hub eval case list`
+
+```text
+List cases as JSON
+
+Usage: zeroshot hub eval case list [OPTIONS]
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+      --suite <NAME>
+          Only cases in this suite
+
+  -h, --help
+          Print help
+```
+
+###### `zeroshot hub eval case show`
+
+```text
+Show one case with its run request and stored files as JSON
+
+Usage: zeroshot hub eval case show [OPTIONS] <CASE_ID>
+
+Arguments:
+  <CASE_ID>
+          Case ID (ec_...)
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help
+```
+
+###### `zeroshot hub eval case help`
+
+```text
+Print this message or the help of the given subcommand(s)
+
+Usage: zeroshot hub eval case help [COMMAND]
+
+Commands:
+  add   Snapshot a task as a case, from a hub job (--from-job) or from run flags
+  list  List cases as JSON
+  show  Show one case with its run request and stored files as JSON
+  help  Print this message or the help of the given subcommand(s)
+```
+
+##### `zeroshot hub eval run`
+
+```text
+Enqueue an eval run: every case x variant x repeat through hub placement
+
+Usage: zeroshot hub eval run [OPTIONS] <--suite <NAME>|--case <CASE_ID>>
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+      --suite <NAME>
+          Run every case of this suite
+
+      --case <CASE_ID>
+          Run this case. Repeat for several; combines with --suite
+
+      --baseline <VARIANT|JOB_ID|none>
+          Baseline: a variant name [default: baseline, the case as captured], a hub job ID whose result is the baseline sample, or none
+
+      --variant <NAME=OVERRIDES>
+          Variant as NAME=KEY=VALUE[,KEY=VALUE...]; see EVALS. Repeat for several
+
+      --repeat <N>
+          Samples per case and variant
+
+          [default: 1]
+
+      --target <NAME>
+          Pin every sample to this hub member instead of the case's placement
+
+      --tag <TAG>
+          Require this member tag instead of the case's tags. Repeat for several
+
+      --priority <N>
+          Queue priority of the samples
+
+          [default: 0]
+
+      --judge <cmd:SCRIPT|zeroshot:GRAPH>
+          Judge: cmd:SCRIPT or zeroshot:GRAPH
+
+      --judge-mode <MODE>
+          Absolute scores each sample; pairwise compares each variant sample with the baseline
+
+          Possible values:
+          - absolute: Score each sample on its own, 0..1
+          - pairwise: Score each variant sample against the baseline sample of the same case and repeat
+
+          [default: absolute]
+
+      --judge-runtime <FILE>
+          Uniform runtime config of a zeroshot:GRAPH judge
+
+      --check <NAME=COMMAND>
+          Check NAME=COMMAND: a shell command run on the hub host for each finished sample; exit 0 passes. Repeat for several
+
+      --prices <FILE>
+          JSON price table (as for `hub stats`) stored with the run for cost estimates
+
+      --key <KEY>
+          Idempotency key: repeating a request with the same key returns the same eval run
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+##### `zeroshot hub eval list`
+
+```text
+List eval runs as JSON
+
+Usage: zeroshot hub eval list [OPTIONS]
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+      --suite <NAME>
+          Only runs of this suite
+
+      --limit <N>
+          Return at most this many of the newest runs
+
+  -h, --help
+          Print help
+```
+
+##### `zeroshot hub eval status`
+
+```text
+Show one eval run with every sample's measurement and verdict as JSON
+
+Usage: zeroshot hub eval status [OPTIONS] <RUN_ID>
+
+Arguments:
+  <RUN_ID>
+          Eval run ID (er_...)
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help
+```
+
+##### `zeroshot hub eval report`
+
+```text
+Compare variants with the baseline per case and in aggregate
+
+Usage: zeroshot hub eval report [OPTIONS] <RUN_ID>
+
+Arguments:
+  <RUN_ID>
+          Eval run ID (er_...)
+
+Options:
+      --baseline <VARIANT|RUN_ID[:VARIANT]>
+          Compare with this variant of the run, or with er_ID[:VARIANT] of another run [default: the run's baseline]
+
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+      --threshold <METRIC=VALUE>
+          METRIC=VALUE threshold for flags, or METRIC=off. passRate and judgeScore are absolute differences [defaults 0.05]; tokens, costUsd, and durationMs are relative changes [defaults 0.10, 0.10, 0.25]
+
+      --prices <FILE>
+          JSON price table for cost estimates [default: the run's --prices]
+
+      --fail-on-regression
+          Exit 6 when a variant regressed, and 3 while the run is unfinished
+
+      --wait [<DURATION>]
+          Wait until every sample is measured and judged, optionally up to DURATION
+
+      --table
+          Print a human-readable table instead of JSON
+
+  -h, --help
+          Print help
+```
+
+##### `zeroshot hub eval help`
+
+```text
+Print this message or the help of the given subcommand(s)
+
+Usage: zeroshot hub eval help [COMMAND]
+
+Commands:
+  suite   Create or describe an eval suite
+  case    Capture, list, or show eval cases
+  run     Enqueue an eval run: every case x variant x repeat through hub placement
+  list    List eval runs as JSON
+  status  Show one eval run with every sample's measurement and verdict as JSON
+  report  Compare variants with the baseline per case and in aggregate
+  help    Print this message or the help of the given subcommand(s)
+```
+
 #### `zeroshot hub help`
 
 ```text
@@ -1861,6 +2432,7 @@ Commands:
   context     Manage named hub endpoints this machine can address
   install     Install the hub daemon as a systemd unit or a Docker container and start it
   uninstall   Stop and remove the hub daemon service. Hub state is kept
+  eval        Capture tasks as eval cases, rerun them under variants, judge, and compare
   help        Print this message or the help of the given subcommand(s)
 ```
 

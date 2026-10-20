@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::sync::Mutex;
 
+use super::eval::SampleState;
 use super::model::{HubState, Job, JobState, MemberState, ScheduleState};
 use super::placement::{Load, Rejection};
 
@@ -460,6 +461,46 @@ fn render_jobs(out: &mut Exposition, state: &HubState, now_ms: u64) {
         "Cron fires skipped because the previous job was still queued.",
     );
     out.sample("zeroshot_hub_cron_skips_total", &[], skipped as f64);
+    out.family(
+        "zeroshot_hub_eval_runs",
+        "gauge",
+        "Eval runs, by whether every sample is settled.",
+    );
+    let complete = state.evals.runs.iter().filter(|run| run.complete()).count();
+    out.sample(
+        "zeroshot_hub_eval_runs",
+        &[("complete", "true")],
+        complete as f64,
+    );
+    out.sample(
+        "zeroshot_hub_eval_runs",
+        &[("complete", "false")],
+        (state.evals.runs.len() - complete) as f64,
+    );
+    out.family(
+        "zeroshot_hub_eval_samples",
+        "gauge",
+        "Eval samples by state: pending, measured, judged, failed.",
+    );
+    for (name, wanted) in [
+        ("pending", SampleState::Pending),
+        ("measured", SampleState::Measured),
+        ("judged", SampleState::Judged),
+        ("failed", SampleState::Failed),
+    ] {
+        let count = state
+            .evals
+            .runs
+            .iter()
+            .flat_map(|run| &run.samples)
+            .filter(|sample| sample.state == wanted)
+            .count();
+        out.sample(
+            "zeroshot_hub_eval_samples",
+            &[("state", name)],
+            count as f64,
+        );
+    }
 }
 
 #[allow(clippy::cast_precision_loss)]

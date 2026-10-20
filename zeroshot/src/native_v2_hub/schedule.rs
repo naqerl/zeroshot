@@ -210,6 +210,9 @@ pub(crate) fn apply_status(job: &mut Job, status: &Value, now_ms: u64) -> bool {
     job.token_usage = status
         .pointer("/status/metadata/tokenUsage")
         .and_then(|usage| serde_json::from_value::<TokenUsage>(usage.clone()).ok());
+    if job.labels.contains_key(super::eval::ROLE_LABEL) {
+        job.output = status.pointer("/status/terminalResult/output").cloned();
+    }
     job.finished_at_ms = Some(now_ms);
     job.error = None;
     true

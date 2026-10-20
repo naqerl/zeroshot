@@ -1,8 +1,9 @@
 use std::ffi::OsString;
 
 use crate::native_v2_cli::hub::{
-    HubApiOptions, HubCommand, HubContextCommand, HubDaemonRun, HubInstall, HubManager,
-    HubMemberState, HubRequest, HubStrategy, HubTokenSource, HubUninstall,
+    HubApiOptions, HubCommand, HubEvalCaseSource, HubEvalCommand, HubJudgeMode, HubContextCommand,
+    HubDaemonRun, HubInstall, HubManager, HubMemberState, HubRequest, HubStrategy, HubTokenSource,
+    HubUninstall,
 };
 use crate::native_v2_cli::{NativeV2CliCommand, NativeV2CliError, parse_native_v2_args};
 
@@ -436,4 +437,219 @@ fn context_commands_parse_and_require_one_token_source() {
     ] {
         assert!(parse(invalid).is_err(), "{invalid:?} must be rejected");
     }
+}
+
+#[test]
+fn eval_case_add_takes_a_job_or_run_flags_but_not_both() {
+    let HubCommand::Eval(HubEvalCommand::CaseAdd(from_job)) = parse(&[
+        "hub",
+        "eval",
+        "case",
+        "add",
+        "--suite",
+        "parser",
+        "--from-job",
+        "hj_1",
+        "--label",
+        "difficulty=hard",
+    ])
+    .expect("from job parses") else {
+        panic!("expected case add");
+    };
+    assert_eq!(
+        from_job.source,
+        HubEvalCaseSource::FromJob("hj_1".to_owned())
+    );
+    assert_eq!(from_job.suites, vec!["parser".to_owned()]);
+    assert_eq!(
+        from_job.labels,
+        vec![("difficulty".to_owned(), "hard".to_owned())]
+    );
+    let HubCommand::Eval(HubEvalCommand::CaseAdd(from_flags)) = parse(&[
+        "hub",
+        "eval",
+        "case",
+        "add",
+        "--name",
+        "p1",
+        "--title",
+        "Fix",
+        "--template",
+        "single-worker",
+        "--input",
+        "in.json",
+        "--label",
+        "task=parser",
+    ])
+    .expect("flags parse") else {
+        panic!("expected case add");
+    };
+    let HubEvalCaseSource::Flags(spec) = &from_flags.source else {
+        panic!("expected flags");
+    };
+    assert_eq!(spec.title, "Fix");
+    assert_eq!(spec.labels, vec![("task".to_owned(), "parser".to_owned())]);
+    assert!(
+        parse(&[
+            "hub",
+            "eval",
+            "case",
+            "add",
+            "--from-job",
+            "hj_1",
+            "--title",
+            "Fix",
+            "--input",
+            "in.json",
+        ])
+        .is_err()
+    );
+    assert!(parse(&["hub", "eval", "case", "add", "--suite", "s"]).is_err());
+}
+
+#[test]
+fn eval_run_parses_variants_judge_and_checks() {
+    let HubCommand::Eval(HubEvalCommand::Run(run)) = parse(&[
+        "hub",
+        "eval",
+        "run",
+        "--suite",
+        "parser",
+        "--variant",
+        "small=model=gpt-5-mini,graph=g.json",
+        "--variant",
+        "duo=template=duo",
+        "--repeat",
+        "3",
+        "--judge",
+        "cmd:judge.py",
+        "--judge-mode",
+        "pairwise",
+        "--check",
+        "tests=cargo test --quiet",
+        "--key",
+        "nightly-1",
+    ])
+    .expect("eval run parses") else {
+        panic!("expected eval run");
+    };
+    assert_eq!(run.suite.as_deref(), Some("parser"));
+    assert_eq!(run.repeat, 3);
+    assert_eq!(run.judge_mode, HubJudgeMode::Pairwise);
+    assert_eq!(run.judge.as_deref(), Some("cmd:judge.py"));
+    assert_eq!(
+        run.variants[0].overrides,
+        vec![
+            ("model".to_owned(), "gpt-5-mini".to_owned()),
+            ("graph".to_owned(), "g.json".to_owned())
+        ]
+    );
+    assert_eq!(run.variants[1].name, "duo");
+    assert_eq!(
+        run.checks,
+        vec![("tests".to_owned(), "cargo test --quiet".to_owned())]
+    );
+    for invalid in [
+        // No cases selected.
+        &["hub", "eval", "run", "--variant", "a=model=x"][..],
+        // An unknown override key, a reserved variant name, and a bad judge prefix.
+        &[
+            "hub",
+            "eval",
+            "run",
+            "--suite",
+            "s",
+            "--variant",
+            "a=speed=1",
+        ],
+        &[
+            "hub",
+            "eval",
+            "run",
+            "--suite",
+            "s",
+            "--variant",
+            "none=model=x",
+        ],
+        &[
+            "hub",
+            "eval",
+            "run",
+            "--suite",
+            "s",
+            "--judge",
+            "py:judge.py",
+        ],
+        // A judge runtime needs a zeroshot judge; pairwise needs a baseline.
+        &[
+            "hub",
+            "eval",
+            "run",
+            "--suite",
+            "s",
+            "--judge",
+            "cmd:j",
+            "--judge-runtime",
+            "r.json",
+        ],
+        &[
+            "hub",
+            "eval",
+            "run",
+            "--suite",
+            "s",
+            "--judge",
+            "cmd:j",
+            "--judge-mode",
+            "pairwise",
+            "--baseline",
+            "none",
+        ],
+        &[
+            "hub",
+            "eval",
+            "run",
+            "--suite",
+            "s",
+            "--check",
+            "no-command",
+        ],
+    ] {
+        assert!(parse(invalid).is_err(), "{invalid:?} should fail");
+    }
+}
+
+#[test]
+fn eval_report_parses_thresholds_and_wait() {
+    let HubCommand::Eval(HubEvalCommand::Report(report)) = parse(&[
+        "hub",
+        "eval",
+        "report",
+        "er_1",
+        "--baseline",
+        "er_0:baseline",
+        "--threshold",
+        "passRate=0.1",
+        "--threshold",
+        "durationMs=off",
+        "--fail-on-regression",
+        "--wait",
+        "--table",
+    ])
+    .expect("report parses") else {
+        panic!("expected report");
+    };
+    assert_eq!(report.run, "er_1");
+    assert_eq!(report.baseline.as_deref(), Some("er_0:baseline"));
+    assert_eq!(
+        report.thresholds,
+        vec![
+            ("passRate".to_owned(), "0.1".to_owned()),
+            ("durationMs".to_owned(), "off".to_owned())
+        ]
+    );
+    assert!(report.fail_on_regression && report.table);
+    assert_eq!(report.wait, Some(None));
+    assert!(parse(&["hub", "eval", "report", "er_1", "--threshold", "speed=1"]).is_err());
+    assert!(parse(&["hub", "eval", "report", "er_1", "--threshold", "tokens=-1"]).is_err());
 }

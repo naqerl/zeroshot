@@ -46,6 +46,8 @@ pub(crate) struct HubService {
     state: Mutex<HubState>,
     placement: Mutex<()>,
     metrics: Metrics,
+    /// Eval work in progress, so the worker never runs one piece twice at once.
+    eval_claims: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 pub(crate) fn member_document(member: &Member) -> Value {
@@ -82,6 +84,7 @@ impl HubService {
             state: Mutex::new(state),
             placement: Mutex::new(()),
             metrics: Metrics::default(),
+            eval_claims: std::sync::Mutex::default(),
         })
     }
 
@@ -102,6 +105,10 @@ impl HubService {
         self.metrics.render(&state, now_ms())
     }
 
+    pub(super) fn eval_claims(&self) -> &std::sync::Mutex<std::collections::BTreeSet<String>> {
+        &self.eval_claims
+    }
+
     pub(crate) fn store(&self) -> &HubStore {
         &self.store
     }
@@ -112,7 +119,7 @@ impl HubService {
 
     /// Apply `change` to a copy of the state, persist it, then publish it. A failed change or
     /// write leaves the state untouched.
-    async fn mutate<R>(
+    pub(super) async fn mutate<R>(
         &self,
         change: impl FnOnce(&mut HubState) -> Result<R, HubError>,
     ) -> Result<R, HubError> {
@@ -127,7 +134,7 @@ impl HubService {
         Ok(result)
     }
 
-    fn driver(&self) -> &dyn HubDriver {
+    pub(super) fn driver(&self) -> &dyn HubDriver {
         self.driver.as_ref()
     }
 

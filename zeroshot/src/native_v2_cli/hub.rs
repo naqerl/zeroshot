@@ -62,6 +62,8 @@ pub enum HubCommand {
     Context(HubContextCommand),
     Install(HubInstall),
     Uninstall(HubUninstall),
+    /// Evaluation suites, cases, runs, and reports.
+    Eval(HubEvalCommand),
 }
 
 /// `hub daemon run` options.
@@ -249,4 +251,108 @@ pub struct HubStats {
     pub since: Option<String>,
     pub until: Option<String>,
     pub prices: Option<PathBuf>,
+}
+
+/// `hub eval`: capture cases, rerun them under variants, measure, judge, and compare.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HubEvalCommand {
+    /// Create a suite, or update its description.
+    SuiteAdd {
+        name: String,
+        description: Option<String>,
+    },
+    SuiteList,
+    CaseAdd(Box<HubEvalCaseAdd>),
+    CaseList {
+        suite: Option<String>,
+    },
+    CaseShow {
+        case: String,
+    },
+    Run(Box<HubEvalRun>),
+    List {
+        suite: Option<String>,
+        limit: Option<usize>,
+    },
+    Status {
+        run: String,
+    },
+    Report(HubEvalReport),
+}
+
+/// `hub eval case add`: snapshot a task from a hub job or from run flags.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HubEvalCaseAdd {
+    /// Suites the case joins; each must exist.
+    pub suites: Vec<String>,
+    pub name: Option<String>,
+    /// Extra labels for a case captured `--from-job`; flag cases carry theirs in the spec.
+    pub labels: Vec<(String, String)>,
+    pub source: HubEvalCaseSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HubEvalCaseSource {
+    /// Copy an existing hub job's run request and source pin.
+    FromJob(String),
+    /// Build the case from `zeroshot run` flags, like `hub enqueue`.
+    Flags(Box<HubJobSpec>),
+}
+
+/// One `--variant NAME=KEY=VALUE[,KEY=VALUE...]`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HubEvalVariant {
+    pub name: String,
+    /// Ordered `(key, value)` overrides; keys are checked by the parser.
+    pub overrides: Vec<(String, String)>,
+}
+
+/// How the judge scores a sample.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum HubJudgeMode {
+    /// Score each sample on its own, 0..=1.
+    #[default]
+    Absolute,
+    /// Compare each variant sample with the baseline sample of the same case and repeat,
+    /// -1..=1 (positive means the variant is better).
+    Pairwise,
+}
+
+/// `hub eval run`: enqueue every case x variant x repeat through hub placement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HubEvalRun {
+    pub suite: Option<String>,
+    pub cases: Vec<String>,
+    /// A variant name (default `baseline`, the case as captured), a hub job ID whose result is
+    /// the baseline sample, or `none`.
+    pub baseline: Option<String>,
+    pub variants: Vec<HubEvalVariant>,
+    pub repeat: u32,
+    pub target: Option<String>,
+    pub tags: Vec<String>,
+    pub priority: i32,
+    /// `cmd:SCRIPT` or `zeroshot:GRAPH`.
+    pub judge: Option<String>,
+    pub judge_mode: HubJudgeMode,
+    /// Uniform runtime config for a `zeroshot:` judge.
+    pub judge_runtime: Option<PathBuf>,
+    /// `(name, shell command)` checks run against each finished sample.
+    pub checks: Vec<(String, String)>,
+    pub prices: Option<PathBuf>,
+    /// Idempotency key: the same key and request return the same eval run.
+    pub key: Option<String>,
+}
+
+/// `hub eval report`: per-case and aggregate deltas against a baseline.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HubEvalReport {
+    pub run: String,
+    /// A variant of this run, or `er_ID[:VARIANT]` of another run.
+    pub baseline: Option<String>,
+    /// `(metric, value)` overrides of the improvement/regression thresholds.
+    pub thresholds: Vec<(String, String)>,
+    pub prices: Option<PathBuf>,
+    pub fail_on_regression: bool,
+    pub wait: Option<Option<String>>,
+    pub table: bool,
 }

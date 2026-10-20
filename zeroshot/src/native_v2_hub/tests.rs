@@ -23,6 +23,8 @@ mod capabilities;
 mod cron;
 #[path = "tests/daemon.rs"]
 mod daemon;
+#[path = "tests/eval.rs"]
+mod eval;
 #[path = "tests/metrics.rs"]
 mod metrics;
 
@@ -62,6 +64,7 @@ pub(super) fn job(id: &str, submitted_at_ms: u64) -> Job {
         token_usage: None,
         error: None,
         schedule_id: None,
+        output: None,
     }
 }
 
@@ -268,6 +271,8 @@ pub(super) struct FakeDriver {
     pub capabilities: BTreeMap<String, Vec<String>>,
     /// Makes status reads slow, like a target that hangs.
     pub status_delay: Option<std::time::Duration>,
+    /// Terminal output of finished runs (default `{}`).
+    pub output: Option<Value>,
 }
 
 impl FakeDriver {
@@ -330,7 +335,7 @@ impl HubDriver for FakeDriver {
         Ok(if phase == "finished" {
             json!({"status": {
                 "phase": "finished",
-                "terminalResult": {"status": "succeeded", "output": {}},
+                "terminalResult": {"status": "succeeded", "output": self.output.clone().unwrap_or_else(|| json!({}))},
                 "metadata": {"tokenUsage": {"inputTokens": 1000, "outputTokens": 100, "complete": true}}
             }})
         } else {

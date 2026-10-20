@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use zeroshot_engine::native_v2_cli::hub::{HubMemberState, HubStrategy};
 
 use super::clock::rfc3339;
+use super::eval::EvalState;
 
 /// Reserved member name for the local controller.
 pub(crate) const LOCAL_MEMBER: &str = "local";
@@ -20,6 +21,8 @@ pub(crate) struct HubState {
     pub jobs: Vec<Job>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schedules: Vec<Schedule>,
+    #[serde(default, skip_serializing_if = "EvalState::is_empty")]
+    pub evals: EvalState,
 }
 
 impl Default for HubState {
@@ -29,6 +32,7 @@ impl Default for HubState {
             members: Vec::new(),
             jobs: Vec::new(),
             schedules: Vec::new(),
+            evals: EvalState::default(),
         }
     }
 }
@@ -271,6 +275,9 @@ pub(crate) struct Job {
     /// Recurring schedule that created this job, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule_id: Option<String>,
+    /// Terminal result output, kept only for eval judge jobs (`eval.role=judge`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<Value>,
 }
 
 impl Job {
