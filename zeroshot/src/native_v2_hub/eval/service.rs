@@ -176,7 +176,15 @@ impl HubService {
                     suites.push(suite.clone());
                     suite
                 };
-            Ok(json!({ "schema": "zeroshot.hub.eval.suite/v1", "suite": suite }))
+            Ok(json!({
+                "schema": "zeroshot.hub.eval.suite/v1",
+                "suite": {
+                    "name": suite.name,
+                    "description": suite.description,
+                    "cases": suite.cases,
+                    "createdAt": rfc3339(suite.created_at_ms),
+                },
+            }))
         })
         .await
     }
