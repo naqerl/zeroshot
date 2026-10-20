@@ -733,28 +733,36 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   plans have static inputs, no cross-node dataflow, and no retry-in-place. Agent runtime bindings
   cannot declare `GH_TOKEN`; the sole merge-delivery binding owns the GitHub write credential. A
   node's queue deadline is the earlier of plan expiry and seven days after readiness.
-- `zeroshot hub` pools registered targets plus `local`. Hub state (members, jobs, and cron
-  schedules) lives in `hub/state.json` beside `targets.json` (or `ZEROSHOT_HUB_DIR`) under one
-  advisory lock; `targets.json` stays unchanged. One daemon per hub folder (`hub daemon run`, held
-  by `hub/daemon.lock`, heartbeat in `hub/daemon.json`) dispatches continuously; other commands
-  change the same state under the same lock, so there is no IPC protocol. `hub install --systemd`
-  writes a user unit (`--system` for a system unit) and `--docker` runs a host-network container
-  named `zeroshot-hub`; both pin `ZEROSHOT_CONFIG_DIR`, `ZEROSHOT_HUB_DIR`, and
-  `ZEROSHOT_STATE_DIR`. Every hub command except `daemon`, `install`, and `uninstall` requires
-  exactly one daemon active under systemd or Docker: exit 5 is `hub.daemon_not_running` and exit 6
-  is `hub.daemon_conflict`. `ZEROSHOT_HUB_DAEMON_PROBE=systemd|docker|systemd,docker|none`
-  replaces that detection in tests and demos only. Every target operation is delegated to this
-  executable's own `run --detach`, `list`, `status`, `watch`, `logs`, `attach`, and `force-stop` in
-  a child process (`ZEROSHOT_HUB_EXECUTABLE` overrides it for tests and demos), so the hub never
-  bypasses admission, authentication, or observation contracts. Placement also matches each job's
-  requirements (explicit source or hooks exclude `local`, named targets need a pushed revision,
-  generic Git transport and per-node lanes need their discovery markers) against capability kinds
-  cached from `/.well-known/zeroshot-native-v2`. Cron schedules use `croner` with an explicit IANA
-  zone (`jiff` bundled tzdb). Member capacity is hub-declared `slots`; load is the observed
-  nonterminal runs. Dispatch submission keys are `hub-JOB_ID-ATTEMPT`. Exit code 3 means no
-  capacity or an expired wait, and 4 means that no active member matches or supports the job.
+- `zeroshot hub` pools registered targets plus `local`. One daemon per hub folder (`hub daemon
+  run`, held by `hub/daemon.lock`, heartbeat in `hub/daemon.json`) owns the hub: it is the only
+  writer of `hub/state.json` (beside `targets.json`, or `ZEROSHOT_HUB_DIR`), dispatches
+  continuously, and serves the hub API (JSON over HTTP, default `127.0.0.1:7383`, bearer token in
+  `hub/api-token` or `--token-file`). State sits behind one in-memory lock that is never held across
+  target calls; a second lock serializes placement (passes and `submit`). Jobs marked placing when a
+  daemon stops return to the queue and retry with the same submission key. API errors carry the
+  `zeroshot.error/v1` diagnostic plus `x-zeroshot-exit-code`; logs, watch, attach, and force-stop
+  stream NDJSON frames from a `zeroshot` child on the hub host. Every other hub command is a client
+  of the context chosen by `--hub`, `ZEROSHOT_HUB`, `hub context use`, then built-in `local` (this
+  machine's daemon via its heartbeat). `hub-contexts.json` in the config folder stores URLs and token
+  sources (`--token-file`/`--token-env`), never tokens. Clients upload `--input`, `--graph`,
+  `--runtime-config`, `--uniform-runtime-config`, and `--environment` files; the daemon spools them
+  in `hub/spool/ID/`. An unreachable hub is `hub.unreachable` (exit 5, details name the context and
+  URL); a wrong token is `hub.unauthorized`. `hub install --systemd` writes a user unit (`--system`
+  for a system unit) and `--docker` runs a host-network container named `zeroshot-hub`; both pin
+  `ZEROSHOT_CONFIG_DIR`, `ZEROSHOT_HUB_DIR`, and `ZEROSHOT_STATE_DIR` and pass `--listen` and
+  `--token-file` through. Every target operation is delegated to this executable's own `run
+  --detach`, `list`, `status`, `watch`, `logs`, `attach`, and `force-stop` in a child process
+  (`ZEROSHOT_HUB_EXECUTABLE` overrides it for tests and demos), so the hub never bypasses admission,
+  authentication, or observation contracts. Placement also matches each job's requirements
+  (explicit source or hooks exclude `local`, named targets need a pushed revision, generic Git
+  transport and per-node lanes need their discovery markers) against capability kinds cached from
+  `/.well-known/zeroshot-native-v2`. Cron schedules use `croner` with an explicit IANA zone (`jiff`
+  bundled tzdb). Member capacity is hub-declared `slots`; load is the observed nonterminal runs.
+  Dispatch submission keys are `hub-JOB_ID-ATTEMPT`. Exit code 3 means no capacity or an expired
+  wait, and 4 means that no active member matches or supports the job.
 - Read-only safe commands include `zeroshot list`, `zeroshot status`, `zeroshot logs`,
-  `zeroshot hub list`, `zeroshot hub ps`, `zeroshot hub stats`, and `zeroshot hub daemon status`.
+  `zeroshot hub list`, `zeroshot hub ps`, `zeroshot hub stats`, `zeroshot hub daemon status`, and
+  `zeroshot hub context list`.
   `zeroshot hub install` and `zeroshot hub uninstall` change system services and need explicit
   user intent; prefer `--dry-run` first.
 - Destructive commands such as `zeroshot force-stop` require explicit user intent.
