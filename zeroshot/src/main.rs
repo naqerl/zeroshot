@@ -68,7 +68,7 @@ async fn dispatch(command: NativeV2CliCommand) -> Result<(), ProcessError> {
 }
 
 async fn run_hub_command(
-    command: zeroshot_engine::native_v2_cli::hub::HubCommand,
+    command: zeroshot_engine::native_v2_cli::hub::HubRequest,
 ) -> Result<(), ProcessError> {
     let code = {
         let stdout = std::io::stdout();

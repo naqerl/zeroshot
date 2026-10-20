@@ -347,7 +347,7 @@ pub enum NativeV2CliCommand {
     Resume(RunResumeCommand),
     Checkpoints(RunCheckpointsCommand),
     DiscardWorkspace(RunSelector),
-    Hub(hub::HubCommand),
+    Hub(hub::HubRequest),
 }
 
 impl NativeV2CliCommand {

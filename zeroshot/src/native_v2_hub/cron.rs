@@ -130,7 +130,13 @@ fn fire_job(schedule: &Schedule, now_ms: u64) -> Job {
     job.expires_at_ms = schedule
         .expires_after_ms
         .map(|after| now_ms.saturating_add(after));
-    if let Some(folder) = &schedule.repin_from {
+    // A schedule created by a client on another machine names a folder the hub host may not
+    // have; it then keeps the revision pinned at acceptance.
+    if let Some(folder) = schedule
+        .repin_from
+        .as_ref()
+        .filter(|folder| folder.is_dir())
+    {
         repin(&mut job, folder);
     }
     job

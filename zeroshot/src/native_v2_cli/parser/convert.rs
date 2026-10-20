@@ -68,7 +68,12 @@ impl CliCommand {
             Self::Profile { command } => command.into_command(),
             Self::Template { command } => command.into_command(),
             Self::Plan { command } => command.into_command(),
-            Self::Hub { command } => command.into_command().map(NativeV2CliCommand::Hub),
+            Self::Hub { hub, command } => command.into_command().map(|command| {
+                NativeV2CliCommand::Hub(crate::native_v2_cli::hub::HubRequest {
+                    context: hub,
+                    command,
+                })
+            }),
             Self::Run(args) => args.into_command(),
             Self::Utility(command) => command.into_command(),
         }

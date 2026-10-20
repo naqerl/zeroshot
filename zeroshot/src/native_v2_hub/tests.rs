@@ -15,6 +15,8 @@ use super::placement::{Load, Placement, describe, place};
 use super::schedule::{active_runs, apply_status, due_jobs, expire, tick};
 use super::stats::{Dimension, ModelPrice, StatsQuery, aggregate, percentiles};
 
+#[path = "tests/api.rs"]
+mod api;
 #[path = "tests/capabilities.rs"]
 mod capabilities;
 #[path = "tests/cron.rs"]
@@ -262,6 +264,8 @@ pub(super) struct FakeDriver {
     pub submissions: Mutex<Vec<(String, String)>>,
     /// Advertised discovery kinds per member; absent members fail discovery.
     pub capabilities: BTreeMap<String, Vec<String>>,
+    /// Makes status reads slow, like a target that hangs.
+    pub status_delay: Option<std::time::Duration>,
 }
 
 impl FakeDriver {
@@ -313,6 +317,9 @@ impl HubDriver for FakeDriver {
     }
 
     async fn status(&self, member: &str, run_id: &str) -> Result<Value, HubError> {
+        if let Some(delay) = self.status_delay {
+            tokio::time::sleep(delay).await;
+        }
         let runs = self.runs.lock().expect("fake lock");
         let phase = runs
             .get(member)

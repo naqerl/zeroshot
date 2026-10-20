@@ -224,28 +224,6 @@ pub(crate) fn hub_executable() -> Result<PathBuf, HubError> {
         .map_err(|error| HubError::storage("executable path is unavailable", error))
 }
 
-/// Run an observation command with inherited streams and return its exit code.
-///
-/// Ctrl-C is left to the child, which detaches observation without stopping the run.
-pub(crate) async fn passthrough(arguments: Vec<String>) -> Result<i32, HubError> {
-    let mut child = Command::new(hub_executable()?)
-        .args(&arguments)
-        .spawn()
-        .map_err(|error| target_error(format!("zeroshot could not start: {error}"), None))?;
-    let wait = child.wait();
-    tokio::pin!(wait);
-    loop {
-        tokio::select! {
-            status = &mut wait => {
-                let status = status
-                    .map_err(|error| target_error(format!("zeroshot did not finish: {error}"), None))?;
-                return Ok(status.code().unwrap_or(1));
-            }
-            _ = tokio::signal::ctrl_c() => {}
-        }
-    }
-}
-
 fn last_json(stdout: &str) -> Option<Value> {
     stdout
         .lines()

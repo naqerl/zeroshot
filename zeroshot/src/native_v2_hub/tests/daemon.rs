@@ -1,16 +1,15 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde_json::json;
-use zeroshot_engine::native_v2_cli::hub::{HubCommand, HubManager, HubStats, HubUninstall};
 
-use super::super::HubContext;
-use super::super::daemon::{DaemonProbe, Detection, StaticProbe, guard, pass, requires_daemon};
-use super::super::error::{EXIT_DAEMON_CONFLICT, EXIT_DAEMON_NOT_RUNNING, HubError};
+use super::super::daemon::{client_url, load_or_create_token};
 use super::super::install::{
-    InstallEnv, Step, docker_install_plan, docker_run, docker_uninstall_plan, systemd_install_plan,
-    systemd_quote, systemd_uninstall_plan, systemd_unit,
+    InstallEnv, Step, daemon_arguments, docker_install_plan, docker_run, docker_uninstall_plan,
+    refuse_other_owner, systemd_install_plan, systemd_quote, systemd_uninstall_plan, systemd_unit,
 };
 use super::super::model::HubState;
+use super::super::service::HubService;
 use super::super::store::HubStore;
 use super::{FakeDriver, job, member};
 use crate::native_v2_target::FileTargetRegistry;
@@ -31,129 +30,34 @@ fn env() -> InstallEnv {
     }
 }
 
-async fn verdict(probe: StaticProbe) -> Result<&'static str, HubError> {
-    guard(&probe).await
-}
-
-#[tokio::test]
-async fn guard_requires_exactly_one_active_daemon() {
-    assert_eq!(
-        verdict(StaticProbe {
-            systemd: true,
-            docker: false
-        })
-        .await
-        .ok(),
-        Some("systemd")
-    );
-    assert_eq!(
-        verdict(StaticProbe {
-            systemd: false,
-            docker: true
-        })
-        .await
-        .ok(),
-        Some("docker")
-    );
-
-    let missing = verdict(StaticProbe::default())
-        .await
-        .expect_err("no daemon");
-    assert_eq!(missing.exit_code(), EXIT_DAEMON_NOT_RUNNING);
-    let diagnostic = missing.diagnostic();
-    assert_eq!(diagnostic["schema"], json!("zeroshot.error/v1"));
-    assert_eq!(diagnostic["code"], json!("hub.daemon_not_running"));
-    assert_eq!(
-        diagnostic["details"]["daemon"]["systemd"]["active"],
-        json!(false)
-    );
-    assert!(
-        missing
-            .to_string()
-            .contains("zeroshot hub install --systemd")
-    );
-
-    let both = verdict(StaticProbe {
-        systemd: true,
-        docker: true,
-    })
-    .await
-    .expect_err("conflict");
-    assert_eq!(both.exit_code(), EXIT_DAEMON_CONFLICT);
-    assert_eq!(both.diagnostic()["code"], json!("hub.daemon_conflict"));
-}
-
-#[tokio::test]
-async fn probe_override_lists_active_managers() {
-    assert_eq!(StaticProbe::parse("none"), StaticProbe::default());
-    assert_eq!(
-        StaticProbe::parse("docker, systemd"),
-        StaticProbe {
-            systemd: true,
-            docker: true
-        }
-    );
-    let probe = StaticProbe::parse("docker");
-    let detection = Detection::probe(&probe).await;
-    assert!(detection.docker.active && !detection.systemd.active);
-    assert!(
-        probe
-            .systemd()
-            .await
-            .detail
-            .contains("ZEROSHOT_HUB_DAEMON_PROBE")
-    );
+fn daemon(interval: &str) -> Vec<String> {
+    daemon_arguments(interval, None, None)
 }
 
 #[test]
-fn only_daemon_and_service_commands_skip_the_guard() {
-    let uninstall = HubCommand::Uninstall(HubUninstall {
-        manager: HubManager::Docker,
-        system: false,
-        dry_run: true,
-    });
-    for exempt in [
-        HubCommand::Daemon {
-            interval: "10s".to_owned(),
-        },
-        HubCommand::DaemonStatus,
-        uninstall,
-    ] {
-        assert!(!requires_daemon(&exempt), "{exempt:?}");
-    }
-    let stats = HubCommand::Stats(HubStats {
-        by: Vec::new(),
-        since: None,
-        until: None,
-        prices: None,
-    });
-    for guarded in [
-        HubCommand::Dispatch,
-        HubCommand::List {
-            tags: Vec::new(),
-            probe: false,
-        },
-        HubCommand::Remove {
-            name: "a".to_owned(),
-        },
-        HubCommand::Dequeue {
-            job: "hj_1".to_owned(),
-        },
-        HubCommand::Status {
-            job: "hj_1".to_owned(),
-        },
-        HubCommand::ForceStop {
-            job: "hj_1".to_owned(),
-        },
-        stats,
-    ] {
-        assert!(requires_daemon(&guarded), "{guarded:?}");
-    }
+fn installed_daemons_pass_listen_and_token_file_through() {
+    let arguments = daemon_arguments(
+        "5s",
+        Some("0.0.0.0:7383"),
+        Some(std::path::Path::new("/srv/hub/token")),
+    );
+    assert_eq!(
+        arguments.join(" "),
+        "hub daemon run --interval 5s --listen 0.0.0.0:7383 --token-file /srv/hub/token"
+    );
+    let unit = systemd_unit(&env(), false, &arguments);
+    assert!(unit.contains("\"--listen\" \"0.0.0.0:7383\" \"--token-file\" \"/srv/hub/token\""));
+    let argv = docker_run(&env(), "zeroshot-hub:dev", &[], &arguments).join(" ");
+    assert!(
+        argv.contains("--volume /srv/hub:/srv/hub"),
+        "token folder is mounted: {argv}"
+    );
+    assert!(argv.ends_with("zeroshot-hub:dev hub daemon run --interval 5s --listen 0.0.0.0:7383 --token-file /srv/hub/token"));
 }
 
 #[test]
 fn systemd_user_unit_pins_this_shells_hub_and_restarts() {
-    let unit = systemd_unit(&env(), false, "15s");
+    let unit = systemd_unit(&env(), false, &daemon("15s"));
     assert!(unit.contains(
         "ExecStart=\"/opt/zero shot/bin/zeroshot\" \"hub\" \"daemon\" \"run\" \"--interval\" \"15s\"\n"
     ));
@@ -177,7 +81,7 @@ fn systemd_user_unit_pins_this_shells_hub_and_restarts() {
         "user units run as the invoking user"
     );
 
-    let plan = systemd_install_plan(&env(), false, "15s");
+    let plan = systemd_install_plan(&env(), false, &daemon("15s"));
     assert_eq!(plan.manager, "systemd");
     let Step::Write { path, .. } = &plan.steps[0] else {
         panic!("first step writes the unit");
@@ -211,10 +115,10 @@ fn systemd_user_unit_pins_this_shells_hub_and_restarts() {
 
 #[test]
 fn systemd_system_unit_runs_as_the_installing_user() {
-    let unit = systemd_unit(&env(), true, "10s");
+    let unit = systemd_unit(&env(), true, &daemon("10s"));
     assert!(unit.contains("User=1000\nGroup=1000\n"));
     assert!(unit.contains("WantedBy=multi-user.target"));
-    let plan = systemd_install_plan(&env(), true, "10s");
+    let plan = systemd_install_plan(&env(), true, &daemon("10s"));
     assert!(matches!(
         &plan.steps[0],
         Step::Write { path, .. } if path == &PathBuf::from("/etc/systemd/system/zeroshot-hub.service")
@@ -237,7 +141,7 @@ fn docker_container_restarts_and_mounts_hub_folders_once() {
         PathBuf::from("/home/andrey/src"),
         PathBuf::from("/home/andrey/src/app"),
     ];
-    let argv = docker_run(&env(), "zeroshot-hub:dev", &volumes, "10s");
+    let argv = docker_run(&env(), "zeroshot-hub:dev", &volumes, &daemon("10s"));
     let joined = argv.join(" ");
     for fragment in [
         "docker run --detach --name zeroshot-hub --restart unless-stopped --network host",
@@ -258,7 +162,7 @@ fn docker_container_restarts_and_mounts_hub_folders_once() {
         "nested hub and app folders reuse their parent mount: {joined}"
     );
 
-    let plan = docker_install_plan(&env(), "zeroshot-hub:dev", &[], "10s");
+    let plan = docker_install_plan(&env(), "zeroshot-hub:dev", &[], &daemon("10s"));
     assert!(matches!(
         &plan.steps[0],
         Step::Run { argv, may_fail: true } if argv.join(" ") == "docker rm --force zeroshot-hub"
@@ -266,8 +170,17 @@ fn docker_container_restarts_and_mounts_hub_folders_once() {
     assert_eq!(docker_uninstall_plan().steps.len(), 1);
 }
 
+fn service(store: &HubStore, driver: FakeDriver, directory: &std::path::Path) -> HubService {
+    HubService::open(
+        store.clone(),
+        Arc::new(driver),
+        FileTargetRegistry::new(directory.join("targets.json")),
+    )
+    .expect("service")
+}
+
 #[tokio::test]
-async fn daemon_pass_fires_places_and_saves_under_the_lock() {
+async fn daemon_pass_fires_places_and_persists() {
     let directory = tempfile::tempdir().expect("tempdir");
     let store = HubStore::new(directory.path().join("hub"));
     {
@@ -279,12 +192,8 @@ async fn daemon_pass_fires_places_and_saves_under_the_lock() {
         };
         store.save(&lock, &state).expect("seed");
     }
-    let context = HubContext {
-        store: store.clone(),
-        driver: Box::new(FakeDriver::default()),
-        registry: FileTargetRegistry::new(directory.path().join("targets.json")),
-    };
-    let (report, view) = pass(&context).await.expect("pass");
+    let service = service(&store, FakeDriver::default(), directory.path());
+    let (report, view) = service.pass().await.expect("pass");
     assert!(!report.is_idle());
     assert_eq!(view["schema"], json!("zeroshot.hub.tick/v1"));
     assert_eq!(view["running"], json!(1));
@@ -294,8 +203,131 @@ async fn daemon_pass_fires_places_and_saves_under_the_lock() {
         Some("local")
     );
     drop(lock);
-    let (report, _) = pass(&context).await.expect("idle pass");
+    let (report, _) = service.pass().await.expect("idle pass");
     assert!(report.is_idle(), "a pass with nothing to do is idle");
+}
+
+#[tokio::test]
+async fn reads_do_not_wait_for_a_pass_blocked_on_a_slow_target() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = HubStore::new(directory.path().join("hub"));
+    {
+        let lock = store.lock().expect("lock");
+        let mut running = job("j1", 0);
+        running.state = super::super::model::JobState::Running;
+        running.target = Some("local".to_owned());
+        running.run_id = Some("local-run-0".to_owned());
+        let state = HubState {
+            members: vec![member("local", &[], 1, 0)],
+            jobs: vec![running],
+            ..HubState::default()
+        };
+        store.save(&lock, &state).expect("seed");
+    }
+    let driver = FakeDriver {
+        status_delay: Some(std::time::Duration::from_secs(30)),
+        ..FakeDriver::default()
+    };
+    let service = Arc::new(service(&store, driver, directory.path()));
+    let pass = tokio::spawn({
+        let service = service.clone();
+        async move { service.pass().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let query = super::super::wire::JobQuery {
+        state: "all".to_owned(),
+        target: None,
+        labels: Vec::new(),
+        limit: None,
+    };
+    let listed = tokio::time::timeout(std::time::Duration::from_secs(2), service.ps(query))
+        .await
+        .expect("ps answers while the pass waits on the target")
+        .expect("ps");
+    assert_eq!(listed["jobs"][0]["jobId"], json!("j1"));
+    let dequeued = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        service.dequeue("missing"),
+    )
+    .await
+    .expect("writes do not wait either");
+    assert!(dequeued.is_err());
+    pass.abort();
+}
+
+#[test]
+fn interrupted_placements_return_to_the_queue_on_open() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = HubStore::new(directory.path().join("hub"));
+    {
+        let lock = store.lock().expect("lock");
+        let mut placing = job("j1", 0);
+        placing.state = super::super::model::JobState::Running;
+        placing.target = Some("local".to_owned());
+        let state = HubState {
+            jobs: vec![placing],
+            ..HubState::default()
+        };
+        store.save(&lock, &state).expect("seed");
+    }
+    drop(service(&store, FakeDriver::default(), directory.path()));
+    let lock = store.lock().expect("lock");
+    let state = store.load(&lock).expect("state");
+    assert_eq!(state.jobs[0].state, super::super::model::JobState::Queued);
+    assert_eq!(state.jobs[0].target, None);
+}
+
+#[test]
+fn api_token_is_created_private_once_and_reused() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("hub").join("api-token");
+    let token = load_or_create_token(&path).expect("token");
+    assert_eq!(token.len(), 64);
+    assert!(token.chars().all(|character| character.is_ascii_hexdigit()));
+    assert_eq!(load_or_create_token(&path).expect("reuse"), token);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    std::fs::write(&path, "\n").expect("empty");
+    assert!(
+        load_or_create_token(&path).is_err(),
+        "an empty token is refused"
+    );
+}
+
+#[test]
+fn client_urls_reach_wildcard_listeners_through_loopback() {
+    assert_eq!(
+        client_url("0.0.0.0:7383".parse().expect("addr")),
+        "http://127.0.0.1:7383"
+    );
+    assert_eq!(
+        client_url("10.0.0.5:9000".parse().expect("addr")),
+        "http://10.0.0.5:9000"
+    );
+    assert_eq!(
+        client_url("[::]:7383".parse().expect("addr")),
+        "http://[::1]:7383"
+    );
+}
+
+#[test]
+fn install_refuses_a_folder_owned_by_another_supervisor() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = HubStore::new(directory.path().join("hub"));
+    refuse_other_owner(&store, "systemd").expect("no daemon owns the folder");
+    let held = store.try_daemon_lock().expect("lock").expect("held");
+    store
+        .write_heartbeat(&json!({"manager": "docker"}))
+        .expect("heartbeat");
+    let error = refuse_other_owner(&store, "systemd").expect_err("docker owns it");
+    assert_eq!(error.diagnostic()["code"], json!("hub.daemon_running"));
+    assert!(error.to_string().contains("uninstall --docker"), "{error}");
+    refuse_other_owner(&store, "docker").expect("reinstalling under docker replaces it");
+    drop(held);
 }
 
 #[test]

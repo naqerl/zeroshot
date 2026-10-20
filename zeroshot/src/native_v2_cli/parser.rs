@@ -83,9 +83,14 @@ enum CliCommand {
 
     /// Pool named targets and place, queue, and account for runs across them.
     ///
-    /// A daemon installed with `zeroshot hub install` dispatches. Members are targets registered
-    /// with `zeroshot target add`, plus `local`. Each placed job is an ordinary run on one target.
+    /// A daemon installed with `zeroshot hub install` owns the hub and serves it over HTTP; hub
+    /// commands address it through a hub context. Members are targets registered with `zeroshot
+    /// target add`, plus `local`. Each placed job is an ordinary run on one target.
     Hub {
+        /// Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local].
+        #[arg(long = "hub", value_name = "CONTEXT", global = true)]
+        hub: Option<String>,
+
         #[command(subcommand)]
         command: hub::HubCliCommand,
     },

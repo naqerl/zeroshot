@@ -215,12 +215,13 @@ pub(crate) fn apply_status(job: &mut Job, status: &Value, now_ms: u64) -> bool {
     true
 }
 
-/// Refresh one running job from its target.
-pub(crate) async fn refresh(job: &mut Job, driver: &dyn HubDriver, now_ms: u64) -> Option<Value> {
-    let (Some(target), Some(run_id)) = (job.target.clone(), job.run_id.clone()) else {
-        return None;
-    };
-    match driver.status(&target, &run_id).await {
+/// Apply one status read to a running job; returns the status when it was read.
+pub(crate) fn apply_refresh(
+    job: &mut Job,
+    result: Result<Value, HubError>,
+    now_ms: u64,
+) -> Option<Value> {
+    match result {
         Ok(status) => {
             apply_status(job, &status, now_ms);
             Some(status)
@@ -230,6 +231,148 @@ pub(crate) async fn refresh(job: &mut Job, driver: &dyn HubDriver, now_ms: u64) 
             None
         }
     }
+}
+
+/// A running job whose run is polled by a dispatcher pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Poll {
+    pub job_id: String,
+    pub target: String,
+    pub run_id: String,
+}
+
+/// Running jobs that have a run to poll. Jobs still being placed have no run yet.
+pub(crate) fn polls(state: &HubState) -> Vec<Poll> {
+    state
+        .jobs
+        .iter()
+        .filter(|job| job.state == JobState::Running)
+        .filter_map(|job| {
+            Some(Poll {
+                job_id: job.job_id.clone(),
+                target: job.target.clone()?,
+                run_id: job.run_id.clone()?,
+            })
+        })
+        .collect()
+}
+
+/// Read every polled run's status concurrently, without touching hub state.
+pub(crate) async fn poll(
+    polls: Vec<Poll>,
+    driver: &dyn HubDriver,
+) -> Vec<(Poll, Result<Value, HubError>)> {
+    join_all(polls.into_iter().map(|poll| async move {
+        let result =
+            match tokio::time::timeout(PROBE_TIMEOUT, driver.status(&poll.target, &poll.run_id))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(HubError::Target {
+                    message: format!("zeroshot status {} timed out", poll.run_id),
+                    diagnostic: None,
+                }),
+            };
+        (poll, result)
+    }))
+    .await
+}
+
+/// Apply polled statuses to jobs that still run the polled run. Returns finished summaries.
+pub(crate) fn apply_polls(
+    state: &mut HubState,
+    results: Vec<(Poll, Result<Value, HubError>)>,
+    now_ms: u64,
+) -> Vec<Value> {
+    let mut finished = Vec::new();
+    for (poll, result) in results {
+        let Some(job) = state.jobs.iter_mut().find(|job| {
+            job.job_id == poll.job_id
+                && job.state == JobState::Running
+                && job.run_id.as_deref() == Some(poll.run_id.as_str())
+        }) else {
+            continue;
+        };
+        apply_refresh(job, result, now_ms);
+        if job.state.is_terminal() {
+            finished.push(json!({
+                "jobId": job.job_id,
+                "state": job.display_state(now_ms),
+                "target": job.target,
+                "runId": job.run_id,
+            }));
+        }
+    }
+    finished
+}
+
+/// Copy discovery results from `discovered` into the members of the same name.
+pub(crate) fn merge_capabilities(members: &mut [Member], discovered: &[Member]) {
+    for member in members {
+        if let Some(found) = discovered.iter().find(|found| found.name == member.name) {
+            member.capabilities.clone_from(&found.capabilities);
+            member.capabilities_at_ms = found.capabilities_at_ms;
+            member.capability_error.clone_from(&found.capability_error);
+        }
+    }
+}
+
+/// Choose a member for each due job that fits now, highest priority first. Chosen jobs are
+/// marked running on their member without a run, so no other pass or request places them
+/// again while their submission is in flight.
+pub(crate) fn choose(
+    state: &mut HubState,
+    now_ms: u64,
+    loads: &mut BTreeMap<String, Load>,
+) -> Vec<(String, String)> {
+    let mut chosen = Vec::new();
+    for index in due_jobs(&state.jobs, now_ms) {
+        let job = &state.jobs[index];
+        let Placement::Place(member) =
+            place(&state.members, &job.placement, &job.requirements, loads)
+        else {
+            continue;
+        };
+        if let Some(load) = loads.get_mut(&member) {
+            load.active = load.active.saturating_add(1);
+        }
+        let job = &mut state.jobs[index];
+        job.state = JobState::Running;
+        job.target = Some(member.clone());
+        chosen.push((job.job_id.clone(), member));
+    }
+    chosen
+}
+
+/// Record one dispatch outcome in a pass report.
+pub(crate) fn record_dispatch(report: &mut TickReport, job: &Job, result: Result<(), HubError>) {
+    let mut entry = json!({ "jobId": job.job_id, "target": job.target });
+    match result {
+        Ok(()) => {
+            entry["runId"] = json!(job.run_id);
+            report.dispatched.push(entry);
+        }
+        Err(error) => {
+            entry["error"] = json!(error.to_string());
+            report.failed.push(entry);
+        }
+    }
+}
+
+/// Put jobs that were mid-placement when a daemon stopped back in the queue. Their next attempt
+/// reuses the same submission key, so a run the target already accepted is not duplicated.
+pub(crate) fn recover_placing(state: &mut HubState) -> usize {
+    let mut recovered = 0;
+    for job in state
+        .jobs
+        .iter_mut()
+        .filter(|job| job.state == JobState::Running && job.run_id.is_none())
+    {
+        job.state = JobState::Queued;
+        job.target = None;
+        recovered += 1;
+    }
+    recovered
 }
 
 /// Mark queued jobs past their expiry. Returns their IDs.
@@ -267,32 +410,19 @@ pub(crate) fn due_jobs(jobs: &[Job], now_ms: u64) -> Vec<usize> {
     due
 }
 
-/// One dispatcher pass: fire due cron schedules, refresh running jobs, expire stale ones, then
-/// place due jobs. Jobs that cannot be placed stay queued; a lower-priority job may still use a
-/// member the head cannot.
+/// One dispatcher pass on an exclusively held state: fire due cron schedules, refresh running
+/// jobs, expire stale ones, then place due jobs. The daemon runs the same phases with target
+/// calls outside its state lock (see `service::HubService::pass`).
+#[cfg(test)]
 pub(crate) async fn tick(state: &mut HubState, driver: &dyn HubDriver, now_ms: u64) -> TickReport {
     let mut report = TickReport {
         fired: super::cron::fire_due(state, now_ms),
         ..TickReport::default()
     };
-    for job in state
-        .jobs
-        .iter_mut()
-        .filter(|job| job.state == JobState::Running)
-    {
-        refresh(job, driver, now_ms).await;
-        if job.state.is_terminal() {
-            report.finished.push(json!({
-                "jobId": job.job_id,
-                "state": job.display_state(now_ms),
-                "target": job.target,
-                "runId": job.run_id,
-            }));
-        }
-    }
+    let results = poll(polls(state), driver).await;
+    report.finished = apply_polls(state, results, now_ms);
     report.expired = expire(&mut state.jobs, now_ms);
-    let due = due_jobs(&state.jobs, now_ms);
-    if due.is_empty() {
+    if due_jobs(&state.jobs, now_ms).is_empty() {
         return report;
     }
     discover(&mut state.members, driver, now_ms, CAPABILITY_TTL_MS).await;
@@ -302,30 +432,13 @@ pub(crate) async fn tick(state: &mut HubState, driver: &dyn HubDriver, now_ms: u
         .filter(|member| member.state == MemberState::Active)
         .collect::<Vec<_>>();
     let mut loads = probe(&active, &state.jobs, driver).await;
-    for index in due {
-        let job = &state.jobs[index];
-        let Placement::Place(member) =
-            place(&state.members, &job.placement, &job.requirements, &loads)
-        else {
+    for (job_id, member) in choose(state, now_ms, &mut loads) {
+        let Some(job) = state.jobs.iter_mut().find(|job| job.job_id == job_id) else {
             continue;
         };
-        let job = &mut state.jobs[index];
-        let entry = json!({ "jobId": job.job_id, "target": member });
-        match dispatch(job, &member, driver, now_ms).await {
-            Ok(()) => {
-                if let Some(load) = loads.get_mut(&member) {
-                    load.active = load.active.saturating_add(1);
-                }
-                let mut entry = entry;
-                entry["runId"] = json!(job.run_id);
-                report.dispatched.push(entry);
-            }
-            Err(error) => {
-                let mut entry = entry;
-                entry["error"] = json!(error.to_string());
-                report.failed.push(entry);
-            }
-        }
+        let result = dispatch(job, &member, driver, now_ms).await;
+        let job = job.clone();
+        record_dispatch(&mut report, &job, result);
     }
     report.loads = Some(loads);
     report

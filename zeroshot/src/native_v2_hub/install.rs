@@ -10,8 +10,9 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 use zeroshot_engine::native_v2_cli::hub::{HubInstall, HubManager, HubUninstall};
 
-use super::daemon::{DaemonProbe, Detection, MANAGER_ENV, SERVICE_NAME};
+use super::daemon::{MANAGER_ENV, SERVICE_NAME};
 use super::error::HubError;
+use super::store::HubStore;
 use super::write_json;
 
 /// Image used by `--docker` without `--image`.
@@ -32,6 +33,25 @@ pub(crate) struct InstallEnv {
     pub state_dir: PathBuf,
     pub user_unit_dir: PathBuf,
     pub credential_store: Option<String>,
+}
+
+/// `hub daemon run` arguments the service starts with: the interval plus any --listen and
+/// --token-file given to `hub install`.
+pub(crate) fn daemon_arguments(
+    interval: &str,
+    listen: Option<&str>,
+    token_file: Option<&Path>,
+) -> Vec<String> {
+    let mut arguments = ["hub", "daemon", "run", "--interval", interval]
+        .map(str::to_owned)
+        .to_vec();
+    if let Some(listen) = listen {
+        arguments.extend(["--listen".to_owned(), listen.to_owned()]);
+    }
+    if let Some(token_file) = token_file {
+        arguments.extend(["--token-file".to_owned(), display(token_file)]);
+    }
+    arguments
 }
 
 /// One install or uninstall step.
@@ -186,19 +206,15 @@ pub(crate) fn systemd_quote(value: &str) -> String {
 }
 
 /// The generated unit file.
-pub(crate) fn systemd_unit(env: &InstallEnv, system: bool, interval: &str) -> String {
-    let exec = [
-        display(&env.executable),
-        "hub".to_owned(),
-        "daemon".to_owned(),
-        "run".to_owned(),
-        "--interval".to_owned(),
-        interval.to_owned(),
-    ]
-    .iter()
-    .map(|part| systemd_quote(part))
-    .collect::<Vec<_>>()
-    .join(" ");
+pub(crate) fn systemd_unit(env: &InstallEnv, system: bool, daemon: &[String]) -> String {
+    let exec = std::iter::once(display(&env.executable))
+        .chain(daemon.iter().cloned())
+        .collect::<Vec<_>>();
+    let exec = exec
+        .iter()
+        .map(|part| systemd_quote(part))
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut environment = env.pinned_environment("systemd");
     environment.push(("PATH".to_owned(), env.path.clone()));
     let mut unit = String::from(
@@ -246,7 +262,7 @@ fn systemctl(system: bool, arguments: &[&str]) -> Vec<String> {
     argv
 }
 
-pub(crate) fn systemd_install_plan(env: &InstallEnv, system: bool, interval: &str) -> Plan {
+pub(crate) fn systemd_install_plan(env: &InstallEnv, system: bool, daemon: &[String]) -> Plan {
     let unit = unit_name();
     let mut notes = vec![format!(
         "logs: journalctl {}-u {unit}",
@@ -263,7 +279,7 @@ pub(crate) fn systemd_install_plan(env: &InstallEnv, system: bool, interval: &st
         steps: vec![
             Step::Write {
                 path: unit_path(env, system),
-                content: systemd_unit(env, system, interval),
+                content: systemd_unit(env, system, daemon),
             },
             Step::Run {
                 argv: systemctl(system, &["daemon-reload"]),
@@ -308,7 +324,7 @@ pub(crate) fn docker_run(
     env: &InstallEnv,
     image: &str,
     volumes: &[PathBuf],
-    interval: &str,
+    daemon: &[String],
 ) -> Vec<String> {
     let mut argv = [
         "docker",
@@ -329,8 +345,14 @@ pub(crate) fn docker_run(
     for (key, value) in env.pinned_environment("docker") {
         argv.extend(["--env".to_owned(), format!("{key}={value}")]);
     }
+    let token_folder = daemon
+        .iter()
+        .position(|argument| argument == "--token-file")
+        .and_then(|index| daemon.get(index + 1))
+        .and_then(|file| Path::new(file).parent().map(Path::to_path_buf));
     let mut mounts: Vec<&PathBuf> = vec![&env.config_dir, &env.hub_dir, &env.state_dir];
     mounts.extend(volumes);
+    mounts.extend(token_folder.as_ref());
     let mut seen: Vec<&PathBuf> = Vec::new();
     for mount in mounts {
         if seen.iter().any(|parent| mount.starts_with(parent)) {
@@ -343,7 +365,8 @@ pub(crate) fn docker_run(
         let path = display(mount);
         argv.extend(["--volume".to_owned(), format!("{path}:{path}")]);
     }
-    argv.extend([image, "hub", "daemon", "run", "--interval", interval].map(str::to_owned));
+    argv.push(image.to_owned());
+    argv.extend(daemon.iter().cloned());
     argv
 }
 
@@ -351,14 +374,14 @@ pub(crate) fn docker_install_plan(
     env: &InstallEnv,
     image: &str,
     volumes: &[PathBuf],
-    interval: &str,
+    daemon: &[String],
 ) -> Plan {
     Plan {
         manager: "docker",
         steps: vec![
             Step::run_may_fail(&["docker", "rm", "--force", SERVICE_NAME]),
             Step::Run {
-                argv: docker_run(env, image, volumes, interval),
+                argv: docker_run(env, image, volumes, daemon),
                 may_fail: false,
             },
         ],
@@ -473,38 +496,71 @@ async fn apply(plan: &Plan) -> Result<Vec<Value>, HubError> {
 pub(crate) async fn install(
     env: &InstallEnv,
     request: HubInstall,
-    probe: &dyn DaemonProbe,
+    store: &HubStore,
     output: &mut impl Write,
 ) -> Result<(), HubError> {
+    let token_file = request.token_file.as_deref().map(absolute).transpose()?;
+    let daemon = daemon_arguments(
+        &request.interval,
+        request.listen.as_deref(),
+        token_file.as_deref(),
+    );
     let plan = match request.manager {
-        HubManager::Systemd => systemd_install_plan(env, request.system, &request.interval),
+        HubManager::Systemd => systemd_install_plan(env, request.system, &daemon),
         HubManager::Docker => docker_install_plan(
             env,
             request.image.as_deref().unwrap_or(DEFAULT_IMAGE),
             &request.volumes,
-            &request.interval,
+            &daemon,
         ),
     };
     let mut document = plan_document(&plan, "install", request.dry_run);
     if request.dry_run {
         return write_json(output, &document);
     }
-    let detection = Detection::probe(probe).await;
-    let other = match request.manager {
-        HubManager::Systemd => detection.docker.active.then_some("docker"),
-        HubManager::Docker => detection.systemd.active.then_some("systemd"),
-    };
-    if let Some(other) = other {
-        return Err(HubError::DaemonConflict {
-            message: format!(
-                "a hub daemon is already active under {other}; run `zeroshot hub uninstall \
-                 --{other}` first"
-            ),
-            detection: detection.view(),
-        });
-    }
+    refuse_other_owner(store, plan.manager)?;
     document["results"] = json!(apply(&plan).await?);
     write_json(output, &document)
+}
+
+/// Refuse to install when a daemon supervised by something else (another manager, or a
+/// foreground `hub daemon run`) owns the hub folder: the new service could never take it.
+/// Reinstalling under the same manager replaces its daemon.
+pub(crate) fn refuse_other_owner(store: &HubStore, manager: &str) -> Result<(), HubError> {
+    if store.try_daemon_lock()?.is_some() {
+        return Ok(());
+    }
+    let owner = store
+        .heartbeat()
+        .and_then(|heartbeat| {
+            heartbeat
+                .get("manager")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "unknown".to_owned());
+    if owner == manager {
+        return Ok(());
+    }
+    Err(HubError::DaemonRunning(format!(
+        "a hub daemon run by {owner} already owns {}; stop it first (for an installed one, \
+         `zeroshot hub uninstall --{}`)",
+        store.directory().display(),
+        if owner == "docker" {
+            "docker"
+        } else {
+            "systemd"
+        }
+    )))
+}
+
+fn absolute(path: &Path) -> Result<PathBuf, HubError> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|folder| folder.join(path))
+        .map_err(|error| HubError::Usage(format!("the invoking folder is unavailable: {error}")))
 }
 
 pub(crate) async fn uninstall(

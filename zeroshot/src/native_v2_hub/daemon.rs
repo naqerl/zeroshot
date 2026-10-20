@@ -1,288 +1,139 @@
-//! The hub daemon: detection of the supervising service, the guard every hub command passes,
-//! and the foreground dispatch loop the services run.
+//! `hub daemon run`: the single owner of a hub folder. It serves the hub API and runs a
+//! dispatcher pass every interval until SIGTERM or Ctrl-C.
 
 use std::io::Write;
-use std::process::Stdio;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::process::Command;
-use zeroshot_engine::native_v2_cli::hub::HubCommand;
+use zeroshot_engine::native_v2_cli::hub::HubDaemonRun;
 
+use super::api::{ApiState, router};
 use super::clock::{now_ms, parse_duration_ms, rfc3339};
 use super::error::HubError;
-use super::schedule::{self, TickReport};
-use super::{HubContext, write_json};
+use super::service::{HubService, write_private};
+use super::store::HubStore;
+use super::write_json;
 
 /// systemd unit and Docker container name of the installed daemon.
 pub(crate) const SERVICE_NAME: &str = "zeroshot-hub";
 /// Set by installers so the daemon reports who supervises it.
 pub(crate) const MANAGER_ENV: &str = "ZEROSHOT_HUB_DAEMON_MANAGER";
-/// Test and demo hook: a comma-separated list of managers to report as active
-/// (`systemd`, `docker`), or `none`, instead of asking systemctl and docker.
-pub(crate) const PROBE_ENV: &str = "ZEROSHOT_HUB_DAEMON_PROBE";
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default hub API address: loopback only.
+pub(crate) const DEFAULT_LISTEN: &str = "127.0.0.1:7383";
+/// Default bearer token file inside the hub folder.
+pub(crate) const TOKEN_FILE: &str = "api-token";
+/// How long shutdown waits for open API streams before closing them.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-/// What one service manager reports about the daemon.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ManagerState {
-    pub active: bool,
-    /// `user` or `system` for systemd units.
-    pub scope: Option<&'static str>,
-    pub detail: String,
-}
-
-impl ManagerState {
-    fn view(&self) -> Value {
-        json!({ "active": self.active, "scope": self.scope, "detail": self.detail })
-    }
-}
-
-/// Asks systemd and Docker whether they run the hub daemon. Injectable for tests.
-#[async_trait]
-pub(crate) trait DaemonProbe: Send + Sync {
-    async fn systemd(&self) -> ManagerState;
-    async fn docker(&self) -> ManagerState;
-}
-
-/// Both managers' answers.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Detection {
-    pub systemd: ManagerState,
-    pub docker: ManagerState,
-}
-
-impl Detection {
-    pub(crate) async fn probe(probe: &dyn DaemonProbe) -> Self {
-        let (systemd, docker) = tokio::join!(probe.systemd(), probe.docker());
-        Self { systemd, docker }
-    }
-
-    pub(crate) fn view(&self) -> Value {
-        json!({ "systemd": self.systemd.view(), "docker": self.docker.view() })
-    }
-
-    /// The single active manager, or the guard error.
-    pub(crate) fn verdict(&self) -> Result<&'static str, HubError> {
-        match (self.systemd.active, self.docker.active) {
-            (true, false) => Ok("systemd"),
-            (false, true) => Ok("docker"),
-            (false, false) => Err(HubError::DaemonNotRunning {
-                message: format!(
-                    "no hub daemon is running (checked systemd unit {SERVICE_NAME}.service and \
-                     Docker container {SERVICE_NAME}); start one with `zeroshot hub install \
-                     --systemd` or `zeroshot hub install --docker`"
-                ),
-                detection: self.view(),
-            }),
-            (true, true) => Err(HubError::DaemonConflict {
-                message: "hub daemons are active under both systemd and Docker; keep one with \
-                          `zeroshot hub uninstall --docker` or `zeroshot hub uninstall --systemd`"
-                    .to_owned(),
-                detection: self.view(),
-            }),
+/// Read the API token, creating the file with a random 256-bit token when it is missing.
+pub(crate) fn load_or_create_token(path: &Path) -> Result<String, HubError> {
+    match std::fs::read_to_string(path) {
+        Ok(token) if !token.trim().is_empty() => return Ok(token.trim().to_owned()),
+        Ok(_) => {
+            return Err(HubError::Usage(format!(
+                "hub API token file {} is empty",
+                path.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(HubError::storage(
+                &format!("{} could not be read", path.display()),
+                error,
+            ));
         }
     }
-}
-
-/// Commands that run without an active daemon: the daemon itself and its service management.
-pub(crate) const fn requires_daemon(command: &HubCommand) -> bool {
-    !matches!(
-        command,
-        HubCommand::Daemon { .. }
-            | HubCommand::DaemonStatus
-            | HubCommand::Install(_)
-            | HubCommand::Uninstall(_)
-    )
-}
-
-/// Fail unless exactly one daemon is active under systemd or Docker.
-pub(crate) async fn guard(probe: &dyn DaemonProbe) -> Result<&'static str, HubError> {
-    Detection::probe(probe).await.verdict()
-}
-
-/// The probe for this process: `ZEROSHOT_HUB_DAEMON_PROBE` when set, otherwise systemctl and
-/// docker.
-pub(crate) fn production_probe() -> Box<dyn DaemonProbe> {
-    match std::env::var(PROBE_ENV) {
-        Ok(value) if !value.is_empty() => Box::new(StaticProbe::parse(&value)),
-        _ => Box::new(ServiceProbe),
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| HubError::storage("a random API token could not be generated", error))?;
+    let token = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if let Some(parent) = path.parent() {
+        super::service::create_private_directory(parent)?;
     }
+    write_private(path, format!("{token}\n").as_bytes())?;
+    Ok(token)
 }
 
-/// Fixed answers, from `ZEROSHOT_HUB_DAEMON_PROBE` or tests.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct StaticProbe {
-    pub systemd: bool,
-    pub docker: bool,
-}
-
-impl StaticProbe {
-    pub(crate) fn parse(value: &str) -> Self {
-        let managers = value.split(',').map(str::trim).collect::<Vec<_>>();
-        Self {
-            systemd: managers.contains(&"systemd"),
-            docker: managers.contains(&"docker"),
+/// URL clients use for a bound address: unspecified addresses are reached through loopback.
+pub(crate) fn client_url(address: std::net::SocketAddr) -> String {
+    let ip = match address.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
         }
-    }
-
-    fn state(active: bool) -> ManagerState {
-        ManagerState {
-            active,
-            scope: None,
-            detail: format!("reported by {PROBE_ENV}"),
+        std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
         }
-    }
+        ip => ip,
+    };
+    format!("http://{}", std::net::SocketAddr::new(ip, address.port()))
 }
 
-#[async_trait]
-impl DaemonProbe for StaticProbe {
-    async fn systemd(&self) -> ManagerState {
-        Self::state(self.systemd)
-    }
-
-    async fn docker(&self) -> ManagerState {
-        Self::state(self.docker)
-    }
-}
-
-/// Asks `systemctl` (user, then system scope) and `docker inspect`.
-struct ServiceProbe;
-
-#[async_trait]
-impl DaemonProbe for ServiceProbe {
-    async fn systemd(&self) -> ManagerState {
-        let unit = format!("{SERVICE_NAME}.service");
-        let mut details = Vec::new();
-        for (scope, arguments) in [
-            ("user", vec!["--user", "is-active", unit.as_str()]),
-            ("system", vec!["is-active", unit.as_str()]),
-        ] {
-            match probe_command("systemctl", &arguments).await {
-                Ok(state) if state == "active" => {
-                    return ManagerState {
-                        active: true,
-                        scope: Some(scope),
-                        detail: format!("{scope} unit {unit} is active"),
-                    };
-                }
-                Ok(state) => details.push(format!(
-                    "{scope} unit {}",
-                    if state.is_empty() { "unknown" } else { &state }
-                )),
-                Err(error) => details.push(format!("{scope}: {error}")),
-            }
-        }
-        ManagerState {
-            active: false,
-            scope: None,
-            detail: details.join("; "),
-        }
-    }
-
-    async fn docker(&self) -> ManagerState {
-        let result = probe_command(
-            "docker",
-            &["inspect", "--format", "{{.State.Running}}", SERVICE_NAME],
-        )
-        .await;
-        match result {
-            Ok(running) if running == "true" => ManagerState {
-                active: true,
-                scope: None,
-                detail: format!("container {SERVICE_NAME} is running"),
-            },
-            Ok(running) if running == "false" => ManagerState {
-                active: false,
-                scope: None,
-                detail: format!("container {SERVICE_NAME} is stopped"),
-            },
-            Ok(_) => ManagerState {
-                active: false,
-                scope: None,
-                detail: format!("no container {SERVICE_NAME}"),
-            },
-            Err(error) => ManagerState {
-                active: false,
-                scope: None,
-                detail: error,
-            },
-        }
-    }
-}
-
-/// First stdout line of a short command, whatever its exit status; `Err` when it cannot run.
-async fn probe_command(program: &str, arguments: &[&str]) -> Result<String, String> {
-    let output = Command::new(program)
-        .args(arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    match tokio::time::timeout(PROBE_TIMEOUT, output).await {
-        Ok(Ok(output)) => Ok(String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_owned()),
-        Ok(Err(error)) => Err(format!("{program} unavailable: {error}")),
-        Err(_) => Err(format!("{program} timed out")),
-    }
-}
-
-/// One dispatcher pass under the hub lock.
-pub(crate) async fn pass(context: &HubContext) -> Result<(TickReport, Value), HubError> {
-    let lock = context.store.lock()?;
-    let mut state = context.store.load(&lock)?;
-    let now = now_ms();
-    let report = schedule::tick(&mut state, context.driver.as_ref(), now).await;
-    context.store.save(&lock, &state)?;
-    let view = report.view(&state, now);
-    Ok((report, view))
-}
-
-impl TickReport {
-    pub(crate) fn is_idle(&self) -> bool {
-        self.fired.is_empty()
-            && self.dispatched.is_empty()
-            && self.finished.is_empty()
-            && self.expired.is_empty()
-            && self.failed.is_empty()
-    }
-}
-
-/// `hub daemon run`: dispatch every `interval` until SIGTERM or Ctrl-C.
+/// `hub daemon run`.
 pub(crate) async fn run(
-    context: &HubContext,
-    interval: &str,
+    store: HubStore,
+    open: impl FnOnce(HubStore) -> Result<HubService, HubError>,
+    options: &HubDaemonRun,
     output: &mut impl Write,
 ) -> Result<(), HubError> {
-    let pause = Duration::from_millis(parse_duration_ms(interval)?);
-    let Some(_instance) = context.store.try_daemon_lock()? else {
-        return Err(HubError::DaemonConflict {
-            message: format!(
-                "another hub daemon already owns {}",
-                context.store.directory().display()
-            ),
-            detection: Value::Null,
-        });
+    let pause = Duration::from_millis(parse_duration_ms(&options.interval)?);
+    let Some(_instance) = store.try_daemon_lock()? else {
+        return Err(HubError::DaemonRunning(format!(
+            "another hub daemon already owns {}; check it with `zeroshot hub daemon status`",
+            store.directory().display()
+        )));
     };
+    let token_file = options
+        .token_file
+        .clone()
+        .unwrap_or_else(|| store.directory().join(TOKEN_FILE));
+    let token_file = absolute(token_file);
+    let token = load_or_create_token(&token_file)?;
+    let listen = options.listen.as_deref().unwrap_or(DEFAULT_LISTEN);
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .map_err(|error| {
+            HubError::Usage(format!("hub API could not listen on {listen}: {error}"))
+        })?;
+    let address = listener
+        .local_addr()
+        .map_err(|error| HubError::storage("hub API address is unavailable", error))?;
+    let service = Arc::new(open(store)?);
     let manager = std::env::var(MANAGER_ENV).unwrap_or_else(|_| "foreground".to_owned());
-    let started = now_ms();
     let mut heartbeat = json!({
         "schema": "zeroshot.hub.daemon/v1",
         "pid": std::process::id(),
         "manager": manager,
         "version": env!("CARGO_PKG_VERSION"),
-        "hubDirectory": context.store.directory(),
+        "hubDirectory": service.store().directory(),
+        "listen": address.to_string(),
+        "url": client_url(address),
+        "tokenFile": token_file,
         "intervalMs": pause.as_millis(),
-        "startedAt": rfc3339(started),
+        "startedAt": rfc3339(now_ms()),
         "lastPassAt": null,
         "lastError": null,
         "passes": 0,
+    });
+    let shared = Arc::new(Mutex::new(heartbeat.clone()));
+    service.store().write_heartbeat(&heartbeat)?;
+    let api = Arc::new(ApiState {
+        service: service.clone(),
+        token,
+        heartbeat: shared.clone(),
+    });
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(async move {
+        let mut stopped = stopped;
+        axum::serve(listener, router(api))
+            .with_graceful_shutdown(async move {
+                let _ = stopped.changed().await;
+            })
+            .await
     });
     let mut event = heartbeat.clone();
     event["event"] = json!("started");
@@ -292,7 +143,7 @@ pub(crate) async fn run(
     let mut passes = 0_u64;
     loop {
         passes += 1;
-        match pass(context).await {
+        match service.pass().await {
             Ok((report, view)) => {
                 heartbeat["lastError"] = Value::Null;
                 if !report.is_idle() {
@@ -306,17 +157,33 @@ pub(crate) async fn run(
         }
         heartbeat["passes"] = json!(passes);
         heartbeat["lastPassAt"] = json!(rfc3339(now_ms()));
-        context.store.write_heartbeat(&heartbeat)?;
+        publish(&service, &shared, &heartbeat)?;
         tokio::select! {
             () = tokio::time::sleep(pause) => {}
             () = &mut shutdown => break,
         }
     }
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(SHUTDOWN_GRACE, server).await;
     heartbeat["stoppedAt"] = json!(rfc3339(now_ms()));
-    context.store.write_heartbeat(&heartbeat)?;
+    publish(&service, &shared, &heartbeat)?;
     let mut event = heartbeat;
     event["event"] = json!("stopped");
     write_json(output, &event)
+}
+
+fn publish(service: &HubService, shared: &Mutex<Value>, heartbeat: &Value) -> Result<(), HubError> {
+    if let Ok(mut current) = shared.lock() {
+        current.clone_from(heartbeat);
+    }
+    service.store().write_heartbeat(heartbeat)
+}
+
+fn absolute(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    std::env::current_dir().map_or(path.clone(), |folder| folder.join(path))
 }
 
 async fn shutdown_signal() {
@@ -334,31 +201,12 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-/// `hub daemon status`: detection plus the last heartbeat. Exit 0, 5, or 6 like the guard.
-pub(crate) async fn status(
-    context: &HubContext,
-    probe: &dyn DaemonProbe,
-    output: &mut impl Write,
-) -> Result<i32, HubError> {
-    let detection = Detection::probe(probe).await;
-    let verdict = detection.verdict();
-    let heartbeat = context.store.heartbeat();
-    let age = heartbeat
-        .as_ref()
-        .and_then(|heartbeat| heartbeat.get("lastPassAt"))
-        .and_then(Value::as_str)
-        .and_then(super::clock::parse_rfc3339_ms)
-        .map(|at| now_ms().saturating_sub(at));
-    write_json(
-        output,
-        &json!({
-            "schema": "zeroshot.hub.daemon-status/v1",
-            "active": verdict.as_ref().ok(),
-            "error": verdict.as_ref().err().map(|error| error.diagnostic()["code"].clone()),
-            "detection": detection.view(),
-            "heartbeat": heartbeat,
-            "heartbeatAgeMs": age,
-        }),
-    )?;
-    Ok(verdict.map_or_else(|error| error.exit_code(), |_| 0))
+impl super::schedule::TickReport {
+    pub(crate) fn is_idle(&self) -> bool {
+        self.fired.is_empty()
+            && self.dispatched.is_empty()
+            && self.finished.is_empty()
+            && self.expired.is_empty()
+            && self.failed.is_empty()
+    }
 }

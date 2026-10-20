@@ -1,15 +1,20 @@
 use std::ffi::OsString;
 
 use crate::native_v2_cli::hub::{
-    HubCommand, HubInstall, HubManager, HubMemberState, HubStrategy, HubUninstall,
+    HubCommand, HubContextCommand, HubDaemonRun, HubInstall, HubManager, HubMemberState,
+    HubRequest, HubStrategy, HubTokenSource, HubUninstall,
 };
 use crate::native_v2_cli::{NativeV2CliCommand, NativeV2CliError, parse_native_v2_args};
 
-fn parse(values: &[&str]) -> Result<HubCommand, NativeV2CliError> {
+fn request(values: &[&str]) -> Result<HubRequest, NativeV2CliError> {
     match parse_native_v2_args(values.iter().map(OsString::from))? {
-        NativeV2CliCommand::Hub(command) => Ok(command),
+        NativeV2CliCommand::Hub(request) => Ok(request),
         other => panic!("expected a hub command, got {other:?}"),
     }
+}
+
+fn parse(values: &[&str]) -> Result<HubCommand, NativeV2CliError> {
+    request(values).map(|request| request.command)
 }
 
 #[test]
@@ -267,9 +272,28 @@ fn enqueue_cron_parses_with_zone_and_conflicts_with_at() {
 fn daemon_and_service_commands_parse() {
     assert_eq!(
         parse(&["hub", "daemon", "run", "--interval", "3s"]).expect("daemon run"),
-        HubCommand::Daemon {
-            interval: "3s".to_owned()
-        }
+        HubCommand::Daemon(HubDaemonRun {
+            interval: "3s".to_owned(),
+            listen: None,
+            token_file: None,
+        })
+    );
+    assert_eq!(
+        parse(&[
+            "hub",
+            "daemon",
+            "run",
+            "--listen",
+            "0.0.0.0:7383",
+            "--token-file",
+            "/srv/token",
+        ])
+        .expect("daemon run with API options"),
+        HubCommand::Daemon(HubDaemonRun {
+            interval: "10s".to_owned(),
+            listen: Some("0.0.0.0:7383".to_owned()),
+            token_file: Some("/srv/token".into()),
+        })
     );
     assert_eq!(
         parse(&["hub", "daemon", "status"]).expect("daemon status"),
@@ -283,6 +307,8 @@ fn daemon_and_service_commands_parse() {
             image: None,
             volumes: Vec::new(),
             interval: "10s".to_owned(),
+            listen: None,
+            token_file: None,
             dry_run: true,
         })
     );
@@ -317,6 +343,90 @@ fn daemon_and_service_commands_parse() {
         &["hub", "install", "--docker", "--system"],
         &["hub", "install", "--systemd", "--image", "x"],
         &["hub", "uninstall"],
+    ] {
+        assert!(parse(invalid).is_err(), "{invalid:?} must be rejected");
+    }
+}
+
+#[test]
+fn hub_flag_selects_a_context_for_any_hub_command() {
+    let selected = request(&["hub", "ps", "--hub", "lab"]).expect("flag after");
+    assert_eq!(selected.context.as_deref(), Some("lab"));
+    assert!(matches!(selected.command, HubCommand::Ps(_)));
+    let selected = request(&["hub", "--hub", "lab", "dequeue", "hj_1"]).expect("flag before");
+    assert_eq!(selected.context.as_deref(), Some("lab"));
+    assert_eq!(request(&["hub", "ps"]).expect("no flag").context, None);
+}
+
+#[test]
+fn context_commands_parse_and_require_one_token_source() {
+    assert_eq!(
+        parse(&[
+            "hub",
+            "context",
+            "add",
+            "lab",
+            "http://lab:7383",
+            "--token-file",
+            "lab.token",
+        ])
+        .expect("add"),
+        HubCommand::Context(HubContextCommand::Add {
+            name: "lab".to_owned(),
+            url: "http://lab:7383".to_owned(),
+            token: HubTokenSource::File("lab.token".into()),
+        })
+    );
+    assert_eq!(
+        parse(&[
+            "hub",
+            "context",
+            "add",
+            "ci",
+            "https://h",
+            "--token-env",
+            "T"
+        ])
+        .expect("env"),
+        HubCommand::Context(HubContextCommand::Add {
+            name: "ci".to_owned(),
+            url: "https://h".to_owned(),
+            token: HubTokenSource::Env("T".to_owned()),
+        })
+    );
+    assert_eq!(
+        parse(&["hub", "context", "ls"]).expect("ls"),
+        HubCommand::Context(HubContextCommand::List)
+    );
+    assert_eq!(
+        parse(&["hub", "context", "use", "lab"]).expect("use"),
+        HubCommand::Context(HubContextCommand::Use {
+            name: "lab".to_owned()
+        })
+    );
+    for invalid in [
+        &["hub", "context", "add", "lab", "http://lab:7383"][..],
+        &[
+            "hub",
+            "context",
+            "add",
+            "lab",
+            "http://x",
+            "--token-file",
+            "f",
+            "--token-env",
+            "T",
+        ],
+        &[
+            "hub",
+            "context",
+            "add",
+            "bad name",
+            "http://x",
+            "--token-env",
+            "T",
+        ],
+        &["hub", "context", "rm"],
     ] {
         assert!(parse(invalid).is_err(), "{invalid:?} must be rejected");
     }

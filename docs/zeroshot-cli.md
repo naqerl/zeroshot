@@ -754,9 +754,9 @@ Commands:
 ```text
 Pool named targets and place, queue, and account for runs across them.
 
-A daemon installed with `zeroshot hub install` dispatches. Members are targets registered with `zeroshot target add`, plus `local`. Each placed job is an ordinary run on one target.
+A daemon installed with `zeroshot hub install` owns the hub and serves it over HTTP; hub commands address it through a hub context. Members are targets registered with `zeroshot target add`, plus `local`. Each placed job is an ordinary run on one target.
 
-Usage: zeroshot hub <COMMAND>
+Usage: zeroshot hub [OPTIONS] <COMMAND>
 
 Commands:
   add         Add a registered target, or `local`, to the hub
@@ -772,14 +772,18 @@ Commands:
   attach      Attach to an execution of a placed job as NDJSON
   force-stop  Force a placed job's run to stop
   dequeue     Remove a queued or scheduled job before it is placed, or a recurring schedule (`hs_…`)
-  dispatch    Run one dispatcher pass now and print its summary, for debugging
+  dispatch    Ask the hub daemon to run one dispatcher pass now and print its summary
   stats       Aggregate job outcomes and provider-reported tokens as JSON
   daemon      Run or inspect the hub daemon
+  context     Manage named hub endpoints this machine can address
   install     Install the hub daemon as a systemd unit or a Docker container and start it
   uninstall   Stop and remove the hub daemon service. Hub state is kept
   help        Print this message or the help of the given subcommand(s)
 
 Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
   -h, --help
           Print help (see a summary with '-h')
 
@@ -789,13 +793,20 @@ It picks a target for each run and keeps queued, scheduled, and recurring runs i
 beside the target registry. Every placed job is one ordinary run on exactly one target, so
 `zeroshot status RUN_ID --target NAME` keeps working.
 
-DAEMON
-A hub daemon dispatches continuously: it fires cron schedules, places due jobs, polls running
-jobs to completion, and records token usage. Install it once with `zeroshot hub install
---systemd` (user unit; --system for a system unit) or `--docker` (restarting container). Every
-other hub command first checks that exactly one daemon is active under systemd or Docker, and
-fails with hub.daemon_not_running or hub.daemon_conflict otherwise. `hub daemon status` shows
-what was detected; `hub daemon run` is the foreground entrypoint the services start.
+DAEMON AND API
+A hub daemon owns the hub: it is the only writer of its state, serves the hub over an HTTP API
+with bearer-token auth (default 127.0.0.1:7383, token in the hub folder's api-token file), and
+dispatches continuously: it fires cron schedules, places due jobs, polls running jobs to
+completion, and records token usage. Install it once with `zeroshot hub install --systemd`
+(user unit; --system for a system unit) or `--docker` (restarting container); `hub daemon run`
+is the foreground entrypoint the services start. One daemon owns a hub folder at a time.
+
+CONTEXTS
+Every other hub command is a client of one hub, chosen by --hub NAME, then ZEROSHOT_HUB, then
+`hub context use`, then the built-in `local` context (this machine's daemon, found through the
+hub folder). Add another machine's hub with `zeroshot hub context add NAME URL --token-file
+FILE` (or --token-env VAR); the token is read at request time and never stored or printed. A
+hub that does not answer fails with hub.unreachable (exit 5) naming the context and URL.
 
 Placement: --target pins one member; each --tag must match (AND). Members must be active, and
 a probe must reach them. Members must also support the run: --repository, --branch, --revision,
@@ -811,11 +822,12 @@ EXIT CODES
   3  no capacity: matching members are busy or unreachable, or --wait timed out (retryable)
   4  no eligible target: no active member matches the placement, or none supports the run
      (not retryable; details.rejected lists each member's reason)
-  5  hub.daemon_not_running: no hub daemon is active under systemd or Docker
-  6  hub.daemon_conflict: hub daemons are active under both systemd and Docker
+  5  hub.unreachable: the selected hub context's daemon does not answer
 
 EXAMPLES
   zeroshot hub install --systemd
+  zeroshot hub context add lab http://lab-box:7383 --token-file ~/.config/zeroshot/lab.token
+  zeroshot hub context use lab
   zeroshot hub add box-1 --tag gpu --slots 2
   zeroshot hub list
   zeroshot hub submit --tag gpu --title Fix --template single-worker --input in.json -d
@@ -838,6 +850,9 @@ Arguments:
           Registered target name, or `local` for the local controller
 
 Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
       --tag <TAG>
           Placement tag, such as gpu or project=citydiff. Repeat for several
 
@@ -870,6 +885,9 @@ Options:
       --add-tag <TAG>
           Add this tag. Repeat for several
 
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
       --remove-tag <TAG>
           Remove this tag. Repeat for several
 
@@ -893,13 +911,16 @@ Options:
 ```text
 Remove a member from the hub. Its target registration is unchanged
 
-Usage: zeroshot hub remove <NAME>
+Usage: zeroshot hub remove [OPTIONS] <NAME>
 
 Arguments:
   <NAME>
           Member name: a registered target name or `local`
 
 Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
   -h, --help
           Print help
 ```
@@ -912,6 +933,9 @@ List members with health and load as JSON
 Usage: zeroshot hub list [OPTIONS]
 
 Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
       --tag <TAG>
           Only list members carrying this tag. Repeat for several
 
@@ -932,6 +956,9 @@ Fails with exit code 3 when every matching member is busy, unless --wait or --qu
 Usage: zeroshot hub submit [OPTIONS] --title <TITLE> --input <FILE>
 
 Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
       --tag <TAG>
           Require this member tag. Repeat for several; all must match
 
@@ -1127,6 +1154,9 @@ Accept a run into the hub queue for later placement, once or on a cron schedule.
 Usage: zeroshot hub enqueue [OPTIONS] --title <TITLE> --input <FILE>
 
 Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
       --tag <TAG>
           Require this member tag. Repeat for several; all must match
 
@@ -1328,6 +1358,9 @@ List hub jobs as JSON
 Usage: zeroshot hub ps [OPTIONS]
 
 Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
       --state <STATE>
           Job state filter: active (queued, scheduled, running), queued, scheduled, running, succeeded, failed, dequeued, expired, recurring (schedules only), or all. Active schedules are listed with active and recurring; all schedules with all
 
@@ -1351,13 +1384,16 @@ Options:
 ```text
 Read one hub job with its run status as JSON
 
-Usage: zeroshot hub status <JOB_ID>
+Usage: zeroshot hub status [OPTIONS] <JOB_ID>
 
 Arguments:
   <JOB_ID>
           Hub job ID
 
 Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
   -h, --help
           Print help
 ```
@@ -1376,6 +1412,9 @@ Arguments:
 Options:
       --after <CURSOR>
           Resume strictly after this durable cursor
+
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
 
   -h, --help
           Print help
@@ -1396,6 +1435,9 @@ Options:
       --after <CURSOR>
           Resume strictly after this durable cursor
 
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
       --execution <EXECUTION_REF>
           Return records only for this opaque execution selector
 
@@ -1408,7 +1450,7 @@ Options:
 ```text
 Attach to an execution of a placed job as NDJSON
 
-Usage: zeroshot hub attach <JOB_ID> <EXECUTION_REF>
+Usage: zeroshot hub attach [OPTIONS] <JOB_ID> <EXECUTION_REF>
 
 Arguments:
   <JOB_ID>
@@ -1418,6 +1460,9 @@ Arguments:
           Execution reference emitted by the run
 
 Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
   -h, --help
           Print help
 ```
@@ -1427,13 +1472,16 @@ Options:
 ```text
 Force a placed job's run to stop
 
-Usage: zeroshot hub force-stop <JOB_ID>
+Usage: zeroshot hub force-stop [OPTIONS] <JOB_ID>
 
 Arguments:
   <JOB_ID>
           Hub job ID
 
 Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
   -h, --help
           Print help
 ```
@@ -1445,13 +1493,16 @@ Remove a queued or scheduled job before it is placed, or a recurring schedule (`
 
 Removing a schedule keeps the jobs it already queued.
 
-Usage: zeroshot hub dequeue <JOB_ID>
+Usage: zeroshot hub dequeue [OPTIONS] <JOB_ID>
 
 Arguments:
   <JOB_ID>
           Hub job ID
 
 Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
   -h, --help
           Print help (see a summary with '-h')
 ```
@@ -1459,13 +1510,16 @@ Options:
 #### `zeroshot hub dispatch`
 
 ```text
-Run one dispatcher pass now and print its summary, for debugging.
+Ask the hub daemon to run one dispatcher pass now and print its summary.
 
-The daemon runs the same pass continuously; a manual pass is safe beside it because both hold the hub lock.
+The daemon runs the same pass every --interval; a requested pass is serialized with it.
 
-Usage: zeroshot hub dispatch
+Usage: zeroshot hub dispatch [OPTIONS]
 
 Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
   -h, --help
           Print help (see a summary with '-h')
 ```
@@ -1482,6 +1536,9 @@ Usage: zeroshot hub stats [OPTIONS]
 Options:
       --by <DIMENSION>
           Group by target, model, project, day, or label:KEY. Repeat to combine
+
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
 
       --since <TIME>
           Only jobs submitted at or after this RFC 3339 time or DURATION ago, such as 7d
@@ -1501,14 +1558,17 @@ Options:
 ```text
 Run or inspect the hub daemon
 
-Usage: zeroshot hub daemon <COMMAND>
+Usage: zeroshot hub daemon [OPTIONS] <COMMAND>
 
 Commands:
-  run     Dispatch in the foreground until SIGTERM or Ctrl-C; the entrypoint of installed services
-  status  Report the detected systemd and Docker daemons and the last heartbeat as JSON
+  run     Serve the hub API and dispatch in the foreground until SIGTERM or Ctrl-C; the entrypoint of installed services
+  status  Ask the selected hub's daemon for its heartbeat as JSON
   help    Print this message or the help of the given subcommand(s)
 
 Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
   -h, --help
           Print help
 ```
@@ -1516,17 +1576,26 @@ Options:
 ##### `zeroshot hub daemon run`
 
 ```text
-Dispatch in the foreground until SIGTERM or Ctrl-C; the entrypoint of installed services.
+Serve the hub API and dispatch in the foreground until SIGTERM or Ctrl-C; the entrypoint of installed services.
 
-Each pass fires due cron schedules, refreshes capabilities and running jobs, expires stale jobs, and places due ones. Passes with activity are written as NDJSON. Only one daemon may own a hub folder at a time.
+Each pass fires due cron schedules, refreshes capabilities and running jobs, expires stale jobs, and places due ones; target calls run outside the state lock, so API reads never wait for a slow target. Passes with activity are written as NDJSON. Only one daemon may own a hub folder at a time.
 
 Usage: zeroshot hub daemon run [OPTIONS]
 
 Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
       --interval <DURATION>
           Pause between dispatcher passes
 
           [default: 10s]
+
+      --listen <ADDR:PORT>
+          Address for the hub API [default: 127.0.0.1:7383]. Use a non-loopback address only on a trusted network or behind a TLS proxy; the API is plain HTTP
+
+      --token-file <FILE>
+          Bearer token file for the hub API [default: api-token in the hub folder, created with a random token when missing]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1535,13 +1604,16 @@ Options:
 ##### `zeroshot hub daemon status`
 
 ```text
-Report the detected systemd and Docker daemons and the last heartbeat as JSON.
+Ask the selected hub's daemon for its heartbeat as JSON.
 
-Exits 0 when exactly one daemon is active, 5 when none is, and 6 when both are.
+Exits 0 when the daemon answers and 5 (hub.unreachable) when it does not.
 
-Usage: zeroshot hub daemon status
+Usage: zeroshot hub daemon status [OPTIONS]
 
 Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
   -h, --help
           Print help (see a summary with '-h')
 ```
@@ -1554,8 +1626,126 @@ Print this message or the help of the given subcommand(s)
 Usage: zeroshot hub daemon help [COMMAND]
 
 Commands:
-  run     Dispatch in the foreground until SIGTERM or Ctrl-C; the entrypoint of installed services
-  status  Report the detected systemd and Docker daemons and the last heartbeat as JSON
+  run     Serve the hub API and dispatch in the foreground until SIGTERM or Ctrl-C; the entrypoint of installed services
+  status  Ask the selected hub's daemon for its heartbeat as JSON
+  help    Print this message or the help of the given subcommand(s)
+```
+
+#### `zeroshot hub context`
+
+```text
+Manage named hub endpoints this machine can address
+
+Usage: zeroshot hub context [OPTIONS] <COMMAND>
+
+Commands:
+  add     Add a hub endpoint. The token is read from FILE or VAR at each request; it is never copied into the context file
+  list    List hub contexts as JSON, marking the current and selected ones [alias: ls]
+  use     Make a context the default for hub commands on this machine
+  remove  Remove a context. The built-in `local` context cannot be removed [alias: rm]
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help
+```
+
+##### `zeroshot hub context add`
+
+```text
+Add a hub endpoint. The token is read from FILE or VAR at each request; it is never copied into the context file
+
+Usage: zeroshot hub context add [OPTIONS] <--token-file <FILE>|--token-env <VAR>> <NAME> <URL>
+
+Arguments:
+  <NAME>
+          Context name
+
+  <URL>
+          Hub API base URL, such as http://lab-box:7383
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+      --token-file <FILE>
+          File holding the bearer token, such as a copy of the hub's api-token
+
+      --token-env <VAR>
+          Environment variable holding the bearer token
+
+  -h, --help
+          Print help
+```
+
+##### `zeroshot hub context list`
+
+```text
+List hub contexts as JSON, marking the current and selected ones
+
+Usage: zeroshot hub context list [OPTIONS]
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help
+```
+
+##### `zeroshot hub context use`
+
+```text
+Make a context the default for hub commands on this machine
+
+Usage: zeroshot hub context use [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>
+          Context name
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help
+```
+
+##### `zeroshot hub context remove`
+
+```text
+Remove a context. The built-in `local` context cannot be removed
+
+Usage: zeroshot hub context remove [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>
+          Context name
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help
+```
+
+##### `zeroshot hub context help`
+
+```text
+Print this message or the help of the given subcommand(s)
+
+Usage: zeroshot hub context help [COMMAND]
+
+Commands:
+  add     Add a hub endpoint. The token is read from FILE or VAR at each request; it is never copied into the context file
+  list    List hub contexts as JSON, marking the current and selected ones
+  use     Make a context the default for hub commands on this machine
+  remove  Remove a context. The built-in `local` context cannot be removed
   help    Print this message or the help of the given subcommand(s)
 ```
 
@@ -1564,11 +1754,14 @@ Commands:
 ```text
 Install the hub daemon as a systemd unit or a Docker container and start it.
 
-The service runs `zeroshot hub daemon run` with this shell's config, hub, and state folders pinned, so it sees the same targets and queue. --dry-run prints the generated unit or container command and the steps without changing anything.
+The service runs `zeroshot hub daemon run` with this shell's config, hub, and state folders pinned, so it sees the same targets and queue; --listen and --token-file are passed through. --dry-run prints the generated unit or container command and the steps without changing anything.
 
 Usage: zeroshot hub install [OPTIONS] <--systemd|--docker>
 
 Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
       --systemd
           Install a systemd unit (user unit unless --system) and enable it now
 
@@ -1589,6 +1782,12 @@ Options:
 
           [default: 10s]
 
+      --listen <ADDR:PORT>
+          Address for the hub API [default: 127.0.0.1:7383]. Use a non-loopback address only on a trusted network or behind a TLS proxy; the API is plain HTTP
+
+      --token-file <FILE>
+          Bearer token file for the hub API [default: api-token in the hub folder, created with a random token when missing]
+
       --dry-run
           Print the generated service definition and steps without applying them
 
@@ -1604,6 +1803,9 @@ Stop and remove the hub daemon service. Hub state is kept
 Usage: zeroshot hub uninstall [OPTIONS] <--systemd|--docker>
 
 Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
       --systemd
           Remove the systemd unit
 
@@ -1641,9 +1843,10 @@ Commands:
   attach      Attach to an execution of a placed job as NDJSON
   force-stop  Force a placed job's run to stop
   dequeue     Remove a queued or scheduled job before it is placed, or a recurring schedule (`hs_…`)
-  dispatch    Run one dispatcher pass now and print its summary, for debugging
+  dispatch    Ask the hub daemon to run one dispatcher pass now and print its summary
   stats       Aggregate job outcomes and provider-reported tokens as JSON
   daemon      Run or inspect the hub daemon
+  context     Manage named hub endpoints this machine can address
   install     Install the hub daemon as a systemd unit or a Docker container and start it
   uninstall   Stop and remove the hub daemon service. Hub state is kept
   help        Print this message or the help of the given subcommand(s)

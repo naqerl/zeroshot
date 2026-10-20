@@ -37,10 +37,6 @@ impl HubState {
     pub(crate) fn member(&self, name: &str) -> Option<&Member> {
         self.members.iter().find(|member| member.name == name)
     }
-
-    pub(crate) fn job_index(&self, job_id: &str) -> Option<usize> {
-        self.jobs.iter().position(|job| job.job_id == job_id)
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

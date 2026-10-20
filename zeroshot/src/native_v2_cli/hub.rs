@@ -1,11 +1,20 @@
 //! Parsed `zeroshot hub` requests.
 //!
 //! The hub pools registered targets behind one queue. A daemon (`hub daemon run`, installed with
-//! `hub install`) owns dispatch; other hub commands read and change the shared state under its
-//! lock. Parsing only checks syntax and keeps the run arguments in the exact `zeroshot run`
+//! `hub install`) owns the hub state and serves it over an authenticated HTTP API; every other
+//! hub command is a client of the hub selected by `--hub`, `ZEROSHOT_HUB`, or the current hub
+//! context. Parsing only checks syntax and keeps the run arguments in the exact `zeroshot run`
 //! form; the shipped binary owns placement, queue state, and the delegated target calls.
 
 use std::path::PathBuf;
+
+/// A hub subcommand plus the hub context it addresses.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HubRequest {
+    /// `--hub NAME`; `None` falls back to `ZEROSHOT_HUB`, then the current context.
+    pub context: Option<String>,
+    pub command: HubCommand,
+}
 
 /// One parsed hub subcommand.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -44,14 +53,50 @@ pub enum HubCommand {
     /// One dispatcher pass, for debugging; the daemon runs these continuously.
     Dispatch,
     Stats(HubStats),
-    /// Foreground daemon: dispatch every `interval` until SIGTERM or Ctrl-C.
-    Daemon {
-        interval: String,
-    },
-    /// Report which service manager runs the daemon and its heartbeat.
+    /// Foreground daemon: serve the hub API and dispatch every `interval` until SIGTERM or
+    /// Ctrl-C.
+    Daemon(HubDaemonRun),
+    /// Ask the selected hub's daemon for its heartbeat.
     DaemonStatus,
+    /// Manage the hub contexts this machine can address.
+    Context(HubContextCommand),
     Install(HubInstall),
     Uninstall(HubUninstall),
+}
+
+/// `hub daemon run` options.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HubDaemonRun {
+    pub interval: String,
+    /// `ADDR:PORT` for the hub API; `None` uses the loopback default.
+    pub listen: Option<String>,
+    /// Bearer token file; `None` uses `api-token` in the hub folder, created when missing.
+    pub token_file: Option<PathBuf>,
+}
+
+/// `hub context`: named hub endpoints, docker-context style.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HubContextCommand {
+    Add {
+        name: String,
+        url: String,
+        token: HubTokenSource,
+    },
+    List,
+    Use {
+        name: String,
+    },
+    Remove {
+        name: String,
+    },
+}
+
+/// Where a context's bearer token is read from at request time; the token itself is never
+/// stored in the context file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HubTokenSource {
+    File(PathBuf),
+    Env(String),
 }
 
 /// Service manager that supervises the hub daemon.
@@ -72,6 +117,10 @@ pub struct HubInstall {
     /// docker only: extra host folders mounted at the same path, such as job working folders.
     pub volumes: Vec<PathBuf>,
     pub interval: String,
+    /// Passed to `hub daemon run --listen`.
+    pub listen: Option<String>,
+    /// Passed to `hub daemon run --token-file`.
+    pub token_file: Option<PathBuf>,
     pub dry_run: bool,
 }
 

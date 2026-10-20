@@ -3,8 +3,9 @@ use clap::{Args, Subcommand, ValueEnum};
 use super::RunArgs;
 use crate::native_v2_cli::NativeV2CliError;
 use crate::native_v2_cli::hub::{
-    HubCommand, HubEnqueue, HubInstall, HubJobSpec, HubLogs, HubManager, HubMemberAdd,
-    HubMemberState, HubMemberUpdate, HubPs, HubStats, HubStrategy, HubSubmit, HubUninstall,
+    HubCommand, HubContextCommand, HubDaemonRun, HubEnqueue, HubInstall, HubJobSpec, HubLogs,
+    HubManager, HubMemberAdd, HubMemberState, HubMemberUpdate, HubPs, HubStats, HubStrategy,
+    HubSubmit, HubTokenSource, HubUninstall,
 };
 
 #[derive(Debug, Subcommand)]
@@ -14,13 +15,20 @@ It picks a target for each run and keeps queued, scheduled, and recurring runs i
 beside the target registry. Every placed job is one ordinary run on exactly one target, so
 `zeroshot status RUN_ID --target NAME` keeps working.
 
-DAEMON
-A hub daemon dispatches continuously: it fires cron schedules, places due jobs, polls running
-jobs to completion, and records token usage. Install it once with `zeroshot hub install
---systemd` (user unit; --system for a system unit) or `--docker` (restarting container). Every
-other hub command first checks that exactly one daemon is active under systemd or Docker, and
-fails with hub.daemon_not_running or hub.daemon_conflict otherwise. `hub daemon status` shows
-what was detected; `hub daemon run` is the foreground entrypoint the services start.
+DAEMON AND API
+A hub daemon owns the hub: it is the only writer of its state, serves the hub over an HTTP API
+with bearer-token auth (default 127.0.0.1:7383, token in the hub folder's api-token file), and
+dispatches continuously: it fires cron schedules, places due jobs, polls running jobs to
+completion, and records token usage. Install it once with `zeroshot hub install --systemd`
+(user unit; --system for a system unit) or `--docker` (restarting container); `hub daemon run`
+is the foreground entrypoint the services start. One daemon owns a hub folder at a time.
+
+CONTEXTS
+Every other hub command is a client of one hub, chosen by --hub NAME, then ZEROSHOT_HUB, then
+`hub context use`, then the built-in `local` context (this machine's daemon, found through the
+hub folder). Add another machine's hub with `zeroshot hub context add NAME URL --token-file
+FILE` (or --token-env VAR); the token is read at request time and never stored or printed. A
+hub that does not answer fails with hub.unreachable (exit 5) naming the context and URL.
 
 Placement: --target pins one member; each --tag must match (AND). Members must be active, and
 a probe must reach them. Members must also support the run: --repository, --branch, --revision,
@@ -36,11 +44,12 @@ EXIT CODES
   3  no capacity: matching members are busy or unreachable, or --wait timed out (retryable)
   4  no eligible target: no active member matches the placement, or none supports the run
      (not retryable; details.rejected lists each member's reason)
-  5  hub.daemon_not_running: no hub daemon is active under systemd or Docker
-  6  hub.daemon_conflict: hub daemons are active under both systemd and Docker
+  5  hub.unreachable: the selected hub context's daemon does not answer
 
 EXAMPLES
   zeroshot hub install --systemd
+  zeroshot hub context add lab http://lab-box:7383 --token-file ~/.config/zeroshot/lab.token
+  zeroshot hub context use lab
   zeroshot hub add box-1 --tag gpu --slots 2
   zeroshot hub list
   zeroshot hub submit --tag gpu --title Fix --template single-worker --input in.json -d
@@ -102,10 +111,9 @@ pub(super) enum HubCliCommand {
     /// Removing a schedule keeps the jobs it already queued.
     Dequeue(HubJobArgs),
 
-    /// Run one dispatcher pass now and print its summary, for debugging.
+    /// Ask the hub daemon to run one dispatcher pass now and print its summary.
     ///
-    /// The daemon runs the same pass continuously; a manual pass is safe beside it because both
-    /// hold the hub lock.
+    /// The daemon runs the same pass every --interval; a requested pass is serialized with it.
     Dispatch,
 
     /// Aggregate job outcomes and provider-reported tokens as JSON.
@@ -118,11 +126,16 @@ pub(super) enum HubCliCommand {
     #[command(subcommand)]
     Daemon(HubDaemonCommand),
 
+    /// Manage named hub endpoints this machine can address.
+    #[command(subcommand)]
+    Context(HubContextCliCommand),
+
     /// Install the hub daemon as a systemd unit or a Docker container and start it.
     ///
     /// The service runs `zeroshot hub daemon run` with this shell's config, hub, and state
-    /// folders pinned, so it sees the same targets and queue. --dry-run prints the generated
-    /// unit or container command and the steps without changing anything.
+    /// folders pinned, so it sees the same targets and queue; --listen and --token-file are
+    /// passed through. --dry-run prints the generated unit or container command and the steps
+    /// without changing anything.
     Install(HubInstallArgs),
 
     /// Stop and remove the hub daemon service. Hub state is kept.
@@ -131,16 +144,18 @@ pub(super) enum HubCliCommand {
 
 #[derive(Debug, Subcommand)]
 pub(super) enum HubDaemonCommand {
-    /// Dispatch in the foreground until SIGTERM or Ctrl-C; the entrypoint of installed services.
+    /// Serve the hub API and dispatch in the foreground until SIGTERM or Ctrl-C; the entrypoint
+    /// of installed services.
     ///
     /// Each pass fires due cron schedules, refreshes capabilities and running jobs, expires stale
-    /// jobs, and places due ones. Passes with activity are written as NDJSON. Only one daemon may
+    /// jobs, and places due ones; target calls run outside the state lock, so API reads never
+    /// wait for a slow target. Passes with activity are written as NDJSON. Only one daemon may
     /// own a hub folder at a time.
     Run(HubDaemonRunArgs),
 
-    /// Report the detected systemd and Docker daemons and the last heartbeat as JSON.
+    /// Ask the selected hub's daemon for its heartbeat as JSON.
     ///
-    /// Exits 0 when exactly one daemon is active, 5 when none is, and 6 when both are.
+    /// Exits 0 when the daemon answers and 5 (hub.unreachable) when it does not.
     Status,
 }
 
@@ -149,6 +164,67 @@ pub(super) struct HubDaemonRunArgs {
     /// Pause between dispatcher passes.
     #[arg(long, value_name = "DURATION", default_value = "10s")]
     interval: String,
+
+    #[command(flatten)]
+    api: HubApiArgs,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubApiArgs {
+    /// Address for the hub API [default: 127.0.0.1:7383]. Use a non-loopback address only on
+    /// a trusted network or behind a TLS proxy; the API is plain HTTP.
+    #[arg(long, value_name = "ADDR:PORT")]
+    listen: Option<String>,
+
+    /// Bearer token file for the hub API [default: api-token in the hub folder, created with
+    /// a random token when missing].
+    #[arg(long, value_name = "FILE")]
+    token_file: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum HubContextCliCommand {
+    /// Add a hub endpoint. The token is read from FILE or VAR at each request; it is never
+    /// copied into the context file.
+    Add(HubContextAddArgs),
+
+    /// List hub contexts as JSON, marking the current and selected ones.
+    #[command(visible_alias = "ls")]
+    List,
+
+    /// Make a context the default for hub commands on this machine.
+    Use(HubContextNameArgs),
+
+    /// Remove a context. The built-in `local` context cannot be removed.
+    #[command(visible_alias = "rm")]
+    Remove(HubContextNameArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("token").required(true).args(["token_file", "token_env"])))]
+pub(super) struct HubContextAddArgs {
+    /// Context name.
+    #[arg(value_name = "NAME")]
+    name: String,
+
+    /// Hub API base URL, such as http://lab-box:7383.
+    #[arg(value_name = "URL")]
+    url: String,
+
+    /// File holding the bearer token, such as a copy of the hub's api-token.
+    #[arg(long, value_name = "FILE")]
+    token_file: Option<std::path::PathBuf>,
+
+    /// Environment variable holding the bearer token.
+    #[arg(long, value_name = "VAR")]
+    token_env: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubContextNameArgs {
+    /// Context name.
+    #[arg(value_name = "NAME")]
+    name: String,
 }
 
 #[derive(Debug, Args)]
@@ -177,6 +253,9 @@ pub(super) struct HubInstallArgs {
     /// Pause between dispatcher passes.
     #[arg(long, value_name = "DURATION", default_value = "10s")]
     interval: String,
+
+    #[command(flatten)]
+    api: HubApiArgs,
 
     /// Print the generated service definition and steps without applying them.
     #[arg(long)]
@@ -510,16 +589,21 @@ impl HubCliCommand {
                 until: args.until,
                 prices: args.prices,
             }),
-            Self::Daemon(HubDaemonCommand::Run(args)) => HubCommand::Daemon {
+            Self::Daemon(HubDaemonCommand::Run(args)) => HubCommand::Daemon(HubDaemonRun {
                 interval: args.interval,
-            },
+                listen: args.api.listen,
+                token_file: args.api.token_file,
+            }),
             Self::Daemon(HubDaemonCommand::Status) => HubCommand::DaemonStatus,
+            Self::Context(command) => HubCommand::Context(command.into_command()?),
             Self::Install(args) => HubCommand::Install(HubInstall {
                 manager: manager(args.systemd),
                 system: args.system,
                 image: args.image,
                 volumes: args.volume,
                 interval: args.interval,
+                listen: args.api.listen,
+                token_file: args.api.token_file,
                 dry_run: args.dry_run,
             }),
             Self::Uninstall(args) => HubCommand::Uninstall(HubUninstall {
@@ -529,6 +613,43 @@ impl HubCliCommand {
             }),
         })
     }
+}
+
+impl HubContextCliCommand {
+    fn into_command(self) -> Result<HubContextCommand, NativeV2CliError> {
+        Ok(match self {
+            Self::Add(args) => HubContextCommand::Add {
+                name: context_name(args.name)?,
+                url: args.url,
+                token: match (args.token_file, args.token_env) {
+                    (Some(file), _) => HubTokenSource::File(file),
+                    (None, Some(variable)) => HubTokenSource::Env(variable),
+                    (None, None) => return Err(usage("--token-file or --token-env is required")),
+                },
+            },
+            Self::List => HubContextCommand::List,
+            Self::Use(args) => HubContextCommand::Use {
+                name: context_name(args.name)?,
+            },
+            Self::Remove(args) => HubContextCommand::Remove {
+                name: context_name(args.name)?,
+            },
+        })
+    }
+}
+
+fn context_name(name: String) -> Result<String, NativeV2CliError> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+    {
+        return Err(usage(
+            "hub context name must be 1-64 ASCII letters, digits, '-', '_', or '.'",
+        ));
+    }
+    Ok(name)
 }
 
 const fn manager(systemd: bool) -> HubManager {
