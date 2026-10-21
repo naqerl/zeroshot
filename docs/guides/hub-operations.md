@@ -304,3 +304,20 @@ These are deliberately left to the loop that calls the hub:
 - Automatic variant search. An evolve loop proposes variants, calls `hub eval run`, and reads the
   report.
 
+
+### Eval to-dos
+
+Not implemented yet. These come from Lauren Tan's (@poteto)
+[eval playbook](https://github.com/cursor/plugins/blob/main/pstack/skills/poteto-mode/playbooks/eval.md):
+
+- **Blind the judge.** The judge request currently names the variant and the model and marks
+  which side is the baseline. Give samples neutral labels (for example `A` and `B`), drop model
+  and variant names from the judge input, and randomize their order. Map the labels back only
+  after the verdict.
+- **Judge both variants in one pass on one scale.** Have one judge call score the baseline and
+  the candidate together, on the same scale, instead of scoring each sample separately.
+  `--judge-mode pairwise` already compares a candidate with the baseline, but it is not blinded
+  and gives one relative score rather than both samples on a shared scale.
+- **Verify behavior from transcripts, not self-report.** Check what the agent actually did, such
+  as tool calls, files read, and commands run, from the job's transcript and events. Do not
+  trust its own summary or claims, and give the judge and checks that evidence.
