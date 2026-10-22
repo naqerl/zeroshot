@@ -653,3 +653,140 @@ fn eval_report_parses_thresholds_and_wait() {
     assert!(parse(&["hub", "eval", "report", "er_1", "--threshold", "speed=1"]).is_err());
     assert!(parse(&["hub", "eval", "report", "er_1", "--threshold", "tokens=-1"]).is_err());
 }
+
+#[test]
+fn eval_suite_case_and_run_queries_parse() {
+    assert_eq!(
+        parse(&[
+            "hub",
+            "eval",
+            "suite",
+            "add",
+            "parser.v2",
+            "--description",
+            "Parser fixes"
+        ])
+        .expect("suite add"),
+        HubCommand::Eval(HubEvalCommand::SuiteAdd {
+            name: "parser.v2".to_owned(),
+            description: Some("Parser fixes".to_owned()),
+        })
+    );
+    assert_eq!(
+        parse(&["hub", "eval", "suite", "list"]).expect("suite list"),
+        HubCommand::Eval(HubEvalCommand::SuiteList)
+    );
+    assert_eq!(
+        parse(&["hub", "eval", "case", "list", "--suite", "parser"]).expect("case list"),
+        HubCommand::Eval(HubEvalCommand::CaseList {
+            suite: Some("parser".to_owned())
+        })
+    );
+    assert_eq!(
+        parse(&["hub", "eval", "case", "list"]).expect("all cases"),
+        HubCommand::Eval(HubEvalCommand::CaseList { suite: None })
+    );
+    assert_eq!(
+        parse(&["hub", "eval", "case", "show", "ec_1"]).expect("case show"),
+        HubCommand::Eval(HubEvalCommand::CaseShow {
+            case: "ec_1".to_owned()
+        })
+    );
+    assert_eq!(
+        parse(&["hub", "eval", "list", "--suite", "parser", "--limit", "5"]).expect("list"),
+        HubCommand::Eval(HubEvalCommand::List {
+            suite: Some("parser".to_owned()),
+            limit: Some(5),
+        })
+    );
+    assert_eq!(
+        parse(&["hub", "eval", "status", "er_1"]).expect("status"),
+        HubCommand::Eval(HubEvalCommand::Status {
+            run: "er_1".to_owned()
+        })
+    );
+}
+
+#[test]
+fn eval_names_cases_and_variants_are_validated() {
+    let message = |values: &[&str]| parse(values).expect_err("invalid").to_string();
+    let long = "x".repeat(65);
+    for name in ["", "has space", "slash/name", long.as_str()] {
+        assert!(
+            message(&["hub", "eval", "suite", "add", name]).contains("suite name must be"),
+            "{name:?}"
+        );
+    }
+    assert!(message(&["hub", "eval", "case", "list", "--suite", "a b"]).contains("suite name"));
+    assert!(
+        message(&[
+            "hub",
+            "eval",
+            "case",
+            "add",
+            "--suite",
+            "a b",
+            "--from-job",
+            "hj_1"
+        ])
+        .contains("suite name")
+    );
+    assert!(
+        message(&[
+            "hub",
+            "eval",
+            "case",
+            "add",
+            "--from-job",
+            "hj_1",
+            "--tag",
+            "gpu"
+        ])
+        .contains("keeps the job's placement")
+    );
+    assert!(
+        message(&[
+            "hub", "eval", "case", "add", "--title", "Fix", "--input", "in.json", "--detach",
+        ])
+        .contains("omit --detach")
+    );
+    let neither = message(&["hub", "eval", "case", "add", "--name", "c1"]);
+    assert!(neither.contains("--title"), "{neither}");
+    assert!(
+        message(&[
+            "hub",
+            "eval",
+            "run",
+            "--suite",
+            "s",
+            "--variant",
+            "a=model=x",
+            "--variant",
+            "a=model=y",
+        ])
+        .contains("given more than once")
+    );
+    for judge in ["cmd:", "zeroshot:"] {
+        assert!(
+            message(&["hub", "eval", "run", "--suite", "s", "--judge", judge])
+                .contains("invalid --judge"),
+            "{judge:?}"
+        );
+    }
+    assert!(
+        message(&[
+            "hub",
+            "eval",
+            "run",
+            "--suite",
+            "s",
+            "--variant",
+            "a=model="
+        ])
+        .contains("model needs a value")
+    );
+    assert!(
+        message(&["hub", "eval", "run", "--suite", "s", "--variant", "a=model"])
+            .contains("KEY=VALUE")
+    );
+}

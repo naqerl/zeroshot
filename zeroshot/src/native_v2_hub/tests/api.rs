@@ -426,3 +426,106 @@ async fn proxied_commands_stream_both_outputs_then_the_exit_code() {
     assert!(frames.contains(&json!({"stderr": "warn"})), "{frames:?}");
     assert_eq!(frames.last(), Some(&json!({"exit": 3})));
 }
+
+#[test]
+fn token_sources_fail_with_their_name_not_their_content() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let missing = TokenRef::File(directory.path().join("missing.token"));
+    let local = missing
+        .read("local", "http://127.0.0.1:7383")
+        .expect_err("no local daemon yet");
+    assert!(
+        matches!(local, HubError::Unreachable { .. }),
+        "the local daemon creates its token on first start: {local}"
+    );
+    let named = missing
+        .read("lab", "http://lab:7383")
+        .expect_err("missing token file");
+    assert!(named.to_string().contains("could not be read"), "{named}");
+    let blank = directory.path().join("blank.token");
+    std::fs::write(&blank, " \n").expect("blank");
+    let empty = TokenRef::File(blank)
+        .read("lab", "http://lab:7383")
+        .expect_err("empty token");
+    assert!(
+        empty.to_string().contains("bearer token is empty"),
+        "{empty}"
+    );
+    let unset = TokenRef::Env("ZEROSHOT_HUB_TEST_TOKEN_NEVER_SET".to_owned())
+        .read("ci", "https://hub.example")
+        .expect_err("unset variable");
+    assert!(
+        unset
+            .to_string()
+            .contains("ZEROSHOT_HUB_TEST_TOKEN_NEVER_SET is not set"),
+        "{unset}"
+    );
+}
+
+#[test]
+fn context_files_and_commands_reject_bad_records() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let hub = HubStore::new(directory.path().join("hub"));
+    let contexts = Contexts::new(directory.path(), hub.clone());
+    let file = directory.path().join("hub-contexts.json");
+    let mut output = Vec::new();
+    let add = |name: &str, url: &str| HubContextCommand::Add {
+        name: name.to_owned(),
+        url: url.to_owned(),
+        token: HubTokenSource::Env("LAB_TOKEN".to_owned()),
+    };
+    contexts
+        .execute(None, add("lab", "http://lab:7383"), &mut output)
+        .expect("add");
+    let duplicate = contexts
+        .execute(None, add("lab", "http://other:7383"), &mut output)
+        .expect_err("duplicate");
+    assert!(matches!(duplicate, HubError::Conflict(_)), "{duplicate}");
+    for url in [
+        "ftp://lab:21",
+        "not a url",
+        "http://lab:7383/?token=x",
+        "file:///tmp/hub",
+    ] {
+        let error = contexts
+            .execute(None, add("other", url), &mut output)
+            .expect_err("invalid url");
+        assert!(
+            error.to_string().contains("invalid hub URL"),
+            "{url}: {error}"
+        );
+    }
+    let missing = contexts
+        .execute(
+            None,
+            HubContextCommand::Remove {
+                name: "absent".to_owned(),
+            },
+            &mut output,
+        )
+        .expect_err("remove absent");
+    assert!(missing.to_string().contains("does not exist"), "{missing}");
+
+    std::fs::write(
+        &file,
+        r#"{"current":"bare","contexts":[{"name":"bare","url":"http://bare:7383"}]}"#,
+    )
+    .expect("tokenless record");
+    let bare = contexts.resolve(None).expect_err("no token source");
+    assert!(bare.to_string().contains("has no token source"), "{bare}");
+
+    std::fs::write(&file, b"{\"contexts\": 3}").expect("malformed");
+    let malformed = contexts.resolve(None).expect_err("malformed");
+    assert!(
+        malformed.to_string().contains("is malformed"),
+        "{malformed}"
+    );
+
+    std::fs::remove_file(&file).expect("remove");
+    std::fs::create_dir(&file).expect("folder in the way");
+    let unreadable = contexts.resolve(None).expect_err("unreadable");
+    assert!(
+        unreadable.to_string().contains("could not be read"),
+        "{unreadable}"
+    );
+}
