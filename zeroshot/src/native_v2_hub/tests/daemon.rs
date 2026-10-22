@@ -562,6 +562,14 @@ async fn the_daemon_refuses_bad_options_before_serving() {
         .expect_err("owned");
     assert_eq!(owned.diagnostic()["code"], json!("hub.daemon_running"));
     drop(held);
+    std::fs::write(directory.path().join("token"), "a-token\n").expect("token");
+    let metrics = run(options("1s", "127.0.0.1:0", Some("256.0.0.1:0")))
+        .await
+        .expect_err("bad metrics address");
+    assert!(
+        metrics.to_string().contains("metrics could not listen"),
+        "{metrics}"
+    );
 }
 
 /// Service installs read `HOME` and the user, which Windows does not provide.
@@ -830,4 +838,49 @@ fn an_unreadable_token_file_is_a_storage_error() {
     let directory = tempfile::tempdir().expect("tempdir");
     let error = load_or_create_token(directory.path()).expect_err("a folder is no token file");
     assert!(error.to_string().contains("could not be read"), "{error}");
+}
+
+#[test]
+fn the_store_reports_each_file_it_cannot_use() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let message = |error: super::super::error::HubError| error.to_string();
+
+    // The hub folder itself is a file.
+    let blocked = directory.path().join("blocked");
+    std::fs::write(&blocked, b"").expect("file");
+    let store = HubStore::new(blocked);
+    assert!(message(store.lock().err().expect("lock")).contains("directory could not be created"));
+    assert!(
+        message(store.try_daemon_lock().err().expect("daemon lock"))
+            .contains("directory could not be created")
+    );
+
+    // Each lock file, state file, and staging file is a folder.
+    let hub = directory.path().join("hub");
+    let store = HubStore::new(hub.clone());
+    for name in ["hub.lock", "daemon.lock"] {
+        std::fs::create_dir_all(hub.join(name)).expect("folder");
+    }
+    assert!(message(store.lock().err().expect("lock")).contains("lock could not be opened"));
+    assert!(
+        message(store.try_daemon_lock().err().expect("daemon lock"))
+            .contains("daemon lock could not be opened")
+    );
+    std::fs::remove_dir(hub.join("hub.lock")).expect("unblock");
+    let lock = store.lock().expect("lock");
+    std::fs::create_dir_all(hub.join("state.json").join("inside")).expect("folder");
+    assert!(message(store.load(&lock).expect_err("read")).contains("state could not be read"));
+    assert!(
+        message(
+            store
+                .save(&lock, &HubState::default())
+                .expect_err("replace")
+        )
+        .contains("state could not be replaced")
+    );
+    std::fs::create_dir(hub.join("daemon.json.tmp")).expect("folder");
+    assert!(
+        message(store.write_heartbeat(&json!({})).expect_err("stage"))
+            .contains("state could not be staged")
+    );
 }
