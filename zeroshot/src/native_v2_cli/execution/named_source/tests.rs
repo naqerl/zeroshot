@@ -217,6 +217,7 @@ async fn wave6_cli_contract_source_selection_obeys_explicit_upstream_and_local_p
         root: root.0.clone(),
         local_branch: Some("local-main".to_owned()),
         upstream: Some(("origin".to_owned(), upstream.clone())),
+        inspected: true,
     };
     assert_eq!(
         select_run_branch(&command, &worktree).assert_value(),
@@ -235,6 +236,7 @@ async fn wave6_cli_contract_source_selection_obeys_explicit_upstream_and_local_p
         root: root.0.clone(),
         local_branch: Some("local-main".to_owned()),
         upstream: None,
+        inspected: true,
     };
     assert_eq!(
         select_run_branch(&command, &local_only)
@@ -246,6 +248,7 @@ async fn wave6_cli_contract_source_selection_obeys_explicit_upstream_and_local_p
         root: root.0.clone(),
         local_branch: None,
         upstream: None,
+        inspected: true,
     };
     assert!(
         select_run_branch(&command, &unavailable)
@@ -782,13 +785,13 @@ async fn detached_named_sources_require_both_repository_and_branch_before_creden
 
     let plain = TestDirectory::new("plain-named-source");
     command.cwd = Some(plain.0.clone());
+    let explicit = inspect_worktree(&command).await.assert_value();
+    assert!(explicit.root.is_absolute());
+    assert!(explicit.local_branch.is_none());
+    assert!(explicit.upstream.is_none());
     assert!(
-        inspect_worktree(&command)
-            .await
-            .err()
-            .expect("named source inspection needs a Git worktree")
-            .to_string()
-            .contains("run from a Git worktree")
+        !explicit.inspected,
+        "a plain folder holds no worktree state to inspect"
     );
     assert!(
         worktree_is_dirty(&plain.0)

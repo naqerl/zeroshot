@@ -248,10 +248,9 @@ pub(crate) fn systemd_unit(env: &InstallEnv, system: bool, daemon: &[String]) ->
             systemd_quote(&format!("{key}={value}"))
         ));
     }
-    unit.push_str(&format!(
-        "WorkingDirectory={}\n",
-        systemd_quote(&display(&env.home))
-    ));
+    // `WorkingDirectory=` takes a bare path: systemd keeps the quotes of a quoted value and
+    // then rejects the unit as a non-absolute path, so it must not be systemd_quote'd.
+    unit.push_str(&format!("WorkingDirectory={}\n", display(&env.home)));
     if system {
         unit.push_str(&format!("User={}\nGroup={}\n", env.uid, env.gid));
     }
