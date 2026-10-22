@@ -927,7 +927,6 @@ async fn zeroshot_judges_run_as_hub_jobs_and_their_output_is_the_verdict() {
 
 #[test]
 fn materialized_blobs_are_replaced_atomically_and_never_rewritten_in_place() {
-    use std::io::Read;
     let directory = tempfile::tempdir().expect("tempdir");
     let blobs = super::super::eval::Blobs::new(directory.path());
     let folder = directory.path().join("programs");
@@ -938,7 +937,6 @@ fn materialized_blobs_are_replaced_atomically_and_never_rewritten_in_place() {
     assert_eq!(path, folder.join("judge.sh"));
 
     // A parallel sample materializing the same blob leaves the running copy alone.
-    let mut running = std::fs::File::open(&path).expect("open");
     let before = std::fs::metadata(&path).expect("metadata").modified().ok();
     blobs.materialize(&first, &folder).expect("again");
     assert_eq!(
@@ -946,26 +944,26 @@ fn materialized_blobs_are_replaced_atomically_and_never_rewritten_in_place() {
         before
     );
 
-    // Different content replaces the file by rename: an open reader still sees all of the
-    // old bytes instead of a truncated file.
+    // Different content replaces the file by rename: a reader that opened the old file still
+    // sees all of its bytes instead of a truncated file. (Windows refuses to rename over an
+    // open file, so only Unix keeps the reader open.)
+    #[cfg(unix)]
+    let mut running = std::fs::File::open(&path).expect("open");
     let second = blobs
         .put("judge.sh", b"#!/bin/sh\necho second\n")
         .expect("put");
-    #[cfg(unix)]
     blobs.materialize(&second, &folder).expect("replace");
     #[cfg(unix)]
     {
+        use std::io::Read;
         let mut old = String::new();
         running.read_to_string(&mut old).expect("read");
         assert_eq!(old, "#!/bin/sh\necho first\n");
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("read"),
-            "#!/bin/sh\necho second\n"
-        );
     }
-    drop(running);
-    #[cfg(not(unix))]
-    blobs.materialize(&second, &folder).expect("replace");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "#!/bin/sh\necho second\n"
+    );
     let names: Vec<_> = std::fs::read_dir(&folder)
         .expect("list")
         .map(|entry| entry.expect("entry").file_name())
