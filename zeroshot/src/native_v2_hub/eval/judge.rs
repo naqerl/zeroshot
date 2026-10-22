@@ -163,17 +163,39 @@ pub(crate) struct HostCommand<'a> {
     pub env: &'a [(String, String)],
 }
 
+const SPAWN_BUSY_RETRIES: u32 = 10;
+
 impl HostCommand<'_> {
+    /// Start the program, retrying briefly while it is busy: a program just written can stay
+    /// open for writing in a child another thread is forking, which makes exec fail with
+    /// `ETXTBSY` for a moment.
+    async fn spawn(&self) -> std::io::Result<tokio::process::Child> {
+        let mut attempts = 0;
+        loop {
+            let spawned = Command::new(self.program)
+                .args(self.arguments)
+                .current_dir(self.cwd)
+                .envs(self.env.iter().map(|(key, value)| (key, value)))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn();
+            match spawned {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && attempts < SPAWN_BUSY_RETRIES =>
+                {
+                    attempts += 1;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                spawned => return spawned,
+            }
+        }
+    }
+
     pub(crate) async fn run(&self, stdin: &[u8], timeout: Duration) -> Finished {
-        let spawned = Command::new(self.program)
-            .args(self.arguments)
-            .current_dir(self.cwd)
-            .envs(self.env.iter().map(|(key, value)| (key, value)))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn();
+        let spawned = self.spawn().await;
         let mut child = match spawned {
             Ok(child) => child,
             Err(error) => {

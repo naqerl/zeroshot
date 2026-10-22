@@ -581,7 +581,7 @@ impl Blobs {
         let path = self.directory.join(&sha256);
         if !path.is_file() {
             create_private_directory(&self.directory)?;
-            write_private(&path, bytes)?;
+            replace_private(&path, bytes)?;
         }
         let name = Path::new(name).file_name().map_or_else(
             || "file".to_owned(),
@@ -604,10 +604,37 @@ impl Blobs {
     }
 
     /// Copy a blob to `folder/NAME` (private) and return that path.
+    ///
+    /// Samples run in parallel and share materialized files (a judge program is one file per
+    /// content hash), so an identical file is left alone and a different one is replaced by an
+    /// atomic rename: a reader or a running program never sees the file truncated.
     pub(crate) fn materialize(&self, blob: &BlobRef, folder: &Path) -> Result<PathBuf, HubError> {
         create_private_directory(folder)?;
         let path = folder.join(&blob.name);
-        write_private(&path, &self.read(blob)?)?;
+        let bytes = self.read(blob)?;
+        if std::fs::read(&path).is_ok_and(|existing| existing == bytes) {
+            return Ok(path);
+        }
+        replace_private(&path, &bytes)?;
         Ok(path)
     }
+}
+
+/// Write `bytes` to a private sibling of `path`, then rename it over `path`.
+fn replace_private(path: &Path, bytes: &[u8]) -> Result<(), HubError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .map_or_else(|| "file".into(), |name| name.to_string_lossy());
+    let staged = path.with_file_name(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    write_private(&staged, bytes)?;
+    std::fs::rename(&staged, path).map_err(|error| {
+        let _ = std::fs::remove_file(&staged);
+        HubError::storage(&format!("{} could not be written", path.display()), error)
+    })
 }

@@ -924,3 +924,51 @@ async fn zeroshot_judges_run_as_hub_jobs_and_their_output_is_the_verdict() {
     assert_eq!(row["delta"]["judgeScore"]["absolute"], 0.25);
     assert_eq!(row["verdict"], "improved");
 }
+
+#[test]
+fn materialized_blobs_are_replaced_atomically_and_never_rewritten_in_place() {
+    use std::io::Read;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let blobs = super::super::eval::Blobs::new(directory.path());
+    let folder = directory.path().join("programs");
+    let first = blobs
+        .put("judge.sh", b"#!/bin/sh\necho first\n")
+        .expect("put");
+    let path = blobs.materialize(&first, &folder).expect("materialize");
+    assert_eq!(path, folder.join("judge.sh"));
+
+    // A parallel sample materializing the same blob leaves the running copy alone.
+    let mut running = std::fs::File::open(&path).expect("open");
+    let before = std::fs::metadata(&path).expect("metadata").modified().ok();
+    blobs.materialize(&first, &folder).expect("again");
+    assert_eq!(
+        std::fs::metadata(&path).expect("metadata").modified().ok(),
+        before
+    );
+
+    // Different content replaces the file by rename: an open reader still sees all of the
+    // old bytes instead of a truncated file.
+    let second = blobs
+        .put("judge.sh", b"#!/bin/sh\necho second\n")
+        .expect("put");
+    #[cfg(unix)]
+    blobs.materialize(&second, &folder).expect("replace");
+    #[cfg(unix)]
+    {
+        let mut old = String::new();
+        running.read_to_string(&mut old).expect("read");
+        assert_eq!(old, "#!/bin/sh\necho first\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "#!/bin/sh\necho second\n"
+        );
+    }
+    drop(running);
+    #[cfg(not(unix))]
+    blobs.materialize(&second, &folder).expect("replace");
+    let names: Vec<_> = std::fs::read_dir(&folder)
+        .expect("list")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("judge.sh")]);
+}
