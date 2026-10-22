@@ -16,6 +16,7 @@ use super::super::eval::client::report_exit_code;
 use super::super::eval::judge::{parse_reply, parse_verdict};
 #[cfg(unix)]
 use super::super::eval::judge::HostCommand;
+use super::super::eval::judge::{Ended, Finished};
 #[cfg(unix)]
 use zeroshot_engine::native_v2_cli::hub::HubEvalReport;
 use super::super::eval::report::{Against, Thresholds, report, stat};
@@ -238,7 +239,12 @@ async fn host_commands_get_the_request_on_stdin_and_the_eval_environment() {
         std::time::Duration::from_secs(10),
     )
     .await;
-    assert_eq!(finished.exit_code, Some(0), "{}", finished.stderr);
+    assert_eq!(
+        finished.ended,
+        Ended::Exited(Some(0)),
+        "{}",
+        finished.stderr
+    );
     assert!(finished.stderr.contains("log: fast"));
     let verdict = parse_reply(&finished.stdout, JudgeMode::Absolute);
     assert_eq!(verdict.score, Some(Score(1.0)));
@@ -997,11 +1003,11 @@ async fn host_commands_report_programs_that_cannot_start_or_finish() {
     }
     .run(b"{}", std::time::Duration::from_secs(5))
     .await;
-    assert_eq!(finished.exit_code, None);
+    assert_eq!(finished.exit_code(), None);
     assert!(
-        finished.stderr.contains("absent-judge could not start"),
-        "{}",
-        finished.stderr
+        matches!(&finished.ended, Ended::NotStarted(reason) if reason.contains("absent-judge could not start")),
+        "{:?}",
+        finished.ended
     );
 
     #[cfg(unix)]
@@ -1019,8 +1025,8 @@ async fn host_commands_report_programs_that_cannot_start_or_finish() {
         }
         .run(b"", std::time::Duration::from_millis(200))
         .await;
-        assert_eq!(finished.exit_code, None);
-        assert_eq!(finished.stderr, "timed out after 0s");
+        assert_eq!(finished.exit_code(), None);
+        assert_eq!(finished.ended.describe(), "timed out after 0s");
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 }
@@ -1048,11 +1054,10 @@ async fn host_commands_retry_then_report_a_program_held_open_for_writing() {
     }
     .run(b"", std::time::Duration::from_secs(5))
     .await;
-    assert_eq!(finished.exit_code, None);
     assert!(
-        finished.stderr.contains("could not start"),
-        "{}",
-        finished.stderr
+        finished.ended.describe().contains("could not start"),
+        "{:?}",
+        finished.ended
     );
     assert!(
         started.elapsed() >= std::time::Duration::from_millis(150),
@@ -1295,5 +1300,155 @@ async fn the_daemon_measures_finished_eval_samples() {
     assert!(
         states.iter().all(|state| state != "pending"),
         "the daemon measured every finished sample: {states:?}"
+    );
+}
+
+/// Write `body` as an executable POSIX shell script in `folder`.
+#[cfg(unix)]
+fn script(folder: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = folder.join(name);
+    std::fs::write(&path, body).expect("script");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    path
+}
+
+/// More input than any pipe buffers, so a command that stops reading blocks the writer.
+#[cfg(unix)]
+fn large_request() -> Vec<u8> {
+    let mut request = b"{\"mode\":\"absolute\",\"padding\":\"".to_vec();
+    request.extend(std::iter::repeat_n(b'x', 4 << 20));
+    request.extend_from_slice(b"\"}\n");
+    request
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_judge_that_never_reads_its_input_ends_by_the_timeout() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let judge = script(directory.path(), "deaf.sh", "#!/bin/sh\nexec sleep 30\n");
+    let started = std::time::Instant::now();
+    let finished = HostCommand {
+        program: &judge,
+        arguments: &[],
+        cwd: directory.path(),
+        env: &[],
+    }
+    .run(&large_request(), std::time::Duration::from_millis(500))
+    .await;
+    assert_eq!(
+        finished.ended,
+        Ended::TimedOut(std::time::Duration::from_millis(500))
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the input is written within the timeout, not before it"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_judge_that_answers_without_reading_all_its_input_is_not_accepted() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let judge = script(
+        directory.path(),
+        "hasty.sh",
+        "#!/bin/sh\nhead -c 16 >/dev/null\necho '{\"score\": 1}'\n",
+    );
+    let finished = HostCommand {
+        program: &judge,
+        arguments: &[],
+        cwd: directory.path(),
+        env: &[],
+    }
+    .run(&large_request(), std::time::Duration::from_secs(30))
+    .await;
+    assert!(
+        matches!(finished.ended, Ended::IncompleteInput(_)),
+        "{:?}",
+        finished.ended
+    );
+    assert_eq!(finished.exit_code(), None, "its exit code is not trusted");
+    assert!(
+        finished
+            .ended
+            .describe()
+            .starts_with("did not read all of its input"),
+        "{}",
+        finished.ended.describe()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn host_command_output_is_capped_while_it_is_read() {
+    use super::super::eval::judge::OUTPUT_LIMIT;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let chatty = script(
+        directory.path(),
+        "chatty.sh",
+        "#!/bin/sh\nhead -c 3000000 /dev/zero | tr '\\0' a\necho\necho '{\"score\": 0.5}'\n\
+         head -c 3000000 /dev/zero >&2\n",
+    );
+    let finished = HostCommand {
+        program: &chatty,
+        arguments: &[],
+        cwd: directory.path(),
+        env: &[],
+    }
+    .run(b"", std::time::Duration::from_secs(30))
+    .await;
+    assert_eq!(finished.ended, Ended::Exited(Some(0)));
+    assert!(finished.stdout.len() <= OUTPUT_LIMIT);
+    assert!(finished.stderr.len() <= OUTPUT_LIMIT);
+    assert_eq!(
+        parse_reply(&finished.stdout, JudgeMode::Absolute).score,
+        Some(Score(0.5)),
+        "the reply at the end of the output is kept"
+    );
+}
+
+#[test]
+fn checks_the_hub_could_not_run_leave_the_sample_unmeasured() {
+    use super::super::eval::worker::check_result;
+    let finished = |ended: Ended| Finished {
+        ended,
+        stdout: "out\n".to_owned(),
+        stderr: String::new(),
+    };
+    let passed = check_result("tests", &finished(Ended::Exited(Some(0))));
+    assert!(passed.passed && passed.error.is_none());
+    assert_eq!(passed.exit_code, Some(0));
+    assert_eq!(passed.output, "out\n");
+    let failed = check_result("tests", &finished(Ended::Exited(Some(1))));
+    assert!(!failed.passed && failed.error.is_none());
+    let killed = check_result("tests", &finished(Ended::Exited(None)));
+    assert_eq!((killed.passed, killed.exit_code), (false, None));
+    let slow = check_result(
+        "tests",
+        &finished(Ended::TimedOut(std::time::Duration::from_secs(600))),
+    );
+    assert!(
+        !slow.passed && slow.error.is_none(),
+        "a hung check fails the candidate"
+    );
+    assert_eq!(slow.output, "out\ntimed out after 600s");
+    let unrun = check_result(
+        "tests",
+        &finished(Ended::NotStarted("sh could not start".to_owned())),
+    );
+    assert!(!unrun.passed);
+    assert_eq!(unrun.error.as_deref(), Some("sh could not start"));
+
+    let mut sample = sample("a", "fast", 0, (true, 10, 100, None));
+    sample.checks = vec![passed.clone()];
+    assert_eq!(sample.passed(None), Some(true));
+    sample.checks = vec![passed.clone(), failed];
+    assert_eq!(sample.passed(None), Some(false));
+    sample.checks = vec![passed, unrun];
+    assert_eq!(
+        sample.passed(None),
+        None,
+        "a hub-side failure is not a candidate failure"
     );
 }

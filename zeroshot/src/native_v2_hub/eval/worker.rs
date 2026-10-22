@@ -12,7 +12,7 @@ use super::super::clock::now_ms;
 use super::super::error::HubError;
 use super::super::model::{HubState, Job, JobState};
 use super::super::service::{HubService, create_private_directory, replace_private};
-use super::judge::{self, COMMAND_TIMEOUT, HostCommand, TAIL_BYTES};
+use super::judge::{self, COMMAND_TIMEOUT, Ended, Finished, HostCommand, TAIL_BYTES};
 use super::service::{case_view, not_found};
 use super::{
     Case, Check, CheckResult, EvalRun, JudgeKind, JudgeMode, Outcome, ROLE_LABEL, Sample,
@@ -249,15 +249,7 @@ impl HubService {
             }
             .run(&[], COMMAND_TIMEOUT)
             .await;
-            checks.push(CheckResult {
-                name: name.clone(),
-                passed: finished.exit_code == Some(0),
-                exit_code: finished.exit_code,
-                output: judge::tail(
-                    &format!("{}{}", finished.stdout, finished.stderr),
-                    TAIL_BYTES,
-                ),
-            });
+            checks.push(check_result(name, &finished));
         }
         self.mutate(|state| {
             if let Some(stored) = find_sample(state, run_id, key) {
@@ -340,16 +332,13 @@ impl HubService {
                     COMMAND_TIMEOUT,
                 )
                 .await;
-                let mut verdict = if finished.exit_code == Some(0) {
+                let mut verdict = if finished.ended == Ended::Exited(Some(0)) {
                     judge::parse_reply(&finished.stdout, judge.mode)
                 } else {
                     Verdict {
                         error: Some(format!(
-                            "the judge exited {}: {}",
-                            finished.exit_code.map_or_else(
-                                || "without a code".to_owned(),
-                                |code| code.to_string()
-                            ),
+                            "the judge {}: {}",
+                            finished.ended.describe(),
                             judge::tail(finished.stderr.trim(), 1024)
                         )),
                         ..Verdict::default()
@@ -606,4 +595,20 @@ fn make_executable(path: &Path) -> Result<(), HubError> {
 #[cfg(not(unix))]
 fn make_executable(_path: &Path) -> Result<(), HubError> {
     Ok(())
+}
+
+/// A check's result. It passes only when it exits 0; a check the hub could not run records why
+/// in `error`, so it does not count against the candidate.
+pub(crate) fn check_result(name: &str, finished: &Finished) -> CheckResult {
+    let mut output = format!("{}{}", finished.stdout, finished.stderr);
+    if !matches!(finished.ended, Ended::Exited(_)) {
+        output.push_str(&finished.ended.describe());
+    }
+    CheckResult {
+        name: name.to_owned(),
+        passed: finished.ended == Ended::Exited(Some(0)),
+        exit_code: finished.exit_code(),
+        output: judge::tail(&output, TAIL_BYTES),
+        error: matches!(finished.ended, Ended::NotStarted(_)).then(|| finished.ended.describe()),
+    }
 }

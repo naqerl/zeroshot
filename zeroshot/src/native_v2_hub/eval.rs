@@ -25,7 +25,7 @@ pub(crate) mod judge;
 pub(crate) mod report;
 mod service;
 pub(crate) mod variant;
-mod worker;
+pub(crate) mod worker;
 
 /// Label naming the eval role of a hub job; judge jobs keep their terminal output.
 pub(crate) const ROLE_LABEL: &str = "eval.role";
@@ -250,6 +250,10 @@ pub(crate) struct CheckResult {
     /// Last lines of combined output.
     #[serde(default)]
     pub output: String,
+    /// Why the hub could not run the check. Such a check is not a candidate failure: the
+    /// sample's pass is unmeasured instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -296,9 +300,12 @@ impl Sample {
     }
 
     /// The pass/fail of a measured sample: its job succeeded, every check passed, and an
-    /// absolute judge did not answer `fail`.
+    /// absolute judge did not answer `fail`. Unmeasured when the hub could not run a check.
     pub(crate) fn passed(&self, mode: Option<JudgeMode>) -> Option<bool> {
         let outcome = self.outcome.as_ref()?;
+        if self.checks.iter().any(|check| check.error.is_some()) {
+            return None;
+        }
         let judged_fail = mode == Some(JudgeMode::Absolute)
             && self
                 .judge

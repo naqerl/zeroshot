@@ -237,7 +237,8 @@ It answers with one JSON object:
   shebang). It reads the request on stdin, in the sample's work folder, with the check
   environment.
     - The last JSON object line on stdout is the answer, so logging before it is fine.
-    - A non-zero exit, a timeout (10 minutes), or an invalid answer is recorded as a judge error.
+    - A non-zero exit, a timeout (10 minutes), an invalid answer, or exiting before reading the
+      whole request is recorded as a judge error.
 - **`zeroshot:GRAPH`**: the judge is a hub job running GRAPH. The request is its `--input`, with
   `--judge-runtime FILE` as its uniform runtime config. It uses the candidate's source flags and
   placement and is labeled `eval.role=judge`. Its terminal result output is the answer: an

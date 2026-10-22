@@ -787,7 +787,11 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   The daemon's eval worker (claimed work spawned beside dispatch) measures finished samples, runs
   checks with `sh -c` in `hub/eval/work/...`, and runs `cmd:` judges on the hub host or
   `zeroshot:` judges as `eval.role=judge` hub jobs whose terminal output (`Job.output`, kept only
-  for judge jobs) is the verdict. Reports are pure (`eval/report.rs`); `--fail-on-regression`
+  for judge jobs) is the verdict. `eval/judge.rs` `HostCommand::run` owns host commands: input
+  written and capped output read together inside the timeout, and a typed `Ended` (not started,
+  timed out, incomplete input, exited N). Only an exit after reading the whole request yields a
+  verdict, and a check the hub could not start records `error` and leaves the pass unmeasured
+  instead of failing the candidate. Reports are pure (`eval/report.rs`); `--fail-on-regression`
   exits 6 on a regression and 3 while incomplete. Judge and report schemas are documented in
   `docs/guides/hub-operations.md`; keep them in sync.
 - Read-only safe commands include `zeroshot list`, `zeroshot status`, `zeroshot logs`,

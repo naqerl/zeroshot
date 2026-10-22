@@ -12,8 +12,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::process::{ChildStdin, Command};
 
 use super::{Case, EvalRun, JudgeMode, Sample, Score, Verdict};
 
@@ -147,12 +147,63 @@ pub(crate) fn tail(text: &str, limit: usize) -> String {
     format!("…{}", &text[start..])
 }
 
-/// The result of one host command.
+/// How a host command ended. Only [`Ended::Exited`] says anything about the candidate: the
+/// other kinds are the hub failing to run the command or the command failing to finish.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Ended {
+    /// The hub could not start the program, or lost track of it: a hub-side failure.
+    NotStarted(String),
+    /// It did not finish within the timeout and was killed.
+    TimedOut(Duration),
+    /// The hub could not deliver all of its input (it stopped reading or closed its standard
+    /// input early), so whatever it answered was not about the whole request.
+    IncompleteInput(String),
+    /// It read all of its input and exited with this code (`None` when a signal ended it).
+    Exited(Option<i32>),
+}
+
+impl Ended {
+    /// A description for records and errors.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::NotStarted(reason) => reason.clone(),
+            Self::TimedOut(after) => format!("timed out after {}s", after.as_secs()),
+            Self::IncompleteInput(reason) => format!("did not read all of its input: {reason}"),
+            Self::Exited(Some(code)) => format!("exited {code}"),
+            Self::Exited(None) => "exited without a code".to_owned(),
+        }
+    }
+}
+
+/// The result of one host command: how it ended, and the last [`OUTPUT_LIMIT`] bytes of each
+/// output stream.
 pub(crate) struct Finished {
-    pub exit_code: Option<i32>,
+    pub ended: Ended,
     pub stdout: String,
     pub stderr: String,
 }
+
+impl Finished {
+    fn without_output(ended: Ended) -> Self {
+        Self {
+            ended,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+
+    /// The exit code of a command that read its whole input and exited.
+    pub(crate) fn exit_code(&self) -> Option<i32> {
+        match self.ended {
+            Ended::Exited(code) => code,
+            _ => None,
+        }
+    }
+}
+
+/// Bytes kept from each output stream of a host command; earlier output is dropped while it is
+/// read, so a chatty command cannot exhaust the daemon's memory.
+pub(crate) const OUTPUT_LIMIT: usize = 1 << 20;
 
 /// One host command run for an eval: `program` with `arguments`, in `cwd`, with `env`, and
 /// `stdin` written to its standard input. Times out after [`COMMAND_TIMEOUT`].
@@ -194,38 +245,69 @@ impl HostCommand<'_> {
         }
     }
 
+    /// Run the command: its input is written and both output streams are read at the same
+    /// time, all within `timeout`, so a command that never reads its input cannot block the
+    /// hub. A command killed by the timeout is reaped before this returns.
     pub(crate) async fn run(&self, stdin: &[u8], timeout: Duration) -> Finished {
-        let spawned = self.spawn().await;
-        let mut child = match spawned {
+        let mut child = match self.spawn().await {
             Ok(child) => child,
             Err(error) => {
-                return Finished {
-                    exit_code: None,
-                    stdout: String::new(),
-                    stderr: format!("{} could not start: {error}", self.program.display()),
-                };
+                return Finished::without_output(Ended::NotStarted(format!(
+                    "{} could not start: {error}",
+                    self.program.display()
+                )));
             }
         };
-        if let Some(mut input) = child.stdin.take() {
-            let _ = input.write_all(stdin).await;
-            drop(input);
-        }
-        match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(Ok(output)) => Finished {
-                exit_code: output.status.code(),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            },
-            Ok(Err(error)) => Finished {
-                exit_code: None,
-                stdout: String::new(),
-                stderr: error.to_string(),
-            },
-            Err(_) => Finished {
-                exit_code: None,
-                stdout: String::new(),
-                stderr: format!("timed out after {}s", timeout.as_secs()),
-            },
+        let input = child.stdin.take();
+        let output = child.stdout.take();
+        let errors = child.stderr.take();
+        let exchange = async {
+            let (written, stdout, stderr) =
+                tokio::join!(deliver(input, stdin), read_tail(output), read_tail(errors));
+            (written, stdout, stderr, child.wait().await)
+        };
+        let ended = tokio::time::timeout(timeout, exchange).await;
+        let Ok((written, stdout, stderr, status)) = ended else {
+            let _ = child.kill().await;
+            return Finished::without_output(Ended::TimedOut(timeout));
+        };
+        let ended = match (status, written) {
+            (Err(error), _) => Ended::NotStarted(format!(
+                "{} could not be watched: {error}",
+                self.program.display()
+            )),
+            (Ok(_), Err(error)) => Ended::IncompleteInput(error.to_string()),
+            (Ok(status), Ok(())) => Ended::Exited(status.code()),
+        };
+        Finished {
+            ended,
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         }
     }
+}
+
+/// Write all of `bytes` to a command's standard input, then close it.
+async fn deliver(input: Option<ChildStdin>, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(mut input) = input {
+        input.write_all(bytes).await?;
+        input.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// Read a stream to its end, keeping its last [`OUTPUT_LIMIT`] bytes. A read error ends the
+/// stream; what was read is kept.
+async fn read_tail(stream: Option<impl AsyncRead + Unpin>) -> Vec<u8> {
+    let mut kept = Vec::new();
+    if let Some(mut stream) = stream {
+        let mut chunk = vec![0; 64 * 1024];
+        while let Ok(read @ 1..) = stream.read(&mut chunk).await {
+            kept.extend_from_slice(&chunk[..read]);
+            if kept.len() > OUTPUT_LIMIT {
+                kept.drain(..kept.len() - OUTPUT_LIMIT);
+            }
+        }
+    }
+    kept
 }
