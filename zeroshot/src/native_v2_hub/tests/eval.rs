@@ -1244,3 +1244,59 @@ async fn samples_whose_hub_job_vanished_fail_instead_of_waiting() {
     assert_eq!(duo["state"], "failed", "{duo}");
     assert!(duo.to_string().contains("no longer exists"), "{duo}");
 }
+
+/// The daemon claims eval work beside dispatching and runs it in the background.
+#[tokio::test]
+async fn the_daemon_measures_finished_eval_samples() {
+    use zeroshot_engine::native_v2_cli::hub::{HubApiOptions, HubDaemonRun};
+    let hub = hub_with(FakeDriver::default()).await;
+    let run_id = zeroshot_judged_run(&hub, &["duo"], None).await;
+    hub.service.pass().await.expect("dispatch");
+    hub.driver.finish_all();
+    hub.service.pass().await.expect("poll");
+    let folder = hub.directory.path().to_path_buf();
+    let store = HubStore::new(folder.join("hub"));
+    let options = HubDaemonRun {
+        interval: "1s".to_owned(),
+        api: HubApiOptions {
+            listen: Some("127.0.0.1:0".to_owned()),
+            token_file: Some(folder.join("daemon-token")),
+            metrics_listen: None,
+            metrics_labels: Vec::new(),
+        },
+    };
+    let open = |store| {
+        HubService::open(
+            store,
+            Arc::new(FakeDriver::default()),
+            FileTargetRegistry::new(folder.join("targets.json")),
+        )
+    };
+    let daemon = super::super::daemon::Daemon {
+        store: store.clone(),
+        options: &options,
+        output: &mut Vec::new(),
+    };
+    super::super::daemon::run_until(daemon, open, async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    })
+    .await
+    .expect("daemon");
+    let reopened = HubService::open(
+        store,
+        Arc::new(FakeDriver::default()),
+        FileTargetRegistry::new(folder.join("targets.json")),
+    )
+    .expect("reopen");
+    let status = reopened.eval_run(&run_id).await.expect("status");
+    let states = status["samples"]
+        .as_array()
+        .expect("samples")
+        .iter()
+        .map(|sample| sample["state"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        states.iter().all(|state| state != "pending"),
+        "the daemon measured every finished sample: {states:?}"
+    );
+}
