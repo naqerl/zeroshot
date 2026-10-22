@@ -1063,3 +1063,184 @@ async fn host_commands_retry_then_report_a_program_held_open_for_writing() {
     );
     drop(writer);
 }
+
+/// Add `local`, one flags case, and a zeroshot-judged run with `variants`; returns the run id.
+async fn zeroshot_judged_run(
+    hub: &Hub,
+    variants: &[&str],
+    judge_runtime: Option<std::path::PathBuf>,
+) -> String {
+    let folder = hub.directory.path();
+    let (input, graph) = (folder.join("input.json"), folder.join("judge-graph.json"));
+    write(&input, &json!({"task": "x"}));
+    write(&graph, &json!({"nodes": {"judge": {}}}));
+    json_call(
+        &hub.client,
+        HubCommand::Add(HubMemberAdd {
+            name: "local".to_owned(),
+            tags: Vec::new(),
+            slots: 8,
+            priority: 0,
+        }),
+    )
+    .await;
+    let spec = HubJobSpec {
+        title: "Task".to_owned(),
+        run_args: vec![
+            "--title".to_owned(),
+            "Task".to_owned(),
+            "--input".to_owned(),
+            input.display().to_string(),
+        ],
+        target: Some("local".to_owned()),
+        tags: Vec::new(),
+        strategy: HubStrategy::FirstFree,
+        labels: Vec::new(),
+        runtime_files: Vec::new(),
+        repository: None,
+        branch: None,
+        revision: None,
+        source_connection: None,
+        environment: false,
+        cwd: None,
+        submission_key: None,
+    };
+    let case = json_call(
+        &hub.client,
+        HubCommand::Eval(HubEvalCommand::CaseAdd(Box::new(HubEvalCaseAdd {
+            suites: Vec::new(),
+            name: None,
+            labels: Vec::new(),
+            source: HubEvalCaseSource::Flags(Box::new(spec)),
+        }))),
+    )
+    .await;
+    let case_id = case["case"]["caseId"].as_str().expect("case").to_owned();
+    let run = json_call(
+        &hub.client,
+        HubCommand::Eval(HubEvalCommand::Run(Box::new(HubEvalRun {
+            suite: None,
+            cases: vec![case_id],
+            baseline: None,
+            variants: variants
+                .iter()
+                .map(|name| HubEvalVariant {
+                    name: (*name).to_owned(),
+                    overrides: vec![("template".to_owned(), (*name).to_owned())],
+                })
+                .collect(),
+            repeat: 1,
+            target: None,
+            tags: Vec::new(),
+            priority: 0,
+            judge: Some(format!("zeroshot:{}", graph.display())),
+            judge_mode: HubJudgeMode::Absolute,
+            judge_runtime,
+            checks: Vec::new(),
+            prices: None,
+            key: None,
+        }))),
+    )
+    .await;
+    run["run"]["runId"].as_str().expect("run").to_owned()
+}
+
+#[tokio::test]
+async fn zeroshot_judge_jobs_that_fail_or_answer_without_a_document_settle_with_errors() {
+    use super::super::model::JobState;
+    let hub = hub_with(FakeDriver::default()).await;
+    let runtime = hub.directory.path().join("judge-runtime.json");
+    write(&runtime, &json!({"providers": {}}));
+    let run_id = zeroshot_judged_run(&hub, &["duo", "solo"], Some(runtime)).await;
+    hub.service.pass().await.expect("dispatch");
+    hub.driver.finish_all();
+    hub.service.pass().await.expect("poll");
+    hub.service.evaluate().await.expect("measure");
+    hub.service.evaluate().await.expect("start judges");
+    // A second claim sees the judge jobs already queued and only records them.
+    hub.service.evaluate().await.expect("judges already queued");
+    let judges = hub
+        .service
+        .snapshot()
+        .await
+        .jobs
+        .into_iter()
+        .filter(|job| job.labels.get("eval.role").map(String::as_str) == Some("judge"))
+        .collect::<Vec<_>>();
+    assert_eq!(judges.len(), 3, "absolute judging scores every variant");
+    for judge in &judges {
+        assert!(
+            judge
+                .run_args
+                .contains(&"--uniform-runtime-config".to_owned()),
+            "{:?}",
+            judge.run_args
+        );
+    }
+    hub.service.pass().await.expect("dispatch judges");
+    hub.driver.finish_all();
+    hub.service.pass().await.expect("poll judges");
+    hub.service
+        .mutate(|state| {
+            for job in &mut state.jobs {
+                match job.labels.get("eval.variant").map(String::as_str) {
+                    _ if job.labels.get("eval.role").map(String::as_str) != Some("judge") => {}
+                    Some("baseline") => {
+                        job.output = Some(json!("{\"score\": 0.5, \"verdict\": \"fine\"}"));
+                    }
+                    Some("duo") => job.output = None,
+                    _ => {
+                        job.state = JobState::Failed;
+                        job.failure_reason = Some("judge graph crashed".to_owned());
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await
+        .expect("shape judge results");
+    hub.service.evaluate().await.expect("settle");
+    let status = hub.service.eval_run(&run_id).await.expect("status");
+    let sample = |variant: &str| {
+        status["samples"]
+            .as_array()
+            .expect("samples")
+            .iter()
+            .find(|sample| sample["variant"] == variant)
+            .cloned()
+            .expect("sample")
+    };
+    let baseline = sample("baseline");
+    assert_eq!(baseline["judge"]["score"], 0.5, "{baseline}");
+    assert_eq!(baseline["judge"]["verdict"], "fine");
+    let duo = sample("duo");
+    assert!(duo.to_string().contains("finished without output"), "{duo}");
+    let solo = sample("solo");
+    assert!(solo.to_string().contains("judge graph crashed"), "{solo}");
+}
+
+#[tokio::test]
+async fn samples_whose_hub_job_vanished_fail_instead_of_waiting() {
+    let hub = hub_with(FakeDriver::default()).await;
+    let run_id = zeroshot_judged_run(&hub, &["duo"], None).await;
+    hub.service
+        .mutate(|state| {
+            state
+                .jobs
+                .retain(|job| job.labels.get("eval.variant").map(String::as_str) != Some("duo"));
+            Ok(())
+        })
+        .await
+        .expect("drop a sample job");
+    hub.service.evaluate().await.expect("claim");
+    let status = hub.service.eval_run(&run_id).await.expect("status");
+    let duo = status["samples"]
+        .as_array()
+        .expect("samples")
+        .iter()
+        .find(|sample| sample["variant"] == "duo")
+        .cloned()
+        .expect("duo");
+    assert_eq!(duo["state"], "failed", "{duo}");
+    assert!(duo.to_string().contains("no longer exists"), "{duo}");
+}
