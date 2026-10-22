@@ -8,6 +8,17 @@
 
 use std::path::PathBuf;
 
+/// Whether `name` can name an eval suite, case, variant, or check: 1 to 64 characters of
+/// ASCII letters, digits, `.`, `_`, and `-`. The parser and the hub daemon share this rule.
+#[must_use]
+pub fn valid_eval_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+}
+
 /// A hub subcommand plus the hub context it addresses.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HubRequest {

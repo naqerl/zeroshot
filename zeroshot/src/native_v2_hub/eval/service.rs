@@ -1,6 +1,7 @@
 //! The hub service's eval operations: capture, run creation, the measuring and judging
 //! worker, and reports.
 
+use zeroshot_engine::native_v2_cli::hub::valid_eval_name;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -28,14 +29,6 @@ const MAX_REPEAT: u32 = 100;
 
 pub(super) fn not_found(what: &str) -> HubError {
     HubError::EvalNotFound(what.to_owned())
-}
-
-pub(crate) fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
 }
 
 fn case_document(case: &Case, created: Option<bool>) -> Value {
@@ -151,7 +144,7 @@ impl HubService {
     // ------------------------------------------------------------ suites and cases
 
     pub(crate) async fn eval_suite_add(&self, request: AddSuite) -> Result<Value, HubError> {
-        if !valid_name(&request.name) {
+        if !valid_eval_name(&request.name) {
             return Err(HubError::Usage(format!(
                 "invalid suite name {:?}: use letters, digits, '.', '_', or '-'",
                 request.name
@@ -448,7 +441,7 @@ impl HubService {
         add_implicit_baseline(&baseline, &mut variants);
         let judge = plan_judge(&blobs, request.judge.as_ref(), &baseline)?;
         for check in &request.checks {
-            if !valid_name(&check.name) || check.command.trim().is_empty() {
+            if !valid_eval_name(&check.name) || check.command.trim().is_empty() {
                 return Err(HubError::Usage(format!("invalid --check {:?}", check.name)));
             }
         }
@@ -761,7 +754,7 @@ fn plan_variants(
 ) -> Result<Vec<Variant>, HubError> {
     let mut variants: Vec<Variant> = Vec::new();
     for requested in requested {
-        if !valid_name(&requested.name) {
+        if !valid_eval_name(&requested.name) {
             return Err(HubError::Usage(format!(
                 "invalid variant name {:?}",
                 requested.name

@@ -1,6 +1,7 @@
 //! `zeroshot hub eval`: capture tasks as cases, rerun them under variants through hub
 //! placement, measure, judge, and compare.
 
+use crate::native_v2_cli::hub::valid_eval_name;
 use clap::{Args, Subcommand, ValueEnum};
 
 use super::super::RunArgs;
@@ -479,7 +480,7 @@ impl HubEvalRunArgs {
             .check
             .into_iter()
             .map(|check| match check.split_once('=') {
-                Some((name, command)) if valid_name(name) && !command.trim().is_empty() => {
+                Some((name, command)) if valid_eval_name(name) && !command.trim().is_empty() => {
                     Ok((name.to_owned(), command.to_owned()))
                 }
                 _ => Err(usage(format!(
@@ -546,7 +547,7 @@ pub(crate) fn parse_variant(text: &str) -> Result<HubEvalVariant, NativeV2CliErr
         ))
     };
     let (name, overrides) = text.split_once('=').ok_or_else(|| invalid("missing '='"))?;
-    if !valid_name(name) || name == "none" || name.starts_with("hj_") {
+    if !valid_eval_name(name) || name == "none" || name.starts_with("hj_") {
         return Err(invalid(
             "the name must be 1-64 ASCII letters, digits, '-', '_', or '.', and not none or hj_*",
         ));
@@ -577,16 +578,8 @@ pub(crate) fn parse_variant(text: &str) -> Result<HubEvalVariant, NativeV2CliErr
     })
 }
 
-fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
-}
-
 fn eval_name(kind: &str, name: String) -> Result<String, NativeV2CliError> {
-    if valid_name(&name) {
+    if valid_eval_name(&name) {
         Ok(name)
     } else {
         Err(usage(format!(
