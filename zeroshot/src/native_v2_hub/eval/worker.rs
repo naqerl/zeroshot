@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use super::super::clock::now_ms;
 use super::super::error::HubError;
 use super::super::model::{HubState, Job, JobState};
-use super::super::service::{HubService, create_private_directory, write_private};
+use super::super::service::{HubService, create_private_directory, replace_private};
 use super::judge::{self, COMMAND_TIMEOUT, HostCommand, TAIL_BYTES};
 use super::service::{case_view, not_found};
 use super::{
@@ -233,11 +233,11 @@ impl HubService {
         let work_dir = self.work_directory(run_id, &sample);
         create_private_directory(&work_dir)?;
         let now = now_ms();
-        write_private(&work_dir.join("status.json"), &pretty(&status))?;
-        write_private(&work_dir.join("job.json"), &pretty(&job.view(now)))?;
-        write_private(&work_dir.join("case.json"), &pretty(&case_view(&case)))?;
+        replace_private(&work_dir.join("status.json"), &pretty(&status))?;
+        replace_private(&work_dir.join("job.json"), &pretty(&job.view(now)))?;
+        replace_private(&work_dir.join("case.json"), &pretty(&case_view(&case)))?;
         sample.outcome = Some(outcome.clone());
-        write_private(&work_dir.join("outcome.json"), &pretty(&json!(outcome)))?;
+        replace_private(&work_dir.join("outcome.json"), &pretty(&json!(outcome)))?;
         let env = self.environment((&run, &sample), Some(&job), &work_dir);
         let mut checks = Vec::new();
         for Check { name, command } in &run.checks {
@@ -327,7 +327,7 @@ impl HubService {
                     .join(&judge.program.sha256);
                 let program = blobs.materialize(&judge.program, &folder)?;
                 make_executable(&program)?;
-                write_private(&work_dir.join("judge-request.json"), &pretty(&request))?;
+                replace_private(&work_dir.join("judge-request.json"), &pretty(&request))?;
                 let env = self.environment((&run, &sample), job.as_ref(), &work_dir);
                 let finished = HostCommand {
                     program: &program,
@@ -356,7 +356,7 @@ impl HubService {
                     }
                 };
                 verdict.against = against;
-                write_private(
+                replace_private(
                     &work_dir.join("judge-verdict.json"),
                     &pretty(&json!(verdict)),
                 )?;
@@ -385,7 +385,7 @@ impl HubService {
                 let folder = self.store().directory().join("spool").join(&judge_job_id);
                 let graph = blobs.materialize(&judge.program, &folder)?;
                 let input = folder.join("judge-request.json");
-                write_private(&input, &pretty(&request))?;
+                replace_private(&input, &pretty(&request))?;
                 let mut run_args = vec![
                     "--title".to_owned(),
                     format!(

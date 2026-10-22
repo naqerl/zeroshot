@@ -1,11 +1,11 @@
 use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
 
 use super::error::HubError;
 use super::model::HubState;
+use super::service::create_private_directory;
 
 const STATE_FILE: &str = "state.json";
 const LOCK_FILE: &str = "hub.lock";
@@ -104,16 +104,7 @@ impl HubStore {
 
     fn replace(&self, name: &str, bytes: &[u8]) -> Result<(), HubError> {
         create_private_directory(&self.directory)?;
-        let staged = self.directory.join(format!("{name}.tmp"));
-        let mut file = private_options()
-            .write(true)
-            .truncate(true)
-            .open(&staged)
-            .map_err(|error| HubError::storage("state could not be staged", error))?;
-        file.write_all(bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| HubError::storage("state could not be written", error))?;
-        std::fs::rename(&staged, self.directory.join(name))
+        crate::private_file::replace(&self.directory.join(name), bytes)
             .map_err(|error| HubError::storage("state could not be replaced", error))
     }
 }
@@ -121,23 +112,6 @@ impl HubStore {
 fn private_options() -> OpenOptions {
     let mut options = OpenOptions::new();
     options.create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+    crate::private_file::set_private_file_mode(&mut options);
     options
-}
-
-fn create_private_directory(path: &Path) -> Result<(), HubError> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder
-        .create(path)
-        .map_err(|error| HubError::storage("directory could not be created", error))
 }

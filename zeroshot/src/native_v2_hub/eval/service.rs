@@ -11,7 +11,7 @@ use super::super::clock::{now_ms, rfc3339};
 use super::super::error::HubError;
 use super::super::model::{HubState, Job, JobState};
 use super::super::placement::{describe, rejections};
-use super::super::service::{FILE_FLAGS, HubService, create_private_directory, write_private};
+use super::super::service::{FILE_FLAGS, HubService, create_private_directory, replace_private};
 use super::super::stats::Prices;
 
 use super::report::{self, Against, Thresholds};
@@ -534,7 +534,7 @@ impl HubService {
         let mut run_args = request.run_args.clone();
         for (index, (flag, material)) in request.files.iter().enumerate() {
             let path = folder.join(format!("{index}-{}", material.name));
-            write_private(&path, &material.content)?;
+            replace_private(&path, &material.content)?;
             let placeholder = format!("file:{flag}");
             for argument in &mut run_args {
                 if *argument == placeholder {

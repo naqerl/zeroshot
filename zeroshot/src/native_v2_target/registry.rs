@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
@@ -363,7 +363,7 @@ pub fn default_target_registry_path() -> Result<PathBuf, TargetConnectorError> {
 pub(super) fn open_lock(path: &Path) -> Result<File, TargetConnectorError> {
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true);
-    set_private_file_mode(&mut options);
+    crate::private_file::set_private_file_mode(&mut options);
     options.open(path).map_err(TargetConnectorError::RegistryIo)
 }
 
@@ -466,27 +466,10 @@ fn write_registry(path: &Path, state: &RegistryState) -> Result<(), TargetConnec
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), TargetConnectorError> {
-    let mut suffix = [0_u8; 8];
-    getrandom::fill(&mut suffix).map_err(|_| TargetConnectorError::Randomness)?;
-    let temporary = path.with_extension(format!("tmp-{}", encode_hex(&suffix)));
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    set_private_file_mode(&mut options);
-    let result = (|| {
-        let mut file = options
-            .open(&temporary)
-            .map_err(TargetConnectorError::RegistryIo)?;
-        file.write_all(bytes)
-            .map_err(TargetConnectorError::RegistryIo)?;
-        file.sync_all().map_err(TargetConnectorError::RegistryIo)?;
-        std::fs::rename(&temporary, path).map_err(TargetConnectorError::RegistryIo)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
+    crate::private_file::replace(path, bytes).map_err(TargetConnectorError::RegistryIo)
 }
 
+#[cfg(target_os = "linux")]
 pub(super) fn encode_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut result = String::with_capacity(bytes.len() * 2);
@@ -497,31 +480,8 @@ pub(super) fn encode_hex(bytes: &[u8]) -> String {
 }
 
 pub(super) fn create_private_directory(path: &Path) -> Result<(), TargetConnectorError> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    set_private_directory_mode(&mut builder);
-    builder
-        .create(path)
-        .map_err(TargetConnectorError::RegistryIo)
+    crate::private_file::create_directory(path).map_err(TargetConnectorError::RegistryIo)
 }
-
-#[cfg(unix)]
-fn set_private_file_mode(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-    options.mode(0o600);
-}
-
-#[cfg(not(unix))]
-fn set_private_file_mode(_options: &mut OpenOptions) {}
-
-#[cfg(unix)]
-fn set_private_directory_mode(builder: &mut std::fs::DirBuilder) {
-    use std::os::unix::fs::DirBuilderExt;
-    builder.mode(0o700);
-}
-
-#[cfg(not(unix))]
-fn set_private_directory_mode(_builder: &mut std::fs::DirBuilder) {}
 
 fn nonempty_env(name: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(name).filter(|value| !value.is_empty())

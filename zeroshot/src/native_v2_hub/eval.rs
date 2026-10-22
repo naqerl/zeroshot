@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 
 use super::error::HubError;
 use super::model::{Job, PlacementSpec, Requirements, TokenUsage};
-use super::service::{create_private_directory, write_private};
+use super::service::{create_private_directory, replace_private};
 use super::wire::JobFile;
 
 pub(crate) mod client;
@@ -618,23 +618,4 @@ impl Blobs {
         replace_private(&path, &bytes)?;
         Ok(path)
     }
-}
-
-/// Write `bytes` to a private sibling of `path`, then rename it over `path`.
-fn replace_private(path: &Path, bytes: &[u8]) -> Result<(), HubError> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let name = path
-        .file_name()
-        .map_or_else(|| "file".into(), |name| name.to_string_lossy());
-    let staged = path.with_file_name(format!(
-        ".{name}.{}.{}.tmp",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    write_private(&staged, bytes)?;
-    std::fs::rename(&staged, path).map_err(|error| {
-        let _ = std::fs::remove_file(&staged);
-        HubError::storage(&format!("{} could not be written", path.display()), error)
-    })
 }

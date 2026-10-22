@@ -461,9 +461,7 @@ pub(crate) async fn apply_steps(steps: &[Step]) -> Result<Vec<Value>, HubError> 
                         )
                     })?;
                 }
-                std::fs::write(path, content).map_err(|error| {
-                    HubError::storage(&format!("{} could not be written", path.display()), error)
-                })?;
+                super::service::replace_private(path, content.as_bytes())?;
                 results.push(json!({ "write": path, "ok": true }));
             }
             Step::Remove { path } => {

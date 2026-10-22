@@ -767,7 +767,7 @@ async fn the_daemon_reports_failing_passes_and_keeps_serving() {
     let directory = tempfile::tempdir().expect("tempdir");
     let store = HubStore::new(directory.path().join("hub"));
     let registry = directory.path().join("targets.json");
-    let staged = directory.path().join("hub").join("state.json.tmp");
+    let state_file = directory.path().join("hub").join("state.json");
     // A queued job past its expiry makes the first pass change, and so save, the state.
     let mut expired = job("hj_expired", 0);
     expired.expires_at_ms = Some(1);
@@ -784,8 +784,9 @@ async fn the_daemon_reports_failing_passes_and_keeps_serving() {
             Arc::new(FakeDriver::default()),
             FileTargetRegistry::new(registry.clone()),
         )?;
-        // Every later save fails: the staging file it writes is a folder.
-        std::fs::create_dir(&staged).expect("block staging");
+        // Every later save fails: the state file it replaces is a non-empty folder.
+        std::fs::remove_file(&state_file).expect("unseed");
+        std::fs::create_dir_all(state_file.join("inside")).expect("block replacing");
         Ok(service)
     };
     let options = HubDaemonRun {
@@ -817,7 +818,7 @@ async fn the_daemon_reports_failing_passes_and_keeps_serving() {
     assert!(lines.first().expect("started")["metricsListen"].is_null());
     let failures = lines
         .iter()
-        .filter(|line| line.to_string().contains("state could not be staged"))
+        .filter(|line| line.to_string().contains("state could not be replaced"))
         .count();
     assert_eq!(
         failures, 2,
@@ -828,7 +829,7 @@ async fn the_daemon_reports_failing_passes_and_keeps_serving() {
     assert!(
         stopped["lastError"]
             .as_str()
-            .is_some_and(|error| error.contains("could not be staged")),
+            .is_some_and(|error| error.contains("could not be replaced")),
         "{stopped}"
     );
 }
@@ -849,10 +850,10 @@ fn the_store_reports_each_file_it_cannot_use() {
     let blocked = directory.path().join("blocked");
     std::fs::write(&blocked, b"").expect("file");
     let store = HubStore::new(blocked);
-    assert!(message(store.lock().err().expect("lock")).contains("directory could not be created"));
+    assert!(message(store.lock().err().expect("lock")).contains("could not be created"));
     assert!(
         message(store.try_daemon_lock().err().expect("daemon lock"))
-            .contains("directory could not be created")
+            .contains("could not be created")
     );
 
     // Each lock file, state file, and staging file is a folder.
@@ -878,9 +879,9 @@ fn the_store_reports_each_file_it_cannot_use() {
         )
         .contains("state could not be replaced")
     );
-    std::fs::create_dir(hub.join("daemon.json.tmp")).expect("folder");
+    std::fs::create_dir_all(hub.join("daemon.json").join("inside")).expect("folder");
     assert!(
-        message(store.write_heartbeat(&json!({})).expect_err("stage"))
-            .contains("state could not be staged")
+        message(store.write_heartbeat(&json!({})).expect_err("replace"))
+            .contains("state could not be replaced")
     );
 }

@@ -760,6 +760,12 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   bundled tzdb). Member capacity is hub-declared `slots`; load is the observed nonterminal runs.
   Dispatch submission keys are `hub-JOB_ID-ATTEMPT`. Exit code 3 means no capacity or an expired
   wait, and 4 means that no active member matches or supports the job.
+- `zeroshot/src/private_file.rs` owns owner-only file replacement for the shipped CLI: a random
+  `create_new` sibling with mode `0600`, fsync, rename over the destination, and cleanup on failure,
+  so readers never see a partial file and a link is replaced rather than written through. The target
+  registry and every hub file (state, heartbeat, contexts, token, spool, eval blobs and work files,
+  installed units) go through it; hub code calls `service::replace_private` and
+  `service::create_private_directory`.
 - Hub metrics: `GET /metrics` (Prometheus text 0.0.4, hand-rolled in `native_v2_hub/metrics.rs`)
   needs the API token; `--metrics-listen` adds a token-free listener that must be loopback, and
   `--metrics-label KEY` opts job label keys into token counters. State-derived series are

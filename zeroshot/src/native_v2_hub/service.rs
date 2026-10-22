@@ -340,7 +340,7 @@ impl HubService {
                 |name| name.to_string_lossy().into_owned(),
             );
             let path = folder.join(format!("{index}-{name}"));
-            write_private(&path, file.content.as_bytes())?;
+            replace_private(&path, file.content.as_bytes())?;
             let text = path.to_string_lossy().into_owned();
             for position in positions {
                 run_args[position].clone_from(&text);
@@ -834,31 +834,14 @@ fn idempotent(state: &HubState, job: &Job) -> Option<Job> {
 }
 
 pub(crate) fn create_private_directory(path: &Path) -> Result<(), HubError> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(path).map_err(|error| {
+    crate::private_file::create_directory(path).map_err(|error| {
         HubError::storage(&format!("{} could not be created", path.display()), error)
     })
 }
 
-pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<(), HubError> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options
-        .open(path)
-        .and_then(|mut file| file.write_all(bytes))
-        .map_err(|error| {
-            HubError::storage(&format!("{} could not be written", path.display()), error)
-        })
+/// Atomically replace `path` with `bytes`, owner-only (see [`crate::private_file::replace`]).
+pub(crate) fn replace_private(path: &Path, bytes: &[u8]) -> Result<(), HubError> {
+    crate::private_file::replace(path, bytes).map_err(|error| {
+        HubError::storage(&format!("{} could not be written", path.display()), error)
+    })
 }

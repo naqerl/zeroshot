@@ -2,6 +2,7 @@
 
 mod native_v2_hub;
 mod native_v2_target;
+mod private_file;
 
 use std::io::Write;
 use std::path::PathBuf;

@@ -14,7 +14,6 @@ use zeroshot_engine::native_v2_cli::hub::{HubContextCommand, HubTokenSource};
 
 use super::daemon::{DEFAULT_LISTEN, TOKEN_FILE};
 use super::error::HubError;
-use super::service::write_private;
 use super::store::HubStore;
 use super::write_json;
 
@@ -160,10 +159,7 @@ impl Contexts {
         }
         let bytes = serde_json::to_vec_pretty(file)
             .map_err(|error| HubError::storage("hub contexts could not be encoded", error))?;
-        let staged = self.path.with_extension("json.tmp");
-        write_private(&staged, &bytes)?;
-        std::fs::rename(&staged, &self.path)
-            .map_err(|error| HubError::storage("hub contexts could not be replaced", error))
+        super::service::replace_private(&self.path, &bytes)
     }
 
     /// The `local` context: the running daemon's recorded address and token file, or the

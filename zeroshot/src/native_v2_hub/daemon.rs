@@ -12,7 +12,7 @@ use zeroshot_engine::native_v2_cli::hub::HubDaemonRun;
 use super::api::{ApiState, metrics_router, router};
 use super::clock::{now_ms, parse_duration_ms, rfc3339};
 use super::error::HubError;
-use super::service::{HubService, write_private};
+use super::service::{HubService, replace_private};
 use super::store::HubStore;
 use super::write_json;
 
@@ -55,7 +55,7 @@ pub(crate) fn load_or_create_token(path: &Path) -> Result<String, HubError> {
     if let Some(parent) = path.parent() {
         super::service::create_private_directory(parent)?;
     }
-    write_private(path, format!("{token}\n").as_bytes())?;
+    replace_private(path, format!("{token}\n").as_bytes())?;
     Ok(token)
 }
 
