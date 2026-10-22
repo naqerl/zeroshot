@@ -40,6 +40,9 @@ pub(crate) struct ApiState {
     pub token: String,
     /// The daemon's latest heartbeat document.
     pub heartbeat: Arc<Mutex<Value>>,
+    /// Program observation streams run; `None` is this executable (or
+    /// `ZEROSHOT_HUB_EXECUTABLE`), like the hub's target driver.
+    pub executable: Option<std::path::PathBuf>,
 }
 
 pub(crate) fn router(state: Arc<ApiState>) -> Router {
@@ -370,7 +373,7 @@ async fn stream(
         Ok(arguments) => arguments,
         Err(error) => return error_response(&error),
     };
-    let executable = match hub_executable() {
+    let executable = match state.executable.clone().map_or_else(hub_executable, Ok) {
         Ok(executable) => executable,
         Err(error) => return error_response(&error),
     };

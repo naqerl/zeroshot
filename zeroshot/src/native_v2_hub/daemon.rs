@@ -73,13 +73,39 @@ pub(crate) fn client_url(address: std::net::SocketAddr) -> String {
     format!("http://{}", std::net::SocketAddr::new(ip, address.port()))
 }
 
-/// `hub daemon run`.
+/// `hub daemon run`: serve and dispatch until SIGTERM or Ctrl-C.
 pub(crate) async fn run(
     store: HubStore,
     open: impl FnOnce(HubStore) -> Result<HubService, HubError>,
     options: &HubDaemonRun,
     output: &mut impl Write,
 ) -> Result<(), HubError> {
+    let daemon = Daemon {
+        store,
+        options,
+        output,
+    };
+    run_until(daemon, open, shutdown_signal()).await
+}
+
+/// One daemon: the hub folder it owns, its options, and where its events go.
+pub(crate) struct Daemon<'a, W> {
+    pub store: HubStore,
+    pub options: &'a HubDaemonRun,
+    pub output: &'a mut W,
+}
+
+/// Serve and dispatch until `shutdown` completes.
+pub(crate) async fn run_until<W: Write>(
+    daemon: Daemon<'_, W>,
+    open: impl FnOnce(HubStore) -> Result<HubService, HubError>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<(), HubError> {
+    let Daemon {
+        store,
+        options,
+        output,
+    } = daemon;
     let pause = Duration::from_millis(parse_duration_ms(&options.interval)?);
     let Some(_instance) = store.try_daemon_lock()? else {
         return Err(HubError::DaemonRunning(format!(
@@ -130,6 +156,7 @@ pub(crate) async fn run(
         service: service.clone(),
         token,
         heartbeat: shared.clone(),
+        executable: None,
     });
     let (stop, stopped) = tokio::sync::watch::channel(false);
     if let Some(metrics_listener) = metrics_listener {
@@ -154,7 +181,6 @@ pub(crate) async fn run(
     let mut event = heartbeat.clone();
     event["event"] = json!("started");
     write_json(output, &event)?;
-    let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     let mut passes = 0_u64;
     loop {

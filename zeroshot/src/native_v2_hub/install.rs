@@ -421,9 +421,15 @@ fn plan_document(plan: &Plan, action: &str, dry_run: bool) -> Value {
     })
 }
 
-/// Apply steps in order; stop at the first failing step that may not fail.
+/// Apply steps in order once the manager is available; stop at the first failing step that
+/// may not fail.
 async fn apply(plan: &Plan) -> Result<Vec<Value>, HubError> {
-    let program = plan.manager_program();
+    require_program(plan.manager_program(), plan.manager).await?;
+    apply_steps(&plan.steps).await
+}
+
+/// Refuse to change anything when `program --version` does not succeed.
+pub(crate) async fn require_program(program: &str, manager: &str) -> Result<(), HubError> {
     let available = Command::new(program)
         .arg("--version")
         .stdin(Stdio::null())
@@ -435,12 +441,16 @@ async fn apply(plan: &Plan) -> Result<Vec<Value>, HubError> {
     if !available {
         return Err(HubError::Usage(format!(
             "{program} is not available on this machine; nothing was changed (use --dry-run to \
-             print the {} definition)",
-            plan.manager
+             print the {manager} definition)"
         )));
     }
+    Ok(())
+}
+
+/// Apply `steps` in order; stop at the first failing step that may not fail.
+pub(crate) async fn apply_steps(steps: &[Step]) -> Result<Vec<Value>, HubError> {
     let mut results = Vec::new();
-    for step in &plan.steps {
+    for step in steps {
         match step {
             Step::Write { path, content } => {
                 if let Some(parent) = path.parent() {

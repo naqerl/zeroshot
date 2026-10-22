@@ -44,6 +44,15 @@ pub(crate) struct ProcessDriver {
 
 impl ProcessDriver {
     pub(crate) fn production(registry_path: PathBuf) -> Result<Self, HubError> {
+        Self::new(hub_executable()?, registry_path, Duration::from_secs(60))
+    }
+
+    /// Delegate to `executable`, giving each command `timeout` to finish.
+    pub(crate) fn new(
+        executable: PathBuf,
+        registry_path: PathBuf,
+        timeout: Duration,
+    ) -> Result<Self, HubError> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(15))
@@ -52,8 +61,8 @@ impl ProcessDriver {
             .build()
             .map_err(|error| HubError::storage("HTTP client could not be initialized", error))?;
         Ok(Self {
-            executable: hub_executable()?,
-            timeout: Duration::from_secs(60),
+            executable,
+            timeout,
             registry: FileTargetRegistry::new(registry_path),
             client,
         })

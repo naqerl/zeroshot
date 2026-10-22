@@ -362,3 +362,348 @@ fn one_daemon_owns_a_hub_folder() {
         .expect("heartbeat");
     assert_eq!(store.heartbeat(), Some(json!({"pid": 1})));
 }
+
+#[tokio::test]
+async fn the_daemon_serves_the_api_dispatches_and_stops_on_shutdown() {
+    use zeroshot_engine::native_v2_cli::hub::{HubDaemonRun, HubSubmit};
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = HubStore::new(directory.path().join("hub"));
+    let token_file = directory.path().join("secrets").join("token");
+    let options = HubDaemonRun {
+        interval: "1s".to_owned(),
+        api: HubApiOptions {
+            listen: Some("127.0.0.1:0".to_owned()),
+            token_file: Some(token_file.clone()),
+            metrics_listen: Some("127.0.0.1:0".to_owned()),
+            metrics_labels: vec!["team".to_owned()],
+        },
+    };
+    let registry = directory.path().join("targets.json");
+    let driver = Arc::new(FakeDriver::default());
+    let fake = driver.clone();
+    let open = |store| HubService::open(store, driver, FileTargetRegistry::new(registry.clone()));
+    let observer = HubStore::new(directory.path().join("hub"));
+    let folder = directory.path().to_path_buf();
+    let client_token = token_file.clone();
+    let drive = async move {
+        let heartbeat = loop {
+            if let Some(heartbeat) = observer.heartbeat() {
+                break heartbeat;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        let url = heartbeat["url"].as_str().expect("url").to_owned();
+        let client = super::super::client::HubClient::new(&super::super::context::Resolved {
+            name: "local".to_owned(),
+            url: url.clone(),
+            token: super::super::context::TokenRef::File(client_token),
+            source: "flag",
+        })
+        .expect("client");
+        let mut output = Vec::new();
+        super::super::client::execute(
+            &client,
+            zeroshot_engine::native_v2_cli::hub::HubCommand::Add(
+                zeroshot_engine::native_v2_cli::hub::HubMemberAdd {
+                    name: "local".to_owned(),
+                    tags: Vec::new(),
+                    slots: 1,
+                    priority: 0,
+                },
+            ),
+            &mut output,
+        )
+        .await
+        .expect("add");
+        // Queue more work than fits; the daemon's next pass places the queued job.
+        for title in ["first", "second"] {
+            super::super::client::execute(
+                &client,
+                zeroshot_engine::native_v2_cli::hub::HubCommand::Submit(Box::new(HubSubmit {
+                    job: super::flows::spec(&folder, title, None),
+                    detach: true,
+                    wait: None,
+                    queue: true,
+                })),
+                &mut output,
+            )
+            .await
+            .expect("submit");
+        }
+        let metrics = heartbeat["metricsListen"].as_str().expect("metrics listen");
+        let scraped = reqwest::get(format!("http://{metrics}/metrics"))
+            .await
+            .expect("metrics")
+            .text()
+            .await
+            .expect("text");
+        assert!(scraped.contains("zeroshot_hub_"), "{scraped}");
+        // The first run finishing frees its slot; a later pass settles it and places the next.
+        fake.finish_all();
+        let passes = || {
+            observer
+                .heartbeat()
+                .and_then(|heartbeat| heartbeat["passes"].as_u64())
+                .unwrap_or(0)
+        };
+        let target = passes() + 2;
+        loop {
+            if passes() >= target {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        heartbeat
+    };
+    let mut output = Vec::new();
+    let (result, heartbeat) = {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let daemon = super::super::daemon::Daemon {
+            store: store.clone(),
+            options: &options,
+            output: &mut output,
+        };
+        let run = super::super::daemon::run_until(daemon, open, async {
+            let _ = receiver.await;
+        });
+        let drive = async move {
+            let heartbeat = drive.await;
+            let _ = sender.send(());
+            heartbeat
+        };
+        tokio::join!(run, drive)
+    };
+    result.expect("daemon");
+    assert_eq!(heartbeat["manager"], json!("foreground"));
+    assert_eq!(heartbeat["tokenFile"], json!(token_file));
+    let events = String::from_utf8(output).expect("utf8");
+    let lines = events
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
+        .collect::<Vec<_>>();
+    assert_eq!(lines.first().expect("started")["event"], json!("started"));
+    assert_eq!(lines.last().expect("stopped")["event"], json!("stopped"));
+    assert!(
+        lines.len() > 2,
+        "a pass that placed work is reported: {events}"
+    );
+    let stopped = store.heartbeat().expect("heartbeat");
+    assert!(stopped["stoppedAt"].is_string());
+    let token =
+        std::fs::read_to_string(directory.path().join("secrets").join("token")).expect("token");
+    assert_eq!(token.trim().len(), 64);
+}
+
+#[tokio::test]
+async fn the_daemon_refuses_bad_options_before_serving() {
+    use zeroshot_engine::native_v2_cli::hub::HubDaemonRun;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = HubStore::new(directory.path().join("hub"));
+    let registry = directory.path().join("targets.json");
+    let open = |store| {
+        HubService::open(
+            store,
+            Arc::new(FakeDriver::default()),
+            FileTargetRegistry::new(registry.clone()),
+        )
+    };
+    let options = |interval: &str, listen: &str, metrics: Option<&str>| HubDaemonRun {
+        interval: interval.to_owned(),
+        api: HubApiOptions {
+            listen: Some(listen.to_owned()),
+            token_file: Some(directory.path().join("token")),
+            metrics_listen: metrics.map(str::to_owned),
+            metrics_labels: Vec::new(),
+        },
+    };
+    let run = |options: HubDaemonRun| {
+        let store = store.clone();
+        async move {
+            let daemon = super::super::daemon::Daemon {
+                store,
+                options: &options,
+                output: &mut Vec::new(),
+            };
+            super::super::daemon::run_until(daemon, open, async {}).await
+        }
+    };
+    assert!(matches!(
+        run(options("soon", "127.0.0.1:0", None)).await,
+        Err(super::super::error::HubError::Usage(_))
+    ));
+    let bad_listen = run(options("1s", "256.0.0.1:0", None))
+        .await
+        .expect_err("bad address");
+    assert!(
+        bad_listen.to_string().contains("could not listen"),
+        "{bad_listen}"
+    );
+    let public = run(options("1s", "127.0.0.1:0", Some("0.0.0.0:0")))
+        .await
+        .expect_err("public metrics");
+    assert!(
+        public.to_string().contains("not a loopback address"),
+        "{public}"
+    );
+    std::fs::write(directory.path().join("token"), "\n").expect("empty token");
+    let empty = run(options("1s", "127.0.0.1:0", None))
+        .await
+        .expect_err("empty token");
+    assert!(empty.to_string().contains("is empty"), "{empty}");
+    let held = store.try_daemon_lock().expect("lock").expect("held");
+    let owned = run(options("1s", "127.0.0.1:0", None))
+        .await
+        .expect_err("owned");
+    assert_eq!(owned.diagnostic()["code"], json!("hub.daemon_running"));
+    drop(held);
+}
+
+#[test]
+fn install_env_reads_this_shells_facts() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let registry = directory.path().join("config").join("targets.json");
+    let env = InstallEnv::detect(&registry, &directory.path().join("hub")).expect("detect");
+    assert!(env.executable.is_absolute());
+    assert_eq!(env.config_dir, directory.path().join("config"));
+    assert_eq!(env.hub_dir, directory.path().join("hub"));
+    assert!(env.user_unit_dir.ends_with("systemd/user"));
+    assert!(!env.user.is_empty());
+    assert!(InstallEnv::detect(std::path::Path::new(""), directory.path()).is_err());
+}
+
+#[tokio::test]
+async fn install_and_uninstall_print_plans_on_dry_runs() {
+    use super::super::install::{install, uninstall};
+    use zeroshot_engine::native_v2_cli::hub::{HubInstall, HubManager, HubUninstall};
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = HubStore::new(directory.path().join("hub"));
+    let request = |manager, dry_run| HubInstall {
+        manager,
+        system: false,
+        image: None,
+        volumes: vec![PathBuf::from("/srv/repos")],
+        interval: "5s".to_owned(),
+        api: HubApiOptions {
+            listen: None,
+            token_file: Some(PathBuf::from("relative-token")),
+            metrics_listen: None,
+            metrics_labels: Vec::new(),
+        },
+        dry_run,
+    };
+    for (manager, name) in [
+        (HubManager::Systemd, "systemd"),
+        (HubManager::Docker, "docker"),
+    ] {
+        let mut output = Vec::new();
+        install(&env(), request(manager, true), &store, &mut output)
+            .await
+            .expect("dry run");
+        let document: serde_json::Value = serde_json::from_slice(&output).expect("json");
+        assert_eq!(document["action"], json!("install"));
+        assert_eq!(document["manager"], json!(name));
+        assert_eq!(document["dryRun"], json!(true));
+        let steps = document["steps"].to_string();
+        let token = std::env::current_dir().expect("cwd").join("relative-token");
+        assert!(steps.contains(&*token.to_string_lossy()), "{steps}");
+        assert!(document.get("results").is_none());
+
+        let mut output = Vec::new();
+        uninstall(
+            &env(),
+            HubUninstall {
+                manager,
+                system: true,
+                dry_run: true,
+            },
+            &mut output,
+        )
+        .await
+        .expect("dry uninstall");
+        let document: serde_json::Value = serde_json::from_slice(&output).expect("json");
+        assert_eq!(document["action"], json!("uninstall"));
+        assert!(
+            document["steps"]
+                .as_array()
+                .is_some_and(|steps| !steps.is_empty())
+        );
+    }
+
+    // A real install never starts while a daemon under another manager owns the folder.
+    let held = store.try_daemon_lock().expect("lock").expect("held");
+    store
+        .write_heartbeat(&json!({"manager": "foreground"}))
+        .expect("heartbeat");
+    let refused = install(
+        &env(),
+        request(HubManager::Docker, false),
+        &store,
+        &mut Vec::new(),
+    )
+    .await
+    .expect_err("owned");
+    assert_eq!(refused.diagnostic()["code"], json!("hub.daemon_running"));
+    drop(held);
+}
+
+#[tokio::test]
+async fn install_steps_apply_in_order_and_stop_at_a_required_failure() {
+    use super::super::install::{apply_steps, require_program};
+    let directory = tempfile::tempdir().expect("tempdir");
+    let unit = directory.path().join("units").join("zeroshot-hub.service");
+    let missing = require_program("zeroshot-no-such-manager", "systemd")
+        .await
+        .expect_err("absent");
+    assert!(missing.to_string().contains("--dry-run"), "{missing}");
+    let shell = if cfg!(windows) { "cmd" } else { "sh" };
+    let (ok, fail) = if cfg!(windows) {
+        (["/C", "exit 0"], ["/C", "exit 1"])
+    } else {
+        (["-c", "exit 0"], ["-c", "exit 1"])
+    };
+    let run = |argv: [&str; 2], may_fail: bool| Step::Run {
+        argv: std::iter::once(shell)
+            .chain(argv)
+            .map(str::to_owned)
+            .collect(),
+        may_fail,
+    };
+    let results = apply_steps(&[
+        Step::Write {
+            path: unit.clone(),
+            content: "[Unit]\n".to_owned(),
+        },
+        run(ok, false),
+        run(fail, true),
+        Step::Run {
+            argv: vec!["zeroshot-no-such-program".to_owned()],
+            may_fail: true,
+        },
+        Step::Remove { path: unit.clone() },
+        Step::Remove { path: unit.clone() },
+    ])
+    .await
+    .expect("apply");
+    assert_eq!(results.len(), 6);
+    assert_eq!(results[1]["ok"], json!(true));
+    assert_eq!(results[2]["ok"], json!(false));
+    assert!(
+        results[3]["stderr"]
+            .as_str()
+            .is_some_and(|stderr| stderr.contains("could not start"))
+    );
+    assert!(!unit.exists());
+    let failed = apply_steps(&[run(fail, false), Step::Remove { path: unit }])
+        .await
+        .expect_err("required step fails");
+    let super::super::error::HubError::Target { diagnostic, .. } = &failed else {
+        panic!("{failed:?}");
+    };
+    assert_eq!(
+        diagnostic.as_ref().expect("steps")["steps"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "later steps never run"
+    );
+}

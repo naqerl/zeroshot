@@ -23,8 +23,14 @@ mod capabilities;
 mod cron;
 #[path = "tests/daemon.rs"]
 mod daemon;
+#[path = "tests/driver.rs"]
+mod driver;
 #[path = "tests/eval.rs"]
 mod eval;
+#[path = "tests/eval_flows.rs"]
+mod eval_flows;
+#[path = "tests/flows.rs"]
+mod flows;
 #[path = "tests/metrics.rs"]
 mod metrics;
 

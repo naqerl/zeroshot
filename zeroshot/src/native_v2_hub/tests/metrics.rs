@@ -438,6 +438,7 @@ async fn metrics_need_the_token_on_the_api_and_count_routes_by_template() {
         service,
         token: "t0ken".to_owned(),
         heartbeat: Arc::new(Mutex::new(json!({}))),
+        executable: None,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
