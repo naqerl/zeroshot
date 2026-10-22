@@ -95,6 +95,9 @@ pub struct HubApiOptions {
     pub metrics_listen: Option<String>,
     /// Job label keys whose values are exported with token counters.
     pub metrics_labels: Vec<String>,
+    /// Submissions a target may leave unconfirmed before the job fails; `None` uses the
+    /// daemon's default.
+    pub unconfirmed_limit: Option<u32>,
 }
 
 /// `hub context`: named hub endpoints, docker-context style.

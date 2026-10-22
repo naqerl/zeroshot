@@ -156,6 +156,10 @@ pub(crate) async fn discover(
     }
 }
 
+/// Unconfirmed submissions a job may have before it fails, unless the daemon sets another
+/// limit (`hub daemon run --unconfirmed-limit`).
+pub(crate) const DEFAULT_UNCONFIRMED_LIMIT: u32 = 30;
+
 /// How one submission attempt ended.
 #[derive(Debug)]
 pub(crate) enum Dispatched {
@@ -181,18 +185,20 @@ impl Dispatched {
 }
 
 /// Place one job on `member`. Only a refused submission fails the job and counts an attempt;
-/// an unconfirmed one keeps it placing (see [`Dispatched::Unconfirmed`]).
+/// an unconfirmed one keeps it placing (see [`Dispatched::Unconfirmed`]) until `limit`
+/// unconfirmed submissions, when the job fails. `now_ms` stamps the outcome.
 pub(crate) async fn dispatch(
     job: &mut Job,
     member: &str,
     driver: &dyn HubDriver,
-    now_ms: u64,
+    (now_ms, limit): (u64, u32),
 ) -> Dispatched {
     let attempt = job.attempts + 1;
+    let submission_key = format!("hub-{}-{attempt}", job.job_id);
     let request = SubmitRequest {
         member,
         job,
-        submission_key: format!("hub-{}-{attempt}", job.job_id),
+        submission_key: submission_key.clone(),
     };
     let submitted = driver.submit(request).await;
     job.target = Some(member.to_owned());
@@ -206,6 +212,20 @@ pub(crate) async fn dispatch(
             Dispatched::Placed
         }
         Err(error @ HubError::Unanswered(_)) => {
+            job.unconfirmed_submissions = job.unconfirmed_submissions.saturating_add(1);
+            if job.unconfirmed_submissions >= limit {
+                job.state = JobState::Failed;
+                job.finished_at_ms = Some(now_ms);
+                job.error = Some(JobError::new(
+                    JobErrorKind::UnconfirmedLimit,
+                    format!(
+                        "{member} did not confirm {} submissions (last: {error}); a run with \
+                         submission key {submission_key} may still exist there",
+                        job.unconfirmed_submissions
+                    ),
+                ));
+                return Dispatched::Rejected(error);
+            }
             job.state = JobState::Running;
             job.error = Some(JobError::new(
                 JobErrorKind::SubmissionUnconfirmed,
@@ -485,7 +505,8 @@ pub(crate) async fn tick(state: &mut HubState, driver: &dyn HubDriver, now_ms: u
     report.expired = expire(&mut state.jobs, now_ms);
     for (job_id, member) in placing(state) {
         if let Some(job) = state.jobs.iter_mut().find(|job| job.job_id == job_id) {
-            let dispatched = dispatch(job, &member, driver, now_ms).await;
+            let dispatched =
+                dispatch(job, &member, driver, (now_ms, DEFAULT_UNCONFIRMED_LIMIT)).await;
             let job = job.clone();
             record_dispatch(&mut report, &job, &dispatched);
         }
@@ -504,7 +525,7 @@ pub(crate) async fn tick(state: &mut HubState, driver: &dyn HubDriver, now_ms: u
         let Some(job) = state.jobs.iter_mut().find(|job| job.job_id == job_id) else {
             continue;
         };
-        let dispatched = dispatch(job, &member, driver, now_ms).await;
+        let dispatched = dispatch(job, &member, driver, (now_ms, DEFAULT_UNCONFIRMED_LIMIT)).await;
         let job = job.clone();
         record_dispatch(&mut report, &job, &dispatched);
     }

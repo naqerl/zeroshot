@@ -1604,6 +1604,9 @@ Options:
       --metrics-label <KEY>
           Export token counters by this job label key, such as task. Repeat for several; values beyond the first 50 collapse into _other
 
+      --unconfirmed-limit <N>
+          Fail a job after this many submissions its target did not confirm (timeouts, lost receipts) [default: 30]. Each is retried on the same member with the same key
+
   -h, --help
           Print help (see a summary with '-h')
 ```
@@ -1800,6 +1803,9 @@ Options:
 
       --metrics-label <KEY>
           Export token counters by this job label key, such as task. Repeat for several; values beyond the first 50 collapse into _other
+
+      --unconfirmed-limit <N>
+          Fail a job after this many submissions its target did not confirm (timeouts, lost receipts) [default: 30]. Each is retried on the same member with the same key
 
       --dry-run
           Print the generated service definition and steps without applying them

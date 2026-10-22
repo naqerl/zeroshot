@@ -68,6 +68,7 @@ pub(super) fn job(id: &str, submitted_at_ms: u64) -> Job {
         not_before_ms: None,
         expires_at_ms: None,
         attempts: 0,
+        unconfirmed_submissions: 0,
         target: None,
         run_id: None,
         dispatched_at_ms: None,
@@ -707,6 +708,10 @@ async fn an_unconfirmed_submission_keeps_the_job_placing_and_retries_with_the_sa
     assert_eq!(placed.state, JobState::Running);
     assert_eq!(placed.run_id.as_deref(), Some("a-run-0"));
     assert_eq!(placed.attempts, 1);
+    assert_eq!(
+        placed.unconfirmed_submissions, 2,
+        "unconfirmed submissions are counted apart from attempts"
+    );
     assert_eq!(placed.dispatched_at_ms, Some(30));
     assert_eq!(placed.error, None);
     let submissions = driver.submissions.lock().expect("fake lock").clone();
@@ -722,4 +727,44 @@ async fn an_unconfirmed_submission_keeps_the_job_placing_and_retries_with_the_sa
     );
     let view = report.view(&state, 30);
     assert_eq!(view["dispatchUnconfirmed"], json!([]));
+}
+
+#[tokio::test]
+async fn too_many_unconfirmed_submissions_fail_the_job_naming_its_key() {
+    let driver = FakeDriver {
+        unanswered: Mutex::new(5),
+        ..FakeDriver::default()
+    };
+    let mut placing = job("j1", 0);
+    let first = super::schedule::dispatch(&mut placing, "a", &driver, (10, 2)).await;
+    assert!(matches!(first, super::schedule::Dispatched::Unconfirmed(_)));
+    assert_eq!(placing.unconfirmed_submissions, 1);
+    assert!(placing.is_placing());
+    let second = super::schedule::dispatch(&mut placing, "a", &driver, (20, 2)).await;
+    assert!(matches!(second, super::schedule::Dispatched::Rejected(_)));
+    assert_eq!(second.label(), "dispatch_failed");
+    assert_eq!(placing.state, JobState::Failed);
+    assert_eq!(placing.finished_at_ms, Some(20));
+    assert_eq!(placing.attempts, 0, "no attempt was confirmed or refused");
+    assert_eq!(placing.unconfirmed_submissions, 2);
+    let error = placing.error.as_ref().expect("error");
+    assert_eq!(error.kind, JobErrorKind::UnconfirmedLimit);
+    assert!(
+        error.message.contains("did not confirm 2 submissions")
+            && error
+                .message
+                .contains("submission key hub-j1-1 may still exist"),
+        "{}",
+        error.message
+    );
+    let view = placing.view(20);
+    assert_eq!(view["errorKind"], json!("unconfirmed_limit"));
+    assert_eq!(view["unconfirmedSubmissions"], json!(2));
+    let stored = serde_json::to_value(&placing).expect("store");
+    assert_eq!(stored["unconfirmedSubmissions"], json!(2));
+    let mut fresh = serde_json::to_value(job("j2", 0)).expect("store");
+    assert!(fresh.get("unconfirmedSubmissions").is_none());
+    fresh.as_object_mut().expect("object").remove("attempts");
+    let loaded: Job = serde_json::from_value(fresh).expect("an earlier hub's job loads");
+    assert_eq!(loaded.unconfirmed_submissions, 0);
 }

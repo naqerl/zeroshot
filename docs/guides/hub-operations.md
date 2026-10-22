@@ -1,7 +1,8 @@
 # Operate a hub: metrics and evals
 
 A hub daemon (`zeroshot hub daemon run`, installed with `zeroshot hub install`) serves the hub
-API. This guide covers its Prometheus metrics and the eval loop built on top of hub placement.
+API. This guide covers its Prometheus metrics, unconfirmed submissions, and the eval loop built on
+top of hub placement.
 
 ## Prometheus metrics
 
@@ -96,6 +97,20 @@ sum by (model) (increase(zeroshot_hub_tokens_total{kind="output"}[1d]))
 # Refused submissions by reason
 sum by (reason) (rate(zeroshot_hub_placement_rejections_total[15m]))
 ```
+
+## Unconfirmed submissions
+
+When a target does not confirm a submission (the `zeroshot run` timed out, returned no receipt, or
+lost its connection), the job is not failed. It stays placing on that member, running without a
+run ID and with `errorKind` `submission_unconfirmed`, and every dispatcher pass submits it there
+again with the same submission key, `hub-JOB_ID-ATTEMPT`. The target deduplicates by that key, so a
+run it already accepted is not started twice. These retries are counted in the job's
+`unconfirmedSubmissions`, apart from `attempts`, and the count survives daemon restarts.
+
+After 30 unconfirmed submissions the job fails with `errorKind` `unconfirmed_limit`. Its error
+names the member and the submission key, because a run with that key may still exist there. Set
+another limit with `zeroshot hub daemon run --unconfirmed-limit N`; `hub install` passes the flag
+through to the service.
 
 ## Evals
 

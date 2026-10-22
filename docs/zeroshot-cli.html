@@ -1516,6 +1516,9 @@ Options:
       --metrics-label &lt;KEY&gt;
           Export token counters by this job label key, such as task. Repeat for several; values beyond the first 50 collapse into _other
 
+      --unconfirmed-limit &lt;N&gt;
+          Fail a job after this many submissions its target did not confirm (timeouts, lost receipts) [default: 30]. Each is retried on the same member with the same key
+
   -h, --help
           Print help (see a summary with &#39;-h&#39;)</code></pre></section>
 <section id="zeroshot-hub-daemon-status"><h5><code>zeroshot hub daemon status</code></h5>
@@ -1676,6 +1679,9 @@ Options:
 
       --metrics-label &lt;KEY&gt;
           Export token counters by this job label key, such as task. Repeat for several; values beyond the first 50 collapse into _other
+
+      --unconfirmed-limit &lt;N&gt;
+          Fail a job after this many submissions its target did not confirm (timeouts, lost receipts) [default: 30]. Each is retried on the same member with the same key
 
       --dry-run
           Print the generated service definition and steps without applying them

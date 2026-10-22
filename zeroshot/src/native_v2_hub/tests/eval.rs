@@ -1265,6 +1265,7 @@ async fn the_daemon_measures_finished_eval_samples() {
             token_file: Some(folder.join("daemon-token")),
             metrics_listen: None,
             metrics_labels: Vec::new(),
+            unconfirmed_limit: None,
         },
     };
     let open = |store| {

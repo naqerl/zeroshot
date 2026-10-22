@@ -46,6 +46,8 @@ pub(crate) struct HubService {
     state: Mutex<HubState>,
     placement: Mutex<()>,
     metrics: Metrics,
+    /// Unconfirmed submissions a job may have before it fails.
+    unconfirmed_limit: u32,
     /// Eval work in progress, so the worker never runs one piece twice at once.
     eval_claims: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
@@ -84,6 +86,7 @@ impl HubService {
             state: Mutex::new(state),
             placement: Mutex::new(()),
             metrics: Metrics::default(),
+            unconfirmed_limit: schedule::DEFAULT_UNCONFIRMED_LIMIT,
             eval_claims: std::sync::Mutex::default(),
         })
     }
@@ -92,6 +95,13 @@ impl HubService {
     #[must_use]
     pub(crate) fn with_metric_labels(mut self, keys: Vec<String>) -> Self {
         self.metrics = Metrics::new(keys);
+        self
+    }
+
+    /// Fail jobs after this many unconfirmed submissions (`None` keeps the default).
+    #[must_use]
+    pub(crate) fn with_unconfirmed_limit(mut self, limit: Option<u32>) -> Self {
+        self.unconfirmed_limit = limit.unwrap_or(self.unconfirmed_limit);
         self
     }
 
@@ -436,7 +446,13 @@ impl HubService {
         else {
             return Err(HubError::JobNotFound(job_id.to_owned()));
         };
-        let dispatched = schedule::dispatch(&mut job, member, self.driver(), now).await;
+        let dispatched = schedule::dispatch(
+            &mut job,
+            member,
+            self.driver(),
+            (now, self.unconfirmed_limit),
+        )
+        .await;
         self.metrics.record_placement(member, dispatched.label());
         self.mutate(|state| {
             if let Some(slot) = state.jobs.iter_mut().find(|slot| slot.job_id == job.job_id) {

@@ -224,6 +224,9 @@ pub(crate) enum JobErrorKind {
     SubmissionUnconfirmed,
     /// The last status read of the job's run failed; the next pass reads it again.
     StatusUnavailable,
+    /// The target left too many submissions unconfirmed; the job failed, though a run with
+    /// its last submission key may still exist there.
+    UnconfirmedLimit,
     /// Recorded as plain text by an earlier hub.
     Unclassified,
 }
@@ -293,6 +296,9 @@ pub(crate) struct Job {
     pub expires_at_ms: Option<u64>,
     #[serde(default)]
     pub attempts: u32,
+    /// Submissions of the current attempt its target did not confirm; apart from `attempts`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unconfirmed_submissions: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -362,6 +368,7 @@ impl Job {
             "models": self.models,
             "pinnedRevision": self.pinned_revision,
             "attempts": self.attempts,
+            "unconfirmedSubmissions": self.unconfirmed_submissions,
             "submittedAt": rfc3339(self.submitted_at_ms),
             "notBefore": time(self.not_before_ms),
             "expiresAt": time(self.expires_at_ms),
@@ -373,4 +380,9 @@ impl Job {
             "errorKind": self.error.as_ref().map(|error| error.kind),
         })
     }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero(value: &u32) -> bool {
+    *value == 0
 }

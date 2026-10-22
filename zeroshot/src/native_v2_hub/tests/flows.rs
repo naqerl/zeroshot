@@ -574,6 +574,7 @@ async fn machine_local_commands_are_refused_through_a_context() {
         token_file: None,
         metrics_listen: None,
         metrics_labels: Vec::new(),
+        unconfirmed_limit: None,
     };
     for command in [
         HubCommand::Daemon(HubDaemonRun {

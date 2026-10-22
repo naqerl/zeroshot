@@ -291,6 +291,8 @@ fn daemon_and_service_commands_parse() {
             "127.0.0.1:9383",
             "--metrics-label",
             "task",
+            "--unconfirmed-limit",
+            "5",
         ])
         .expect("daemon run with API options"),
         HubCommand::Daemon(HubDaemonRun {
@@ -300,6 +302,7 @@ fn daemon_and_service_commands_parse() {
                 token_file: Some("/srv/token".into()),
                 metrics_listen: Some("127.0.0.1:9383".to_owned()),
                 metrics_labels: vec!["task".to_owned()],
+                unconfirmed_limit: Some(5),
             },
         })
     );

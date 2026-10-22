@@ -130,7 +130,11 @@ pub(crate) async fn run_until<W: Write>(
         Some(listen) => Some(bind_loopback_metrics(listen).await?),
         None => None,
     };
-    let service = Arc::new(open(store)?.with_metric_labels(options.api.metrics_labels.clone()));
+    let service = Arc::new(
+        open(store)?
+            .with_metric_labels(options.api.metrics_labels.clone())
+            .with_unconfirmed_limit(options.api.unconfirmed_limit),
+    );
     let manager = std::env::var(MANAGER_ENV).unwrap_or_else(|_| "foreground".to_owned());
     let mut heartbeat = json!({
         "schema": "zeroshot.hub.daemon/v1",

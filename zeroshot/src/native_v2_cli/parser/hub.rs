@@ -197,6 +197,11 @@ pub(super) struct HubApiArgs {
     /// beyond the first 50 collapse into _other.
     #[arg(long = "metrics-label", value_name = "KEY", action = clap::ArgAction::Append)]
     metrics_labels: Vec<String>,
+
+    /// Fail a job after this many submissions its target did not confirm (timeouts, lost
+    /// receipts) [default: 30]. Each is retried on the same member with the same key.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    unconfirmed_limit: Option<u32>,
 }
 
 impl HubApiArgs {
@@ -213,6 +218,7 @@ impl HubApiArgs {
             token_file: self.token_file,
             metrics_listen: self.metrics_listen,
             metrics_labels: self.metrics_labels,
+            unconfirmed_limit: self.unconfirmed_limit,
         })
     }
 }

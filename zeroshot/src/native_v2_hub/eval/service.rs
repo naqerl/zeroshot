@@ -586,6 +586,7 @@ impl HubService {
             not_before_ms: None,
             expires_at_ms: None,
             attempts: 0,
+            unconfirmed_submissions: 0,
             target: None,
             run_id: None,
             dispatched_at_ms: None,

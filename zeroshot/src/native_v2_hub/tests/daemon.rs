@@ -62,6 +62,17 @@ fn installed_daemons_pass_listen_and_token_file_through() {
         "hub daemon run --interval 5s --metrics-listen 127.0.0.1:9383 --metrics-label task \
          --metrics-label eval.variant"
     );
+    let limited = daemon_arguments(
+        "5s",
+        &HubApiOptions {
+            unconfirmed_limit: Some(5),
+            ..HubApiOptions::default()
+        },
+    );
+    assert_eq!(
+        limited.join(" "),
+        "hub daemon run --interval 5s --unconfirmed-limit 5"
+    );
     let unit = systemd_unit(&env(), false, &arguments);
     assert!(unit.contains("\"--listen\" \"0.0.0.0:7383\" \"--token-file\" \"/srv/hub/token\""));
     let argv = docker_run(&env(), "zeroshot-hub:dev", &[], &arguments).join(" ");
@@ -301,6 +312,40 @@ async fn daemon_passes_confirm_unanswered_submissions_with_the_same_key() {
     assert_eq!(state.jobs[0].error, None);
 }
 
+#[tokio::test]
+async fn unconfirmed_submission_counts_survive_a_restart_up_to_the_limit() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = HubStore::new(directory.path().join("hub"));
+    {
+        let lock = store.lock().expect("lock");
+        let mut placing = job("j1", 0);
+        placing.state = super::super::model::JobState::Running;
+        placing.target = Some("local".to_owned());
+        placing.unconfirmed_submissions = 2;
+        let state = HubState {
+            members: vec![member("local", &[], 1, 0)],
+            jobs: vec![placing],
+            ..HubState::default()
+        };
+        store.save(&lock, &state).expect("seed");
+    }
+    let driver = FakeDriver {
+        unanswered: std::sync::Mutex::new(1),
+        ..FakeDriver::default()
+    };
+    let service = service(&store, driver, directory.path()).with_unconfirmed_limit(Some(3));
+    let (_, view) = service.pass().await.expect("pass");
+    assert_eq!(view["dispatchFailed"][0]["jobId"], json!("j1"));
+    let lock = store.lock().expect("lock");
+    let state = store.load(&lock).expect("state");
+    assert_eq!(state.jobs[0].state, super::super::model::JobState::Failed);
+    assert_eq!(state.jobs[0].unconfirmed_submissions, 3);
+    assert_eq!(
+        state.jobs[0].error.as_ref().map(|error| error.kind),
+        Some(super::super::model::JobErrorKind::UnconfirmedLimit)
+    );
+}
+
 #[test]
 fn interrupted_placements_stay_on_their_member_unconfirmed_on_open() {
     let directory = tempfile::tempdir().expect("tempdir");
@@ -416,6 +461,7 @@ async fn the_daemon_serves_the_api_dispatches_and_stops_on_shutdown() {
             token_file: Some(token_file.clone()),
             metrics_listen: Some("127.0.0.1:0".to_owned()),
             metrics_labels: vec!["team".to_owned()],
+            unconfirmed_limit: None,
         },
     };
     let registry = directory.path().join("targets.json");
@@ -553,6 +599,7 @@ async fn the_daemon_refuses_bad_options_before_serving() {
             token_file: Some(directory.path().join("token")),
             metrics_listen: metrics.map(str::to_owned),
             metrics_labels: Vec::new(),
+            unconfirmed_limit: None,
         },
     };
     // Each refusal gets its own hub folder: a just-released daemon lock can stay held for a
@@ -644,6 +691,7 @@ async fn install_and_uninstall_print_plans_on_dry_runs() {
             token_file: Some(PathBuf::from("relative-token")),
             metrics_listen: None,
             metrics_labels: Vec::new(),
+            unconfirmed_limit: None,
         },
         dry_run,
     };
@@ -836,6 +884,7 @@ async fn the_daemon_reports_failing_passes_and_keeps_serving() {
             token_file: Some(directory.path().join("token")),
             metrics_listen: None,
             metrics_labels: Vec::new(),
+            unconfirmed_limit: None,
         },
     };
     let mut output = Vec::new();
