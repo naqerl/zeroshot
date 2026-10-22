@@ -87,7 +87,7 @@ impl ProcessDriver {
         let operation = arguments.first().cloned().unwrap_or_default();
         let output = tokio::time::timeout(self.timeout, command.output())
             .await
-            .map_err(|_| target_error(format!("zeroshot {operation} timed out"), None))?
+            .map_err(|_| HubError::Unanswered(format!("zeroshot {operation} timed out")))?
             .map_err(|error| {
                 target_error(
                     format!("zeroshot {operation} could not start: {error}"),
@@ -144,7 +144,10 @@ impl HubDriver for ProcessDriver {
             request.submission_key,
             "--detach".to_owned(),
         ]);
-        let stdout = self.call(arguments, Some(&request.job.cwd)).await?;
+        let stdout = self
+            .call(arguments, Some(&request.job.cwd))
+            .await
+            .map_err(unanswered_when_uncertain)?;
         stdout
             .lines()
             .rev()
@@ -155,7 +158,7 @@ impl HubDriver for ProcessDriver {
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             })
-            .ok_or_else(|| target_error("zeroshot run returned no run receipt".to_owned(), None))
+            .ok_or_else(|| HubError::Unanswered("zeroshot run returned no run receipt".to_owned()))
     }
 
     async fn status(&self, member: &str, run_id: &str) -> Result<Value, HubError> {
@@ -238,6 +241,24 @@ fn last_json(stdout: &str) -> Option<Value> {
         .lines()
         .rev()
         .find_map(|line| serde_json::from_str::<Value>(line).ok())
+}
+
+/// A failed `zeroshot run` that may still have reached the target: its transport failed
+/// (`target.unavailable`) or its answer was unreadable (a `protocol` diagnostic). Refusals the
+/// target or the CLI reported (invalid requests, submission conflicts, backend errors) stay
+/// rejections.
+fn unanswered_when_uncertain(error: HubError) -> HubError {
+    let uncertain = matches!(
+        &error,
+        HubError::Target { diagnostic: Some(diagnostic), .. }
+            if diagnostic.get("kind") == Some(&Value::from("protocol"))
+                || diagnostic.get("code") == Some(&Value::from("target.unavailable"))
+    );
+    if uncertain {
+        HubError::Unanswered(error.to_string())
+    } else {
+        error
+    }
 }
 
 const fn target_error(message: String, diagnostic: Option<Value>) -> HubError {

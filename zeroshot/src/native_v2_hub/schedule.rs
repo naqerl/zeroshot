@@ -22,6 +22,7 @@ pub(crate) struct TickReport {
     pub finished: Vec<Value>,
     pub expired: Vec<String>,
     pub failed: Vec<Value>,
+    pub unconfirmed: Vec<Value>,
     pub loads: Option<BTreeMap<String, Load>>,
 }
 
@@ -51,6 +52,7 @@ impl TickReport {
             "finished": self.finished,
             "expired": self.expired,
             "dispatchFailed": self.failed,
+            "dispatchUnconfirmed": self.unconfirmed,
             "queued": queued,
             "running": running,
         })
@@ -154,39 +156,72 @@ pub(crate) async fn discover(
     }
 }
 
-/// Place one job on `member`. A failed submission marks the job failed and returns the error.
+/// How one submission attempt ended.
+#[derive(Debug)]
+pub(crate) enum Dispatched {
+    /// The target confirmed the run.
+    Placed,
+    /// The target gave no usable answer: the job stays placing on the member, and the next
+    /// pass submits it again with the same submission key, so a run the target did accept is
+    /// not duplicated.
+    Unconfirmed(HubError),
+    /// The submission was refused: the job failed without a run.
+    Rejected(HubError),
+}
+
+impl Dispatched {
+    /// The `outcome` label of the placement counter.
+    pub(crate) const fn label(&self) -> &'static str {
+        match self {
+            Self::Placed => "placed",
+            Self::Unconfirmed(_) => "unconfirmed",
+            Self::Rejected(_) => "dispatch_failed",
+        }
+    }
+}
+
+/// Place one job on `member`. Only a refused submission fails the job and counts an attempt;
+/// an unconfirmed one keeps it placing (see [`Dispatched::Unconfirmed`]).
 pub(crate) async fn dispatch(
     job: &mut Job,
     member: &str,
     driver: &dyn HubDriver,
     now_ms: u64,
-) -> Result<(), HubError> {
+) -> Dispatched {
     let attempt = job.attempts + 1;
     let request = SubmitRequest {
         member,
         job,
         submission_key: format!("hub-{}-{attempt}", job.job_id),
     };
-    match driver.submit(request).await {
+    let submitted = driver.submit(request).await;
+    job.target = Some(member.to_owned());
+    match submitted {
         Ok(run_id) => {
             job.attempts = attempt;
             job.state = JobState::Running;
-            job.target = Some(member.to_owned());
             job.run_id = Some(run_id);
             job.dispatched_at_ms = Some(now_ms);
             job.error = None;
-            Ok(())
+            Dispatched::Placed
+        }
+        Err(error @ HubError::Unanswered(_)) => {
+            job.state = JobState::Running;
+            job.error = Some(JobError::new(
+                JobErrorKind::SubmissionUnconfirmed,
+                error.to_string(),
+            ));
+            Dispatched::Unconfirmed(error)
         }
         Err(error) => {
             job.attempts = attempt;
             job.state = JobState::Failed;
-            job.target = Some(member.to_owned());
             job.finished_at_ms = Some(now_ms);
             job.error = Some(JobError::new(
                 JobErrorKind::SubmissionRejected,
                 error.to_string(),
             ));
-            Err(error)
+            Dispatched::Rejected(error)
         }
     }
 }
@@ -353,31 +388,49 @@ pub(crate) fn choose(
 }
 
 /// Record one dispatch outcome in a pass report.
-pub(crate) fn record_dispatch(report: &mut TickReport, job: &Job, result: Result<(), HubError>) {
+pub(crate) fn record_dispatch(report: &mut TickReport, job: &Job, dispatched: &Dispatched) {
     let mut entry = json!({ "jobId": job.job_id, "target": job.target });
-    match result {
-        Ok(()) => {
+    match dispatched {
+        Dispatched::Placed => {
             entry["runId"] = json!(job.run_id);
             report.dispatched.push(entry);
         }
-        Err(error) => {
+        Dispatched::Unconfirmed(error) => {
+            entry["error"] = json!(error.to_string());
+            report.unconfirmed.push(entry);
+        }
+        Dispatched::Rejected(error) => {
             entry["error"] = json!(error.to_string());
             report.failed.push(entry);
         }
     }
 }
 
-/// Put jobs that were mid-placement when a daemon stopped back in the queue. Their next attempt
-/// reuses the same submission key, so a run the target already accepted is not duplicated.
+/// Jobs placing on a member, as (job, member): each pass submits them again there. Placement
+/// is serialized, so none of them has a submission in flight when a pass reads them.
+pub(crate) fn placing(state: &HubState) -> Vec<(String, String)> {
+    state
+        .jobs
+        .iter()
+        .filter(|job| job.is_placing())
+        .filter_map(|job| Some((job.job_id.clone(), job.target.clone()?)))
+        .collect()
+}
+
+/// Mark jobs that were mid-placement when a daemon stopped as unconfirmed on their member, so
+/// the next pass submits them there again with the same key and a run the target already
+/// accepted is not duplicated. A placing job without a member returns to the queue.
 pub(crate) fn recover_placing(state: &mut HubState) -> usize {
     let mut recovered = 0;
-    for job in state
-        .jobs
-        .iter_mut()
-        .filter(|job| job.state == JobState::Running && job.run_id.is_none())
-    {
-        job.state = JobState::Queued;
-        job.target = None;
+    for job in state.jobs.iter_mut().filter(|job| job.is_placing()) {
+        if job.target.is_some() {
+            job.error = Some(JobError::new(
+                JobErrorKind::SubmissionUnconfirmed,
+                "the hub stopped before the target confirmed the submission",
+            ));
+        } else {
+            job.state = JobState::Queued;
+        }
         recovered += 1;
     }
     recovered
@@ -430,6 +483,13 @@ pub(crate) async fn tick(state: &mut HubState, driver: &dyn HubDriver, now_ms: u
     let results = poll(polls(state), driver).await;
     report.finished = apply_polls(state, results, now_ms);
     report.expired = expire(&mut state.jobs, now_ms);
+    for (job_id, member) in placing(state) {
+        if let Some(job) = state.jobs.iter_mut().find(|job| job.job_id == job_id) {
+            let dispatched = dispatch(job, &member, driver, now_ms).await;
+            let job = job.clone();
+            record_dispatch(&mut report, &job, &dispatched);
+        }
+    }
     if due_jobs(&state.jobs, now_ms).is_empty() {
         return report;
     }
@@ -444,9 +504,9 @@ pub(crate) async fn tick(state: &mut HubState, driver: &dyn HubDriver, now_ms: u
         let Some(job) = state.jobs.iter_mut().find(|job| job.job_id == job_id) else {
             continue;
         };
-        let result = dispatch(job, &member, driver, now_ms).await;
+        let dispatched = dispatch(job, &member, driver, now_ms).await;
         let job = job.clone();
-        record_dispatch(&mut report, &job, result);
+        record_dispatch(&mut report, &job, &dispatched);
     }
     report.loads = Some(loads);
     report

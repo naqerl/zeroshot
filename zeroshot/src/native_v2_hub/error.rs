@@ -66,6 +66,10 @@ pub(crate) enum HubError {
         message: String,
         diagnostic: Option<Value>,
     },
+    /// The target gave no usable answer (a timeout, a lost connection, or no receipt), so
+    /// whether it acted is unknown.
+    #[error("{0}")]
+    Unanswered(String),
 }
 
 impl HubError {
@@ -88,7 +92,7 @@ impl HubError {
             Self::NoEligibleTarget { .. } => 422,
             Self::NoCapacity(_) | Self::WaitTimeout(_) => 503,
             Self::Unauthorized { .. } => 401,
-            Self::Target { .. } | Self::Unreachable { .. } => 502,
+            Self::Target { .. } | Self::Unreachable { .. } | Self::Unanswered(_) => 502,
             Self::Storage(_) | Self::Remote { .. } => 500,
         }
     }
@@ -110,6 +114,7 @@ impl HubError {
             Self::DaemonRunning(_) => ("invalid_request", "hub.daemon_running"),
             Self::Remote { .. } => ("target", "hub.remote"),
             Self::Target { .. } => ("target", "hub.target"),
+            Self::Unanswered(_) => ("target", "hub.target_unanswered"),
         }
     }
 

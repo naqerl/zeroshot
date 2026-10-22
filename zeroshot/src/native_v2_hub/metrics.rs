@@ -222,8 +222,7 @@ impl Metrics {
         });
     }
 
-    pub(crate) fn record_placement(&self, member: &str, placed: bool) {
-        let outcome = if placed { "placed" } else { "dispatch_failed" };
+    pub(crate) fn record_placement(&self, member: &str, outcome: &'static str) {
         self.with(|counters| {
             *counters
                 .placements
@@ -332,7 +331,7 @@ impl Metrics {
         out.family(
             "zeroshot_hub_placements_total",
             "counter",
-            "Placement attempts by member and outcome (placed, dispatch_failed).",
+            "Placement attempts by member and outcome (placed, unconfirmed, dispatch_failed).",
         );
         for ((member, outcome), count) in &counters.placements {
             out.sample(

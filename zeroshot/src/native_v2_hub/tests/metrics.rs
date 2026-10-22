@@ -230,8 +230,8 @@ fn state_with_history(now: u64) -> HubState {
 fn record_activity(metrics: &Metrics) {
     metrics.record_pass(0.2, false);
     metrics.record_pass(3.0, true);
-    metrics.record_placement("a", true);
-    metrics.record_placement("b", false);
+    metrics.record_placement("a", "placed");
+    metrics.record_placement("b", "dispatch_failed");
     metrics.record_rejection(None);
     metrics.record_rejection(Some(&[]));
     metrics.record_rejection(Some(&[

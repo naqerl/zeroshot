@@ -22,7 +22,7 @@ use super::model::{
     HubState, Job, JobState, LOCAL_MEMBER, Member, MemberState, Schedule, ScheduleState,
 };
 use super::placement::{Fit, Placement, describe, fit, matching_members, place, rejections};
-use super::schedule::{self, TickReport};
+use super::schedule::{self, Dispatched, TickReport};
 use super::stats;
 use super::store::HubStore;
 use super::wire::{
@@ -394,9 +394,10 @@ impl HubService {
                     Ok(())
                 })
                 .await?;
-                let placed = self.dispatch(&job.job_id, &member, now).await?;
-                let (job, result) = placed;
-                result?;
+                let (job, dispatched) = self.dispatch(&job.job_id, &member, now).await?;
+                if let Dispatched::Rejected(error) = dispatched {
+                    return Err(error);
+                }
                 Ok(job_document(&job, now))
             }
             Placement::NoEligible { rejected } => {
@@ -425,7 +426,7 @@ impl HubService {
         job_id: &str,
         member: &str,
         now: u64,
-    ) -> Result<(Job, Result<(), HubError>), HubError> {
+    ) -> Result<(Job, Dispatched), HubError> {
         let Some(mut job) = self
             .snapshot()
             .await
@@ -435,8 +436,8 @@ impl HubService {
         else {
             return Err(HubError::JobNotFound(job_id.to_owned()));
         };
-        let result = schedule::dispatch(&mut job, member, self.driver(), now).await;
-        self.metrics.record_placement(member, result.is_ok());
+        let dispatched = schedule::dispatch(&mut job, member, self.driver(), now).await;
+        self.metrics.record_placement(member, dispatched.label());
         self.mutate(|state| {
             if let Some(slot) = state.jobs.iter_mut().find(|slot| slot.job_id == job.job_id) {
                 *slot = job.clone();
@@ -444,7 +445,7 @@ impl HubService {
             Ok(())
         })
         .await?;
-        Ok((job, result))
+        Ok((job, dispatched))
     }
 
     pub(crate) async fn enqueue(
@@ -762,12 +763,16 @@ impl HubService {
             .await?;
         let results = schedule::poll(polls, self.driver()).await;
         let now = now_ms();
-        let (finished, expired, due, members) = self
+        let (finished, expired, placing, members) = self
             .mutate(|state| {
                 let finished = schedule::apply_polls(state, results, now);
                 let expired = schedule::expire(&mut state.jobs, now);
-                let due = !schedule::due_jobs(&state.jobs, now).is_empty();
-                Ok((finished, expired, due, state.members.clone()))
+                Ok((
+                    finished,
+                    expired,
+                    schedule::placing(state),
+                    state.members.clone(),
+                ))
             })
             .await?;
         let mut report = TickReport {
@@ -776,6 +781,11 @@ impl HubService {
             expired,
             ..TickReport::default()
         };
+        for (job_id, member) in placing {
+            let (job, dispatched) = self.dispatch(&job_id, &member, now).await?;
+            schedule::record_dispatch(&mut report, &job, &dispatched);
+        }
+        let due = !schedule::due_jobs(&self.snapshot().await.jobs, now_ms()).is_empty();
         if due {
             let mut members = members;
             schedule::discover(
@@ -804,8 +814,8 @@ impl HubService {
                 .mutate(|state| Ok(schedule::choose(state, now, &mut loads)))
                 .await?;
             for (job_id, member) in chosen {
-                let (job, result) = self.dispatch(&job_id, &member, now).await?;
-                schedule::record_dispatch(&mut report, &job, result);
+                let (job, dispatched) = self.dispatch(&job_id, &member, now).await?;
+                schedule::record_dispatch(&mut report, &job, &dispatched);
             }
             report.loads = Some(loads);
         }

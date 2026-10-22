@@ -272,8 +272,37 @@ async fn reads_do_not_wait_for_a_pass_blocked_on_a_slow_target() {
     pass.abort();
 }
 
+#[tokio::test]
+async fn daemon_passes_confirm_unanswered_submissions_with_the_same_key() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = HubStore::new(directory.path().join("hub"));
+    {
+        let lock = store.lock().expect("lock");
+        let state = HubState {
+            members: vec![member("local", &[], 1, 0)],
+            jobs: vec![job("j1", 0)],
+            ..HubState::default()
+        };
+        store.save(&lock, &state).expect("seed");
+    }
+    let driver = FakeDriver {
+        unanswered: std::sync::Mutex::new(1),
+        ..FakeDriver::default()
+    };
+    let service = service(&store, driver, directory.path());
+    let (_, view) = service.pass().await.expect("pass");
+    assert_eq!(view["dispatchUnconfirmed"][0]["jobId"], json!("j1"));
+    assert_eq!(view["dispatchFailed"], json!([]));
+    let (_, view) = service.pass().await.expect("retry");
+    assert_eq!(view["dispatched"][0]["runId"], json!("local-run-0"));
+    let lock = store.lock().expect("lock");
+    let state = store.load(&lock).expect("state");
+    assert_eq!(state.jobs[0].attempts, 1);
+    assert_eq!(state.jobs[0].error, None);
+}
+
 #[test]
-fn interrupted_placements_return_to_the_queue_on_open() {
+fn interrupted_placements_stay_on_their_member_unconfirmed_on_open() {
     let directory = tempfile::tempdir().expect("tempdir");
     let store = HubStore::new(directory.path().join("hub"));
     {
@@ -281,8 +310,10 @@ fn interrupted_placements_return_to_the_queue_on_open() {
         let mut placing = job("j1", 0);
         placing.state = super::super::model::JobState::Running;
         placing.target = Some("local".to_owned());
+        let mut unplaced = job("j2", 0);
+        unplaced.state = super::super::model::JobState::Running;
         let state = HubState {
-            jobs: vec![placing],
+            jobs: vec![placing, unplaced],
             ..HubState::default()
         };
         store.save(&lock, &state).expect("seed");
@@ -290,8 +321,17 @@ fn interrupted_placements_return_to_the_queue_on_open() {
     drop(service(&store, FakeDriver::default(), directory.path()));
     let lock = store.lock().expect("lock");
     let state = store.load(&lock).expect("state");
-    assert_eq!(state.jobs[0].state, super::super::model::JobState::Queued);
-    assert_eq!(state.jobs[0].target, None);
+    assert_eq!(state.jobs[0].state, super::super::model::JobState::Running);
+    assert_eq!(state.jobs[0].target.as_deref(), Some("local"));
+    assert_eq!(
+        state.jobs[0].error.as_ref().map(|error| error.kind),
+        Some(super::super::model::JobErrorKind::SubmissionUnconfirmed)
+    );
+    assert_eq!(
+        state.jobs[0].attempts, 0,
+        "the same submission key is reused"
+    );
+    assert_eq!(state.jobs[1].state, super::super::model::JobState::Queued);
 }
 
 #[test]

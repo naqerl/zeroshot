@@ -31,6 +31,9 @@ case "$member" in
   plain) echo 'plain failure' >&2; exit 2 ;;
   quiet) echo 'not json'; exit 0 ;;
   slow) sleep 5; exit 0 ;;
+  lost) echo '{"schema":"zeroshot.error/v1","kind":"target","code":"target.unavailable","message":"connection reset"}' >&2; exit 1 ;;
+  garbled) echo '{"schema":"zeroshot.error/v1","kind":"protocol","code":"protocol.invalid","message":"bad answer"}' >&2; exit 1 ;;
+  refusing) echo '{"schema":"zeroshot.error/v1","kind":"invalid_request","code":"request.invalid","message":"bad graph"}' >&2; exit 1 ;;
 esac
 case "$command" in
   list) echo 'noise'; echo '{"runs":[{"status":{"phase":"running"}}]}' ;;
@@ -226,4 +229,56 @@ async fn capabilities_come_from_the_targets_discovery_document() {
 fn named_members_are_routed_with_target() {
     assert!(route("local").is_empty());
     assert_eq!(route("box"), ["--target", "box"]);
+}
+
+#[cfg(unix)]
+async fn submit(driver: &ProcessDriver, member: &str) -> HubError {
+    driver
+        .submit(SubmitRequest {
+            member,
+            job: &super::job("hj_uncertain", 0),
+            submission_key: "k".to_owned(),
+        })
+        .await
+        .expect_err(member)
+}
+
+/// Only a submission the target or the CLI refused is a rejection; one that may have reached
+/// the target is unanswered, so the hub retries it with the same key.
+#[cfg(unix)]
+#[tokio::test]
+async fn uncertain_submissions_are_unanswered_and_refusals_are_not() {
+    let folder = tempfile::tempdir().expect("tempdir");
+    let executable = fake_zeroshot(folder.path());
+    let driver = ProcessDriver::new(
+        executable.clone(),
+        registry(folder.path()),
+        Duration::from_secs(10),
+    )
+    .expect("driver");
+    for member in ["lost", "garbled", "quiet"] {
+        let error = submit(&driver, member).await;
+        assert!(
+            matches!(error, HubError::Unanswered(_)),
+            "{member}: {error:?}"
+        );
+    }
+    for member in ["refusing", "down", "plain"] {
+        let error = submit(&driver, member).await;
+        assert!(
+            matches!(error, HubError::Target { .. }),
+            "{member}: {error:?}"
+        );
+    }
+    let impatient = ProcessDriver::new(
+        executable,
+        registry(folder.path()),
+        Duration::from_millis(200),
+    )
+    .expect("driver");
+    let slow = submit(&impatient, "slow").await;
+    assert!(matches!(slow, HubError::Unanswered(_)), "{slow:?}");
+    assert_eq!(slow.diagnostic()["code"], json!("hub.target_unanswered"));
+    assert_eq!(slow.http_status(), 502);
+    assert_eq!(slow.exit_code(), 1);
 }

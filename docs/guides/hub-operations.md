@@ -59,7 +59,7 @@ restarts. Pass, placement, and API series are counted since the daemon started.
 | `zeroshot_hub_member_up` | gauge | `member` (last load probe; absent until probed) |
 | `zeroshot_hub_member_state` | gauge | `member`, `state` |
 | `zeroshot_hub_member_capabilities_known` | gauge | `member` |
-| `zeroshot_hub_placements_total` | counter | `member`, `outcome` (placed, dispatch_failed) |
+| `zeroshot_hub_placements_total` | counter | `member`, `outcome` (placed, unconfirmed, dispatch_failed) |
 | `zeroshot_hub_placement_rejections_total` | counter | `reason` (no_capacity, no_matching_member, missing_capability, local_unsupported, remote_unsupported) |
 | `zeroshot_hub_tokens_total` | counter | `target`, `model`, `project`, `kind` (input, output, cache_read, cache_creation) |
 | `zeroshot_hub_label_tokens_total` | counter | `label`, `value`, `kind` for keys opted in with `--metrics-label KEY` |

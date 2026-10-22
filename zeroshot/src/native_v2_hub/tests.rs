@@ -276,6 +276,11 @@ pub(super) struct FakeDriver {
     pub status_delay: Option<std::time::Duration>,
     /// Terminal output of finished runs (default `{}`).
     pub output: Option<Value>,
+    /// Submissions still to accept without answering, like a `zeroshot run` that times out
+    /// after the target took the run.
+    pub unanswered: Mutex<u32>,
+    /// Run IDs by submission key: the target's idempotency.
+    pub accepted: Mutex<BTreeMap<String, String>>,
 }
 
 impl FakeDriver {
@@ -315,14 +320,26 @@ impl HubDriver for FakeDriver {
                 diagnostic: None,
             });
         }
-        let mut runs = self.runs.lock().expect("fake lock");
-        let entry = runs.entry(request.member.to_owned()).or_default();
-        let run_id = format!("{}-run-{}", request.member, entry.len());
-        entry.push((run_id.clone(), "running"));
         self.submissions
             .lock()
             .expect("fake lock")
-            .push((request.member.to_owned(), request.submission_key));
+            .push((request.member.to_owned(), request.submission_key.clone()));
+        let mut accepted = self.accepted.lock().expect("fake lock");
+        let run_id = if let Some(run_id) = accepted.get(&request.submission_key) {
+            run_id.clone()
+        } else {
+            let mut runs = self.runs.lock().expect("fake lock");
+            let entry = runs.entry(request.member.to_owned()).or_default();
+            let run_id = format!("{}-run-{}", request.member, entry.len());
+            entry.push((run_id.clone(), "running"));
+            accepted.insert(request.submission_key, run_id.clone());
+            run_id
+        };
+        let mut unanswered = self.unanswered.lock().expect("fake lock");
+        if *unanswered > 0 {
+            *unanswered -= 1;
+            return Err(HubError::Unanswered("zeroshot run timed out".to_owned()));
+        }
         Ok(run_id)
     }
 
@@ -651,4 +668,58 @@ fn job_errors_are_typed_and_older_plain_messages_still_load() {
         running.error.map(|error| error.kind),
         Some(JobErrorKind::StatusUnavailable)
     );
+}
+
+#[tokio::test]
+async fn an_unconfirmed_submission_keeps_the_job_placing_and_retries_with_the_same_key() {
+    let driver = FakeDriver {
+        unanswered: Mutex::new(2),
+        ..FakeDriver::default()
+    };
+    let mut state = HubState {
+        members: vec![member("a", &[], 1, 0)],
+        jobs: vec![job("j1", 0), job("j2", 0)],
+        ..HubState::default()
+    };
+    let report = tick(&mut state, &driver, 10).await;
+    assert!(report.failed.is_empty(), "a timeout is not a rejection");
+    assert_eq!(report.unconfirmed.len(), 1);
+    let placing = &state.jobs[0];
+    assert!(placing.is_placing());
+    assert_eq!(placing.target.as_deref(), Some("a"));
+    assert_eq!(placing.attempts, 0, "no attempt is counted");
+    assert_eq!(placing.finished_at_ms, None);
+    assert_eq!(
+        placing.error.as_ref().map(|error| error.kind),
+        Some(JobErrorKind::SubmissionUnconfirmed)
+    );
+    assert_eq!(
+        state.jobs[1].state,
+        JobState::Queued,
+        "the placing job keeps its slot"
+    );
+
+    let report = tick(&mut state, &driver, 20).await;
+    assert_eq!(report.unconfirmed.len(), 1, "still unanswered");
+    let report = tick(&mut state, &driver, 30).await;
+    assert_eq!(report.dispatched.len(), 1);
+    let placed = &state.jobs[0];
+    assert_eq!(placed.state, JobState::Running);
+    assert_eq!(placed.run_id.as_deref(), Some("a-run-0"));
+    assert_eq!(placed.attempts, 1);
+    assert_eq!(placed.dispatched_at_ms, Some(30));
+    assert_eq!(placed.error, None);
+    let submissions = driver.submissions.lock().expect("fake lock").clone();
+    assert_eq!(
+        submissions,
+        vec![("a".to_owned(), "hub-j1-1".to_owned()); 3],
+        "every retry reuses the first submission key"
+    );
+    assert_eq!(
+        driver.runs.lock().expect("fake lock")["a"].len(),
+        1,
+        "the target ran it once"
+    );
+    let view = report.view(&state, 30);
+    assert_eq!(view["dispatchUnconfirmed"], json!([]));
 }

@@ -738,8 +738,13 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   writer of `hub/state.json` (beside `targets.json`, or `ZEROSHOT_HUB_DIR`), dispatches
   continuously, and serves the hub API (JSON over HTTP, default `127.0.0.1:7383`, bearer token in
   `hub/api-token` or `--token-file`). State sits behind one in-memory lock that is never held across
-  target calls; a second lock serializes placement (passes and `submit`). Jobs marked placing when a
-  daemon stops return to the queue and retry with the same submission key. API errors carry the
+  target calls; a second lock serializes placement (passes and `submit`). `schedule::Dispatched` owns
+  dispatch outcome kinds: `Placed`; `Unconfirmed` when the driver returns `HubError::Unanswered`
+  (a timeout, no receipt, a transport or protocol failure), which keeps the job placing (running
+  without a run ID, `errorKind` `submission_unconfirmed`) on its member with no attempt counted,
+  so every pass resubmits it there with the same key; and `Rejected`, the only kind that fails the
+  job. Jobs placing when a daemon stops stay on their member as unconfirmed. Hub-side job problems
+  are a typed `JobError` (plain strings from older state load as `unclassified`). API errors carry the
   `zeroshot.error/v1` diagnostic plus `x-zeroshot-exit-code`; logs, watch, attach, and force-stop
   stream NDJSON frames from a `zeroshot` child on the hub host. Every other hub command is a client
   of the context chosen by `--hub`, `ZEROSHOT_HUB`, `hub context use`, then built-in `local` (this

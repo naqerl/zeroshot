@@ -317,6 +317,12 @@ pub(crate) struct Job {
 }
 
 impl Job {
+    /// Placed on a member that has not confirmed a run yet: stored as running without a run
+    /// ID, so state files of earlier hubs read the same.
+    pub(crate) fn is_placing(&self) -> bool {
+        self.state == JobState::Running && self.run_id.is_none()
+    }
+
     /// Public state, distinguishing future queued jobs as `scheduled`.
     pub(crate) fn display_state(&self, now_ms: u64) -> &'static str {
         match self.state {
