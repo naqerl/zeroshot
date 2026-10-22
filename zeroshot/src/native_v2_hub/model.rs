@@ -214,6 +214,54 @@ impl JobState {
     }
 }
 
+/// What kind of problem the hub had with a job.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum JobErrorKind {
+    /// The target refused the submission; the job failed without a run.
+    SubmissionRejected,
+    /// The target did not confirm the submission; it is retried with the same key.
+    SubmissionUnconfirmed,
+    /// The last status read of the job's run failed; the next pass reads it again.
+    StatusUnavailable,
+    /// Recorded as plain text by an earlier hub.
+    Unclassified,
+}
+
+/// A hub-side problem with a job. Earlier hubs stored only the message; such records still
+/// load, as [`JobErrorKind::Unclassified`].
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(from = "StoredJobError")]
+pub(crate) struct JobError {
+    pub kind: JobErrorKind,
+    pub message: String,
+}
+
+impl JobError {
+    pub(crate) fn new(kind: JobErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredJobError {
+    Message(String),
+    Typed { kind: JobErrorKind, message: String },
+}
+
+impl From<StoredJobError> for JobError {
+    fn from(stored: StoredJobError) -> Self {
+        match stored {
+            StoredJobError::Message(message) => Self::new(JobErrorKind::Unclassified, message),
+            StoredJobError::Typed { kind, message } => Self::new(kind, message),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct Job {
@@ -257,8 +305,9 @@ pub(crate) struct Job {
     pub failure_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<JobUsage>,
+    /// The hub's own problem with this job, apart from its run's `failure_reason`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub error: Option<JobError>,
     /// Recurring schedule that created this job, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule_id: Option<String>,
@@ -314,7 +363,8 @@ impl Job {
             "finishedAt": time(self.finished_at_ms),
             "failureReason": self.failure_reason,
             "tokenUsage": self.token_usage,
-            "error": self.error,
+            "error": self.error.as_ref().map(|error| &error.message),
+            "errorKind": self.error.as_ref().map(|error| error.kind),
         })
     }
 }

@@ -9,7 +9,8 @@ use super::driver::{HubDriver, SubmitRequest};
 use super::error::{EXIT_NO_CAPACITY, EXIT_NO_ELIGIBLE_TARGET, HubError};
 use super::jobs::{repository_name, runtime_models};
 use super::model::{
-    HubState, Job, JobState, Member, MemberState, PlacementSpec, Requirements, Strategy,
+    HubState, Job, JobError, JobErrorKind, JobState, Member, MemberState, PlacementSpec,
+    Requirements, Strategy,
 };
 use super::usage::{JobUsage, Tokens, reported};
 use super::placement::{Load, Placement, describe, place};
@@ -426,12 +427,9 @@ async fn tick_skips_unreachable_members_and_records_rejections() {
     assert_eq!(report.failed.len(), 1);
     assert_eq!(state.jobs[0].state, JobState::Failed);
     assert_eq!(state.jobs[0].target.as_deref(), Some("b"));
-    assert!(
-        state.jobs[0]
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("rejected"))
-    );
+    let error = state.jobs[0].error.as_ref().expect("error");
+    assert_eq!(error.kind, JobErrorKind::SubmissionRejected);
+    assert!(error.message.contains("rejected"));
 }
 
 fn finished_job(id: &str, target: &str, model: &str, usage: (u64, u64)) -> Job {
@@ -608,4 +606,49 @@ fn store_round_trips_state_under_lock() {
     };
     store.save(&lock, &state).expect("save");
     assert_eq!(store.load(&lock).expect("reload"), state);
+}
+
+#[test]
+fn job_errors_are_typed_and_older_plain_messages_still_load() {
+    let mut legacy = serde_json::to_value(job("j1", 0)).expect("job");
+    legacy["error"] = json!("zeroshot run: target down");
+    let loaded: Job = serde_json::from_value(legacy).expect("an earlier hub's job loads");
+    assert_eq!(
+        loaded.error,
+        Some(JobError::new(
+            JobErrorKind::Unclassified,
+            "zeroshot run: target down"
+        ))
+    );
+
+    let mut typed = job("j2", 0);
+    typed.error = Some(JobError::new(
+        JobErrorKind::SubmissionUnconfirmed,
+        "zeroshot run timed out",
+    ));
+    let stored = serde_json::to_value(&typed).expect("store");
+    assert_eq!(
+        stored["error"],
+        json!({"kind": "submission_unconfirmed", "message": "zeroshot run timed out"})
+    );
+    assert_eq!(
+        serde_json::from_value::<Job>(stored).expect("reload"),
+        typed
+    );
+    let view = typed.view(0);
+    assert_eq!(view["error"], json!("zeroshot run timed out"));
+    assert_eq!(view["errorKind"], json!("submission_unconfirmed"));
+
+    let mut running = job("j3", 0);
+    running.state = JobState::Running;
+    let read = super::schedule::apply_refresh(
+        &mut running,
+        Err(HubError::Usage("status unreadable".to_owned())),
+        5,
+    );
+    assert!(read.is_none());
+    assert_eq!(
+        running.error.map(|error| error.kind),
+        Some(JobErrorKind::StatusUnavailable)
+    );
 }

@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use super::driver::{HubDriver, SubmitRequest};
 use super::error::HubError;
-use super::model::{HubState, Job, JobState, LOCAL_MEMBER, Member, MemberState};
+use super::model::{HubState, Job, JobError, JobErrorKind, JobState, LOCAL_MEMBER, Member, MemberState};
 use super::usage::JobUsage;
 use super::placement::{Load, Placement, place};
 
@@ -182,7 +182,10 @@ pub(crate) async fn dispatch(
             job.state = JobState::Failed;
             job.target = Some(member.to_owned());
             job.finished_at_ms = Some(now_ms);
-            job.error = Some(error.to_string());
+            job.error = Some(JobError::new(
+                JobErrorKind::SubmissionRejected,
+                error.to_string(),
+            ));
             Err(error)
         }
     }
@@ -229,7 +232,10 @@ pub(crate) fn apply_refresh(
             Some(status)
         }
         Err(error) => {
-            job.error = Some(error.to_string());
+            job.error = Some(JobError::new(
+                JobErrorKind::StatusUnavailable,
+                error.to_string(),
+            ));
             None
         }
     }

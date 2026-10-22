@@ -560,7 +560,10 @@ fn outcome(job: &Job) -> Outcome {
     let ready = job.not_before_ms.unwrap_or(0).max(job.submitted_at_ms);
     Outcome {
         status: job.display_state(now_ms()).to_owned(),
-        failure_reason: job.failure_reason.clone().or_else(|| job.error.clone()),
+        failure_reason: job
+            .failure_reason
+            .clone()
+            .or_else(|| job.error.as_ref().map(|error| error.message.clone())),
         target: job.target.clone(),
         run_id: job.run_id.clone(),
         queue_wait_ms: job
