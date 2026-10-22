@@ -227,6 +227,9 @@ pub(crate) enum JobErrorKind {
     /// The target left too many submissions unconfirmed; the job failed, though a run with
     /// its last submission key may still exist there.
     UnconfirmedLimit,
+    /// Dequeued while placing. A run with its submission key may exist on the member; the hub
+    /// does not follow or adopt it.
+    DequeuedWhilePlacing,
     /// Recorded as plain text by an earlier hub.
     Unclassified,
 }

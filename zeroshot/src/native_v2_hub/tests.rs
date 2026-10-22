@@ -280,6 +280,8 @@ pub(super) struct FakeDriver {
     /// Submissions still to accept without answering, like a `zeroshot run` that times out
     /// after the target took the run.
     pub unanswered: Mutex<u32>,
+    /// Makes submissions slow, so a test can act while one is in flight.
+    pub submit_delay: Option<std::time::Duration>,
     /// Run IDs by submission key: the target's idempotency.
     pub accepted: Mutex<BTreeMap<String, String>>,
 }
@@ -320,6 +322,9 @@ impl HubDriver for FakeDriver {
                 message: "rejected".to_owned(),
                 diagnostic: None,
             });
+        }
+        if let Some(delay) = self.submit_delay {
+            tokio::time::sleep(delay).await;
         }
         self.submissions
             .lock()

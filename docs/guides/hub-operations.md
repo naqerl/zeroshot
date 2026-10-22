@@ -112,6 +112,12 @@ names the member and the submission key, because a run with that key may still e
 another limit with `zeroshot hub daemon run --unconfirmed-limit N`; `hub install` passes the flag
 through to the service.
 
+`zeroshot hub dequeue JOB_ID` also removes a placing job, for example one whose target is down.
+The job becomes `dequeued` with `errorKind` `dequeued_while_placing`, and the hub stops submitting
+it. The target may still hold a run under the job's submission key; the error names that key, and
+the hub never follows or adopts such a run. If a submission that was in flight when you dequeued
+is then accepted, the error also names the run ID so you can stop it on the target.
+
 ## Evals
 
 `zeroshot hub eval` reruns captured tasks under other topologies, models, or runtime settings,

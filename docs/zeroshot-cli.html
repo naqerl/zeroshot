@@ -751,7 +751,7 @@ Commands:
   logs        Follow a placed job&#39;s run logs as NDJSON
   attach      Attach to an execution of a placed job as NDJSON
   force-stop  Force a placed job&#39;s run to stop
-  dequeue     Remove a queued or scheduled job before it is placed, or a recurring schedule (`hs_…`)
+  dequeue     Remove a queued or scheduled job before it is placed, a placing job its target has not confirmed, or a recurring schedule (`hs_…`)
   dispatch    Ask the hub daemon to run one dispatcher pass now and print its summary
   stats       Aggregate job outcomes and provider-reported tokens as JSON
   daemon      Run or inspect the hub daemon
@@ -1418,9 +1418,9 @@ Options:
   -h, --help
           Print help</code></pre></section>
 <section id="zeroshot-hub-dequeue"><h4><code>zeroshot hub dequeue</code></h4>
-<pre><code>Remove a queued or scheduled job before it is placed, or a recurring schedule (`hs_…`).
+<pre><code>Remove a queued or scheduled job before it is placed, a placing job its target has not confirmed, or a recurring schedule (`hs_…`).
 
-Removing a schedule keeps the jobs it already queued.
+A placing job&#39;s target may already hold a run under its submission key (`hub-JOB_ID-ATTEMPT`); the hub records that in the job&#39;s error and never follows or adopts that run. Removing a schedule keeps the jobs it already queued.
 
 Usage: zeroshot hub dequeue [OPTIONS] &lt;JOB_ID&gt;
 
@@ -2239,7 +2239,7 @@ Commands:
   logs        Follow a placed job&#39;s run logs as NDJSON
   attach      Attach to an execution of a placed job as NDJSON
   force-stop  Force a placed job&#39;s run to stop
-  dequeue     Remove a queued or scheduled job before it is placed, or a recurring schedule (`hs_…`)
+  dequeue     Remove a queued or scheduled job before it is placed, a placing job its target has not confirmed, or a recurring schedule (`hs_…`)
   dispatch    Ask the hub daemon to run one dispatcher pass now and print its summary
   stats       Aggregate job outcomes and provider-reported tokens as JSON
   daemon      Run or inspect the hub daemon

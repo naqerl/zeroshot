@@ -858,3 +858,59 @@ async fn non_hub_servers_are_reported_as_unreachable() {
     .expect_err("no stream route");
     assert_eq!(stream.exit_code(), 5, "{stream:?}");
 }
+
+#[tokio::test]
+async fn placing_jobs_can_be_dequeued_through_the_api_and_are_never_adopted() {
+    let driver = FakeDriver {
+        unanswered: Mutex::new(1),
+        ..FakeDriver::default()
+    };
+    let hub = hub_with(driver, None).await;
+    let client = &hub.client;
+    run(client, add("local", 1)).await.expect("add");
+    let placing = run(
+        client,
+        submit(spec(hub.directory.path(), "unanswered", None), false, None),
+    )
+    .await
+    .expect("an unconfirmed submission is not an error");
+    assert_eq!(placing["job"]["state"], json!("running"));
+    assert_eq!(placing["job"]["runId"], Value::Null);
+    assert_eq!(placing["job"]["errorKind"], json!("submission_unconfirmed"));
+    let job_id = placing["job"]["jobId"].as_str().expect("job id").to_owned();
+
+    let dequeued = run(
+        client,
+        HubCommand::Dequeue {
+            job: job_id.clone(),
+        },
+    )
+    .await
+    .expect("dequeue a placing job");
+    assert_eq!(dequeued["job"]["state"], json!("dequeued"));
+    assert_eq!(
+        dequeued["job"]["errorKind"],
+        json!("dequeued_while_placing")
+    );
+    let message = dequeued["job"]["error"].as_str().expect("error");
+    assert!(
+        message.contains(&format!("submission key hub-{job_id}-1 may exist there")),
+        "{message}"
+    );
+
+    hub.service.pass().await.expect("pass");
+    assert_eq!(
+        hub.driver.submissions.lock().expect("lock").len(),
+        1,
+        "a dequeued job is not submitted again"
+    );
+    let status = run(client, HubCommand::Status { job: job_id })
+        .await
+        .expect("status");
+    assert_eq!(status["job"]["state"], json!("dequeued"));
+    assert_eq!(
+        status["job"]["runId"],
+        Value::Null,
+        "the run is not adopted"
+    );
+}

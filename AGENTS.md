@@ -744,7 +744,8 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   without a run ID, `errorKind` `submission_unconfirmed`) on its member with no attempt counted,
   so every pass resubmits it there with the same key, counted in `unconfirmed_submissions` apart
   from `attempts`, until `--unconfirmed-limit` (default 30) fails it as `unconfirmed_limit`; and
-  `Rejected`, the only other kind that fails the job. Jobs placing when a daemon stops stay on their member as unconfirmed. Hub-side job problems
+  `Rejected`, the only other kind that fails the job. `hub dequeue` also removes placing jobs
+  (`dequeued_while_placing`); a run the target accepts under their key is noted, never adopted. Jobs placing when a daemon stops stay on their member as unconfirmed. Hub-side job problems
   are a typed `JobError` (plain strings from older state load as `unclassified`). API errors carry the
   `zeroshot.error/v1` diagnostic plus `x-zeroshot-exit-code`; logs, watch, attach, and force-stop
   stream NDJSON frames from a `zeroshot` child on the hub host. Every other hub command is a client

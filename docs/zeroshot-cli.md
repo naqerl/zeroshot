@@ -771,7 +771,7 @@ Commands:
   logs        Follow a placed job's run logs as NDJSON
   attach      Attach to an execution of a placed job as NDJSON
   force-stop  Force a placed job's run to stop
-  dequeue     Remove a queued or scheduled job before it is placed, or a recurring schedule (`hs_…`)
+  dequeue     Remove a queued or scheduled job before it is placed, a placing job its target has not confirmed, or a recurring schedule (`hs_…`)
   dispatch    Ask the hub daemon to run one dispatcher pass now and print its summary
   stats       Aggregate job outcomes and provider-reported tokens as JSON
   daemon      Run or inspect the hub daemon
@@ -1490,9 +1490,9 @@ Options:
 #### `zeroshot hub dequeue`
 
 ```text
-Remove a queued or scheduled job before it is placed, or a recurring schedule (`hs_…`).
+Remove a queued or scheduled job before it is placed, a placing job its target has not confirmed, or a recurring schedule (`hs_…`).
 
-Removing a schedule keeps the jobs it already queued.
+A placing job's target may already hold a run under its submission key (`hub-JOB_ID-ATTEMPT`); the hub records that in the job's error and never follows or adopts that run. Removing a schedule keeps the jobs it already queued.
 
 Usage: zeroshot hub dequeue [OPTIONS] <JOB_ID>
 
@@ -2431,7 +2431,7 @@ Commands:
   logs        Follow a placed job's run logs as NDJSON
   attach      Attach to an execution of a placed job as NDJSON
   force-stop  Force a placed job's run to stop
-  dequeue     Remove a queued or scheduled job before it is placed, or a recurring schedule (`hs_…`)
+  dequeue     Remove a queued or scheduled job before it is placed, a placing job its target has not confirmed, or a recurring schedule (`hs_…`)
   dispatch    Ask the hub daemon to run one dispatcher pass now and print its summary
   stats       Aggregate job outcomes and provider-reported tokens as JSON
   daemon      Run or inspect the hub daemon

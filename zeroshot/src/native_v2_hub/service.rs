@@ -19,7 +19,8 @@ use super::driver::{HubDriver, route};
 use super::error::HubError;
 use super::metrics::Metrics;
 use super::model::{
-    HubState, Job, JobState, LOCAL_MEMBER, Member, MemberState, Schedule, ScheduleState,
+    HubState, Job, JobError, JobErrorKind, JobState, LOCAL_MEMBER, Member, MemberState, Schedule,
+    ScheduleState,
 };
 use super::placement::{Fit, Placement, describe, fit, matching_members, place, rejections};
 use super::schedule::{self, Dispatched, TickReport};
@@ -456,7 +457,15 @@ impl HubService {
         self.metrics.record_placement(member, dispatched.label());
         self.mutate(|state| {
             if let Some(slot) = state.jobs.iter_mut().find(|slot| slot.job_id == job.job_id) {
-                *slot = job.clone();
+                if slot.is_placing() {
+                    *slot = job.clone();
+                } else if let (Some(error), Some(run_id)) = (&mut slot.error, &job.run_id) {
+                    // Dequeued while this submission was in flight: note the run, never adopt it.
+                    error.message = format!(
+                        "{}; {member} then accepted run {run_id}, which the hub does not follow",
+                        error.message
+                    );
+                }
             }
             Ok(())
         })
@@ -666,9 +675,13 @@ impl HubService {
                 .iter_mut()
                 .find(|job| job.job_id == job_id)
                 .ok_or_else(|| HubError::JobNotFound(job_id.to_owned()))?;
+            if job.is_placing() {
+                return Ok(dequeue_placing(job, now));
+            }
             if job.state != JobState::Queued {
                 return Err(HubError::InvalidState(format!(
-                    "hub job {job_id} is {}; only queued or scheduled jobs can be dequeued{}",
+                    "hub job {job_id} is {}; only queued, scheduled, or placing jobs can be \
+                     dequeued{}",
                     job.display_state(now),
                     if job.state == JobState::Running {
                         "; use `zeroshot hub force-stop` to stop its run"
@@ -838,6 +851,25 @@ impl HubService {
         let view = report.view(&self.snapshot().await, now_ms());
         Ok((report, view))
     }
+}
+
+/// Dequeue a job placing on its member. The target may hold a run under the job's submission key
+/// (the submission was unconfirmed or still in flight); the hub records that and stops placing
+/// the job, but never follows or adopts such a run.
+fn dequeue_placing(job: &mut Job, now: u64) -> Value {
+    let member = job.target.clone().unwrap_or_default();
+    job.state = JobState::Dequeued;
+    job.finished_at_ms = Some(now);
+    job.error = Some(JobError::new(
+        JobErrorKind::DequeuedWhilePlacing,
+        format!(
+            "dequeued while placing on {member}; a run with submission key hub-{}-{} may exist \
+             there, and the hub does not follow it",
+            job.job_id,
+            job.attempts + 1
+        ),
+    ));
+    job_document(job, now)
 }
 
 fn state_matches(job: &Job, filter: &str, now: u64) -> bool {

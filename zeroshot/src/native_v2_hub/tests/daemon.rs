@@ -346,6 +346,58 @@ async fn unconfirmed_submission_counts_survive_a_restart_up_to_the_limit() {
     );
 }
 
+#[tokio::test]
+async fn a_job_dequeued_mid_submission_records_the_run_without_adopting_it() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = HubStore::new(directory.path().join("hub"));
+    {
+        let lock = store.lock().expect("lock");
+        let state = HubState {
+            members: vec![member("local", &[], 1, 0)],
+            jobs: vec![job("j1", 0)],
+            ..HubState::default()
+        };
+        store.save(&lock, &state).expect("seed");
+    }
+    let driver = FakeDriver {
+        submit_delay: Some(std::time::Duration::from_secs(2)),
+        ..FakeDriver::default()
+    };
+    let service = Arc::new(service(&store, driver, directory.path()));
+    let pass = tokio::spawn({
+        let service = service.clone();
+        async move { service.pass().await }
+    });
+    let mut dequeued = None;
+    for _ in 0..150 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if service.snapshot().await.jobs[0].is_placing() {
+            dequeued = Some(service.dequeue("j1").await.expect("dequeue"));
+            break;
+        }
+    }
+    let dequeued = dequeued.expect("the job is placing while its submission is in flight");
+    assert_eq!(dequeued["job"]["state"], json!("dequeued"));
+    pass.await.expect("join").expect("pass");
+    let lock = store.lock().expect("lock");
+    let state = store.load(&lock).expect("state");
+    let job = &state.jobs[0];
+    assert_eq!(job.state, super::super::model::JobState::Dequeued);
+    assert_eq!(job.run_id, None, "the accepted run is not adopted");
+    let error = job.error.as_ref().expect("error");
+    assert_eq!(
+        error.kind,
+        super::super::model::JobErrorKind::DequeuedWhilePlacing
+    );
+    assert!(
+        error
+            .message
+            .ends_with("local then accepted run local-run-0, which the hub does not follow"),
+        "{}",
+        error.message
+    );
+}
+
 #[test]
 fn interrupted_placements_stay_on_their_member_unconfirmed_on_open() {
     let directory = tempfile::tempdir().expect("tempdir");

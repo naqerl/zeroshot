@@ -109,9 +109,12 @@ pub(super) enum HubCliCommand {
     /// Force a placed job's run to stop.
     ForceStop(HubJobArgs),
 
-    /// Remove a queued or scheduled job before it is placed, or a recurring schedule (`hs_…`).
+    /// Remove a queued or scheduled job before it is placed, a placing job its target has not
+    /// confirmed, or a recurring schedule (`hs_…`).
     ///
-    /// Removing a schedule keeps the jobs it already queued.
+    /// A placing job's target may already hold a run under its submission key
+    /// (`hub-JOB_ID-ATTEMPT`); the hub records that in the job's error and never follows or
+    /// adopts that run. Removing a schedule keeps the jobs it already queued.
     Dequeue(HubJobArgs),
 
     /// Ask the hub daemon to run one dispatcher pass now and print its summary.
