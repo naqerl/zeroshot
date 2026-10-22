@@ -14,6 +14,7 @@ use zeroshot_engine::native_v2_cli::hub::{HubContextCommand, HubTokenSource};
 
 use super::daemon::{DEFAULT_LISTEN, TOKEN_FILE};
 use super::error::HubError;
+use super::paths::absolute;
 use super::store::HubStore;
 use super::write_json;
 
@@ -344,13 +345,4 @@ pub(crate) fn normalize_url(text: &str) -> Result<String, HubError> {
         )));
     }
     Ok(url.as_str().trim_end_matches('/').to_owned())
-}
-
-fn absolute(path: &Path) -> Result<PathBuf, HubError> {
-    if path.is_absolute() {
-        return Ok(path.to_path_buf());
-    }
-    std::env::current_dir()
-        .map(|folder| folder.join(path))
-        .map_err(|error| HubError::Usage(format!("the invoking folder is unavailable: {error}")))
 }

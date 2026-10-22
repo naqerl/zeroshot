@@ -33,6 +33,8 @@ mod eval_flows;
 mod flows;
 #[path = "tests/metrics.rs"]
 mod metrics;
+#[path = "tests/paths.rs"]
+mod paths;
 
 pub(super) fn member(name: &str, tags: &[&str], slots: u32, priority: i32) -> Member {
     Member {

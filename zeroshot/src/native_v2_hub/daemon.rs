@@ -2,7 +2,7 @@
 //! dispatcher pass every interval until SIGTERM or Ctrl-C.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,6 +12,7 @@ use zeroshot_engine::native_v2_cli::hub::HubDaemonRun;
 use super::api::{ApiState, metrics_router, router};
 use super::clock::{now_ms, parse_duration_ms, rfc3339};
 use super::error::HubError;
+use super::paths::absolute;
 use super::service::{HubService, replace_private};
 use super::store::HubStore;
 use super::write_json;
@@ -118,7 +119,7 @@ pub(crate) async fn run_until<W: Write>(
         .token_file
         .clone()
         .unwrap_or_else(|| store.directory().join(TOKEN_FILE));
-    let token_file = absolute(token_file);
+    let token_file = absolute(&token_file)?;
     let token = load_or_create_token(&token_file)?;
     let listen = options.api.listen.as_deref().unwrap_or(DEFAULT_LISTEN);
     let listener = bind(listen, "hub API").await?;
@@ -262,13 +263,6 @@ fn publish(service: &HubService, shared: &Mutex<Value>, heartbeat: &Value) -> Re
         current.clone_from(heartbeat);
     }
     service.store().write_heartbeat(heartbeat)
-}
-
-fn absolute(path: PathBuf) -> PathBuf {
-    if path.is_absolute() {
-        return path;
-    }
-    std::env::current_dir().map_or(path.clone(), |folder| folder.join(path))
 }
 
 async fn shutdown_signal() {

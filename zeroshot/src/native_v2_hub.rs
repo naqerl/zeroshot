@@ -31,6 +31,7 @@ mod install;
 mod jobs;
 mod metrics;
 mod model;
+mod paths;
 mod placement;
 mod schedule;
 mod service;

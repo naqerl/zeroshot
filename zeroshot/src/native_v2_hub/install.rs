@@ -12,6 +12,7 @@ use zeroshot_engine::native_v2_cli::hub::{HubApiOptions, HubInstall, HubManager,
 
 use super::daemon::{MANAGER_ENV, SERVICE_NAME};
 use super::error::HubError;
+use super::paths::{absolute, absolute_from};
 use super::store::HubStore;
 use super::write_json;
 
@@ -114,13 +115,16 @@ impl InstallEnv {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .ok_or_else(|| unavailable("HOME"))?;
+        // A unit or container runs later from another folder, so every pinned folder is resolved
+        // now: home shorthand against this shell's home, relative paths against this folder.
+        let pin = |path: &Path| absolute_from(path, Some(&home), std::env::current_dir());
         let executable = std::env::current_exe()
             .and_then(std::fs::canonicalize)
             .map_err(|error| HubError::storage("executable path is unavailable", error))?;
         let config_dir = registry_path
             .parent()
-            .map(Path::to_path_buf)
-            .ok_or_else(|| unavailable("the target registry folder"))?;
+            .map(pin)
+            .ok_or_else(|| unavailable("the target registry folder"))??;
         let state_dir = std::env::var_os("ZEROSHOT_STATE_DIR")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
@@ -130,11 +134,14 @@ impl InstallEnv {
                     .map(|root| PathBuf::from(root).join("zeroshot"))
             })
             .unwrap_or_else(|| home.join(".local").join("state").join("zeroshot"));
+        let state_dir = pin(&state_dir)?;
         let user_unit_dir = std::env::var_os("XDG_CONFIG_HOME")
             .filter(|value| !value.is_empty())
             .map_or_else(|| home.join(".config"), PathBuf::from)
             .join("systemd")
             .join("user");
+        let user_unit_dir = pin(&user_unit_dir)?;
+        let hub_dir = pin(hub_dir)?;
         let (uid, gid) = ids();
         Ok(Self {
             executable,
@@ -147,7 +154,7 @@ impl InstallEnv {
             gid,
             path: std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into()),
             config_dir,
-            hub_dir: hub_dir.to_path_buf(),
+            hub_dir,
             state_dir,
             user_unit_dir,
             credential_store: std::env::var("ZEROSHOT_CREDENTIAL_STORE")
@@ -156,7 +163,7 @@ impl InstallEnv {
         })
     }
 
-    fn pinned_environment(&self, manager: &str) -> Vec<(String, String)> {
+    pub(crate) fn pinned_environment(&self, manager: &str) -> Vec<(String, String)> {
         let mut environment = vec![
             (MANAGER_ENV.to_owned(), manager.to_owned()),
             ("HOME".to_owned(), display(&self.home)),
@@ -566,15 +573,6 @@ pub(crate) fn refuse_other_owner(store: &HubStore, manager: &str) -> Result<(), 
             "systemd"
         }
     )))
-}
-
-fn absolute(path: &Path) -> Result<PathBuf, HubError> {
-    if path.is_absolute() {
-        return Ok(path.to_path_buf());
-    }
-    std::env::current_dir()
-        .map(|folder| folder.join(path))
-        .map_err(|error| HubError::Usage(format!("the invoking folder is unavailable: {error}")))
 }
 
 pub(crate) async fn uninstall(
