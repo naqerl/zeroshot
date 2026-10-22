@@ -766,6 +766,12 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   registry and every hub file (state, heartbeat, contexts, token, spool, eval blobs and work files,
   installed units) go through it; hub code calls `service::replace_private` and
   `service::create_private_directory`.
+- `native_v2_hub/usage.rs` owns token-usage completeness for `hub stats`, eval reports, and
+  `/metrics`. A job keeps the run's protocol `TokenUsage` as reported, or an explicit `invalid`
+  record when it cannot be read. Only complete usage is totalled or priced; incomplete and invalid
+  usage is counted separately (`jobsWithIncompleteUsage`, `jobsWithInvalidUsage`), cache totals are
+  claimed only when every counted job reported them, and an overflowing total is withheld
+  (`usageOverflowed`) rather than published partially.
 - Hub metrics: `GET /metrics` (Prometheus text 0.0.4, hand-rolled in `native_v2_hub/metrics.rs`)
   needs the API token; `--metrics-listen` adds a token-free listener that must be loopback, and
   `--metrics-label KEY` opts job label keys into token counters. State-derived series are

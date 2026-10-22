@@ -14,6 +14,7 @@ use std::sync::Mutex;
 use super::eval::SampleState;
 use super::model::{HubState, Job, JobState, MemberState, ScheduleState};
 use super::placement::{Load, Rejection};
+use super::usage::{TOKEN_KINDS, Tokens};
 
 /// Distinct values kept per bounded label before the rest collapse into `_other`.
 pub(crate) const VALUE_CAP: usize = 50;
@@ -660,16 +661,17 @@ fn render_job_histograms(out: &mut Exposition, state: &HubState) {
     }
 }
 
-const TOKEN_KINDS: [&str; 4] = ["input", "output", "cache_read", "cache_creation"];
-
+/// Complete usage only: incomplete or invalid usage never enters the token counters.
 fn token_counts(job: &Job) -> Option<[u64; 4]> {
-    let usage = job.token_usage?;
-    Some([
-        usage.input_tokens,
-        usage.output_tokens,
-        usage.cache_read_input_tokens.unwrap_or(0),
-        usage.cache_creation_input_tokens.unwrap_or(0),
-    ])
+    let usage = job.token_usage.as_ref()?.complete()?;
+    Some(Tokens::of(usage).kinds())
+}
+
+/// Counter totals saturate rather than wrap: a counter must never go backwards.
+fn add_counts(total: &mut [u64; 4], counts: [u64; 4]) {
+    for (total, count) in total.iter_mut().zip(counts) {
+        *total = total.saturating_add(count);
+    }
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -688,18 +690,14 @@ fn render_tokens(out: &mut Exposition, state: &HubState, label_keys: &[String]) 
             projects.admit(job.project.as_deref().unwrap_or("unknown")),
         );
         let entry = totals.entry(key).or_default();
-        for (total, count) in entry.iter_mut().zip(counts) {
-            *total += count;
-        }
+        add_counts(entry, counts);
         for label in label_keys {
             let Some(value) = job.labels.get(label) else {
                 continue;
             };
             let value = values.entry(label).or_default().admit(value);
             let entry = by_label.entry((label.clone(), value)).or_default();
-            for (total, count) in entry.iter_mut().zip(counts) {
-                *total += count;
-            }
+            add_counts(entry, counts);
         }
     }
     out.family(

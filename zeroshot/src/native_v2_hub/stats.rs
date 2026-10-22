@@ -6,6 +6,7 @@ use serde_json::{Map, Value, json};
 use super::clock::{rfc3339, utc_day};
 use super::error::HubError;
 use super::model::{Job, JobState};
+use super::usage::{UsageTotals, cost};
 
 /// USD per million tokens for one model. Missing fields price those tokens at zero.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
@@ -85,12 +86,7 @@ struct Row {
     succeeded: u64,
     failed: u64,
     other: u64,
-    input: u64,
-    output: u64,
-    cache_read: u64,
-    cache_creation: u64,
-    with_usage: u64,
-    incomplete_usage: u64,
+    usage: UsageTotals,
     cost: f64,
     unpriced: u64,
     queue_wait: Vec<u64>,
@@ -114,27 +110,16 @@ impl Row {
                 self.duration.push(finished.saturating_sub(dispatched));
             }
         }
-        let Some(usage) = job.token_usage else {
+        // Only complete usage is totalled and priced; the rest is counted in `usage`.
+        let Some(usage) = self.usage.add(job.token_usage.as_ref()) else {
             return;
         };
-        self.with_usage += 1;
-        if !usage.complete {
-            self.incomplete_usage += 1;
-        }
-        let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
-        let cache_creation = usage.cache_creation_input_tokens.unwrap_or(0);
-        self.input += usage.input_tokens;
-        self.output += usage.output_tokens;
-        self.cache_read += cache_read;
-        self.cache_creation += cache_creation;
         if let Some(prices) = prices {
-            match prices.get(&job.model_key()) {
-                Some(price) => {
-                    self.cost += per_million(usage.input_tokens, price.input)
-                        + per_million(usage.output_tokens, price.output)
-                        + per_million(cache_read, price.cache_read)
-                        + per_million(cache_creation, price.cache_creation);
-                }
+            match prices
+                .get(&job.model_key())
+                .and_then(|price| cost(usage, price))
+            {
+                Some(cost) => self.cost += cost,
                 None => self.unpriced += 1,
             }
         }
@@ -149,26 +134,18 @@ impl Row {
             "succeeded": self.succeeded,
             "failed": self.failed,
             "dequeuedOrExpired": self.other,
-            "inputTokens": self.input,
-            "outputTokens": self.output,
-            "cacheReadInputTokens": self.cache_read,
-            "cacheCreationInputTokens": self.cache_creation,
-            "jobsWithUsage": self.with_usage,
-            "jobsWithIncompleteUsage": self.incomplete_usage,
             "queueWaitMs": percentiles(&self.queue_wait),
             "runDurationMs": percentiles(&self.duration),
         });
+        if let (Value::Object(row), Value::Object(usage)) = (&mut row, self.usage.view()) {
+            row.extend(usage);
+        }
         if priced {
             row["estimatedCostUsd"] = json!((self.cost * 1_000_000.0).round() / 1_000_000.0);
             row["unpricedJobs"] = json!(self.unpriced);
         }
         row
     }
-}
-
-#[allow(clippy::cast_precision_loss)]
-fn per_million(tokens: u64, price: f64) -> f64 {
-    tokens as f64 / 1_000_000.0 * price
 }
 
 /// Nearest-rank p50 and p95; null when no samples exist.

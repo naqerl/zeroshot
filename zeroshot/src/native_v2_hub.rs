@@ -37,6 +37,7 @@ mod schedule;
 mod service;
 mod stats;
 mod store;
+mod usage;
 mod wire;
 
 #[cfg(test)]

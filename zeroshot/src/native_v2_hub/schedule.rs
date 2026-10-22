@@ -6,7 +6,8 @@ use serde_json::{Value, json};
 
 use super::driver::{HubDriver, SubmitRequest};
 use super::error::HubError;
-use super::model::{HubState, Job, JobState, LOCAL_MEMBER, Member, MemberState, TokenUsage};
+use super::model::{HubState, Job, JobState, LOCAL_MEMBER, Member, MemberState};
+use super::usage::JobUsage;
 use super::placement::{Load, Placement, place};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -207,9 +208,7 @@ pub(crate) fn apply_status(job: &mut Job, status: &Value, now_ms: u64) -> bool {
         .pointer("/status/terminalResult/reason")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    job.token_usage = status
-        .pointer("/status/metadata/tokenUsage")
-        .and_then(|usage| serde_json::from_value::<TokenUsage>(usage.clone()).ok());
+    job.token_usage = JobUsage::from_status(status);
     if job.labels.contains_key(super::eval::ROLE_LABEL) {
         job.output = status.pointer("/status/terminalResult/output").cloned();
     }

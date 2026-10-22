@@ -15,7 +15,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::error::HubError;
-use super::model::{Job, PlacementSpec, Requirements, TokenUsage};
+use super::model::{Job, PlacementSpec, Requirements};
+use super::usage::JobUsage;
 use super::service::{create_private_directory, replace_private};
 use super::wire::JobFile;
 
@@ -234,7 +235,7 @@ pub(crate) struct Outcome {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_usage: Option<TokenUsage>,
+    pub token_usage: Option<JobUsage>,
     /// Model attribution: one model, `mixed`, or `unknown`.
     pub model: String,
 }

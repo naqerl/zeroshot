@@ -6,7 +6,8 @@ use serde_json::json;
 use super::super::api::{ApiState, router};
 use super::super::daemon::bind_loopback_metrics;
 use super::super::metrics::{Exposition, Histogram, Metrics, OTHER, VALUE_CAP, escape};
-use super::super::model::{HubState, JobState, Schedule, ScheduleState, TokenUsage};
+use super::super::model::{HubState, JobState, Schedule, ScheduleState};
+use super::super::usage::{JobUsage, reported};
 use super::super::placement::{Load, Rejection};
 use super::super::service::HubService;
 use super::super::store::HubStore;
@@ -172,14 +173,8 @@ fn exposition_escapes_labels_and_writes_cumulative_histograms() {
     parse_exposition(&text);
 }
 
-const fn usage(input: u64) -> Option<TokenUsage> {
-    Some(TokenUsage {
-        input_tokens: input,
-        output_tokens: 10,
-        cache_read_input_tokens: Some(5),
-        cache_creation_input_tokens: None,
-        complete: true,
-    })
+fn usage(input: u64) -> Option<JobUsage> {
+    Some(reported(input, 10, Some(5)))
 }
 
 fn state_with_history(now: u64) -> HubState {

@@ -9,8 +9,9 @@ use super::driver::{HubDriver, SubmitRequest};
 use super::error::{EXIT_NO_CAPACITY, EXIT_NO_ELIGIBLE_TARGET, HubError};
 use super::jobs::{repository_name, runtime_models};
 use super::model::{
-    HubState, Job, JobState, Member, MemberState, PlacementSpec, Requirements, Strategy, TokenUsage,
+    HubState, Job, JobState, Member, MemberState, PlacementSpec, Requirements, Strategy,
 };
+use super::usage::{JobUsage, Tokens, reported};
 use super::placement::{Load, Placement, describe, place};
 use super::schedule::{active_runs, apply_status, due_jobs, expire, tick};
 use super::stats::{Dimension, ModelPrice, StatsQuery, aggregate, percentiles};
@@ -35,6 +36,8 @@ mod flows;
 mod metrics;
 #[path = "tests/paths.rs"]
 mod paths;
+#[path = "tests/usage.rs"]
+mod usage;
 
 pub(super) fn member(name: &str, tags: &[&str], slots: u32, priority: i32) -> Member {
     Member {
@@ -244,16 +247,7 @@ fn finished_status_records_outcome_and_tokens() {
         running.failure_reason.as_deref(),
         Some("runtime_unavailable")
     );
-    assert_eq!(
-        running.token_usage,
-        Some(TokenUsage {
-            input_tokens: 10,
-            output_tokens: 4,
-            cache_read_input_tokens: None,
-            cache_creation_input_tokens: None,
-            complete: true,
-        })
-    );
+    assert_eq!(running.token_usage, Some(reported(10, 4, None)));
     assert_eq!(running.finished_at_ms, Some(9));
 }
 
@@ -406,7 +400,11 @@ async fn tick_fills_free_slots_in_queue_order_and_keeps_the_rest_queued() {
     assert_eq!(state.jobs[3].state, JobState::Running);
     assert_eq!(state.jobs[0].state, JobState::Succeeded);
     assert_eq!(
-        state.jobs[0].token_usage.map(|usage| usage.input_tokens),
+        state.jobs[0]
+            .token_usage
+            .as_ref()
+            .and_then(JobUsage::complete)
+            .map(|usage| Tokens::of(usage).input),
         Some(1000)
     );
 }
@@ -446,13 +444,7 @@ fn finished_job(id: &str, target: &str, model: &str, usage: (u64, u64)) -> Job {
     finished
         .labels
         .insert("task".to_owned(), "parser".to_owned());
-    finished.token_usage = Some(TokenUsage {
-        input_tokens: usage.0,
-        output_tokens: usage.1,
-        cache_read_input_tokens: Some(10),
-        cache_creation_input_tokens: None,
-        complete: true,
-    });
+    finished.token_usage = Some(reported(usage.0, usage.1, Some(10)));
     finished
 }
 

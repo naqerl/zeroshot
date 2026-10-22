@@ -7,6 +7,7 @@ use zeroshot_engine::native_v2_cli::hub::{HubMemberState, HubStrategy};
 
 use super::clock::rfc3339;
 use super::eval::EvalState;
+use super::usage::JobUsage;
 
 /// Reserved member name for the local controller.
 pub(crate) const LOCAL_MEMBER: &str = "local";
@@ -213,20 +214,6 @@ impl JobState {
     }
 }
 
-/// Provider-reported usage copied from a finished run's status metadata.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct TokenUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_read_input_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_creation_input_tokens: Option<u64>,
-    #[serde(default)]
-    pub complete: bool,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct Job {
@@ -269,7 +256,7 @@ pub(crate) struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_usage: Option<TokenUsage>,
+    pub token_usage: Option<JobUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Recurring schedule that created this job, if any.

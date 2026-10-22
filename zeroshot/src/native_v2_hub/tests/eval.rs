@@ -24,7 +24,8 @@ use super::super::eval::{
     Baseline, Case, EvalRun, JudgeMode, Outcome, Sample, SampleState, Score, Verdict, canonical,
     sample_job_id,
 };
-use super::super::model::{PlacementSpec, Requirements, TokenUsage};
+use super::super::model::{PlacementSpec, Requirements};
+use super::super::usage::reported;
 use super::super::service::HubService;
 use super::super::store::HubStore;
 use super::FakeDriver;
@@ -264,11 +265,7 @@ fn sample(
             run_id: None,
             queue_wait_ms: Some(0),
             duration_ms: Some(duration),
-            token_usage: Some(TokenUsage {
-                input_tokens: tokens,
-                output_tokens: 0,
-                ..TokenUsage::default()
-            }),
+            token_usage: Some(reported(tokens, 0, None)),
             model: "m".to_owned(),
         }),
         checks: Vec::new(),

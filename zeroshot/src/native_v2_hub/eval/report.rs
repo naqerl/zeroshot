@@ -2,7 +2,8 @@
 //! and improvement/regression flags. Pure functions over stored samples.
 //!
 //! Metrics per sample: pass (job succeeded, every check passed, and an absolute judge did not
-//! say `fail`), judge score, tokens (input + output), estimated cost (from a price table), and
+//! say `fail`), judge score, tokens (input + output) and estimated cost (from a price table) of
+//! complete usage only (see `usage.rs`), and
 //! run duration. Each aggregate is a mean with a 95% normal-approximation confidence interval
 //! (mean ± 1.96·s/√n, none below two samples); nothing more is claimed about significance.
 //! Pass rate and judge score deltas are absolute; tokens, cost, and duration deltas are
@@ -14,6 +15,7 @@ use serde_json::{Value, json};
 
 use super::super::error::HubError;
 use super::super::stats::Prices;
+use super::super::usage::{JobUsage, Tokens, cost};
 use super::{EvalRun, JudgeMode, Sample};
 
 pub(crate) const SCHEMA: &str = "zeroshot.hub.eval.report/v1";
@@ -138,20 +140,10 @@ impl Stat {
 #[allow(clippy::cast_precision_loss)]
 fn values(sample: &Sample, mode: Option<JudgeMode>, prices: Option<&Prices>) -> [Option<f64>; 5] {
     let outcome = sample.outcome.as_ref();
-    let usage = outcome.and_then(|outcome| outcome.token_usage);
-    let cost = usage.and_then(|usage| {
-        let price = prices?.get(&outcome?.model)?;
-        let per_million = |tokens: u64, price: f64| tokens as f64 / 1_000_000.0 * price;
-        Some(
-            per_million(usage.input_tokens, price.input)
-                + per_million(usage.output_tokens, price.output)
-                + per_million(usage.cache_read_input_tokens.unwrap_or(0), price.cache_read)
-                + per_million(
-                    usage.cache_creation_input_tokens.unwrap_or(0),
-                    price.cache_creation,
-                ),
-        )
-    });
+    let usage = outcome
+        .and_then(|outcome| outcome.token_usage.as_ref())
+        .and_then(JobUsage::complete);
+    let cost = usage.and_then(|usage| cost(usage, prices?.get(&outcome?.model)?));
     [
         sample
             .passed(mode)
@@ -161,7 +153,9 @@ fn values(sample: &Sample, mode: Option<JudgeMode>, prices: Option<&Prices>) -> 
             .as_ref()
             .and_then(|verdict| verdict.score)
             .map(|score| score.0),
-        usage.map(|usage| (usage.input_tokens + usage.output_tokens) as f64),
+        usage
+            .and_then(|usage| Tokens::of(usage).input_and_output())
+            .map(|tokens| tokens as f64),
         cost,
         outcome
             .and_then(|outcome| outcome.duration_ms)

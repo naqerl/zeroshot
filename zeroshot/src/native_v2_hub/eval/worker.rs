@@ -581,7 +581,7 @@ fn outcome(job: &Job) -> Outcome {
             .dispatched_at_ms
             .zip(job.finished_at_ms)
             .map(|(dispatched, finished)| finished.saturating_sub(dispatched)),
-        token_usage: job.token_usage,
+        token_usage: job.token_usage.clone(),
         model: job.model_key(),
     }
 }
