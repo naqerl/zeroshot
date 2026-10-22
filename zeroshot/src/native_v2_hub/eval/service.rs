@@ -442,158 +442,11 @@ impl HubService {
                 "--repeat must be 1..={MAX_REPEAT}"
             )));
         }
-        let mut cases = Vec::new();
-        if let Some(name) = &request.suite {
-            let suite = state
-                .evals
-                .suites
-                .iter()
-                .find(|suite| &suite.name == name)
-                .ok_or_else(|| not_found(&format!("eval suite {name} does not exist")))?;
-            cases.extend(suite.cases.iter().cloned());
-        }
-        for case in &request.cases {
-            let found = state
-                .evals
-                .cases
-                .iter()
-                .find(|existing| {
-                    &existing.case_id == case || existing.name.as_deref() == Some(case)
-                })
-                .ok_or_else(|| not_found(&format!("eval case {case} does not exist")))?;
-            if !cases.contains(&found.case_id) {
-                cases.push(found.case_id.clone());
-            }
-        }
-        if cases.is_empty() {
-            return Err(HubError::Usage(
-                "the eval run selects no cases; add cases to the suite or pass --case".to_owned(),
-            ));
-        }
-        let mut variants = Vec::new();
-        for requested in &request.variants {
-            if !valid_name(&requested.name) {
-                return Err(HubError::Usage(format!(
-                    "invalid variant name {:?}",
-                    requested.name
-                )));
-            }
-            if variants
-                .iter()
-                .any(|variant: &Variant| variant.name == requested.name)
-            {
-                return Err(HubError::Usage(format!(
-                    "variant {} is given twice",
-                    requested.name
-                )));
-            }
-            let mut overrides = Vec::new();
-            for change in &requested.overrides {
-                if !variant::KEYS.iter().any(|(key, _)| *key == change.key) {
-                    return Err(HubError::Usage(format!(
-                        "unknown variant key {:?}; use one of {}",
-                        change.key,
-                        variant::KEYS.map(|(key, _)| key).join(", ")
-                    )));
-                }
-                let file = if variant::is_file_key(&change.key) {
-                    let upload = change.upload.as_ref().ok_or_else(|| {
-                        HubError::Usage(format!(
-                            "variant key {} needs its file uploaded",
-                            change.key
-                        ))
-                    })?;
-                    Some(blobs.put(&upload.name, upload.content.as_bytes())?)
-                } else {
-                    None
-                };
-                overrides.push(Override {
-                    key: change.key.clone(),
-                    value: if file.is_some() {
-                        String::new()
-                    } else {
-                        change.value.clone()
-                    },
-                    file,
-                });
-            }
-            variants.push(Variant {
-                name: requested.name.clone(),
-                overrides,
-            });
-        }
-        let baseline = match request.baseline.as_deref() {
-            Some("none") => Baseline::None,
-            Some(job_id) if job_id.starts_with("hj_") => {
-                if cases.len() != 1 {
-                    return Err(HubError::Usage(
-                        "--baseline JOB compares one case; select exactly one case".to_owned(),
-                    ));
-                }
-                if !state.jobs.iter().any(|job| job.job_id == job_id) {
-                    return Err(HubError::JobNotFound(job_id.to_owned()));
-                }
-                if variants.iter().any(|variant| variant.name == BASELINE) {
-                    return Err(HubError::Usage(format!(
-                        "--baseline JOB names its samples {BASELINE}; rename that variant"
-                    )));
-                }
-                Baseline::Job {
-                    job_id: job_id.to_owned(),
-                }
-            }
-            Some(name) => {
-                if name != BASELINE && !variants.iter().any(|variant| variant.name == name) {
-                    return Err(HubError::Usage(format!(
-                        "--baseline {name} is not a variant of this run; use {BASELINE}, a --variant name, a hub job ID, or none"
-                    )));
-                }
-                Baseline::Variant {
-                    name: name.to_owned(),
-                }
-            }
-            None => Baseline::Variant {
-                name: BASELINE.to_owned(),
-            },
-        };
-        if let Baseline::Variant { name } = &baseline {
-            if name == BASELINE && !variants.iter().any(|variant| variant.name == BASELINE) {
-                variants.insert(
-                    0,
-                    Variant {
-                        name: BASELINE.to_owned(),
-                        overrides: Vec::new(),
-                    },
-                );
-            }
-        }
-        if variants.is_empty() && !matches!(baseline, Baseline::Job { .. }) {
-            variants.push(Variant {
-                name: BASELINE.to_owned(),
-                overrides: Vec::new(),
-            });
-        }
-        let judge = request
-            .judge
-            .as_ref()
-            .map(|judge| -> Result<Judge, HubError> {
-                if judge.mode == JudgeMode::Pairwise && baseline == Baseline::None {
-                    return Err(HubError::Usage(
-                        "a pairwise judge needs a baseline".to_owned(),
-                    ));
-                }
-                Ok(Judge {
-                    kind: judge.kind,
-                    mode: judge.mode,
-                    program: blobs.put(&judge.program.name, judge.program.content.as_bytes())?,
-                    runtime: judge
-                        .runtime
-                        .as_ref()
-                        .map(|runtime| blobs.put(&runtime.name, runtime.content.as_bytes()))
-                        .transpose()?,
-                })
-            })
-            .transpose()?;
+        let cases = select_cases(state, &request)?;
+        let mut variants = plan_variants(&blobs, &request.variants)?;
+        let baseline = plan_baseline(state, request.baseline.as_deref(), &cases, &variants)?;
+        add_implicit_baseline(&baseline, &mut variants);
+        let judge = plan_judge(&blobs, request.judge.as_ref(), &baseline)?;
         for check in &request.checks {
             if !valid_name(&check.name) || check.command.trim().is_empty() {
                 return Err(HubError::Usage(format!("invalid --check {:?}", check.name)));
@@ -607,19 +460,7 @@ impl HubService {
                 strategy: super::super::model::Strategy::default(),
             }
         });
-        let mut samples = Vec::new();
-        for case_id in &cases {
-            if let Baseline::Job { job_id } = &baseline {
-                samples.push(new_sample(case_id, BASELINE, 1, job_id.clone()));
-            }
-            for variant in &variants {
-                for repeat in 1..=request.repeat {
-                    let job_id = sample_job_id(&run_id, case_id, &variant.name, repeat);
-                    samples.push(new_sample(case_id, &variant.name, repeat, job_id));
-                }
-            }
-        }
-        Ok(EvalRun {
+        let mut run = EvalRun {
             run_id,
             key: request.key,
             suite: request.suite,
@@ -633,8 +474,10 @@ impl HubService {
             checks: request.checks,
             prices: request.prices,
             created_at_ms: now_ms(),
-            samples,
-        })
+            samples: Vec::new(),
+        };
+        run.samples = plan_samples(&run);
+        Ok(run)
     }
 
     /// The queued hub job of one sample: the case's request with the variant applied, its
@@ -878,4 +721,207 @@ fn new_sample(case_id: &str, variant: &str, repeat: u32, job_id: String) -> Samp
         judge_job: None,
         error: None,
     }
+}
+
+/// The run's case IDs: the suite's cases, then each `--case` by ID or name, without repeats.
+fn select_cases(state: &HubState, request: &CreateRun) -> Result<Vec<String>, HubError> {
+    let mut cases = Vec::new();
+    if let Some(name) = &request.suite {
+        let suite = state
+            .evals
+            .suites
+            .iter()
+            .find(|suite| &suite.name == name)
+            .ok_or_else(|| not_found(&format!("eval suite {name} does not exist")))?;
+        cases.extend(suite.cases.iter().cloned());
+    }
+    for case in &request.cases {
+        let found = state
+            .evals
+            .cases
+            .iter()
+            .find(|existing| &existing.case_id == case || existing.name.as_deref() == Some(case))
+            .ok_or_else(|| not_found(&format!("eval case {case} does not exist")))?;
+        if !cases.contains(&found.case_id) {
+            cases.push(found.case_id.clone());
+        }
+    }
+    if cases.is_empty() {
+        return Err(HubError::Usage(
+            "the eval run selects no cases; add cases to the suite or pass --case".to_owned(),
+        ));
+    }
+    Ok(cases)
+}
+
+/// Validate the requested variants and store their file overrides.
+fn plan_variants(
+    blobs: &Blobs,
+    requested: &[super::VariantRequest],
+) -> Result<Vec<Variant>, HubError> {
+    let mut variants: Vec<Variant> = Vec::new();
+    for requested in requested {
+        if !valid_name(&requested.name) {
+            return Err(HubError::Usage(format!(
+                "invalid variant name {:?}",
+                requested.name
+            )));
+        }
+        if variants
+            .iter()
+            .any(|variant| variant.name == requested.name)
+        {
+            return Err(HubError::Usage(format!(
+                "variant {} is given twice",
+                requested.name
+            )));
+        }
+        let overrides = requested
+            .overrides
+            .iter()
+            .map(|change| plan_override(blobs, change))
+            .collect::<Result<Vec<_>, _>>()?;
+        variants.push(Variant {
+            name: requested.name.clone(),
+            overrides,
+        });
+    }
+    Ok(variants)
+}
+
+/// Validate one variant override; a file key's upload goes to the blob store.
+fn plan_override(blobs: &Blobs, change: &super::OverrideRequest) -> Result<Override, HubError> {
+    if !variant::KEYS.iter().any(|(key, _)| *key == change.key) {
+        return Err(HubError::Usage(format!(
+            "unknown variant key {:?}; use one of {}",
+            change.key,
+            variant::KEYS.map(|(key, _)| key).join(", ")
+        )));
+    }
+    if !variant::is_file_key(&change.key) {
+        return Ok(Override {
+            key: change.key.clone(),
+            value: change.value.clone(),
+            file: None,
+        });
+    }
+    let upload = change.upload.as_ref().ok_or_else(|| {
+        HubError::Usage(format!(
+            "variant key {} needs its file uploaded",
+            change.key
+        ))
+    })?;
+    Ok(Override {
+        key: change.key.clone(),
+        value: String::new(),
+        file: Some(blobs.put(&upload.name, upload.content.as_bytes())?),
+    })
+}
+
+/// Resolve `--baseline`: none, a hub job, a variant name, or the implicit baseline.
+fn plan_baseline(
+    state: &HubState,
+    requested: Option<&str>,
+    cases: &[String],
+    variants: &[Variant],
+) -> Result<Baseline, HubError> {
+    match requested {
+        Some("none") => Ok(Baseline::None),
+        Some(job_id) if job_id.starts_with("hj_") => {
+            if cases.len() != 1 {
+                return Err(HubError::Usage(
+                    "--baseline JOB compares one case; select exactly one case".to_owned(),
+                ));
+            }
+            if !state.jobs.iter().any(|job| job.job_id == job_id) {
+                return Err(HubError::JobNotFound(job_id.to_owned()));
+            }
+            if variants.iter().any(|variant| variant.name == BASELINE) {
+                return Err(HubError::Usage(format!(
+                    "--baseline JOB names its samples {BASELINE}; rename that variant"
+                )));
+            }
+            Ok(Baseline::Job {
+                job_id: job_id.to_owned(),
+            })
+        }
+        Some(name) => {
+            if name != BASELINE && !variants.iter().any(|variant| variant.name == name) {
+                return Err(HubError::Usage(format!(
+                    "--baseline {name} is not a variant of this run; use {BASELINE}, a --variant name, a hub job ID, or none"
+                )));
+            }
+            Ok(Baseline::Variant {
+                name: name.to_owned(),
+            })
+        }
+        None => Ok(Baseline::Variant {
+            name: BASELINE.to_owned(),
+        }),
+    }
+}
+
+/// Add the unchanged baseline variant when the run compares against it or has no variants.
+fn add_implicit_baseline(baseline: &Baseline, variants: &mut Vec<Variant>) {
+    let has_baseline = variants.iter().any(|variant| variant.name == BASELINE);
+    let compares_baseline =
+        matches!(baseline, Baseline::Variant { name } if name == BASELINE) && !has_baseline;
+    if compares_baseline {
+        variants.insert(
+            0,
+            Variant {
+                name: BASELINE.to_owned(),
+                overrides: Vec::new(),
+            },
+        );
+    }
+    if variants.is_empty() && !matches!(baseline, Baseline::Job { .. }) {
+        variants.push(Variant {
+            name: BASELINE.to_owned(),
+            overrides: Vec::new(),
+        });
+    }
+}
+
+/// Validate the judge against the baseline and store its program and runtime.
+fn plan_judge(
+    blobs: &Blobs,
+    judge: Option<&super::JudgeRequest>,
+    baseline: &Baseline,
+) -> Result<Option<Judge>, HubError> {
+    let Some(judge) = judge else {
+        return Ok(None);
+    };
+    if judge.mode == JudgeMode::Pairwise && *baseline == Baseline::None {
+        return Err(HubError::Usage(
+            "a pairwise judge needs a baseline".to_owned(),
+        ));
+    }
+    Ok(Some(Judge {
+        kind: judge.kind,
+        mode: judge.mode,
+        program: blobs.put(&judge.program.name, judge.program.content.as_bytes())?,
+        runtime: judge
+            .runtime
+            .as_ref()
+            .map(|runtime| blobs.put(&runtime.name, runtime.content.as_bytes()))
+            .transpose()?,
+    }))
+}
+
+/// One sample per case, variant, and repeat; a job baseline adds one sample per case.
+fn plan_samples(run: &EvalRun) -> Vec<Sample> {
+    let mut samples = Vec::new();
+    for case_id in &run.cases {
+        if let Baseline::Job { job_id } = &run.baseline {
+            samples.push(new_sample(case_id, BASELINE, 1, job_id.clone()));
+        }
+        for variant in &run.variants {
+            for repeat in 1..=run.repeat {
+                let job_id = sample_job_id(&run.run_id, case_id, &variant.name, repeat);
+                samples.push(new_sample(case_id, &variant.name, repeat, job_id));
+            }
+        }
+    }
+    samples
 }

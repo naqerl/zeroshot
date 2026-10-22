@@ -238,17 +238,94 @@ pub(crate) async fn execute(
     command: HubCommand,
     output: &mut impl Write,
 ) -> Result<i32, HubError> {
-    let document = match command {
+    match command {
+        HubCommand::Submit(request) => submit(client, *request, output).await,
+        HubCommand::Eval(command) => super::eval::client::execute(client, command, output).await,
+        HubCommand::Watch { .. }
+        | HubCommand::Logs(_)
+        | HubCommand::Attach { .. }
+        | HubCommand::ForceStop { .. } => stream_command(client, command).await,
+        HubCommand::Daemon(_)
+        | HubCommand::Install(_)
+        | HubCommand::Uninstall(_)
+        | HubCommand::Context(_) => Err(local_only()),
+        command => {
+            let document = request_document(client, command).await?;
+            write_json(output, &document)?;
+            Ok(0)
+        }
+    }
+}
+
+fn local_only() -> HubError {
+    HubError::Usage("this hub command runs on this machine, not through a hub context".to_owned())
+}
+
+/// Follow one placed job's event, log, attach, or force-stop stream.
+async fn stream_command(client: &HubClient, command: HubCommand) -> Result<i32, HubError> {
+    let (job, request) = match command {
+        HubCommand::Watch { job, after } => (job, StreamRequest::Watch { after }),
+        HubCommand::Logs(logs) => (
+            logs.job,
+            StreamRequest::Logs {
+                after: logs.after,
+                execution: logs.execution,
+            },
+        ),
+        HubCommand::Attach { job, execution } => (job, StreamRequest::Attach { execution }),
+        HubCommand::ForceStop { job } => (job, StreamRequest::ForceStop),
+        _ => return Err(local_only()),
+    };
+    client.stream(&job, &request).await
+}
+
+/// Send one request/response hub command and return its JSON document.
+async fn request_document(client: &HubClient, command: HubCommand) -> Result<Value, HubError> {
+    match command {
         HubCommand::DaemonStatus => {
             let heartbeat = client.get(&["v1", "hub", "daemon"]).await?;
-            json!({
+            Ok(json!({
                 "schema": "zeroshot.hub.daemon-status/v1",
                 "context": client.context,
                 "url": client.url,
                 "reachable": true,
                 "daemon": heartbeat,
-            })
+            }))
         }
+        HubCommand::Add(_)
+        | HubCommand::Update(_)
+        | HubCommand::Remove { .. }
+        | HubCommand::List { .. } => member_document(client, command).await,
+        HubCommand::Enqueue(request) => enqueue(client, *request).await,
+        HubCommand::Ps(HubPs {
+            state,
+            target,
+            labels,
+            limit,
+        }) => {
+            let query = JobQuery {
+                state,
+                target,
+                labels,
+                limit,
+            };
+            client.post(&["v1", "hub", "jobs", "query"], &query).await
+        }
+        HubCommand::Status { job } => client.get(&["v1", "hub", "jobs", &job]).await,
+        HubCommand::Dequeue { job } => {
+            client
+                .call(Method::DELETE, &["v1", "hub", "jobs", &job], None::<&Value>)
+                .await
+        }
+        HubCommand::Dispatch => client.post(&["v1", "hub", "dispatch"], &json!({})).await,
+        HubCommand::Stats(request) => client.post(&["v1", "hub", "stats"], &stats(request)?).await,
+        _ => Err(local_only()),
+    }
+}
+
+/// Add, update, remove, or list hub members.
+async fn member_document(client: &HubClient, command: HubCommand) -> Result<Value, HubError> {
+    match command {
         HubCommand::Add(request) => {
             let body = AddMember {
                 name: request.name,
@@ -256,7 +333,7 @@ pub(crate) async fn execute(
                 slots: request.slots,
                 priority: request.priority,
             };
-            client.post(&["v1", "hub", "members"], &body).await?
+            client.post(&["v1", "hub", "members"], &body).await
         }
         HubCommand::Update(request) => {
             let body = UpdateMember {
@@ -272,7 +349,7 @@ pub(crate) async fn execute(
                     &["v1", "hub", "members", &request.name],
                     Some(&body),
                 )
-                .await?
+                .await
         }
         HubCommand::Remove { name } => {
             client
@@ -281,7 +358,7 @@ pub(crate) async fn execute(
                     &["v1", "hub", "members", &name],
                     None::<&Value>,
                 )
-                .await?
+                .await
         }
         HubCommand::List { tags, probe } => {
             client
@@ -289,68 +366,10 @@ pub(crate) async fn execute(
                     &["v1", "hub", "members", "query"],
                     &MemberQuery { tags, probe },
                 )
-                .await?
+                .await
         }
-        HubCommand::Submit(request) => return submit(client, *request, output).await,
-        HubCommand::Enqueue(request) => enqueue(client, *request).await?,
-        HubCommand::Ps(HubPs {
-            state,
-            target,
-            labels,
-            limit,
-        }) => {
-            let query = JobQuery {
-                state,
-                target,
-                labels,
-                limit,
-            };
-            client.post(&["v1", "hub", "jobs", "query"], &query).await?
-        }
-        HubCommand::Status { job } => client.get(&["v1", "hub", "jobs", &job]).await?,
-        HubCommand::Dequeue { job } => {
-            client
-                .call(Method::DELETE, &["v1", "hub", "jobs", &job], None::<&Value>)
-                .await?
-        }
-        HubCommand::Dispatch => client.post(&["v1", "hub", "dispatch"], &json!({})).await?,
-        HubCommand::Stats(request) => {
-            client
-                .post(&["v1", "hub", "stats"], &stats(request)?)
-                .await?
-        }
-        HubCommand::Watch { job, after } => {
-            return client.stream(&job, &StreamRequest::Watch { after }).await;
-        }
-        HubCommand::Logs(logs) => {
-            let request = StreamRequest::Logs {
-                after: logs.after,
-                execution: logs.execution,
-            };
-            return client.stream(&logs.job, &request).await;
-        }
-        HubCommand::Attach { job, execution } => {
-            return client
-                .stream(&job, &StreamRequest::Attach { execution })
-                .await;
-        }
-        HubCommand::ForceStop { job } => {
-            return client.stream(&job, &StreamRequest::ForceStop).await;
-        }
-        HubCommand::Eval(command) => {
-            return super::eval::client::execute(client, command, output).await;
-        }
-        HubCommand::Daemon(_)
-        | HubCommand::Install(_)
-        | HubCommand::Uninstall(_)
-        | HubCommand::Context(_) => {
-            return Err(HubError::Usage(
-                "this hub command runs on this machine, not through a hub context".to_owned(),
-            ));
-        }
-    };
-    write_json(output, &document)?;
-    Ok(0)
+        _ => Err(local_only()),
+    }
 }
 
 /// Read the files a job's run arguments name, relative to the job's invoking folder, so a

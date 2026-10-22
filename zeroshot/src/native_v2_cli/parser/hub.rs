@@ -571,82 +571,108 @@ pub(super) struct HubStatsArgs {
 
 impl HubCliCommand {
     pub(super) fn into_command(self) -> Result<HubCommand, NativeV2CliError> {
-        Ok(match self {
-            Self::Add(args) => HubCommand::Add(HubMemberAdd {
+        match self {
+            Self::Add(args) => add_command(args),
+            Self::Update(args) => update_command(args),
+            Self::Remove(args) => Ok(HubCommand::Remove {
                 name: member_name(args.name)?,
-                tags: tags(args.tag)?,
-                slots: args.slots,
-                priority: args.priority,
             }),
-            Self::Update(args) => HubCommand::Update(HubMemberUpdate {
-                name: member_name(args.name)?,
-                add_tags: tags(args.add_tag)?,
-                remove_tags: tags(args.remove_tag)?,
-                slots: args.slots,
-                priority: args.priority,
-                state: args.state.map(HubStateArg::into_state),
-            }),
-            Self::Remove(args) => HubCommand::Remove {
-                name: member_name(args.name)?,
-            },
-            Self::List(args) => HubCommand::List {
+            Self::List(args) => Ok(HubCommand::List {
                 tags: tags(args.tag)?,
                 probe: !args.no_probe,
-            },
-            Self::Submit(args) => HubCommand::Submit(Box::new(args.into_submit()?)),
-            Self::Enqueue(args) => HubCommand::Enqueue(Box::new(args.into_enqueue()?)),
-            Self::Ps(args) => HubCommand::Ps(HubPs {
-                state: args.state,
-                target: args.target,
-                labels: labels(args.label)?,
-                limit: args.limit,
             }),
-            Self::Status(args) => HubCommand::Status { job: args.job },
-            Self::Watch(args) => HubCommand::Watch {
+            Self::Submit(args) => Ok(HubCommand::Submit(Box::new(args.into_submit()?))),
+            Self::Enqueue(args) => Ok(HubCommand::Enqueue(Box::new(args.into_enqueue()?))),
+            Self::Ps(args) => ps_command(args),
+            Self::Status(args) => Ok(HubCommand::Status { job: args.job }),
+            Self::Watch(args) => Ok(HubCommand::Watch {
                 job: args.job,
                 after: args.after,
-            },
-            Self::Logs(args) => HubCommand::Logs(HubLogs {
+            }),
+            Self::Logs(args) => Ok(HubCommand::Logs(HubLogs {
                 job: args.job,
                 after: args.after,
                 execution: args.execution,
-            }),
-            Self::Attach(args) => HubCommand::Attach {
+            })),
+            Self::Attach(args) => Ok(HubCommand::Attach {
                 job: args.job,
                 execution: args.execution,
-            },
-            Self::ForceStop(args) => HubCommand::ForceStop { job: args.job },
-            Self::Dequeue(args) => HubCommand::Dequeue { job: args.job },
-            Self::Dispatch => HubCommand::Dispatch,
-            Self::Stats(args) => HubCommand::Stats(HubStats {
-                by: args.by,
-                since: args.since,
-                until: args.until,
-                prices: args.prices,
             }),
-            Self::Daemon(HubDaemonCommand::Run(args)) => HubCommand::Daemon(HubDaemonRun {
-                interval: args.interval,
-                api: args.api.into_options()?,
-            }),
-            Self::Daemon(HubDaemonCommand::Status) => HubCommand::DaemonStatus,
-            Self::Context(command) => HubCommand::Context(command.into_command()?),
-            Self::Install(args) => HubCommand::Install(HubInstall {
-                manager: manager(args.systemd),
-                system: args.system,
-                image: args.image,
-                volumes: args.volume,
-                interval: args.interval,
-                api: args.api.into_options()?,
-                dry_run: args.dry_run,
-            }),
-            Self::Uninstall(args) => HubCommand::Uninstall(HubUninstall {
+            Self::ForceStop(args) => Ok(HubCommand::ForceStop { job: args.job }),
+            Self::Dequeue(args) => Ok(HubCommand::Dequeue { job: args.job }),
+            Self::Dispatch => Ok(HubCommand::Dispatch),
+            Self::Stats(args) => Ok(stats_command(args)),
+            Self::Daemon(command) => daemon_command(command),
+            Self::Context(command) => Ok(HubCommand::Context(command.into_command()?)),
+            Self::Install(args) => install_command(args),
+            Self::Uninstall(args) => Ok(HubCommand::Uninstall(HubUninstall {
                 manager: manager(args.systemd),
                 system: args.system,
                 dry_run: args.dry_run,
-            }),
-            Self::Eval(command) => HubCommand::Eval(command.into_command()?),
-        })
+            })),
+            Self::Eval(command) => Ok(HubCommand::Eval(command.into_command()?)),
+        }
     }
+}
+
+fn add_command(args: HubAddArgs) -> Result<HubCommand, NativeV2CliError> {
+    Ok(HubCommand::Add(HubMemberAdd {
+        name: member_name(args.name)?,
+        tags: tags(args.tag)?,
+        slots: args.slots,
+        priority: args.priority,
+    }))
+}
+
+fn update_command(args: HubUpdateArgs) -> Result<HubCommand, NativeV2CliError> {
+    Ok(HubCommand::Update(HubMemberUpdate {
+        name: member_name(args.name)?,
+        add_tags: tags(args.add_tag)?,
+        remove_tags: tags(args.remove_tag)?,
+        slots: args.slots,
+        priority: args.priority,
+        state: args.state.map(HubStateArg::into_state),
+    }))
+}
+
+fn ps_command(args: HubPsArgs) -> Result<HubCommand, NativeV2CliError> {
+    Ok(HubCommand::Ps(HubPs {
+        state: args.state,
+        target: args.target,
+        labels: labels(args.label)?,
+        limit: args.limit,
+    }))
+}
+
+fn stats_command(args: HubStatsArgs) -> HubCommand {
+    HubCommand::Stats(HubStats {
+        by: args.by,
+        since: args.since,
+        until: args.until,
+        prices: args.prices,
+    })
+}
+
+fn daemon_command(command: HubDaemonCommand) -> Result<HubCommand, NativeV2CliError> {
+    Ok(match command {
+        HubDaemonCommand::Run(args) => HubCommand::Daemon(HubDaemonRun {
+            interval: args.interval,
+            api: args.api.into_options()?,
+        }),
+        HubDaemonCommand::Status => HubCommand::DaemonStatus,
+    })
+}
+
+fn install_command(args: HubInstallArgs) -> Result<HubCommand, NativeV2CliError> {
+    Ok(HubCommand::Install(HubInstall {
+        manager: manager(args.systemd),
+        system: args.system,
+        image: args.image,
+        volumes: args.volume,
+        interval: args.interval,
+        api: args.api.into_options()?,
+        dry_run: args.dry_run,
+    }))
 }
 
 impl HubContextCliCommand {
