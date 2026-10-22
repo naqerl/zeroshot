@@ -564,6 +564,8 @@ async fn the_daemon_refuses_bad_options_before_serving() {
     drop(held);
 }
 
+/// Service installs read `HOME` and the user, which Windows does not provide.
+#[cfg(unix)]
 #[test]
 fn install_env_reads_this_shells_facts() {
     let directory = tempfile::tempdir().expect("tempdir");
@@ -610,8 +612,13 @@ async fn install_and_uninstall_print_plans_on_dry_runs() {
         assert_eq!(document["manager"], json!(name));
         assert_eq!(document["dryRun"], json!(true));
         let steps = document["steps"].to_string();
+        // The relative token file is resolved against the invoking folder. Windows paths are
+        // escaped once more inside unit files, so compare the unescaped form only on Unix.
         let token = std::env::current_dir().expect("cwd").join("relative-token");
-        assert!(steps.contains(&*token.to_string_lossy()), "{steps}");
+        if cfg!(unix) {
+            assert!(steps.contains(&*token.to_string_lossy()), "{steps}");
+        }
+        assert!(steps.contains("relative-token"), "{steps}");
         assert!(document.get("results").is_none());
 
         let mut output = Vec::new();
