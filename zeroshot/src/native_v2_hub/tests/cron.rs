@@ -135,3 +135,96 @@ fn fire_due_queues_one_job_per_due_schedule_and_advances() {
     assert_eq!(state.jobs.len(), 3);
     assert_eq!(state.schedules[2].fired, 0, "removed schedules never fire");
 }
+
+fn git(folder: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=hub",
+            "-c",
+            "user.email=hub@example.invalid",
+        ])
+        .args(["-c", "commit.gpgsign=false"])
+        .args(args)
+        .current_dir(folder)
+        .output()
+        .expect("git");
+    assert!(output.status.success(), "git {args:?}: {output:?}");
+    String::from_utf8(output.stdout)
+        .expect("utf8")
+        .trim()
+        .to_owned()
+}
+
+#[test]
+fn fires_repin_to_the_working_folder_head_when_it_exists_here() {
+    let folder = tempfile::tempdir().expect("folder");
+    git(folder.path(), &["init", "-q"]);
+    git(
+        folder.path(),
+        &["commit", "-q", "--allow-empty", "-m", "first"],
+    );
+    let first = git(folder.path(), &["rev-parse", "HEAD"]);
+
+    let now = at("2026-10-20T10:07:00Z");
+    let mut here = schedule("hs_here", now);
+    here.template.pinned_revision = Some("0".repeat(40));
+    here.repin_from = Some(folder.path().to_path_buf());
+    let mut elsewhere = schedule("hs_elsewhere", now);
+    elsewhere.template.pinned_revision = Some("1".repeat(40));
+    elsewhere.repin_from = Some(folder.path().join("absent"));
+    let mut state = HubState {
+        schedules: vec![here, elsewhere],
+        ..HubState::default()
+    };
+    assert_eq!(fire_due(&mut state, now).len(), 2);
+    assert_eq!(
+        state.jobs[0].pinned_revision.as_deref(),
+        Some(first.as_str())
+    );
+    assert!(
+        state.jobs[0].requirements.remote_unsupported.is_some(),
+        "a commit on no remote branch cannot run remotely"
+    );
+    assert_eq!(
+        state.jobs[1].pinned_revision.as_deref(),
+        Some("1".repeat(40).as_str()),
+        "a folder this host lacks keeps the accepted pin"
+    );
+
+    git(
+        folder.path(),
+        &["commit", "-q", "--allow-empty", "-m", "second"],
+    );
+    let second = git(folder.path(), &["rev-parse", "HEAD"]);
+    for job in &mut state.jobs {
+        job.state = JobState::Succeeded;
+    }
+    fire_due(&mut state, at("2026-10-20T10:15:00Z"));
+    assert_eq!(
+        state.jobs[2].pinned_revision.as_deref(),
+        Some(second.as_str())
+    );
+}
+
+#[test]
+fn schedule_views_name_times_in_utc_and_the_schedule_zone() {
+    let mut fired = schedule("hs_view", at("2026-10-25T08:00:00Z"));
+    fired.timezone = "Europe/Belgrade".to_owned();
+    fired.last_fired_ms = Some(at("2026-10-25T07:45:00Z"));
+    fired.last_job_id = Some("hj_last".to_owned());
+    fired.fired = 4;
+    let view = fired.view();
+    assert_eq!(view["scheduleId"], "hs_view");
+    assert_eq!(view["cron"], "*/15 * * * *");
+    assert_eq!(view["nextFireAt"], "2026-10-25T08:00:00Z");
+    assert_eq!(
+        view["nextFireLocal"],
+        "2026-10-25T09:00:00+01:00[Europe/Belgrade]"
+    );
+    assert_eq!(view["lastFiredAt"], "2026-10-25T07:45:00Z");
+    assert_eq!(view["lastJobId"], "hj_last");
+    assert_eq!(view["fired"], 4);
+    assert_eq!(view["expiresAfterMs"], 60_000);
+    assert!(view["removedAt"].is_null());
+}

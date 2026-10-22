@@ -971,3 +971,95 @@ fn materialized_blobs_are_replaced_atomically_and_never_rewritten_in_place() {
         .collect();
     assert_eq!(names, vec![std::ffi::OsString::from("judge.sh")]);
 }
+
+#[test]
+fn judge_text_is_cut_on_character_boundaries() {
+    use super::super::eval::judge::{tail, truncate};
+    assert_eq!(truncate("short", 10), "short");
+    assert_eq!(
+        truncate("ab\u{e9}cd", 3),
+        "ab…",
+        "never split the two-byte é"
+    );
+    assert_eq!(truncate("abcdef", 4), "abcd…");
+    assert_eq!(tail("short", 10), "short");
+    assert_eq!(tail("ab\u{e9}cd", 3), "…cd", "never split the two-byte é");
+    assert_eq!(tail("abcdef", 2), "…ef");
+}
+
+#[tokio::test]
+async fn host_commands_report_programs_that_cannot_start_or_finish() {
+    use super::super::eval::judge::HostCommand;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let absent = directory.path().join("absent-judge");
+    let finished = HostCommand {
+        program: &absent,
+        arguments: &[],
+        cwd: directory.path(),
+        env: &[],
+    }
+    .run(b"{}", std::time::Duration::from_secs(5))
+    .await;
+    assert_eq!(finished.exit_code, None);
+    assert!(
+        finished.stderr.contains("absent-judge could not start"),
+        "{}",
+        finished.stderr
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let slow = directory.path().join("slow.sh");
+        std::fs::write(&slow, "#!/bin/sh\nexec sleep 30\n").expect("script");
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let started = std::time::Instant::now();
+        let finished = HostCommand {
+            program: &slow,
+            arguments: &[],
+            cwd: directory.path(),
+            env: &[],
+        }
+        .run(b"", std::time::Duration::from_millis(200))
+        .await;
+        assert_eq!(finished.exit_code, None);
+        assert_eq!(finished.stderr, "timed out after 0s");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+}
+
+/// A program still open for writing cannot be executed (`ETXTBSY`); the judge retries briefly
+/// and then reports the failure instead of hanging.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn host_commands_retry_then_report_a_program_held_open_for_writing() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::super::eval::judge::HostCommand;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let busy = directory.path().join("busy.sh");
+    let mut writer = std::fs::File::create(&busy).expect("create");
+    writer.write_all(b"#!/bin/sh\necho never\n").expect("write");
+    std::fs::set_permissions(&busy, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let started = std::time::Instant::now();
+    let finished = HostCommand {
+        program: &busy,
+        arguments: &[],
+        cwd: directory.path(),
+        env: &[],
+    }
+    .run(b"", std::time::Duration::from_secs(5))
+    .await;
+    assert_eq!(finished.exit_code, None);
+    assert!(
+        finished.stderr.contains("could not start"),
+        "{}",
+        finished.stderr
+    );
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(150),
+        "busy programs are retried before giving up"
+    );
+    drop(writer);
+}

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::json;
@@ -498,7 +498,6 @@ async fn the_daemon_serves_the_api_dispatches_and_stops_on_shutdown() {
 async fn the_daemon_refuses_bad_options_before_serving() {
     use zeroshot_engine::native_v2_cli::hub::HubDaemonRun;
     let directory = tempfile::tempdir().expect("tempdir");
-    let store = HubStore::new(directory.path().join("hub"));
     let registry = directory.path().join("targets.json");
     let open = |store| {
         HubService::open(
@@ -516,8 +515,12 @@ async fn the_daemon_refuses_bad_options_before_serving() {
             metrics_labels: Vec::new(),
         },
     };
+    // Each refusal gets its own hub folder: a just-released daemon lock can stay held for a
+    // moment by a child another test is forking.
+    let runs = std::sync::atomic::AtomicUsize::new(0);
     let run = |options: HubDaemonRun| {
-        let store = store.clone();
+        let next = runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let store = HubStore::new(directory.path().join(format!("hub-{next}")));
         async move {
             let daemon = super::super::daemon::Daemon {
                 store,
@@ -550,7 +553,10 @@ async fn the_daemon_refuses_bad_options_before_serving() {
         .await
         .expect_err("empty token");
     assert!(empty.to_string().contains("is empty"), "{empty}");
-    let held = store.try_daemon_lock().expect("lock").expect("held");
+    let held = HubStore::new(directory.path().join("hub-4"))
+        .try_daemon_lock()
+        .expect("lock")
+        .expect("held");
     let owned = run(options("1s", "127.0.0.1:0", None))
         .await
         .expect_err("owned");
@@ -706,4 +712,115 @@ async fn install_steps_apply_in_order_and_stop_at_a_required_failure() {
         Some(1),
         "later steps never run"
     );
+}
+
+#[test]
+fn the_store_refuses_malformed_state_and_defaults_beside_the_registry() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = HubStore::new(directory.path().join("hub"));
+    let lock = store.lock().expect("lock");
+    assert!(
+        store.load(&lock).expect("absent state").jobs.is_empty(),
+        "a fresh hub folder starts empty"
+    );
+    std::fs::write(
+        directory.path().join("hub").join("state.json"),
+        b"{not json",
+    )
+    .expect("write");
+    let error = store.load(&lock).expect_err("malformed state").to_string();
+    assert!(error.contains("state.json is malformed"), "{error}");
+    std::fs::write(directory.path().join("hub").join("daemon.json"), b"[").expect("write");
+    assert!(
+        store.heartbeat().is_none(),
+        "a torn heartbeat reads as none"
+    );
+    drop(lock);
+
+    if std::env::var_os("ZEROSHOT_HUB_DIR").is_none() {
+        assert_eq!(
+            HubStore::default_directory(Path::new("/srv/zeroshot/targets.json")),
+            Path::new("/srv/zeroshot/hub")
+        );
+        assert_eq!(HubStore::default_directory(Path::new("")), Path::new("hub"));
+    }
+}
+
+#[tokio::test]
+async fn the_daemon_reports_failing_passes_and_keeps_serving() {
+    use zeroshot_engine::native_v2_cli::hub::HubDaemonRun;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = HubStore::new(directory.path().join("hub"));
+    let registry = directory.path().join("targets.json");
+    let staged = directory.path().join("hub").join("state.json.tmp");
+    // A queued job past its expiry makes the first pass change, and so save, the state.
+    let mut expired = job("hj_expired", 0);
+    expired.expires_at_ms = Some(1);
+    let seeded = HubState {
+        jobs: vec![expired],
+        ..HubState::default()
+    };
+    store
+        .save(&store.lock().expect("lock"), &seeded)
+        .expect("seed");
+    let open = |store| {
+        let service = HubService::open(
+            store,
+            Arc::new(FakeDriver::default()),
+            FileTargetRegistry::new(registry.clone()),
+        )?;
+        // Every later save fails: the staging file it writes is a folder.
+        std::fs::create_dir(&staged).expect("block staging");
+        Ok(service)
+    };
+    let options = HubDaemonRun {
+        interval: "1s".to_owned(),
+        api: HubApiOptions {
+            listen: Some("127.0.0.1:0".to_owned()),
+            token_file: Some(directory.path().join("token")),
+            metrics_listen: None,
+            metrics_labels: Vec::new(),
+        },
+    };
+    let mut output = Vec::new();
+    let daemon = super::super::daemon::Daemon {
+        store: store.clone(),
+        options: &options,
+        output: &mut output,
+    };
+    super::super::daemon::run_until(daemon, open, async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    })
+    .await
+    .expect("a failing pass does not stop the daemon");
+    let lines = String::from_utf8(output)
+        .expect("utf8")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
+        .collect::<Vec<_>>();
+    assert_eq!(lines.first().expect("started")["event"], json!("started"));
+    assert!(lines.first().expect("started")["metricsListen"].is_null());
+    let failures = lines
+        .iter()
+        .filter(|line| line.to_string().contains("state could not be staged"))
+        .count();
+    assert_eq!(
+        failures, 2,
+        "the dispatch and the eval pass both report: {lines:?}"
+    );
+    let stopped = lines.last().expect("stopped");
+    assert_eq!(stopped["event"], json!("stopped"));
+    assert!(
+        stopped["lastError"]
+            .as_str()
+            .is_some_and(|error| error.contains("could not be staged")),
+        "{stopped}"
+    );
+}
+
+#[test]
+fn an_unreadable_token_file_is_a_storage_error() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let error = load_or_create_token(directory.path()).expect_err("a folder is no token file");
+    assert!(error.to_string().contains("could not be read"), "{error}");
 }
