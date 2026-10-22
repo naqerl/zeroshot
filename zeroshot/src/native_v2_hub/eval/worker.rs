@@ -592,18 +592,18 @@ fn pretty(value: &Value) -> Vec<u8> {
     bytes
 }
 
+#[cfg(unix)]
 fn make_executable(path: &Path) -> Result<(), HubError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
-            |error| {
-                HubError::storage(
-                    &format!("{} could not be made executable", path.display()),
-                    error,
-                )
-            },
-        )?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|error| {
+        HubError::storage(
+            &format!("{} could not be made executable", path.display()),
+            error,
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> Result<(), HubError> {
     Ok(())
 }

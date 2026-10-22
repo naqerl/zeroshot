@@ -302,7 +302,11 @@ async fn remote_client_drives_the_hub_and_replays_errors() {
     // The client's input file was uploaded and the run now reads the hub's copy.
     let state = hub.service.snapshot().await;
     let spooled = &state.jobs[0].run_args[3];
-    assert!(spooled.contains("/hub/spool/"), "{spooled}");
+    let spool = hub.directory.path().join("hub").join("spool");
+    assert!(
+        std::path::Path::new(spooled).starts_with(&spool),
+        "{spooled}"
+    );
     assert_eq!(
         std::fs::read_to_string(spooled).expect("spooled input"),
         "{\"task\":\"remote\"}"

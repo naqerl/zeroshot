@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 use zeroshot_engine::native_v2_cli::hub::{
-    HubCommand, HubEvalCaseAdd, HubEvalCaseSource, HubEvalCommand, HubEvalReport, HubEvalRun,
-    HubEvalVariant, HubJobSpec, HubJudgeMode, HubMemberAdd, HubStrategy,
+    HubCommand, HubEvalCaseAdd, HubEvalCaseSource, HubEvalCommand, HubEvalRun, HubEvalVariant,
+    HubJobSpec, HubJudgeMode, HubMemberAdd, HubStrategy,
 };
 
 use super::super::api::{ApiState, router};
@@ -13,7 +13,11 @@ use super::super::client::{HubClient, execute};
 use super::super::context::{Resolved, TokenRef};
 use super::super::error::HubError;
 use super::super::eval::client::report_exit_code;
-use super::super::eval::judge::{HostCommand, parse_reply, parse_verdict};
+use super::super::eval::judge::{parse_reply, parse_verdict};
+#[cfg(unix)]
+use super::super::eval::judge::HostCommand;
+#[cfg(unix)]
+use zeroshot_engine::native_v2_cli::hub::HubEvalReport;
 use super::super::eval::report::{Against, Thresholds, report, stat};
 use super::super::eval::variant::{Change, Material, Request, merge_patch};
 use super::super::eval::{
@@ -203,6 +207,8 @@ fn judge_replies_are_validated_against_the_mode() {
     );
 }
 
+// The judge is a POSIX shell script.
+#[cfg(unix)]
 #[tokio::test]
 async fn host_commands_get_the_request_on_stdin_and_the_eval_environment() {
     let directory = tempfile::tempdir().expect("tempdir");
@@ -501,6 +507,7 @@ struct Hub {
     directory: tempfile::TempDir,
 }
 
+#[cfg(unix)]
 async fn hub() -> Hub {
     hub_with(FakeDriver::default()).await
 }
@@ -558,6 +565,8 @@ fn write(path: &Path, value: &Value) {
     std::fs::write(path, serde_json::to_vec(value).expect("json")).expect("write");
 }
 
+// The judge is a POSIX shell script.
+#[cfg(unix)]
 #[tokio::test]
 async fn eval_runs_baseline_and_variant_through_the_hub_and_reports_deltas() {
     let hub = hub().await;
