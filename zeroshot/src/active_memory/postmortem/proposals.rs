@@ -32,6 +32,27 @@ impl<'a> From<&'a BuiltinPostmortemConfig> for LessonContext<'a> {
     }
 }
 
+/// Only validation stages and host-owned field names enter diagnostics, never proposal text.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum ProposalRejection {
+    #[error("invalid output shape or serialized size")]
+    Output,
+    #[error("incomplete or invalid maintenance reconciliation")]
+    Maintenance,
+    #[error("disabled scope or unknown executed node")]
+    Node,
+    #[error("invalid evidence references")]
+    References,
+    #[error("cited references do not prove the required main-run cost for this node")]
+    Cost,
+    #[error("current repository source does not verify the proposed associations")]
+    Source,
+    #[error("invalid lesson scope")]
+    Scope,
+    #[error("invalid lesson card: {0}")]
+    Card(crate::active_memory::ActiveMemoryError),
+}
+
 pub(super) struct ProposalContext<'a> {
     config: LessonContext<'a>,
     request: MainRunFacts<'a>,
@@ -180,14 +201,19 @@ impl<'a> ProposalContext<'a> {
         role: Role,
         input: &Value,
         output: Value,
-    ) -> Result<Vec<LessonMutation>, ()> {
-        if serde_json::to_vec(&output).map_err(|_| ())?.len() > MAX_STORE_BYTES {
-            return Err(());
+    ) -> Result<Vec<LessonMutation>, ProposalRejection> {
+        if serde_json::to_vec(&output)
+            .map_err(|_| ProposalRejection::Output)?
+            .len()
+            > MAX_STORE_BYTES
+        {
+            return Err(ProposalRejection::Output);
         }
         if role.is_maintenance() {
             return self.maintenance_mutations(role, input, output);
         }
-        let output: DiscoveryOutput = serde_json::from_value(output).map_err(|_| ())?;
+        let output: DiscoveryOutput =
+            serde_json::from_value(output).map_err(|_| ProposalRejection::Output)?;
         let mutations = output
             .lessons
             .into_iter()
@@ -214,34 +240,40 @@ impl<'a> ProposalContext<'a> {
         role: Role,
         input: &Value,
         output: Value,
-    ) -> Result<Vec<LessonMutation>, ()> {
-        let output: MaintenanceOutput = serde_json::from_value(output).map_err(|_| ())?;
+    ) -> Result<Vec<LessonMutation>, ProposalRejection> {
+        let output: MaintenanceOutput =
+            serde_json::from_value(output).map_err(|_| ProposalRejection::Output)?;
         let mut pending = input["supplied_lessons"]
             .as_object()
-            .ok_or(())?
+            .ok_or(ProposalRejection::Maintenance)?
             .keys()
             .cloned()
             .collect::<BTreeSet<_>>();
         let mut mutations = Vec::new();
         for decision in output.decisions {
             if !pending.remove(&decision.id) {
-                return Err(());
+                return Err(ProposalRejection::Maintenance);
             }
             if let Some(mutation) = self.maintenance(role, decision)? {
                 mutations.push(mutation);
             }
         }
         if !pending.is_empty() {
-            return Err(());
+            return Err(ProposalRejection::Maintenance);
         }
         Ok(mutations)
     }
 
-    fn discovery(&self, role: Role, candidate: Candidate) -> Result<LessonMutation, ()> {
+    fn discovery(
+        &self,
+        role: Role,
+        candidate: Candidate,
+    ) -> Result<LessonMutation, ProposalRejection> {
         if !self.role_enabled(role) || !self.actual_nodes.contains(&candidate.node_id) {
-            return Err(());
+            return Err(ProposalRejection::Node);
         }
-        self.references(&candidate.references)?;
+        self.references(&candidate.references)
+            .map_err(|()| ProposalRejection::References)?;
         if !self
             .evidence
             .impact
@@ -249,14 +281,19 @@ impl<'a> ProposalContext<'a> {
             .get(&candidate.node_id)
             .is_some_and(|episode| episode.allows(role, &candidate.references))
         {
-            return Err(());
+            return Err(ProposalRejection::Cost);
         }
         if role == Role::Repository {
-            self.repository_discovery_source(&candidate)?;
+            self.repository_discovery_source(&candidate)
+                .map_err(|()| ProposalRejection::Source)?;
         }
-        let scope = canonical_scope(&self.discovery_scope(role, &candidate)?);
-        let encoded =
-            serde_json::to_vec(&(&scope, normalize(&candidate.recommendation))).map_err(|_| ())?;
+        let scope = canonical_scope(
+            &self
+                .discovery_scope(role, &candidate)
+                .map_err(|()| ProposalRejection::Scope)?,
+        );
+        let encoded = serde_json::to_vec(&(&scope, normalize(&candidate.recommendation)))
+            .map_err(|_| ProposalRejection::Output)?;
         let digest = Sha256::digest(encoded);
         let draft = LessonDraft {
             id: format!("lesson-{:x}", digest),
@@ -270,7 +307,7 @@ impl<'a> ProposalContext<'a> {
                 costly_recurring_reason: candidate.costly_recurring_reason,
             },
         };
-        draft.validate().map_err(|_| ())?;
+        validate_advice(&draft).map_err(ProposalRejection::Card)?;
         Ok(LessonMutation::Upsert {
             expected_revision: None,
             draft: Box::new(draft),
@@ -308,16 +345,21 @@ impl<'a> ProposalContext<'a> {
         &self,
         role: Role,
         decision: MaintenanceDecision,
-    ) -> Result<Option<LessonMutation>, ()> {
+    ) -> Result<Option<LessonMutation>, ProposalRejection> {
         if self.supplied.is_none() {
-            return Err(());
+            return Err(ProposalRejection::Maintenance);
         }
-        let original = self.supplied_lessons.get(&decision.id).ok_or(())?;
-        if original.revision != decision.revision
+        let original = self
+            .supplied_lessons
+            .get(&decision.id)
+            .ok_or(ProposalRejection::Maintenance)?;
+        if decision
+            .legacy_revision
+            .is_some_and(|revision| revision != original.revision)
             || !role.accepts_scope(&original.scope)
             || !self.scope_enabled(&original.scope)
         {
-            return Err(());
+            return Err(ProposalRejection::Maintenance);
         }
         self.maintenance_action(role, original, decision)
     }
@@ -327,24 +369,36 @@ impl<'a> ProposalContext<'a> {
         role: Role,
         original: &Lesson,
         decision: MaintenanceDecision,
-    ) -> Result<Option<LessonMutation>, ()> {
+    ) -> Result<Option<LessonMutation>, ProposalRejection> {
         match decision.action.as_str() {
             "defer" => Ok(None),
             "keep" => {
-                self.current_maintenance_evidence(original, &decision)?;
+                validate_advice(&original.draft()).map_err(ProposalRejection::Card)?;
+                self.current_maintenance_evidence(original, &decision)
+                    .map_err(|()| ProposalRejection::Maintenance)?;
                 Ok(None)
             }
             "retire" => {
-                self.references(&decision.references)?;
-                self.current_maintenance_evidence(original, &decision)?;
+                self.maintenance_change_evidence(original, &decision)?;
                 Ok(Some(LessonMutation::Delete {
                     id: original.id.clone(),
                     expected_revision: original.revision,
                 }))
             }
             "adapt" => self.adaptation(role, original, decision).map(Some),
-            _ => Err(()),
+            _ => Err(ProposalRejection::Maintenance),
         }
+    }
+
+    fn maintenance_change_evidence(
+        &self,
+        original: &Lesson,
+        decision: &MaintenanceDecision,
+    ) -> Result<(), ProposalRejection> {
+        self.references(&decision.references)
+            .map_err(|()| ProposalRejection::References)?;
+        self.current_maintenance_evidence(original, decision)
+            .map_err(|()| ProposalRejection::Maintenance)
     }
 
     fn adaptation(
@@ -352,9 +406,8 @@ impl<'a> ProposalContext<'a> {
         role: Role,
         original: &Lesson,
         decision: MaintenanceDecision,
-    ) -> Result<LessonMutation, ()> {
-        self.references(&decision.references)?;
-        self.current_maintenance_evidence(original, &decision)?;
+    ) -> Result<LessonMutation, ProposalRejection> {
+        self.maintenance_change_evidence(original, &decision)?;
         let mut draft = original.draft();
         draft.title = decision.title;
         draft.recommendation = decision.recommendation;
@@ -378,7 +431,7 @@ impl<'a> ProposalContext<'a> {
             costly_recurring_reason: decision.reason,
         };
         draft.scope = canonical_scope(&draft.scope);
-        draft.validate().map_err(|_| ())?;
+        validate_advice(&draft).map_err(ProposalRejection::Card)?;
         Ok(LessonMutation::Upsert {
             expected_revision: Some(original.revision),
             draft: Box::new(draft),
@@ -494,6 +547,72 @@ fn maintenance_reason(reason: &str) -> Result<(), ()> {
     Ok(())
 }
 
+// Admission-only policy: legacy records stay readable until scoped maintenance adapts them.
+fn validate_advice(draft: &LessonDraft) -> Result<(), crate::active_memory::ActiveMemoryError> {
+    draft.validate()?;
+    let LessonScope::Repository { files, .. } = &draft.scope else {
+        return Ok(());
+    };
+    let mut paths = files.iter().map(String::as_str).chain(
+        draft
+            .evidence
+            .references
+            .iter()
+            .filter_map(|reference| reference.strip_prefix("repository:")),
+    );
+    if paths.any(|path| {
+        source_position(&draft.title, path) || source_position(&draft.recommendation, path)
+    }) {
+        return Err(crate::active_memory::ActiveMemoryError::Invalid(
+            "source line positions in repository advice; use stable paths and identifiers"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn source_position(text: &str, path: &str) -> bool {
+    let plain_path = (path.contains('/') && std::path::Path::new(path).extension().is_some())
+        .then(|| format!("{path}:"));
+    [Some(format!("./{path}:")), plain_path]
+        .into_iter()
+        .flatten()
+        .any(|prefix| {
+            text.match_indices(prefix.as_str()).any(|(offset, _)| {
+                let before = &text[..offset];
+                source_reference_boundary(before)
+                    && !non_source_context(before)
+                    && text
+                        .as_bytes()
+                        .get(offset + prefix.len())
+                        .is_some_and(u8::is_ascii_digit)
+            })
+        })
+}
+
+fn source_reference_boundary(before: &str) -> bool {
+    before
+        .chars()
+        .next_back()
+        .is_none_or(|c| c.is_whitespace() || "([`'\"*".contains(c))
+}
+
+fn non_source_context(before: &str) -> bool {
+    let token = before
+        .rsplit(char::is_whitespace)
+        .next()
+        .unwrap_or_default();
+    let clause = before.rsplit([';', '\n']).next().unwrap_or_default();
+    let clause = clause.rsplit_once(". ").map_or(clause, |(_, tail)| tail);
+    token.contains("://")
+        || clause.split_whitespace().rev().take(4).any(|word| {
+            let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+            ["image", "docker", "podman", "tag"]
+                .into_iter()
+                .any(|kind| word.eq_ignore_ascii_case(kind))
+        })
+}
+
 fn normalize(value: &str) -> String {
     value
         .split_whitespace()
@@ -559,7 +678,9 @@ struct MaintenanceOutput {
 #[serde(deny_unknown_fields)]
 struct MaintenanceDecision {
     id: String,
-    revision: u64,
+    // Prior initialization response files echoed the revision; preserve their precondition.
+    #[serde(default, rename = "revision")]
+    legacy_revision: Option<u64>,
     action: String,
     title: String,
     recommendation: String,

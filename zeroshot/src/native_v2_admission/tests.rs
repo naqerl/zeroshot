@@ -187,7 +187,9 @@ async fn admits_authored_loop_and_parallel_verifiers_without_defaulting_effort()
     for binding in admitted.runtime.nodes().values() {
         let effort = match binding {
             NodeRuntimeBinding::Agent { effort, .. } => Some(effort),
-            NodeRuntimeBinding::GitDelivery { .. } => None,
+            NodeRuntimeBinding::GitDelivery { .. } | NodeRuntimeBinding::CommentDelivery { .. } => {
+                None
+            }
         };
         let effort = effort.assert_value_with("fixture has only agent bindings");
         assert_eq!(*effort, None);
@@ -618,3 +620,6 @@ async fn rejects_invalid_caller_declared_model_limits_at_admission() {
         .await
         .assert_value();
 }
+
+#[path = "tests/comments.rs"]
+mod comments;

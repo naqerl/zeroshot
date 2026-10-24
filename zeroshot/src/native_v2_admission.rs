@@ -77,6 +77,8 @@ pub enum NativeV2AdmissionError {
     },
     #[error("Git delivery requires a committed repository source")]
     DeliverySourceRequired,
+    #[error("invalid comment delivery: {0}")]
+    InvalidCommentDelivery(String),
     #[error("invalid source delivery: {0}")]
     InvalidSourceDelivery(String),
     #[error("merge plans require exactly one graph-visible Git merge delivery node")]
@@ -130,6 +132,7 @@ impl NativeV2Admission {
         let declarations = executable_declarations(&graph.root);
         validate_executable_bindings(&declarations, runtime, delivery_policy)?;
         validate_delivery_concurrency(&graph.root)?;
+        comment::validate_comment_profile(graph)?;
         let registry = GraphBoundWorkerRegistry::from_declarations(graph, &declarations, runtime)?;
         ProductionGraphVerifier::new(registry)
             .verify(graph)
@@ -338,6 +341,8 @@ fn prepare_submission(
     let declarations = executable_declarations(&graph.root);
     validate_executable_bindings(&declarations, &runtime, delivery_policy)?;
     validate_delivery_concurrency(&graph.root)?;
+    comment::validate_comment_profile(&graph)?;
+    comment::resolve_comment_input(&graph.root, &initial_input)?;
 
     Ok(PreparedSubmission {
         title,
@@ -376,6 +381,8 @@ async fn verify_submission(
         .map_err(Into::into)
 }
 
+mod comment;
+pub(crate) use comment::{admitted_comment_input, comment_node};
 mod concurrency;
 mod loop_limits;
 mod validation;
@@ -393,6 +400,7 @@ pub(crate) fn executable_runtime_roles(root: &GraphNode) -> Vec<(NodeName, bool)
 enum RuntimeRole {
     Agent,
     GitDelivery,
+    CommentDelivery,
 }
 
 #[derive(Clone, Debug)]
@@ -419,6 +427,7 @@ impl GraphBoundWorkerRegistry {
             let role = match runtime.nodes().get(&declaration.name) {
                 Some(NodeRuntimeBinding::Agent { .. }) => RuntimeRole::Agent,
                 Some(NodeRuntimeBinding::GitDelivery { .. }) => RuntimeRole::GitDelivery,
+                Some(NodeRuntimeBinding::CommentDelivery { .. }) => RuntimeRole::CommentDelivery,
                 None => continue,
             };
             if let Some(first) = resolved.get(&declaration.worker) {

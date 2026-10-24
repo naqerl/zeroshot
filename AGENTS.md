@@ -60,10 +60,19 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   lessons. Maintenance contexts and mutation authority are partitioned by lesson scope, including
   repository-qualified graph lessons; each scope's opt-out disables its maintenance and discovery.
   Adaptation provenance names the responsible scoped maintenance specialist. Maintenance uses
-  complete byte-bounded batches and requires exactly one decision per supplied ID/revision; omitted
-  or duplicate decisions cannot count as completed reconciliation. Maintenance consolidates redundant
+  complete byte-bounded batches and requires exactly one decision per supplied ID, bound by the host to its frozen revision; omitted
+  or duplicate decisions cannot count as completed reconciliation. The host owns revision preconditions
+  and increments; agents do not echo or propose revision counters, while prior initialization responses
+  with an explicit revision remain accepted only when it matches the frozen supplied version. Maintenance consolidates redundant
   paraphrases only within the same repository or exact graph/node/repository-qualified scope, retaining
-  one canonical recommendation and all useful detail while deciding every supplied ID. Discovery has no findings count
+  one canonical recommendation and all useful detail while deciding every supplied ID. Rejected discovery proposals report a validation stage and host-owned card field names without echoing
+  proposal text. Repository advice admission detects common literal file:line positions for associated/cited source
+  while preserving ambiguous endpoint, URL and image references;
+  legacy cards remain readable but scoped maintenance must adapt or defer them rather than keep
+  or renumber volatile positions. Postmortem transcript collection scans bounded ledger pages and reclaims its fixed
+  byte budget from the largest execution tail, preserving earlier worker evidence under late reviewer
+  output rather than using a global last-record window. Replay observes cancellation between bounded
+  reads; final context trimming shrinks the largest arrays and retains per-execution transcript tails. Discovery has no findings count
   quota: impact, recurrence, current evidence and usefulness determine admission. Shared transactions
   are bounded by serialized bytes and store capacity rather than a mutation count quota. Their work runs
   before runner closure/cleanup, preserves the durably latched primary outcome and its failure
@@ -250,6 +259,57 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   mutation. Pure remote identification uses each registered
   provider's `repository_from_remote` hook; CLI source selection has no separate forge catalog and
   rejects ambiguous matches and unsupported provider versions.
+- Conversation-comment delivery uses the same source registry's optional comment authority,
+  independently of Git transport and checkout. `builtin.comment-delivery.post@1` has a
+  `comment_delivery` binding with no model or lane. Its required inputs are `url` and `body`,
+  with optional `reviewScope`. Admission freezes destination/scope from required caller-input
+  bindings; the trusted publisher rechecks them before effects. At most one publisher runs,
+  outside loops/maps, after every other execution and cleanup, with no later executable work.
+  Native output and review results preserve the complete `receipt` record, including absent optional
+  provenance. Terminal success must contain that exact native output. Generic local comment graphs need no
+  Git source; contained placement requirements remain unchanged.
+- Comment publication is write-once per root delivery identity and node. A scoped publication
+  store durably records intent before POST and confirmation before a receipt. Local/direct
+  files live outside workspace/checkpoint rollback; `HostedWorkspace.comment_publications`
+  supplies host-owned persistence. Matching retries reuse the original comment; changed content
+  refuses. Lost responses reconcile exact marker, target, author and body hash; unresolved
+  publication never authorizes another blind POST. Comment credentials remain private to the
+  native adapter. Source-less receipts omit `sourceRevision`.
+- `--task-from` prepares a review before graph dispatch, resolving an issue/PR URL into ordinary
+  `url`/`context` input and exact source. Workers have no mandatory `task` field. Review context
+  always includes `reviewScope`: empty for an issue, complete base/head identity for a PR.
+  `issue-review` retains the basic issue-proposal report. `pr-review` requires complete PR scope
+  and `linkedIssues` captured from a bounded GitHub GraphQL snapshot, including manual and keyword
+  closing links. Incomplete/erroring linked metadata refuses preparation; plain mentions remain
+  narrative references. Its classifier returns zero or one `{plan}` task, a `maxItems: 1` map
+  runs the reproducer when required, and a final code checker authors a comment with a 150-word
+  instruction budget. Reproducer evidence begins with short `Reproduction:`/`Setup:` sentences
+  covering the actual workflow/result and startup failures or workarounds, even resolved ones;
+  the checker preserves them in the comment. PR headers omit a source revision already named
+  by their captured head. Classifier/checker are inspection-only verifiers; the reproducer is a step
+  that can prepare the full local stack and browser tests without repairing tracked source.
+  Mapped runtime failures and overflow stop before publication; failed checks and environment
+  blockers return evidence for the report. All model choices remain caller-authored; the supplied
+  PR runtime binds the three independent agents to `gpt-6.1-sol` with `xhigh`. Negative findings
+  are successful reviews. Selecting either review template defaults to comment
+  delivery. PR review currently requires comment delivery for comparison preparation; issue review
+  also supports `--delivery none`. Local review never switches/resets a worktree and rejects tracked changes or a
+  mismatched PR head. Explicit submission-key retries retain prepared input/source and authored
+  configuration within the selected target/credential identity. Human login attempts rotate a private
+  cache generation; OAuth refresh preserves it. Machine credentials and organization selection have
+  separate hashed namespaces; snapshot files contain no credentials. Target resolution uses an authenticated read-only route; hosted access uses
+  host-owned GitHub authority, while direct requests carry explicit ephemeral source authority.
+  PR preparation fetches the exact head/base, retaining the base under a private Git ref so
+  checkpoint normalization preserves comparison objects. It uses the admitted publisher's bound
+  URL/scope, leaving arbitrary caller input keys unreserved. Local fetch/ref writes run only under
+  the controller's workspace lease, after checkpoint restoration and before dispatch.
+  Targets advertise comment delivery and
+  task resolution through separate versioned discovery extensions.
+- Built-in template selection defaults to PR delivery for `software-change`, comment delivery for
+  `pr-review` and `issue-review`, and no delivery for the other templates. Explicit supported delivery choices override
+  these defaults. Run, profile creation, template export, and editor ordering agree; Python leaves
+  unspecified delivery to Rust rather than maintaining a second default catalog. Custom graphs and
+  saved profiles retain their authored delivery nodes and bindings.
 - Named targets store only endpoint, access mode, and login identity. Named runs resolve repository, branch, exact remote revision, and worktree dirtiness client-side from the selected Git worktree plus per-run overrides; target records never bind repositories.
 - `ZEROSHOT_API_KEY` selects hosted machine authentication for the whole target CLI. It stays in
   memory and HTTP Authorization, bypasses OAuth and the credential store, and never falls back to
