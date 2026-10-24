@@ -85,12 +85,20 @@ pub use execution::{
 };
 pub use parser::{Cli, parse_native_v2_args};
 
+#[path = "native_v2_cli/mcp.rs"]
+pub mod mcp;
+
 mod acp;
 pub use acp::{AcpServeError, serve_local_acp};
 
 #[cfg(test)]
 #[path = "native_v2_cli/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(in crate::native_v2_cli) use tests::support::{
+    Call as CliTestCall, FakeBackend as CliTestBackend,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetAdd {
@@ -296,6 +304,8 @@ pub enum NativeV2CliCommand {
     Acp {
         profile: RunProfileName,
     },
+    /// The process entrypoint owns the stdio MCP loop.
+    McpServe,
     Update,
     TargetAdd(TargetAdd),
     TargetLogin {

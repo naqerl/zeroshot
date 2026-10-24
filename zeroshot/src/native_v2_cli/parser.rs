@@ -82,6 +82,16 @@ enum CliCommand {
         command: PlanCommand,
     },
 
+    /// Serve Zeroshot tools and run events as an MCP server on stdin and stdout.
+    ///
+    /// Tools call the same commands as this CLI. Run events use the
+    /// `io.modelcontextprotocol/events` extension and the durable stream `watch` already reads.
+    /// Signed webhooks are unsupported. The process writes no banner.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+
     /// Pool named targets and place, queue, and account for runs across them.
     ///
     /// A daemon installed with `zeroshot hub install` owns the hub and serves it over HTTP; hub
@@ -114,6 +124,15 @@ enum CliCommand {
 
     #[command(flatten)]
     Utility(UtilityCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum McpCommand {
+    /// Serve JSON-RPC MCP on stdin and stdout until the client closes stdin.
+    ///
+    /// One JSON-RPC message per line. Each tool returns that command's JSON. A failing command is
+    /// a tool error carrying the command's diagnostic code and message.
+    Serve,
 }
 
 #[derive(Debug, Subcommand)]

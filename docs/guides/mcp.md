@@ -1,0 +1,101 @@
+# Serve Zeroshot over MCP
+
+`zeroshot mcp serve` is a Model Context Protocol server on stdin and stdout. It speaks one
+JSON-RPC 2.0 message per line. Each tool runs the same command the CLI would, in this process.
+Run events come from the durable stream `zeroshot watch` already reads.
+
+A client starts it as:
+
+```json
+{
+  "command": "zeroshot",
+  "args": ["mcp", "serve"]
+}
+```
+
+The process writes no banner. It exits when the client closes stdin.
+
+## Handshake
+
+`initialize` answers with the negotiated protocol version, `serverInfo.name` `zeroshot`,
+`capabilities.tools.listChanged` set to false, and the events extension
+`io.modelcontextprotocol/events`. The client then sends `notifications/initialized`.
+`ping` returns an empty object.
+
+## Tools
+
+`tools/list` returns one tool per command. The description is that command's help text. Argument
+names are camelCase (`runId`, `runtimeConfig`, `noPrFeedback`). Unknown fields are rejected.
+`tools/list` does not paginate: a `cursor` returns an empty page.
+
+`tools/call` builds the CLI command from `arguments` and runs it. A successful command returns its
+stdout as a text content block and, when that stdout is one JSON value or NDJSON, as
+`structuredContent`. A failing command is still a JSON-RPC success, with `isError: true`.
+`structuredContent.code` and `message` are the CLI diagnostic (`zeroshot.error/v1`). An unknown
+tool name is a JSON-RPC invalid-params error.
+
+| Tool                | Command                      | What it does                                      |
+| ------------------- | ---------------------------- | ------------------------------------------------- |
+| `run`               | `zeroshot run`               | Submit a run. `detach` returns after submission.  |
+| `status`            | `zeroshot status`            | Read one run's status JSON.                       |
+| `logs`              | `zeroshot logs`              | Follow one run's log stream until it ends.        |
+| `watch`             | `zeroshot watch`             | Follow one run's event stream until it ends.      |
+| `list`              | `zeroshot list`              | List runs as JSON.                                |
+| `resume`            | `zeroshot resume`            | Resume a failed run on its retained workspace.    |
+| `force-stop`        | `zeroshot force-stop`        | Stop a run.                                       |
+| `report`            | `zeroshot report`            | Print one lifecycle report from retained history. |
+| `hub_list`          | `zeroshot hub list`          | List hub members.                                 |
+| `hub_ps`            | `zeroshot hub ps`            | List hub jobs.                                    |
+| `hub_status`        | `zeroshot hub status`        | Read one hub job.                                 |
+| `hub_submit`        | `zeroshot hub submit`        | Place a run on a free member.                     |
+| `hub_enqueue`       | `zeroshot hub enqueue`       | Queue a run for later placement.                  |
+| `hub_stats`         | `zeroshot hub stats`         | Aggregate job outcomes and token usage.           |
+| `hub_logs`          | `zeroshot hub logs`          | Follow a placed job's logs until the stream ends. |
+| `hub_daemon_status` | `zeroshot hub daemon status` | Read the hub daemon heartbeat.                    |
+
+`run` and `hub_submit` follow events until the run settles unless `detach` is true. `watch`,
+`logs`, and `hub_logs` do the same and hold the MCP session until that stream ends. For live run
+events, use the events extension instead of those tools.
+
+Read-only tools are `status`, `logs`, `watch`, `list`, `report`, `hub_list`, `hub_ps`,
+`hub_stats`, `hub_logs`, and `hub_daemon_status`. `run`, `resume`, `hub_submit`, and `hub_enqueue`
+submit work. `force-stop` stops a run.
+
+## Run events
+
+The server advertises `io.modelcontextprotocol/events` (SEP-3415). There is one event type,
+`run.event`. Subscription arguments are `runId` and an optional `target`. The payload is the
+durable watch notification: `subscriptionId`, `runId`, `title`, optional `source`, `size`,
+`cursor`, and `status`.
+
+`events/list` reports `delivery` as `poll` and `push`, and `resultType` `complete`. Signed
+webhooks are not offered. `events/subscribe` and `events/unsubscribe` return JSON-RPC
+`Unsupported` (`-32026`) with `data.feature` `deliveryMode` and `data.value` `webhook`.
+
+`events/poll` returns occurrences after an opaque cursor:
+
+- `cursor: null` means start from now. The response has no events and a cursor at the current head.
+- A cursor is exclusive. The response cursor advances to the last delivered event.
+- `truncated: true` means the retained window skipped events since the supplied cursor.
+- `hasMore: true` means the batch hit `maxEvents` (default 50) and another event was waiting.
+- `nextPollMs` is `1000`. `maxAgeMs` is accepted and not applied: watch records have no occurrence time.
+
+`events/stream` is the same subscription as a long-lived request. The server sends
+`notifications/events/active`, then one `notifications/events/event` per event, and
+`notifications/events/heartbeat` about every 30 seconds. Every notification carries
+`_meta["io.modelcontextprotocol/subscriptionId"]` set to the request id. A gap sends another
+`notifications/events/active` with `truncated: true`, then continues. When the watch stream ends,
+the server answers the request with `resultType: complete`.
+
+Both modes open the same `run_watch` subscription `zeroshot watch` uses: the local ledger, or the
+named target's watch transport. There is no second event pipeline.
+
+## Stop polling
+
+Keep the cursor from the last `events/poll`, then open `events/stream` with that cursor, the same
+`name`, and the same `arguments`. The client receives events as notifications and does not call
+`events/poll` again.
+
+To stop the stream, send `notifications/cancelled` with `params.requestId` set to the
+`events/stream` request id. The server stops delivery and releases the watch. It does not send a
+final result for a cancelled stream.

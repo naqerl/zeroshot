@@ -696,6 +696,11 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   loss terminalizes active work as `runtime_lost` and poisons the session. The local UI requires both
   per-run leases before treating an in-process ACP owner without a controller socket as live.
   Ordinary runs retain run-scoped session keys.
+- `zeroshot mcp serve` is a local stdio MCP server. Each tool builds the same command value as the
+  CLI and runs it through the existing public or hub executor. The `io.modelcontextprotocol/events`
+  extension exposes one `run.event` type whose payload is the durable notification `watch` already
+  emits; `events/poll` and `events/stream` both open that `run_watch` subscription. Signed webhooks
+  are unsupported. The server does not itself start a run.
 
 ## CLI and target contracts
 
@@ -833,7 +838,12 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   enqueues real runs.
   `zeroshot hub install` and `zeroshot hub uninstall` change system services and need explicit
   user intent; prefer `--dry-run` first.
-- Destructive commands such as `zeroshot force-stop` require explicit user intent.
+  `zeroshot mcp serve` is a local stdio server and does not itself start a run. Its read-only tools
+  are `status`, `logs`, `watch`, `list`, `report`, `hub_list`, `hub_ps`, `hub_stats`, `hub_logs`,
+  and `hub_daemon_status`. `watch`, `logs`, and `hub_logs` follow until the stream ends; live run
+  events use the events extension. `run`, `resume`, `hub_submit`, and `hub_enqueue` submit work.
+- Destructive commands such as `zeroshot force-stop` require explicit user intent. The MCP
+  `force-stop` tool is that command.
 
 ## Where to look
 
@@ -842,6 +852,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 | Canonical crate and CLI       | `zeroshot/`                                                                                                                                                                                       |
 | CLI grammar/help              | `zeroshot/src/native_v2_cli/parser.rs`                                                                                                                                                            |
 | CLI composition               | `zeroshot/src/native_v2_cli.rs`, `zeroshot/src/main.rs`                                                                                                                                           |
+| MCP server                    | `zeroshot/src/native_v2_cli/mcp.rs`, `zeroshot/src/mcp_host.rs`                                                                                                                                   |
 | CLI self-update               | `zeroshot/src/native_v2_cli/update.rs`                                                                                                                                                            |
 | Built-in templates            | `zeroshot/src/native_v2_templates.rs`, `zeroshot/src/native_v2_templates/`                                                                                                                        |
 | Local run composition         | `zeroshot/src/native_v2_local.rs`                                                                                                                                                                 |
