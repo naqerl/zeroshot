@@ -34,7 +34,6 @@ enum Action {
         data: Option<Value>,
     },
     Stream(Prepared),
-    Ignore,
 }
 
 /// Serve newline-delimited JSON-RPC MCP on `reader` and `writer` until stdin closes.
@@ -96,7 +95,6 @@ where
             Action::Stream(prepared) => {
                 spawn_stream(prepared, id, &writer, &mut cancellations);
             }
-            Action::Ignore => {}
         }
     }
     for cancel in cancellations.values() {

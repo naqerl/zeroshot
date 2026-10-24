@@ -18,7 +18,7 @@ pub struct McpFailure {
 impl McpFailure {
     #[must_use]
     pub fn from_cli(error: &NativeV2CliError) -> Self {
-        let value = serde_json::to_value(error.diagnostic()).unwrap_or_else(|_| Value::Null);
+        let value = serde_json::to_value(error.diagnostic()).unwrap_or(Value::Null);
         let fallback = error.to_string();
         Self {
             code: value

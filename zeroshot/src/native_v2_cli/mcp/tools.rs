@@ -9,12 +9,15 @@ use super::host::{parse_cli, McpFailure, McpHost};
 use super::super::hub::HubCommand;
 use super::super::{Cli, NativeV2CliCommand};
 
+type ToolArgvResult = Result<Vec<String>, McpFailure>;
+type ToolArgv = fn(&Map<String, Value>) -> ToolArgvResult;
+
 struct Tool {
     name: &'static str,
     cli: &'static [&'static str],
     allowed: &'static [&'static str],
     schema: fn() -> Value,
-    argv: fn(&Map<String, Value>) -> Result<Vec<String>, McpFailure>,
+    argv: ToolArgv,
 }
 
 const RUN_KEYS: &[&str] = &[
