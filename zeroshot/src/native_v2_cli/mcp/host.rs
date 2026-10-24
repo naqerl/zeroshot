@@ -66,7 +66,9 @@ impl Drop for WatchStream {
 }
 
 /// Runs CLI command values and opens the watch stream those commands already use.
-#[async_trait::async_trait]
+///
+/// Futures are not `Send`. They await the CLI executor, which holds non-`Send` state.
+#[async_trait::async_trait(?Send)]
 pub trait McpHost: Send + Sync {
     async fn execute(&self, command: NativeV2CliCommand) -> Result<String, McpFailure>;
 

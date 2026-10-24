@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use super::super::{CliTestBackend, CliTestCall, NeverDetach, RunWatchCommand};
@@ -13,7 +13,7 @@ struct ToolHost {
     backend: CliTestBackend,
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl McpHost for ToolHost {
     async fn execute(&self, command: NativeV2CliCommand) -> Result<String, McpFailure> {
         let mut output = Vec::new();
@@ -31,7 +31,7 @@ impl McpHost for ToolHost {
 
 struct ScriptHost;
 
-#[async_trait]
+#[async_trait(?Send)]
 impl McpHost for ScriptHost {
     async fn execute(&self, _command: NativeV2CliCommand) -> Result<String, McpFailure> {
         Err(McpFailure::invalid("scripted host has no command executor"))
@@ -74,10 +74,21 @@ impl Session {
     fn spawn(host: impl McpHost + 'static) -> Self {
         let (client_input, server_input) = tokio::io::duplex(1 << 20);
         let (server_output, client_output) = tokio::io::duplex(1 << 20);
-        tokio::spawn(async move {
-            let reader = BufReader::new(server_input);
-            let _ = serve(host, reader, server_output).await;
-        });
+        // The CLI executor future is not Send, so the server runs on its own
+        // current-thread runtime.
+        let _thread = std::thread::Builder::new()
+            .name("mcp-test-server".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("mcp test runtime");
+                runtime.block_on(async move {
+                    let reader = BufReader::new(server_input);
+                    let _ = serve(host, reader, server_output).await;
+                });
+            })
+            .expect("spawn mcp test server");
         Self {
             input: client_input,
             output: BufReader::new(client_output),
