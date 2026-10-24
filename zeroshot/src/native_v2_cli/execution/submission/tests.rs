@@ -152,6 +152,8 @@ fn wave6_cli_contract_uniform_runtime_and_template_bindings_preserve_authority()
             lane: None,
             model: ModelId::new("wrong-kind").assert_value(),
             effort: None,
+            context_window: None,
+            max_tokens: None,
             session_scope: SessionScope::Execution,
             connections: DeclaredConnections::empty(),
         },

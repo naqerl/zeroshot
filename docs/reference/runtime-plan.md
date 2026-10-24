@@ -27,8 +27,8 @@ on local CLI runs and direct targets. The same sections are accepted by uniform 
 See [Active Memory](../guides/active-memory.md) for budgets, provider inheritance and opt-out examples.
 
 `harness` and `provider` form the default lane. Every agent node runs on it unless its binding
-carries its own [`lane`](#per-node-lanes). `size` applies to the whole run. Model, effort, session
-scope, and connections are chosen per node.
+carries its own [`lane`](#per-node-lanes). `size` applies to the whole run. Model, effort, context
+window, output limit, session scope, and connections are chosen per node.
 
 `size` is a run-level resource class. Zeroshot records it with the run and reports it in run
 status; the hosting target decides what resources each class receives.
@@ -70,7 +70,10 @@ need a connection.
 `pi/gateway` carries `GATEWAY_BASE_URL`, `GATEWAY_API_KEY`, and `GATEWAY_API`. The last names the
 wire protocol as `openai-responses`, `openai-completions`, or `anthropic-messages`, so one lane
 reaches any endpoint Pi implements and the model identifier stays opaque and caller-owned. Zeroshot
-never infers the protocol from the identifier, and an unrecognized value fails before launch.
+never infers the protocol from the identifier, and an unrecognized value fails before launch. The
+synthesized model entry carries a node's `contextWindow` and `maxTokens` only when the caller
+declared them; omitted limits keep Pi's own defaults. The built-in-provider endpoint overrides keep
+Pi's catalog and receive no synthesized model entry.
 
 To send the `anthropic` lane to a caller-owned Messages-compatible endpoint, declare
 `ANTHROPIC_BASE_URL` with any one of the lane's credentials (`ANTHROPIC_API_KEY`,
@@ -91,17 +94,22 @@ rather than a bypass argument.
 
 ### `agent`
 
-| Field          | Required | Value                                                              |
-| -------------- | -------- | ------------------------------------------------------------------ |
-| `kind`         | Yes      | `agent`                                                            |
-| `lane`         | No       | [Harness and provider](#per-node-lanes); default lane when omitted |
-| `model`        | Yes      | Provider-owned model identifier, 1 to 2,048 non-control characters |
-| `effort`       | No       | `low`, `medium`, `high`, `xhigh`, or `max`; unset when omitted     |
-| `sessionScope` | No       | `execution` (default) or `node_instance`                           |
-| `connections`  | No       | [Connection declarations](#connections); empty when omitted        |
+| Field           | Required | Value                                                              |
+| --------------- | -------- | ------------------------------------------------------------------ |
+| `kind`          | Yes      | `agent`                                                            |
+| `lane`          | No       | [Harness and provider](#per-node-lanes); default lane when omitted |
+| `model`         | Yes      | Provider-owned model identifier, 1 to 2,048 non-control characters |
+| `effort`        | No       | `low`, `medium`, `high`, `xhigh`, or `max`; unset when omitted     |
+| `contextWindow` | No       | Model context window, 1 to 10,000,000; unset when omitted          |
+| `maxTokens`     | No       | Model output limit, 1 to 10,000,000; unset when omitted            |
+| `sessionScope`  | No       | `execution` (default) or `node_instance`                           |
+| `connections`   | No       | [Connection declarations](#connections); empty when omitted        |
 
 Zeroshot passes `model` and `effort` to the harness unchanged. It keeps no model catalog and does not
-check whether a model supports the chosen effort.
+check whether a model supports the chosen effort. `contextWindow` and `maxTokens` are caller
+declarations, never inferences: they are validated at admission, emitted only into the
+`pi/gateway` model entry, and otherwise left unset for the provider to default. An absent value
+retains the provider's own limit; a present value must be a positive integer in the stated range.
 
 `sessionScope` controls provider conversation state. It does not change graph state or bindings.
 

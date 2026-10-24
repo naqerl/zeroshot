@@ -582,6 +582,8 @@ impl UniformRuntimePlan {
             lane: None,
             model: self.model.clone(),
             effort: self.effort,
+            context_window: None,
+            max_tokens: None,
             session_scope: self.session_scope.unwrap_or_else(|| {
                 template.map_or(SessionScope::Execution, |template| {
                     template.default_session_scope(name.as_str())
