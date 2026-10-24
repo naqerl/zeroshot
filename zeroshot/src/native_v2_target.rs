@@ -655,6 +655,22 @@ where
             .map_err(|error| self.authority.redact_error(error).into_cli(&target))
             .map(Some)
     }
+
+    async fn run_history(
+        &self,
+        name: &str,
+        request: zeroshot_engine::native_v2_observability::history::RunHistoryRequest,
+    ) -> Result<
+        Option<zeroshot_engine::native_v2_observability::history::RunHistoryResponse>,
+        NativeV2CliError,
+    > {
+        let target = self.target(name)?;
+        self.authority
+            .run_history(&target, request)
+            .await
+            .map_err(|error| error.into_cli(&target))
+            .map(Some)
+    }
 }
 
 impl<R, A, D> NativeV2TargetConnector<R, A, D>

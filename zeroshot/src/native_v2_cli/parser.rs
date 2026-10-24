@@ -82,6 +82,20 @@ enum CliCommand {
         command: PlanCommand,
     },
 
+    /// Pool named targets and place, queue, and account for runs across them.
+    ///
+    /// A daemon installed with `zeroshot hub install` owns the hub and serves it over HTTP; hub
+    /// commands address it through a hub context. Members are targets registered with `zeroshot
+    /// target add`, plus `local`. Each placed job is an ordinary run on one target.
+    Hub {
+        /// Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local].
+        #[arg(long = "hub", value_name = "CONTEXT", global = true)]
+        hub: Option<String>,
+
+        #[command(subcommand)]
+        command: hub::HubCliCommand,
+    },
+
     /// Submit a graph run locally or to a named target.
     ///
     /// Local runs use --cwd or the invoking folder; Git worktrees use their root. Local Git delivery
@@ -150,6 +164,12 @@ enum UtilityCommand {
 
     /// Read a run's current status as JSON.
     Status(RunSelectorArgs),
+
+    /// Print one JSON lifecycle report for a run.
+    ///
+    /// Reads only retained run history; it never starts, resumes, or stops a run. Named targets
+    /// reuse their discovered run-history capability, while local runs read their local ledger.
+    Report(RunReportArgs),
 
     /// Follow a run's durable event stream as NDJSON.
     Watch(RunWatchArgs),
@@ -674,6 +694,16 @@ struct RunSelectorArgs {
 }
 
 #[derive(Debug, Args)]
+struct RunReportArgs {
+    #[command(flatten)]
+    run: RunSelectorArgs,
+
+    /// Emit machine-readable JSON. This is the default and only report format.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 struct RunResumeArgs {
     #[command(flatten)]
     run: RunSelectorArgs,
@@ -738,6 +768,8 @@ struct AttachArgs {
 
 #[path = "parser/convert.rs"]
 mod convert;
+#[path = "parser/hub.rs"]
+mod hub;
 #[path = "parser/profiles.rs"]
 mod profiles;
 use profiles::{ProfileCommand, ProfileNameArgs, ProfileScopeArg};

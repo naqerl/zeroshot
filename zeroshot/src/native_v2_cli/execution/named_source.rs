@@ -17,6 +17,9 @@ struct WorktreeSourceContext {
     root: PathBuf,
     local_branch: Option<String>,
     upstream: Option<(String, SourceBranchId)>,
+    /// Whether the folder really is a Git worktree. An explicit `--repository` and `--branch`
+    /// identify the source without one, and then there is no local checkout whose state matters.
+    inspected: bool,
 }
 
 struct RevisionSelection<'a> {
@@ -72,7 +75,11 @@ where
         },
     )
     .await?;
-    let dirty = worktree_is_dirty(&worktree.root).await?;
+    let dirty = if worktree.inspected {
+        worktree_is_dirty(&worktree.root).await?
+    } else {
+        false
+    };
     Ok(Some(NamedSourceResolution {
         git_credentials,
         source: NamedRunSource {
@@ -148,14 +155,10 @@ where
 
 async fn inspect_worktree(run: &RunCommand) -> Result<WorktreeSourceContext, NativeV2CliError> {
     let directory = run.cwd.as_deref().unwrap_or(Path::new("."));
-    let root = git_at(directory, &["rev-parse", "--show-toplevel"])
-        .await
-        .map_err(|_| {
-            source_error(
-                "run from a Git worktree, or supply --repository and --branch from a Git worktree",
-            )
-        })?;
-    let root = PathBuf::from(root.trim());
+    let root = match git_at(directory, &["rev-parse", "--show-toplevel"]).await {
+        Ok(root) => PathBuf::from(root.trim()),
+        Err(_) => return explicit_source_context(run, directory),
+    };
     let local_branch = git_at(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .await
         .ok()
@@ -177,6 +180,31 @@ async fn inspect_worktree(run: &RunCommand) -> Result<WorktreeSourceContext, Nat
         root,
         local_branch,
         upstream,
+        inspected: true,
+    })
+}
+
+/// Source context for a folder that is not a Git worktree. An explicit repository and branch
+/// name the source on their own, which is how a hub places a job from its own folder.
+fn explicit_source_context(
+    run: &RunCommand,
+    directory: &Path,
+) -> Result<WorktreeSourceContext, NativeV2CliError> {
+    let unavailable = || {
+        source_error(
+            "run from a Git worktree, or supply both --repository and --branch to name the source \
+             without one",
+        )
+    };
+    if run.repository.is_none() || run.branch.is_none() {
+        return Err(unavailable());
+    }
+    let root = std::path::absolute(directory).map_err(|_| unavailable())?;
+    Ok(WorktreeSourceContext {
+        root,
+        local_branch: None,
+        upstream: None,
+        inspected: false,
     })
 }
 

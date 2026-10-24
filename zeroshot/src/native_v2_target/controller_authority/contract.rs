@@ -9,7 +9,6 @@ use zeroshot_engine::native_v2_target_authority::{
 };
 
 mod connections;
-#[cfg(feature = "ui")]
 mod history;
 mod hosted_runs;
 mod http_error;
@@ -17,7 +16,6 @@ mod profiles;
 
 use hosted_runs::{build_hosted_runs_descriptor, build_merge_plans_descriptor};
 pub(super) use hosted_runs::{HostedRunsDescriptor, MergePlansDescriptor};
-#[cfg(feature = "ui")]
 pub(super) use history::{RunHistoryDescriptor, build_run_history_descriptor};
 pub(super) use http_error::{http_error, read_success_json, read_success_json_with_limit};
 use connections::build_connections_descriptor;

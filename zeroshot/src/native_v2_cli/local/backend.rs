@@ -278,6 +278,36 @@ impl NativeV2CliBackend for LocalCliBackend {
         self.force_local(params).await.map(Into::into)
     }
 
+    async fn run_report(
+        &self,
+        target: Option<&str>,
+        run_id: RunId,
+    ) -> Result<crate::native_v2_observability::history::RunReport, NativeV2CliError> {
+        require_local(target)?;
+        let ledger_path = self.run_storage(&run_id)?.join("runs.sqlite3");
+        if !require_existing_ledger(&ledger_path)? {
+            return Err(local_message("run does not exist"));
+        }
+        let ledger = SqliteRunLedger::open_read_only(&ledger_path).map_err(local_error)?;
+        let stored = ledger
+            .get(&run_id)
+            .await
+            .map_err(local_error)?
+            .ok_or_else(|| local_message("run does not exist"))?;
+        let token_usage = stored.snapshot.token_usage.clone();
+        let ledger: Arc<dyn RunLedger> = Arc::new(ledger);
+        let service =
+            crate::native_v2_observability::history::RunHistoryService::for_ledger(ledger);
+        let definition = service
+            .definition(&run_id)
+            .await
+            .map_err(|error| local_message(error.message))?;
+        Ok(crate::native_v2_observability::history::build_run_report(
+            &definition,
+            token_usage,
+        ))
+    }
+
     async fn run_checkpoints(
         &self,
         target: Option<&str>,

@@ -478,13 +478,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The smoke asks the target to check out `the-open-engine/zeroshot` at --revision, and the
+          # target fetches that exact commit. `HEAD` is the CI merge commit, which exists only in this
+          # repository, so the fetch fails with `upload-pack: not our ref` (a fork's fresh objects are
+          # not reliably served by the network). Use the public main tip the target can fetch: the code
+          # under test is this image, not the checkout.
+          revision="$(git ls-remote https://github.com/the-open-engine/zeroshot refs/heads/main | cut -f1)"
+          test -n "$revision"
           container="$(docker run --detach --publish 127.0.0.1:4185:8080 \
             zeroshot-target:ci target serve --listen 0.0.0.0:8080 \
             --public-origin http://127.0.0.1:4185 --storage /var/lib/zeroshot/native-v2)"
           trap 'docker logs "$container"; docker rm --force --volumes "$container"' EXIT
           node tests/tooling/smoke-ui.js --url http://127.0.0.1:4185
           node tests/tooling/smoke-environment.js --url http://127.0.0.1:4185 \
-            --revision "$(git rev-parse HEAD)" --container "$container"
+            --revision "$revision" --container "$container"
           docker stop --time 20 "$container"
           test "$(docker inspect --format '{{.State.ExitCode}}' "$container")" = 0
           docker start "$container"

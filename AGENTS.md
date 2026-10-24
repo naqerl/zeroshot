@@ -756,7 +756,83 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   plans have static inputs, no cross-node dataflow, and no retry-in-place. Agent runtime bindings
   cannot declare `GH_TOKEN`; the sole merge-delivery binding owns the GitHub write credential. A
   node's queue deadline is the earlier of plan expiry and seven days after readiness.
-- Read-only safe commands include `zeroshot list`, `zeroshot status`, and `zeroshot logs`.
+- `zeroshot hub` pools registered targets plus `local`. One daemon per hub folder (`hub daemon
+  run`, held by `hub/daemon.lock`, heartbeat in `hub/daemon.json`) owns the hub: it is the only
+  writer of `hub/state.json` (beside `targets.json`, or `ZEROSHOT_HUB_DIR`), dispatches
+  continuously, and serves the hub API (JSON over HTTP, default `127.0.0.1:7383`, bearer token in
+  `hub/api-token` or `--token-file`). State sits behind one in-memory lock that is never held across
+  target calls; a second lock serializes placement (passes and `submit`). `schedule::Dispatched` owns
+  dispatch outcome kinds: `Placed`; `Unconfirmed` when the driver returns `HubError::Unanswered`
+  (a timeout, no receipt, a transport or protocol failure), which keeps the job placing (running
+  without a run ID, `errorKind` `submission_unconfirmed`) on its member with no attempt counted,
+  so every pass resubmits it there with the same key, counted in `unconfirmed_submissions` apart
+  from `attempts`, until `--unconfirmed-limit` (default 30) fails it as `unconfirmed_limit`; and
+  `Rejected`, the only other kind that fails the job. `hub dequeue` also removes placing jobs
+  (`dequeued_while_placing`); a run the target accepts under their key is noted, never adopted. Jobs placing when a daemon stops stay on their member as unconfirmed. Hub-side job problems
+  are a typed `JobError` (plain strings from older state load as `unclassified`). API errors carry the
+  `zeroshot.error/v1` diagnostic plus `x-zeroshot-exit-code`; logs, watch, attach, and force-stop
+  stream NDJSON frames from a `zeroshot` child on the hub host. Every other hub command is a client
+  of the context chosen by `--hub`, `ZEROSHOT_HUB`, `hub context use`, then built-in `local` (this
+  machine's daemon via its heartbeat). `hub-contexts.json` in the config folder stores URLs and token
+  sources (`--token-file`/`--token-env`), never tokens. Clients upload `--input`, `--graph`,
+  `--runtime-config`, `--uniform-runtime-config`, and `--environment` files; the daemon spools them
+  in `hub/spool/ID/`. An unreachable hub is `hub.unreachable` (exit 5, details name the context and
+  URL); a wrong token is `hub.unauthorized`. `hub install --systemd` writes a user unit (`--system`
+  for a system unit) and `--docker` runs a host-network container named `zeroshot-hub`; both pin
+  `ZEROSHOT_CONFIG_DIR`, `ZEROSHOT_HUB_DIR`, and `ZEROSHOT_STATE_DIR` and pass `--listen` and
+  `--token-file` through. Every target operation is delegated to this executable's own `run
+  --detach`, `list`, `status`, `watch`, `logs`, `attach`, and `force-stop` in a child process
+  (`ZEROSHOT_HUB_EXECUTABLE` overrides it for tests and demos), so the hub never bypasses admission,
+  authentication, or observation contracts. Placement also matches each job's requirements
+  (explicit source or hooks exclude `local`, named targets need a pushed revision, generic Git
+  transport and per-node lanes need their discovery markers) against capability kinds cached from
+  `/.well-known/zeroshot-native-v2`. Cron schedules use `croner` with an explicit IANA zone (`jiff`
+  bundled tzdb). Member capacity is hub-declared `slots`; load is the observed nonterminal runs.
+  Dispatch submission keys are `hub-JOB_ID-ATTEMPT`. Exit code 3 means no capacity or an expired
+  wait, and 4 means that no active member matches or supports the job.
+- `zeroshot/src/private_file.rs` owns owner-only file replacement for the shipped CLI: a random
+  `create_new` sibling with mode `0600`, fsync, rename over the destination, and cleanup on failure,
+  so readers never see a partial file and a link is replaced rather than written through. The target
+  registry and every hub file (state, heartbeat, contexts, token, spool, eval blobs and work files,
+  installed units) go through it; hub code calls `service::replace_private` and
+  `service::create_private_directory`.
+- `native_v2_hub/usage.rs` owns token-usage completeness for `hub stats`, eval reports, and
+  `/metrics`. A job keeps the run's protocol `TokenUsage` as reported, or an explicit `invalid`
+  record when it cannot be read. Only complete usage is totalled or priced; incomplete and invalid
+  usage is counted separately (`jobsWithIncompleteUsage`, `jobsWithInvalidUsage`), cache totals are
+  claimed only when every counted job reported them, and an overflowing total is withheld
+  (`usageOverflowed`) rather than published partially.
+- Hub metrics: `GET /metrics` (Prometheus text 0.0.4, hand-rolled in `native_v2_hub/metrics.rs`)
+  needs the API token; `--metrics-listen` adds a token-free listener that must be loopback, and
+  `--metrics-label KEY` opts job label keys into token counters. State-derived series are
+  recomputed per scrape; pass, placement, and API series count since daemon start. Never label by
+  job, run, schedule, or eval ID; label values cap at 50 distinct (`_other`), removed members are
+  `_removed`, and routes use axum templates.
+- Hub evals (`hub eval`, `native_v2_hub/eval*`) store suites, cases, and runs in
+  `HubState.evals` and file contents in `hub/eval/blobs/SHA256`. Case IDs (`ec_`) hash the
+  captured request, run IDs (`er_`) hash the request plus `--key`, and sample job IDs hash run,
+  case, variant, and repeat, so retries never duplicate work. Samples are ordinary queued hub jobs
+  labeled `eval.*`. Variant overrides are a pure merge in `eval/variant.rs` (graph/template and the
+  two runtime flags replace each other; model/harness/provider/runtime-patch edit the runtime file).
+  The daemon's eval worker (claimed work spawned beside dispatch) measures finished samples, runs
+  checks with `sh -c` in `hub/eval/work/...`, and runs `cmd:` judges on the hub host or
+  `zeroshot:` judges as `eval.role=judge` hub jobs whose terminal output (`Job.output`, kept only
+  for judge jobs) is the verdict. `eval/judge.rs` `HostCommand::run` owns host commands: input
+  written and capped output read together inside the timeout, and a typed `Ended` (not started,
+  timed out, incomplete input, exited N). Only an exit after reading the whole request yields a
+  verdict, and a check the hub could not start records `error` and leaves the pass unmeasured
+  instead of failing the candidate. Reports are pure (`eval/report.rs`); `--fail-on-regression`
+  exits 6 on a regression and 3 while incomplete. Judge and report schemas are documented in
+  `docs/guides/hub-operations.md`; keep them in sync.
+- Read-only safe commands include `zeroshot list`, `zeroshot status`, `zeroshot report`,
+  `zeroshot logs`, `zeroshot hub list`, `zeroshot hub ps`, `zeroshot hub stats`,
+  `zeroshot hub daemon status`, `zeroshot hub eval report|status|list`, and
+  `zeroshot hub context list`. `zeroshot report RUN_ID` emits one
+  `zeroshot.run.report/v1` JSON document from retained history; it never starts, resumes, or stops
+  a run, and named targets reuse their discovered run-history capability. `zeroshot hub eval run`
+  enqueues real runs.
+  `zeroshot hub install` and `zeroshot hub uninstall` change system services and need explicit
+  user intent; prefer `--dry-run` first.
 - Destructive commands such as `zeroshot force-stop` require explicit user intent.
 
 ## Where to look
@@ -774,10 +850,12 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 | Portable controller           | `zeroshot/src/native_v2_portable_controller.rs`, `zeroshot/src/native_v2_portable_controller/`                                                                                                    |
 | Provider/delivery composition | `zeroshot/src/native_v2_candidate.rs`, `zeroshot/src/native_v2_candidate/`                                                                                                                        |
 | Target server                 | `zeroshot/src/native_v2_target.rs`, `zeroshot/src/native_v2_target/`                                                                                                                              |
+| Hub (target pool and queue)   | `zeroshot/src/native_v2_cli/hub.rs`, `zeroshot/src/native_v2_cli/parser/hub.rs`, `zeroshot/src/native_v2_hub.rs`, `zeroshot/src/native_v2_hub/`                                                   |
 | Target authority/auth         | `zeroshot/src/native_v2_target_authority.rs`, `zeroshot/src/native_v2_target_authority/`                                                                                                          |
 | Contained execution           | `zeroshot/src/execution.rs`, `zeroshot/src/execution/`                                                                                                                                            |
 | Faults and redaction          | `zeroshot/src/fault.rs`, `zeroshot/src/fault/`                                                                                                                                                    |
 | Run ledger                    | `zeroshot/src/v2_run_ledger.rs`, `zeroshot/src/v2_run_ledger/`                                                                                                                                    |
+| Run history and report        | `zeroshot/src/native_v2_observability/history.rs`, `zeroshot/src/native_v2_observability/history/`                                                                                                |
 | Cluster protocol types        | `crates/openengine-cluster-protocol/`                                                                                                                                                             |
 | Cluster server                | `crates/openengine-cluster-server/`                                                                                                                                                               |
 | Cluster client                | `crates/openengine-cluster-client/`                                                                                                                                                               |

@@ -36,6 +36,7 @@ fn primary_completion_requires_quiescence_is_immutable_and_prevents_new_dispatch
             result: TerminalResult::Succeeded {
                 output: Value::Null,
             },
+            timestamp: None,
         },
         6,
     )

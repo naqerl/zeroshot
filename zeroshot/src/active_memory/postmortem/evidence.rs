@@ -109,7 +109,7 @@ fn main_event(request: &MainRunFacts<'_>, event: &RunEvent) -> bool {
             execution: Some(execution),
             ..
         } => main_execution(request, *execution),
-        RunEvent::NodeCompleted { completion } => {
+        RunEvent::NodeCompleted { completion, .. } => {
             main_execution(request, completion.reference.execution)
         }
         _ => false,

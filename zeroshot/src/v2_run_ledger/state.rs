@@ -52,6 +52,7 @@ fn bounded_json(value: &impl Serialize, maximum: usize) -> Result<(), ()> {
 pub(crate) fn prepare_event(snapshot: &RunSnapshot, mut event: RunEvent) -> RunEvent {
     if let RunEvent::Terminal {
         result: TerminalResult::Failed { reason, context },
+        ..
     }
     | RunEvent::PrimaryGraphCompleted {
         result: TerminalResult::Failed { reason, context },
@@ -92,6 +93,7 @@ fn apply_event_kind(
             occurrence,
             attempt,
             input,
+            timestamp: _,
         } => apply_node_started(
             snapshot,
             NodeStart {
@@ -102,12 +104,12 @@ fn apply_event_kind(
             },
             sequence,
         ),
-        RunEvent::NodeCompleted { completion } => {
+        RunEvent::NodeCompleted { completion, .. } => {
             apply_node_completed(snapshot, completion, sequence)
         }
-        RunEvent::ExecutionVoided { reference, reason } => {
-            apply_execution_voided(snapshot, reference, *reason, sequence)
-        }
+        RunEvent::ExecutionVoided {
+            reference, reason, ..
+        } => apply_execution_voided(snapshot, reference, *reason, sequence),
         RunEvent::SafeLog { .. }
         | RunEvent::TokenUsageObserved { .. }
         | RunEvent::RunTokenUsageObserved { .. } => {
@@ -118,7 +120,7 @@ fn apply_event_kind(
             auxiliary_pending,
         } => apply_primary_graph_completed(snapshot, result, *auxiliary_pending),
         RunEvent::ForceStopRequested => apply_force_stop(snapshot),
-        RunEvent::Terminal { result } => apply_terminal(snapshot, result),
+        RunEvent::Terminal { result, .. } => apply_terminal(snapshot, result),
     }
 }
 
