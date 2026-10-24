@@ -449,7 +449,12 @@ impl<'de> de::Visitor<'de> for ModelLimitVisitor {
     }
 }
 
-fn deserialize_optional_model_limit<'de, D>(
+/// Deserializes an optional caller-declared model limit shared by every runtime shape.
+///
+/// The field name and bounds are used in the rejection so a uniform runtime configuration
+/// reports the same diagnostic as an exact agent binding.
+#[doc(hidden)]
+pub fn deserialize_optional_model_limit<'de, D>(
     deserializer: D,
     field: &'static str,
     min: u32,

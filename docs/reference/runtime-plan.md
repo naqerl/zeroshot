@@ -295,15 +295,21 @@ the fields of several providers.
 
 `--uniform-runtime-config` accepts a single agent configuration and expands it into a full plan:
 
-| Field          | Required | Value                                 |
-| -------------- | -------- | ------------------------------------- |
-| `harness`      | Yes      | As in `RuntimePlan`                   |
-| `provider`     | Yes      | As in `RuntimePlan`                   |
-| `size`         | No       | As in `RuntimePlan`; default `medium` |
-| `model`        | Yes      | As in an `agent` binding              |
-| `effort`       | No       | As in an `agent` binding              |
-| `sessionScope` | No       | As in an `agent` binding              |
-| `connections`  | No       | Applied to every agent node           |
+| Field           | Required | Value                                 |
+| --------------- | -------- | ------------------------------------- |
+| `harness`       | Yes      | As in `RuntimePlan`                   |
+| `provider`      | Yes      | As in `RuntimePlan`                   |
+| `size`          | No       | As in `RuntimePlan`; default `medium` |
+| `model`         | Yes      | As in an `agent` binding              |
+| `effort`        | No       | As in an `agent` binding              |
+| `contextWindow` | No       | As in an `agent` binding              |
+| `maxTokens`     | No       | As in an `agent` binding              |
+| `sessionScope`  | No       | As in an `agent` binding              |
+| `connections`   | No       | Applied to every agent node           |
+
+`contextWindow` and `maxTokens` are available in both an exact `agent` binding and a uniform
+runtime configuration. They are caller declarations and are never inferred from the model
+identifier.
 
 Every executable node gets an `agent` binding with these values, except nodes that use a delivery
 worker. Those get a `git_delivery` binding as described below.
