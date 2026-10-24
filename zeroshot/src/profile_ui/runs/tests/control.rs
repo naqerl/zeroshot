@@ -12,6 +12,7 @@ fn terminal() -> RunEvent {
         result: TerminalResult::Succeeded {
             output: Value::Null,
         },
+        timestamp: None,
     }
 }
 
@@ -99,6 +100,7 @@ async fn dispatch_ready(fixture: &Fixture) -> Vec<ExecutionRef> {
                 occurrence,
                 attempt,
                 input,
+                timestamp: None,
             })
         })
         .collect::<Vec<_>>();
@@ -132,6 +134,7 @@ async fn finish(fixture: &Fixture, reference: ExecutionRef, verdict: Option<&str
             &fixture.id,
             vec![RunEvent::NodeCompleted {
                 completion: NodeCompletion { reference, outcome },
+                timestamp: None,
             }],
         )
         .await
@@ -304,6 +307,7 @@ async fn stopped_runs_settle_pending_controls_without_selecting_post_stop_routes
                     context: None,
                     reason: "runtime_failed".parse().assert_value(),
                 },
+                timestamp: None,
             }],
         )
         .await

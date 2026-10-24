@@ -276,7 +276,7 @@ async fn capsule_deadline_preserves_usage_and_waits_for_cleanup_before_settlemen
         .assert_value();
     let completion = tail.events.iter().position(|event| matches!(
         &event.event,
-        RunEvent::NodeCompleted { completion }
+        RunEvent::NodeCompleted { completion, .. }
             if completion.outcome == WorkerOutcome::declared_failure(WorkerErrorCode::Timeout)
     )).assert_value();
     assert!(usage < completion);

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use openengine_cluster_protocol::is_canonical_uuid_v7;
 use reqwest::header::{ACCEPT, CACHE_CONTROL};
 use std::sync::Arc;
-use zeroshot_engine::profile_ui::{
+use zeroshot_engine::native_v2_observability::history::{
     RunHistoryRequest, RunHistoryResponse, RunHistoryTransport, RunHistoryTransportError,
 };
 

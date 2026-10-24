@@ -100,6 +100,7 @@ section { margin-block: 2.5rem; }
 <li><a href="#zeroshot-update"><code>zeroshot update</code></a></li>
 <li><a href="#zeroshot-list"><code>zeroshot list</code></a></li>
 <li><a href="#zeroshot-status"><code>zeroshot status</code></a></li>
+<li><a href="#zeroshot-report"><code>zeroshot report</code></a></li>
 <li><a href="#zeroshot-watch"><code>zeroshot watch</code></a></li>
 <li><a href="#zeroshot-logs"><code>zeroshot logs</code></a></li>
 <li><a href="#zeroshot-attach"><code>zeroshot attach</code></a></li>
@@ -130,6 +131,7 @@ Commands:
   update             Update this executable and managed agent skill to the newest canonical release
   list               List runs as JSON
   status             Read a run&#39;s current status as JSON
+  report             Print one JSON lifecycle report for a run
   watch              Follow a run&#39;s durable event stream as NDJSON
   logs               Follow a run&#39;s log stream as NDJSON
   attach             Attach to an execution&#39;s interactive event stream as NDJSON
@@ -2461,6 +2463,26 @@ Options:
 
   -h, --help
           Print help</code></pre></section>
+<section id="zeroshot-report"><h3><code>zeroshot report</code></h3>
+<pre><code>Print one JSON lifecycle report for a run.
+
+Reads only retained run history; it never starts, resumes, or stops a run. Named targets reuse their discovered run-history capability, while local runs read their local ledger.
+
+Usage: zeroshot report [OPTIONS] &lt;RUN_ID&gt;
+
+Arguments:
+  &lt;RUN_ID&gt;
+          Public run ID
+
+Options:
+      --target &lt;NAME&gt;
+          Use this named target. If omitted, use the local controller
+
+      --json
+          Emit machine-readable JSON. This is the default and only report format
+
+  -h, --help
+          Print help (see a summary with &#39;-h&#39;)</code></pre></section>
 <section id="zeroshot-watch"><h3><code>zeroshot watch</code></h3>
 <pre><code>Follow a run&#39;s durable event stream as NDJSON
 
@@ -2619,6 +2641,7 @@ Commands:
   update             Update this executable and managed agent skill to the newest canonical release
   list               List runs as JSON
   status             Read a run&#39;s current status as JSON
+  report             Print one JSON lifecycle report for a run
   watch              Follow a run&#39;s durable event stream as NDJSON
   logs               Follow a run&#39;s log stream as NDJSON
   attach             Attach to an execution&#39;s interactive event stream as NDJSON

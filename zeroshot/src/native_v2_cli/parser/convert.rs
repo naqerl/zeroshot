@@ -10,7 +10,8 @@ use openengine_cluster_protocol::{
 use super::{
     AcpArgs, AttachArgs, Cli, CliCommand, ConnectionCommand, ConnectionScopeArg, PlanCommand,
     PlanSelectorArgs, PlanSubmitArgs, RunArgs, RunCheckpointsArgs, RunResumeArgs, RunLogsArgs,
-    RunSelectorArgs, RunWatchArgs, TargetCommand, TemplateCommand, TemplateName, UtilityCommand,
+    RunReportArgs, RunSelectorArgs, RunWatchArgs, TargetCommand, TemplateCommand, TemplateName,
+    UtilityCommand,
 };
 use crate::native_v2_cli::{
     BuiltinGraphTemplate, ConnectionInput, ConnectionRoute, ConnectionSetCommand,
@@ -176,6 +177,7 @@ impl UtilityCommand {
                 validated_target(args.target).map(|target| NativeV2CliCommand::List { target })
             }
             Self::Status(args) => args.into_selector().map(NativeV2CliCommand::Status),
+            Self::Report(args) => args.into_command(),
             Self::Watch(args) => args.into_command(),
             Self::Logs(args) => args.into_command(),
             Self::Attach(args) => args.into_command(),
@@ -196,6 +198,13 @@ impl UtilityCommand {
                 .map(NativeV2CliCommand::DiscardWorkspace),
             _ => unreachable!("recovery command was checked by the caller"),
         }
+    }
+}
+
+impl RunReportArgs {
+    fn into_command(self) -> Result<NativeV2CliCommand, NativeV2CliError> {
+        let _ = self.json;
+        self.run.into_selector().map(NativeV2CliCommand::Report)
     }
 }
 

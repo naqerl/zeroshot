@@ -67,6 +67,7 @@ fn started(reference: ExecutionRef) -> RunEvent {
         },
         attempt: PositiveInteger::new(1).assert_value(),
         input: json!({ "request": "edit" }),
+        timestamp: None,
     }
 }
 
@@ -79,6 +80,7 @@ fn completed(reference: ExecutionRef, output: Value) -> RunEvent {
                 artifacts: Vec::new(),
             },
         },
+        timestamp: None,
     }
 }
 
@@ -145,6 +147,52 @@ fn public_phase_and_safe_log_contracts_cover_every_wire_boundary() {
     assert!(serde_json::from_str::<SafeLogLine>(r#""before\u0000after""#).is_err());
 }
 
+#[test]
+fn lifecycle_events_written_without_timestamps_still_decode() {
+    let reference = json!({
+        "runId": "018f5e78-7f95-7c22-8d98-3f15af20c981",
+        "node": "worker",
+        "nodeInstance": 7,
+        "execution": 7
+    });
+    let events = [
+        json!({
+            "kind": "node_started",
+            "reference": reference.clone(),
+            "occurrence": { "node": "worker", "mapIndices": [] },
+            "attempt": 1,
+            "input": null
+        }),
+        json!({
+            "kind": "node_completed",
+            "completion": {
+                "reference": reference.clone(),
+                "outcome": { "status": "verified", "output": null, "artifacts": [] }
+            }
+        }),
+        json!({
+            "kind": "execution_voided",
+            "reference": reference.clone(),
+            "reason": "parallel_join"
+        }),
+        json!({
+            "kind": "terminal",
+            "result": { "status": "succeeded", "output": null }
+        }),
+    ];
+    let decoded = events
+        .into_iter()
+        .map(|event| serde_json::from_value::<RunEvent>(event).assert_value())
+        .collect::<Vec<_>>();
+    assert!(decoded.iter().all(|event| match event {
+        RunEvent::NodeStarted { timestamp, .. }
+        | RunEvent::NodeCompleted { timestamp, .. }
+        | RunEvent::ExecutionVoided { timestamp, .. }
+        | RunEvent::Terminal { timestamp, .. } => timestamp.is_none(),
+        _ => false,
+    }));
+}
+
 fn active_snapshot(run: &str) -> (RunSnapshot, ExecutionRef) {
     let run_id = RunId::new(run);
     let reference = reference(&run_id, 1);
@@ -184,6 +232,7 @@ fn state_projection_rejects_invalid_cursors_dispatches_and_log_references() {
             result: TerminalResult::Succeeded {
                 output: Value::Null,
             },
+            timestamp: None,
         },
         "cannot finish with active executions",
     );
@@ -253,6 +302,7 @@ fn state_projection_rejects_usage_and_settlement_identity_corruption() {
             result: TerminalResult::Succeeded {
                 output: Value::Null,
             },
+            timestamp: None,
         },
         7,
     )
@@ -309,6 +359,7 @@ async fn node_completion_with_artifact_reference_is_never_persisted() {
                         artifacts: vec![artifact],
                     },
                 },
+                timestamp: None,
             }],
         )
         .await;
@@ -394,11 +445,13 @@ async fn fake_projects_outputs_voids_safe_logs_and_terminal_in_order() {
                 RunEvent::ExecutionVoided {
                     reference: second.clone(),
                     reason: ExecutionVoidReason::ParallelJoin,
+                    timestamp: None,
                 },
                 RunEvent::Terminal {
                     result: TerminalResult::Succeeded {
                         output: json!({ "merged": true }),
                     },
+                    timestamp: None,
                 },
             ],
         )
@@ -760,6 +813,7 @@ async fn sqlite_reopens_legacy_generic_and_absent_source_without_fabricated_prov
                             result: TerminalResult::Succeeded {
                                 output: Value::Null,
                             },
+                            timestamp: None,
                         },
                     ],
                 )

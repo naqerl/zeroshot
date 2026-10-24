@@ -21,6 +21,9 @@ use zeroshot_engine::native_v2_cli::oecp::BoxedSubscription;
 use zeroshot_engine::native_v2_cli::{
     CliRunForceResult, CliRunListResult, CliRunStatusResult, CliRunWatchEventNotification,
 };
+use zeroshot_engine::native_v2_observability::history::{
+    RunHistoryRequest, RunHistoryResponse, RunHistoryTransport,
+};
 use zeroshot_engine::native_v2_target_authority::{
     TargetOecpSession, TargetRunReceipt, TargetRunRequest,
 };
@@ -307,5 +310,16 @@ impl TargetControlAuthority for TargetHttpControlAuthority {
         params: RunForceParams,
     ) -> Result<CliRunForceResult, TargetAuthorityError> {
         TargetHttpControlAuthority::hosted_run_force(self, target, params).await
+    }
+    async fn run_history(
+        &self,
+        target: &TargetRecord,
+        request: RunHistoryRequest,
+    ) -> Result<RunHistoryResponse, TargetAuthorityError> {
+        let transport = super::TargetRunHistoryTransport::new(self.clone(), target.clone())?;
+        transport
+            .get(request)
+            .await
+            .map_err(|error| authority_error(error.to_string()))
     }
 }

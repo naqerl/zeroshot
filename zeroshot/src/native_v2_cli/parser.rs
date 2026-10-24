@@ -135,6 +135,12 @@ enum UtilityCommand {
     /// Read a run's current status as JSON.
     Status(RunSelectorArgs),
 
+    /// Print one JSON lifecycle report for a run.
+    ///
+    /// Reads only retained run history; it never starts, resumes, or stops a run. Named targets
+    /// reuse their discovered run-history capability, while local runs read their local ledger.
+    Report(RunReportArgs),
+
     /// Follow a run's durable event stream as NDJSON.
     Watch(RunWatchArgs),
 
@@ -654,6 +660,16 @@ struct RunSelectorArgs {
     /// Use this named target. If omitted, use the local controller.
     #[arg(long, value_name = "NAME")]
     target: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct RunReportArgs {
+    #[command(flatten)]
+    run: RunSelectorArgs,
+
+    /// Emit machine-readable JSON. This is the default and only report format.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]

@@ -801,9 +801,12 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   instead of failing the candidate. Reports are pure (`eval/report.rs`); `--fail-on-regression`
   exits 6 on a regression and 3 while incomplete. Judge and report schemas are documented in
   `docs/guides/hub-operations.md`; keep them in sync.
-- Read-only safe commands include `zeroshot list`, `zeroshot status`, `zeroshot logs`,
-  `zeroshot hub list`, `zeroshot hub ps`, `zeroshot hub stats`, `zeroshot hub daemon status`,
-  `zeroshot hub eval report|status|list`, and `zeroshot hub context list`. `zeroshot hub eval run`
+- Read-only safe commands include `zeroshot list`, `zeroshot status`, `zeroshot report`,
+  `zeroshot logs`, `zeroshot hub list`, `zeroshot hub ps`, `zeroshot hub stats`,
+  `zeroshot hub daemon status`, `zeroshot hub eval report|status|list`, and
+  `zeroshot hub context list`. `zeroshot report RUN_ID` emits one
+  `zeroshot.run.report/v1` JSON document from retained history; it never starts, resumes, or stops
+  a run, and named targets reuse their discovered run-history capability. `zeroshot hub eval run`
   enqueues real runs.
   `zeroshot hub install` and `zeroshot hub uninstall` change system services and need explicit
   user intent; prefer `--dry-run` first.
@@ -829,6 +832,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 | Contained execution           | `zeroshot/src/execution.rs`, `zeroshot/src/execution/`                                                                                                                                            |
 | Faults and redaction          | `zeroshot/src/fault.rs`, `zeroshot/src/fault/`                                                                                                                                                    |
 | Run ledger                    | `zeroshot/src/v2_run_ledger.rs`, `zeroshot/src/v2_run_ledger/`                                                                                                                                    |
+| Run history and report        | `zeroshot/src/native_v2_observability/history.rs`, `zeroshot/src/native_v2_observability/history/`                                                                                                |
 | Cluster protocol types        | `crates/openengine-cluster-protocol/`                                                                                                                                                             |
 | Cluster server                | `crates/openengine-cluster-server/`                                                                                                                                                               |
 | Cluster client                | `crates/openengine-cluster-client/`                                                                                                                                                               |

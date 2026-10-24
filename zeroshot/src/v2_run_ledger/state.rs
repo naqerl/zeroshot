@@ -52,6 +52,7 @@ fn bounded_json(value: &impl Serialize, maximum: usize) -> Result<(), ()> {
 pub(crate) fn prepare_event(snapshot: &RunSnapshot, mut event: RunEvent) -> RunEvent {
     if let RunEvent::Terminal {
         result: TerminalResult::Failed { reason, context },
+        ..
     } = &mut event
         && context.is_none()
         && reason.as_str() != "force_stopped"
@@ -88,6 +89,7 @@ fn apply_event_kind(
             occurrence,
             attempt,
             input,
+            timestamp: _,
         } => apply_node_started(
             snapshot,
             NodeStart {
@@ -98,18 +100,18 @@ fn apply_event_kind(
             },
             sequence,
         ),
-        RunEvent::NodeCompleted { completion } => {
+        RunEvent::NodeCompleted { completion, .. } => {
             apply_node_completed(snapshot, completion, sequence)
         }
-        RunEvent::ExecutionVoided { reference, reason } => {
-            apply_execution_voided(snapshot, reference, *reason, sequence)
-        }
+        RunEvent::ExecutionVoided {
+            reference, reason, ..
+        } => apply_execution_voided(snapshot, reference, *reason, sequence),
         RunEvent::SafeLog { .. } => apply_safe_log(snapshot, event, sequence),
         RunEvent::TokenUsageObserved { execution, usage } => {
             apply_token_usage(snapshot, *execution, usage.as_ref())
         }
         RunEvent::ForceStopRequested => apply_force_stop(snapshot),
-        RunEvent::Terminal { result } => apply_terminal(snapshot, result),
+        RunEvent::Terminal { result, .. } => apply_terminal(snapshot, result),
     }
 }
 

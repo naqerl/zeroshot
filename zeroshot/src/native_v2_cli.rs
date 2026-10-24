@@ -26,6 +26,7 @@ use thiserror::Error;
 
 pub use crate::native_v2_contract::RunSubmissionIntent as TargetRunIntent;
 use crate::native_v2_admission::NativeV2AdmissionError;
+use crate::native_v2_observability::history::RunReport;
 use crate::native_v2_supervisor::RunEnvironmentError;
 
 #[path = "native_v2_templates.rs"]
@@ -337,6 +338,7 @@ pub enum NativeV2CliCommand {
         target: Option<String>,
     },
     Status(RunSelector),
+    Report(RunSelector),
     Watch(RunWatchCommand),
     Logs(RunLogsCommand),
     Attach {
@@ -655,6 +657,16 @@ pub trait NativeV2CliBackend: Send + Sync {
         target: Option<&str>,
         params: RunForceParams,
     ) -> Result<CliRunForceResult, NativeV2CliError>;
+    async fn run_report(
+        &self,
+        target: Option<&str>,
+        run_id: RunId,
+    ) -> Result<RunReport, NativeV2CliError> {
+        let _ = (target, run_id);
+        Err(NativeV2CliError::Target(
+            "target does not support run reports".to_owned(),
+        ))
+    }
     async fn authorize_resume_connection_requirements(
         &self,
         target: Option<&str>,

@@ -262,6 +262,7 @@ async fn populate_history(fixture: &HistoryServer) {
             },
             attempt: PositiveInteger::new(1).assert_value(),
             input: json!({"task":"Inspect native history"}),
+            timestamp: None,
         },
     ];
     events.extend((0..MAX_REPLAY_EVENTS + 2).map(|index| RunEvent::SafeLog {
@@ -278,11 +279,15 @@ async fn populate_history(fixture: &HistoryServer) {
             artifacts: vec![],
         },
     };
-    events.push(RunEvent::NodeCompleted { completion });
+    events.push(RunEvent::NodeCompleted {
+        completion,
+        timestamp: None,
+    });
     events.push(RunEvent::Terminal {
         result: TerminalResult::Succeeded {
             output: Value::Null,
         },
+        timestamp: None,
     });
     fixture
         .factory
