@@ -318,21 +318,34 @@ Each row has these fields:
 #### Human-readable table
 
 `--table` only changes the rendering; the JSON report, its schema, and its field names stay the
-same. The title names the run, its baseline, and whether the run is complete. Aggregate rows are
-labelled `ALL CASES (aggregate)`. Deltas are absolute for pass rate and judge score and relative
-for tokens, cost, and duration; `-` means the metric is unavailable.
+same. The title names the run, its baseline, and whether the run is complete, wrapping when needed
+to stay within 80 columns. The table is split into column groups so every line remains readable in
+an 80-column terminal. Aggregate rows are labelled `ALL CASES`. Long case ids are truncated with an
+ellipsis. Deltas are absolute for pass rate and judge score and relative for tokens, cost, and
+duration; `-` means the metric is unavailable.
 
 ```text
-Eval report er_4c1d0e9a7b2f3c51  baseline=er_4c1d0e9a7b2f3c51:baseline  complete=true
-CASE                  VARIANT  SAMPLES(count) PASS_RATE(0..1) JUDGE_SCORE(0..1)     TOKENS(tok)   COST_USD(USD) DURATION_MS(ms) VERDICT
-ALL CASES (aggregate) baseline              6            1.00              0.82          412300          0.0912           81234 baseline
-ALL CASES (aggregate) small                 6   1.00 (+0.000)     0.74 (-0.080) 298400 (-27.6%) 0.0660 (-27.6%)  70110 (-13.7%) regressed
-ec_4c1d0e9a7b2f3c51   baseline              3            1.00              0.80          400000          0.0880           80000 baseline
-ec_4c1d0e9a7b2f3c51   small                 3   1.00 (+0.000)     0.70 (-0.100) 300000 (-25.0%) 0.0660 (-25.0%)  70000 (-12.5%) regressed
+Eval report er_4c1d0e9a7b2f3c51  baseline=er_4c1d0e9a7b2f3c51:baseline
+  complete=true
+CASE         VARIANT          SAMPLES(count) PASS_RATE(0..1) JUDGE_SCORE(0..1)
+ALL CASES    baseline                      6            1.00              0.82
+ALL CASES    small                         6   1.00 (+0.000)     0.74 (-0.080)
+ec_4c1d0e9a… baseline                      3            1.00              0.80
+ec_4c1d0e9a… small                         3   1.00 (+0.000)     0.70 (-0.100)
+CASE         VARIANT                TOKENS(tok)   COST_USD(USD) DURATION_MS(ms)
+ALL CASES    baseline                    412300          0.0912           81234
+ALL CASES    small              298400 (-27.6%) 0.0660 (-27.6%)  70110 (-13.7%)
+ec_4c1d0e9a… baseline                    400000          0.0880           80000
+ec_4c1d0e9a… small              300000 (-25.0%) 0.0660 (-25.0%)  70000 (-12.5%)
+CASE         VARIANT          VERDICT
+ALL CASES    baseline         baseline
+ALL CASES    small            regressed
+ec_4c1d0e9a… baseline         baseline
+ec_4c1d0e9a… small            regressed
 
 Legend: delta = candidate - baseline; absolute difference or relative % change
-  CASE         case id; ALL CASES (aggregate) covers every case
-  VARIANT      variant name; baseline rows print role=baseline, no delta
+  CASE         case id (truncated); ALL CASES aggregates every case
+  VARIANT      variant name; baseline rows print 'baseline' with no delta
   SAMPLES      samples counted, unit: samples; no delta
   PASS_RATE    passing fraction, unit: 0..1; delta is absolute
   JUDGE_SCORE  mean judge score, unit: 0..1 (pairwise -1..1); delta absolute

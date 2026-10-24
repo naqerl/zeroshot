@@ -517,12 +517,11 @@ fn table_is_self_describing_and_names_units_and_delta_kinds() {
         Some(&prices),
     );
     let rendered = table(&document);
-    let mut lines = rendered.lines();
+    let lines = rendered.lines().collect::<Vec<_>>();
     assert_eq!(
-        lines.next().expect("title"),
+        lines[0],
         "Eval report er_1  baseline=er_1:baseline  complete=true"
     );
-    let header = lines.next().expect("header");
     for name in [
         "CASE",
         "VARIANT",
@@ -534,42 +533,67 @@ fn table_is_self_describing_and_names_units_and_delta_kinds() {
         "DURATION_MS(ms)",
         "VERDICT",
     ] {
-        assert!(header.contains(name), "{name} missing from {header}");
+        assert!(
+            lines.iter().any(|line| line.contains(name)),
+            "{name} missing from the table"
+        );
     }
-    let data = lines
-        .by_ref()
-        .take_while(|line| !line.is_empty())
+    let cheap = lines
+        .iter()
+        .filter(|line| line.contains("ALL CASES") && line.contains("cheap"))
+        .copied()
         .collect::<Vec<_>>();
-    assert!(!data.is_empty());
-    let cheap = data
-        .iter()
-        .find(|line| line.contains("ALL CASES (aggregate)") && line.contains("cheap"))
-        .expect("cheap aggregate row");
+    assert!(!cheap.is_empty());
+    let cheap_text = cheap.join("\n");
     // pass rate and judge score deltas are absolute, the rest are relative.
-    assert!(cheap.contains("0.75 (-0.250)"), "{cheap}");
-    assert!(cheap.contains("0.30 (-0.500)"), "{cheap}");
-    assert!(cheap.contains("500000 (-50.0%)"), "{cheap}");
-    assert!(cheap.contains("1.5000 (-25.0%)"), "{cheap}");
-    assert!(cheap.contains("2000 (+100.0%)"), "{cheap}");
+    assert!(cheap_text.contains("0.75 (-0.250)"), "{cheap_text}");
+    assert!(cheap_text.contains("0.30 (-0.500)"), "{cheap_text}");
+    assert!(cheap_text.contains("500000 (-50.0%)"), "{cheap_text}");
+    assert!(cheap_text.contains("1.5000 (-25.0%)"), "{cheap_text}");
+    assert!(cheap_text.contains("2000 (+100.0%)"), "{cheap_text}");
     // A long case id is truncated, so every row keeps the same column alignment.
-    let long = data
+    let long = lines
         .iter()
-        .find(|line| line.contains("ec_0123456789abcdef") && line.contains("cheap"))
-        .expect("long case row");
-    assert!(!long.contains("ec_0123456789abcdef_long_case_id"), "{long}");
+        .filter(|line| line.contains("ec_01234567…") && line.contains("cheap"))
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(!long.is_empty());
+    assert!(
+        !rendered.contains("ec_0123456789abcdef_long_case_id"),
+        "{rendered}"
+    );
     let column =
         |line: &str, needle: &str| line[..line.find(needle).expect("column")].chars().count();
+    let cheap_overview = cheap
+        .iter()
+        .find(|line| line.contains("0.75 (-0.250)"))
+        .expect("cheap overview row");
+    let long_overview = long
+        .iter()
+        .find(|line| line.contains("0.30 (-0.500)"))
+        .expect("long overview row");
     assert_eq!(
-        column(long, "cheap"),
-        column(cheap, "cheap"),
-        "{long}\n{cheap}"
+        column(long_overview, "cheap"),
+        column(cheap_overview, "cheap"),
+        "{long_overview}\n{cheap_overview}"
     );
+    let cheap_measure = cheap
+        .iter()
+        .find(|line| line.contains("500000 (-50.0%)"))
+        .expect("cheap measure row");
+    let long_measure = long
+        .iter()
+        .find(|line| line.contains("500000 (-50.0%)"))
+        .expect("long measure row");
     assert_eq!(
-        column(long, "2000 (+100.0%)"),
-        column(cheap, "2000 (+100.0%)")
+        column(long_measure, "2000 (+100.0%)"),
+        column(cheap_measure, "2000 (+100.0%)")
     );
-    let legend = lines.collect::<Vec<_>>();
-    assert!(legend[0].starts_with("Legend:"), "{legend:?}");
+    let legend_start = lines
+        .iter()
+        .position(|line| line.starts_with("Legend:"))
+        .expect("legend");
+    let legend = &lines[legend_start..];
     assert!(
         legend
             .iter()
@@ -583,6 +607,12 @@ fn table_is_self_describing_and_names_units_and_delta_kinds() {
     assert!(
         legend
             .iter()
+            .any(|line| line.contains("baseline rows print 'baseline'"))
+    );
+    assert!(!legend.iter().any(|line| line.contains("role=baseline")));
+    assert!(
+        legend
+            .iter()
             .any(|line| line.contains("All variants are compared with the baseline"))
     );
     assert!(
@@ -590,7 +620,34 @@ fn table_is_self_describing_and_names_units_and_delta_kinds() {
             .iter()
             .any(|line| line.contains("'-' means unavailable"))
     );
-    for line in legend {
+    for line in lines {
+        assert!(
+            line.chars().count() <= 80,
+            "{} columns: {line}",
+            line.chars().count()
+        );
+    }
+}
+
+#[test]
+fn table_wraps_a_long_title_within_eighty_columns() {
+    let document = json!({
+        "runId": "er_0123456789abcdef",
+        "baseline": {"runId": "er_0123456789abcdef", "variant": "baseline"},
+        "complete": true,
+        "variants": [],
+        "cases": [],
+        "improvements": 0,
+        "regressions": 0
+    });
+    let rendered = table(&document);
+    let lines = rendered.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines[0],
+        "Eval report er_0123456789abcdef  baseline=er_0123456789abcdef:baseline"
+    );
+    assert_eq!(lines[1], "  complete=true");
+    for line in lines {
         assert!(
             line.chars().count() <= 80,
             "{} columns: {line}",
@@ -609,11 +666,14 @@ fn table_prints_a_dash_for_a_missing_cost() {
         None,
     );
     let rendered = table(&document);
-    let data = rendered
-        .lines()
-        .skip_while(|line| !line.starts_with("CASE"))
-        .skip(1)
-        .take_while(|line| !line.is_empty())
+    let lines = rendered.lines().collect::<Vec<_>>();
+    let header = lines
+        .iter()
+        .position(|line| line.contains("TOKENS(tok)") && line.contains("COST_USD(USD)"))
+        .expect("measure header");
+    let data = lines[header + 1..]
+        .iter()
+        .take_while(|line| !line.is_empty() && !line.starts_with("CASE"))
         .collect::<Vec<_>>();
     assert!(!data.is_empty());
     for line in data {

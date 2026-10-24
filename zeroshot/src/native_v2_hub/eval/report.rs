@@ -402,8 +402,13 @@ pub(crate) fn report(
     })
 }
 
-const CASE_WIDTH: usize = 22;
-const VARIANT_WIDTH: usize = 16;
+const MAX_WIDTH: usize = 80;
+
+/// Fixed column widths keep every rendered section within the terminal budget.
+const COLUMN_WIDTHS: [usize; 9] = [12, 16, 14, 15, 17, 17, 15, 15, 12];
+const OVERVIEW_COLUMNS: &[usize] = &[0, 1, 2, 3, 4];
+const MEASURE_COLUMNS: &[usize] = &[0, 1, 5, 6, 7];
+const VERDICT_COLUMNS: &[usize] = &[0, 1, 8];
 
 /// Column headings of the human table, named with their unit, in report order.
 const HEADERS: [&str; 9] = [
@@ -421,8 +426,8 @@ const HEADERS: [&str; 9] = [
 /// One compact line per column, then the comparison rule; each fits in 80 columns.
 const LEGEND: [&str; 11] = [
     "Legend: delta = candidate - baseline; absolute difference or relative % change",
-    "  CASE         case id; ALL CASES (aggregate) covers every case",
-    "  VARIANT      variant name; baseline rows print role=baseline, no delta",
+    "  CASE         case id (truncated); ALL CASES aggregates every case",
+    "  VARIANT      variant name; baseline rows print 'baseline' with no delta",
     "  SAMPLES      samples counted, unit: samples; no delta",
     "  PASS_RATE    passing fraction, unit: 0..1; delta is absolute",
     "  JUDGE_SCORE  mean judge score, unit: 0..1 (pairwise -1..1); delta absolute",
@@ -444,6 +449,52 @@ fn fit(text: &str, width: usize) -> String {
         .collect::<String>();
     fitted.push('…');
     fitted
+}
+
+fn bounded(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        text.to_owned()
+    } else {
+        fit(text, width)
+    }
+}
+
+fn aligned(text: &str, width: usize, right: bool) -> String {
+    if text.chars().count() > width {
+        return fit(text, width);
+    }
+    if right {
+        format!("{text:>width$}")
+    } else {
+        format!("{text:<width$}")
+    }
+}
+
+/// The title is allowed to wrap, but every physical line must fit the table width.
+fn title_lines(run: &str, baseline: &str, complete: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for part in [
+        format!("Eval report {run}"),
+        format!("baseline={baseline}"),
+        format!("complete={complete}"),
+    ] {
+        let part = bounded(&part, MAX_WIDTH);
+        if current.is_empty() {
+            current = part;
+        } else if current.chars().count() + 2 + part.chars().count() <= MAX_WIDTH {
+            current.push_str("  ");
+            current.push_str(&part);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            let part = bounded(&part, MAX_WIDTH.saturating_sub(2));
+            current = format!("  {part}");
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 /// A self-describing summary of a report document for people.
@@ -485,43 +536,25 @@ pub(crate) fn table(report: &Value) -> String {
         ]);
     };
     for row in report["variants"].as_array().into_iter().flatten() {
-        push("ALL CASES (aggregate)", row);
+        push("ALL CASES", row);
     }
     for case in report["cases"].as_array().into_iter().flatten() {
         for row in case["variants"].as_array().into_iter().flatten() {
             push(case["caseId"].as_str().unwrap_or("-"), row);
         }
     }
-    let mut widths = HEADERS.map(|header| header.chars().count());
-    widths[0] = rows
-        .iter()
-        .map(|row| row[0].chars().count().min(CASE_WIDTH))
-        .max()
-        .unwrap_or(0)
-        .max(HEADERS[0].chars().count());
-    widths[1] = rows
-        .iter()
-        .map(|row| row[1].chars().count().min(VARIANT_WIDTH))
-        .max()
-        .unwrap_or(0)
-        .max(HEADERS[1].chars().count());
-    for row in &rows {
-        for (index, value) in row.iter().enumerate().skip(2) {
-            widths[index] = widths[index].max(value.chars().count());
-        }
-    }
-    let line = |cells: &[&str; 9]| {
+    let line = |cells: &[&str], columns: &[usize]| {
         let mut line = String::new();
-        for (index, cell) in cells.iter().enumerate() {
-            if index > 0 {
+        for (position, index) in columns.iter().copied().enumerate() {
+            if position > 0 {
                 line.push(' ');
             }
             // Rendered columns are right-aligned; descriptive columns keep text left.
-            if (2..=7).contains(&index) {
-                line.push_str(&format!("{cell:>width$}", width = widths[index]));
-            } else {
-                line.push_str(&fit(cell, widths[index]));
-            }
+            line.push_str(&aligned(
+                cells[index],
+                COLUMN_WIDTHS[index],
+                (2..=7).contains(&index),
+            ));
         }
         line.trim_end().to_owned()
     };
@@ -537,16 +570,17 @@ pub(crate) fn table(report: &Value) -> String {
                 )
             },
         );
-    let mut lines = vec![
-        format!(
-            "Eval report {}  baseline={baseline}  complete={}",
-            report["runId"].as_str().unwrap_or("-"),
-            report["complete"],
-        ),
-        line(&HEADERS),
-    ];
-    for row in &rows {
-        lines.push(line(&std::array::from_fn(|index| row[index].as_str())));
+    let mut lines = title_lines(
+        report["runId"].as_str().unwrap_or("-"),
+        &baseline,
+        &report["complete"].to_string(),
+    );
+    for columns in [OVERVIEW_COLUMNS, MEASURE_COLUMNS, VERDICT_COLUMNS] {
+        lines.push(line(&HEADERS, columns));
+        for row in &rows {
+            let cells: [&str; 9] = std::array::from_fn(|index| row[index].as_str());
+            lines.push(line(&cells, columns));
+        }
     }
     lines.push(String::new());
     lines.extend(LEGEND.map(str::to_owned));
