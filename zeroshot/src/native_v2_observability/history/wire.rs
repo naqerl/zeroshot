@@ -1,7 +1,8 @@
 //! Versioned browser/archive wire records. Pages inherit the ledger's 256-event/1 MiB bound;
 //! derived control updates have the canonical projector's separate 4 MiB limit.
 use openengine_cluster_protocol::{
-    Cursor, GraphSpec, ResolvedSource, RunId, RunTitle, RuntimePlan, TerminalResult,
+    Cursor, GraphSpec, NodeName, ResolvedSource, RunId, RunTitle, RuntimePlan, TerminalResult,
+    UnixTimestampMillis,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -176,6 +177,32 @@ pub struct RunDefinition {
     pub observation: Observation,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_failure: Option<RuntimeFailure>,
+    /// Additive lifecycle rollup: old definitions decode with no rows, and rows are omitted when
+    /// a run never dispatched a node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<RunNodeDetail>,
+    /// Additive run-level counters derived from retained safe logs.
+    #[serde(default)]
+    pub compactions: u64,
+    #[serde(default)]
+    pub format_rejections: u64,
+}
+
+/// One lifecycle row aggregated by node and node instance.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunNodeDetail {
+    pub name: NodeName,
+    /// Serialized as an opaque string so browser consumers never round a large identity.
+    pub node_instance: String,
+    pub attempts: u64,
+    #[serde(default)]
+    pub started_at: Option<UnixTimestampMillis>,
+    #[serde(default)]
+    pub completed_at: Option<UnixTimestampMillis>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    pub voided: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

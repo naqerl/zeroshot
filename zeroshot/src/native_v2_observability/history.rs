@@ -2,21 +2,34 @@
 //! Reading this service never starts, initializes, or recovers a controller.
 use std::sync::Arc;
 
-use openengine_cluster_protocol::{is_canonical_uuid_v7, Cursor, GraphSpec, RunId};
+use std::collections::BTreeMap;
+
+use openengine_cluster_protocol::{is_canonical_uuid_v7, Cursor, GraphSpec, RunId, UnixTimestampMillis};
 use serde_json::{json, Value};
 
-use crate::v2_run_ledger::{cursor_sequence, initial_cursor, RunLedger, RunLedgerError, RunSnapshot};
+use crate::v2_run_ledger::{
+    cursor_sequence, initial_cursor, RunEvent, RunLedger, RunLedgerError, RunSnapshot,
+};
 
 mod contract;
 pub(crate) mod control;
+mod report;
 pub(crate) mod status;
+pub mod transport;
 mod wire;
 pub use control::ControlRecord;
 pub use contract::{validate_history_page, validate_run_definition, RunHistoryContractError};
+pub use report::{
+    build_run_report, RunReport, RunReportHeader, RunReportSource, RunReportTotals,
+    RUN_REPORT_SCHEMA,
+};
 pub use status::RuntimeFailure;
+pub use transport::{
+    RunHistoryRequest, RunHistoryResponse, RunHistoryTransport, RunHistoryTransportError,
+};
 pub use wire::{
     HistoryMetadata, HistoryPage, HistoryProblemCode, Observation, ObservationState, RunDefinition,
-    RunHistoryList, RunHistoryPhase, RunHistorySummary, RunHistoryTerminalSynopsis,
+    RunHistoryList, RunHistoryPhase, RunHistorySummary, RunHistoryTerminalSynopsis, RunNodeDetail,
     RUN_HISTORY_DEFINITION_MAX_BYTES, RUN_HISTORY_LIST_MAX_BYTES, RUN_HISTORY_LIST_PAGE_SIZE,
     RUN_HISTORY_PAGE_MAX_BYTES, RUN_HISTORY_PROBLEM_MAX_BYTES,
 };
@@ -41,6 +54,16 @@ pub struct RunHistoryService {
 }
 
 impl RunHistoryService {
+    /// Builds a read-only service over one already-open ledger with no live status source.
+    #[must_use]
+    pub fn for_ledger(ledger: Arc<dyn RunLedger>) -> Self {
+        Self {
+            ledger,
+            control: ControlCache::empty(),
+            status: None,
+        }
+    }
+
     pub(crate) fn with_sources(
         ledger: Arc<dyn RunLedger>,
         control: ControlCache,
@@ -71,6 +94,8 @@ impl RunHistoryService {
             policy: stored.admitted.graph.policy,
             root: stored.admitted.graph.root,
         };
+        let head = cursor_sequence(&stored.snapshot.cursor).map_err(ledger_error)?;
+        let summary = self.lifecycle_summary(id, head).await?;
         let mut value = json!({
             "version":1, "projectionVersion":1,
             "runId":id, "title":stored.admitted.title, "createdAt":created_at(id),
@@ -83,7 +108,10 @@ impl RunHistoryService {
                 "initialCursor":initial_cursor(),"cursor":stored.snapshot.cursor,
                 "complete":stored.snapshot.terminal.is_some(),
                 "limitations":["control_flow_projected_by_reducer","retained_provider_output_only"]
-            }
+            },
+            "nodes":summary.nodes,
+            "compactions":summary.compactions,
+            "formatRejections":summary.format_rejections
         });
         if let Some(failure) = runtime_failure {
             failure.apply(&mut value);
@@ -105,6 +133,159 @@ impl RunHistoryService {
             self,
         )
         .await
+    }
+}
+
+#[derive(Default)]
+struct LifecycleSummary {
+    nodes: Vec<RunNodeDetail>,
+    compactions: u64,
+    format_rejections: u64,
+}
+
+struct NodeLifecycle {
+    name: openengine_cluster_protocol::NodeName,
+    node_instance: String,
+    attempts: u64,
+    started_at: Option<UnixTimestampMillis>,
+    completed_at: Option<UnixTimestampMillis>,
+    voided: bool,
+}
+
+impl RunHistoryService {
+    /// Folds retained lifecycle and counters up to the captured head. Bounded pages make this
+    /// safe for large ledgers; the result is additive metadata, never a replacement for replay.
+    async fn lifecycle_summary(
+        &self,
+        id: &RunId,
+        head: u64,
+    ) -> Result<LifecycleSummary, HistoryError> {
+        let mut after = initial_cursor();
+        let mut nodes: BTreeMap<(String, u64), NodeLifecycle> = BTreeMap::new();
+        let mut summary = LifecycleSummary::default();
+        loop {
+            let page = self
+                .ledger
+                .snapshot_and_tail(id, Some(&after))
+                .await
+                .map_err(ledger_error)?;
+            if page.events.is_empty() {
+                break;
+            }
+            let mut advanced = false;
+            for stored in page.events {
+                let at = cursor_sequence(&stored.cursor).map_err(ledger_error)?;
+                if at > head {
+                    break;
+                }
+                apply_lifecycle_event(&stored.event, &mut nodes, &mut summary);
+                after = stored.cursor;
+                advanced = true;
+                if at >= head {
+                    break;
+                }
+            }
+            if !advanced || cursor_sequence(&after).map_err(ledger_error)? >= head {
+                break;
+            }
+        }
+        summary.nodes = nodes
+            .into_values()
+            .map(|node| {
+                let duration_ms = match (node.started_at, node.completed_at) {
+                    (Some(start), Some(complete)) => complete.get().checked_sub(start.get()),
+                    _ => None,
+                };
+                RunNodeDetail {
+                    name: node.name,
+                    node_instance: node.node_instance,
+                    attempts: node.attempts,
+                    started_at: node.started_at,
+                    completed_at: node.completed_at,
+                    duration_ms,
+                    voided: node.voided,
+                }
+            })
+            .collect();
+        Ok(summary)
+    }
+}
+
+fn apply_lifecycle_event(
+    event: &RunEvent,
+    nodes: &mut BTreeMap<(String, u64), NodeLifecycle>,
+    summary: &mut LifecycleSummary,
+) {
+    match event {
+        RunEvent::NodeStarted {
+            reference,
+            timestamp,
+            ..
+        } => {
+            let node = lifecycle_node(nodes, reference);
+            node.attempts = node.attempts.saturating_add(1);
+            node.started_at = earliest(node.started_at, *timestamp);
+        }
+        RunEvent::NodeCompleted {
+            completion,
+            timestamp,
+        } => {
+            let node = lifecycle_node(nodes, &completion.reference);
+            node.completed_at = latest(node.completed_at, *timestamp);
+        }
+        RunEvent::ExecutionVoided { reference, .. } => {
+            lifecycle_node(nodes, reference).voided = true;
+        }
+        RunEvent::SafeLog { line, .. } => {
+            if line.as_str().contains("Pi compacted the session context") {
+                summary.compactions = summary.compactions.saturating_add(1);
+            }
+            if line.as_str().contains("final output rejected") {
+                summary.format_rejections = summary.format_rejections.saturating_add(1);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn lifecycle_node<'a>(
+    nodes: &'a mut BTreeMap<(String, u64), NodeLifecycle>,
+    reference: &crate::native_v2_contract::ExecutionRef,
+) -> &'a mut NodeLifecycle {
+    nodes
+        .entry((
+            reference.node.as_str().to_owned(),
+            reference.node_instance.get(),
+        ))
+        .or_insert_with(|| NodeLifecycle {
+            name: reference.node.clone(),
+            node_instance: reference.node_instance.to_string(),
+            attempts: 0,
+            started_at: None,
+            completed_at: None,
+            voided: false,
+        })
+}
+
+fn earliest(
+    current: Option<UnixTimestampMillis>,
+    candidate: Option<UnixTimestampMillis>,
+) -> Option<UnixTimestampMillis> {
+    match (current, candidate) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, None) => left,
+        (None, right) => right,
+    }
+}
+
+fn latest(
+    current: Option<UnixTimestampMillis>,
+    candidate: Option<UnixTimestampMillis>,
+) -> Option<UnixTimestampMillis> {
+    match (current, candidate) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, None) => left,
+        (None, right) => right,
     }
 }
 

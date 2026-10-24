@@ -193,6 +193,7 @@ pub(crate) fn node_started(
         },
         attempt: PositiveInteger::new(1).assert_value(),
         input,
+        timestamp: None,
     }
 }
 

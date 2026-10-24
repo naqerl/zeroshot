@@ -64,6 +64,7 @@ async fn seed_tail(
                     artifacts: Vec::new(),
                 },
             },
+            timestamp: None,
         },
         RunEvent::PrimaryGraphCompleted {
             result: outcome(failed),

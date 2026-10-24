@@ -16,6 +16,7 @@ use crate::native_v2_cli::{
     CliRunForceResult, CliRunListResult, CliRunStatusResult, CliRunWatchEventNotification,
     NativeV2CliError, PreparedMergePlanRequest, PreparedRunRequest, TargetAdd,
 };
+use crate::native_v2_observability::history::{RunHistoryRequest, RunHistoryResponse};
 
 /// Named-target authority. The CLI does not interpret login credentials or runtime configuration.
 #[async_trait]
@@ -208,4 +209,11 @@ pub trait TargetConnector: Send + Sync {
         name: &str,
         params: RunForceParams,
     ) -> Result<Option<CliRunForceResult>, NativeV2CliError>;
+    async fn run_history(
+        &self,
+        _name: &str,
+        _request: RunHistoryRequest,
+    ) -> Result<Option<RunHistoryResponse>, NativeV2CliError> {
+        Ok(None)
+    }
 }

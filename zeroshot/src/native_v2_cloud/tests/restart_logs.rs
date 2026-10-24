@@ -44,6 +44,7 @@ fn node_start(run_id: &RunId, name: &str, identity: u64) -> RunEvent {
         },
         attempt: PositiveInteger::new(1).assert_value(),
         input: Value::Null,
+        timestamp: None,
     }
 }
 
@@ -74,6 +75,7 @@ async fn interrupted_parallel_run(ledger: &Arc<FakeRunLedger>) -> RunId {
                 artifacts: Vec::new(),
             },
         },
+        timestamp: None,
     };
     ledger
         .append(

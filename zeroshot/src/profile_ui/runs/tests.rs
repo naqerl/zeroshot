@@ -420,6 +420,7 @@ impl Fixture {
                         },
                         attempt: PositiveInteger::new(2).assert_value(),
                         input: json!({"request":"observed input"}),
+                        timestamp: None,
                     },
                 ],
             )
@@ -453,11 +454,13 @@ async fn definition_uses_admitted_inputs_and_history_preserves_browser_identitie
                             artifacts: vec![],
                         },
                     },
+                    timestamp: None,
                 },
                 RunEvent::Terminal {
                     result: TerminalResult::Succeeded {
                         output: json!({"report":"report.md"}),
                     },
+                    timestamp: None,
                 },
             ],
         )
@@ -523,6 +526,7 @@ async fn large_accumulated_snapshot_does_not_expand_the_definition() {
             },
             attempt: PositiveInteger::new(2).assert_value(),
             input: json!({"payload": payload}),
+            timestamp: None,
         });
         events.push(RunEvent::NodeCompleted {
             completion: NodeCompletion {
@@ -532,6 +536,7 @@ async fn large_accumulated_snapshot_does_not_expand_the_definition() {
                     artifacts: vec![],
                 },
             },
+            timestamp: None,
         });
     }
     fixture
@@ -568,11 +573,13 @@ async fn pages_remain_bounded_and_terminal_does_not_skip_retained_output() {
                 artifacts: vec![],
             },
         },
+        timestamp: None,
     });
     events.push(RunEvent::Terminal {
         result: TerminalResult::Succeeded {
             output: Value::Null,
         },
+        timestamp: None,
     });
     fixture
         .ledger

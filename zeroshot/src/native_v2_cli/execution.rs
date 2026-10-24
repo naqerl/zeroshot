@@ -81,7 +81,8 @@ where
         NativeV2CliCommand::Run(run) => execute_run(*run, context, signal, output).await,
         NativeV2CliCommand::Update
         | NativeV2CliCommand::TargetServe(_)
-        | NativeV2CliCommand::Ui { .. } => Err(NativeV2CliError::ProcessCommand),
+        | NativeV2CliCommand::Ui { .. }
+        | NativeV2CliCommand::Hub(_) => Err(NativeV2CliError::ProcessCommand),
         command => execute_run_operation(command, context, signal, output).await,
     }
 }
@@ -154,7 +155,9 @@ where
     };
     if matches!(
         command,
-        NativeV2CliCommand::List { .. } | NativeV2CliCommand::Status(_)
+        NativeV2CliCommand::List { .. }
+            | NativeV2CliCommand::Status(_)
+            | NativeV2CliCommand::Report(_)
     ) {
         return execute_run_unary(command, backend, output).await;
     }
@@ -290,6 +293,13 @@ where
                 .await?;
             write_json(output, &result)?;
             Ok(outcome_for_status(&result.status))
+        }
+        NativeV2CliCommand::Report(run) => {
+            let result = backend
+                .run_report(run.target.as_deref(), run.run_id)
+                .await?;
+            write_json(output, &result)?;
+            Ok(CliOutcome::Completed)
         }
         _ => Err(NativeV2CliError::Usage(
             "expected a unary run operation".to_owned(),

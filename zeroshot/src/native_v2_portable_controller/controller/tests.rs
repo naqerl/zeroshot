@@ -59,6 +59,7 @@ async fn terminal_observer(root: &Path, run_id: RunId) -> PortableRunController 
                 result: openengine_cluster_protocol::TerminalResult::Succeeded {
                     output: serde_json::Value::Null,
                 },
+                timestamp: None,
             }],
         )
         .await
