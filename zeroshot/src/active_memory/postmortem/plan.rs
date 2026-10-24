@@ -56,6 +56,9 @@ impl Role {
             Self::RepositoryMaintenance => concat!(
                 "Maintain ONLY supplied repository lessons. Do not maintain graph procedures or discover new lessons. You MUST read current associated files before keep, adapt or retire. ",
                 "Follow folder/identifier associations to the authoritative source. Compare every concrete version, number, command and path against current source. A card repeated in a transcript or agent response is not corroboration. ",
+                "KEEP is inadmissible for legacy advice containing source-location pointers, even if the locations still happen to match. ADAPT must remove source positions from title and recommendation, including file:line, prose line numbers and #L links; preserve stable paths, identifiers and the useful procedure. Never merely renumber. ",
+                "Source line numbers are facts too: if a helper moved from file.js:120 to file.js:300, keep is invalid even if its behavior is unchanged. Adapt legacy file:line pointers away; use stable paths and identifiers, never merely renumber them. If you cannot verify the advice, defer. ",
+                "Check new conditional modes against unconditional advice; a new read-only preview may require qualifying guidance as applying only to real installation. ",
                 "Each keep/adapt/retire MUST cite repository:<root-relative-file> for current source actually read, and a nonempty reason explaining the comparison. Adapt fills the replacement repository associations while preserving the repository identity.",
             ),
             Self::Graph => concat!(
@@ -69,9 +72,11 @@ impl Role {
             Self::Repository => concat!(
                 "Find only high-impact repository lessons: an observed costly mistake or substantial non-obvious exploration/experiment, with a concrete corrective recommendation and a ",
                 "common future operation likely to need it. Exclude generic advice, task summaries, ordinary code reading, speculative tips, large output alone and facts readily obvious ",
-                "from nearby source. Admission requires either at least two impact_episodes failure_references for that node, or at least three distinct hook:<seq> tool observations spanning five minutes. Model waiting time and one ordinary output correction do not qualify. The cost must actually support this specific non-obvious ",
+                "from nearby source. Admission requires either at least two impact_episodes failure_references for that node, or at least three distinct hook:<seq> tool observations spanning five minutes. ",
+                "The references you cite must themselves contain that proof for node_id; the whole episode span is insufficient when your selected hooks cover less than five minutes. Model waiting time and one ordinary output correction do not qualify. The cost must actually support this specific non-obvious ",
                 "finding, not merely occur in the same run. Check current repository files before proposing a lesson. Include at least one literal root-relative file/folder association or exact identifier verified in a cited current file. Add multiple associations where useful,",
-                " or conjunctive keyword groups of 2..4 specific lowercase terms. Keep title <=96 UTF-8 bytes and recommendation <=640 bytes, both single-line. node_id names an agent node",
+                " or conjunctive keyword groups of 2..4 specific lowercase alphanumeric terms (no spaces or punctuation within a term). ",
+                "Identifiers are whole source identifiers of 3..128 ASCII letters, digits or underscores; commands such as format:check belong in prose, not identifiers. Keep title <=96 UTF-8 bytes and recommendation <=640 bytes, both single-line. node_id names an agent node",
                 " that actually executed. Cite the required failure or hook references for impact AND repository:<root-relative-file> after actually reading the associated authoritative source. Return {lessons:[...]}; zero ",
                 "lessons is valid.",
             ),
@@ -85,7 +90,7 @@ impl Role {
 }
 
 const MAINTENANCE_INSTRUCTION: &str = concat!(
-    "Reconcile EVERY entry in supplied_lessons, returning exactly one decision for each supplied ID and revision. Do not reconcile lessons outside this batch or your assigned scope. ",
+    "Reconcile EVERY entry in supplied_lessons, returning exactly one decision for each supplied ID. Do not reconcile lessons outside this batch or your assigned scope. ",
     "The delivery manifest is authoritative: missing means unknown, so return no decisions if manifest_known is false. Do not discover new lessons. ",
     "If current authority cannot be verified, return defer. Keep requires the ENTIRE recommendation to remain valid, including every concrete operand. A still-useful general principle never excuses a stale command, version or path: adapt the invalid part, or defer if uncertain. Retire when current authority disproves continued usefulness. ",
     "Compare supplied cards for redundant advice, including different wording of the same cause and prevention. In the same repository scope or exact graph-hash/node/repository-qualifier scope, keep one concise canonical card when it fully covers the others. ",
@@ -93,7 +98,7 @@ const MAINTENANCE_INSTRUCTION: &str = concat!(
     "Never consolidate across repositories, graph hashes, nodes or different repository qualifiers. Preserve distinct failure causes or corrective operations. Return a decision for every supplied ID even when consolidating, and never mutate an ID outside the current batch. ",
     "Every adapt/retire also MUST cite at least one current MAIN-run reference from evidence.records or evidence.executions: v2:<sequence>, node:<node_id>, or hook:<seq>. ",
     "Use the supplied current-run references exactly. Historical references inside lesson.evidence describe its origin and are NOT accepted output citations; do not copy them. Repeated lesson text alone is not evidence. ",
-    "Every decision names its supplied ID and exact revision. For keep/defer, leave ONLY replacement title, recommendation, files, folders, identifiers and keyword_groups empty. Keep still REQUIRES nonempty references and reason; these are evidence, not replacements. Defer may have empty references. ",
+    "Every decision names its supplied ID. Do not return a revision field or propose a new revision: the host binds each ID to its exact frozen supplied revision, enforces compare-and-swap and owns increments. For keep/defer, leave ONLY replacement title, recommendation, files, folders, identifiers and keyword_groups empty. Keep still REQUIRES nonempty references and reason; these are evidence, not replacements. Defer may have empty references. ",
     "Adapt preserves the original scope identity and fills replacement title/recommendation; follow your scope-specific association rules. ",
     "The host delivers all supplied lessons in your scope in complete byte-bounded batches, identified by maintenance_batch.index and maintenance_batch.total. Check every lesson in this batch; use defer when evidence is insufficient. Return {decisions:[...]}; an empty array is valid only when supplied_lessons is empty or manifest_known is false.",
 );
@@ -105,7 +110,8 @@ const SHARED_INSTRUCTION: &str = concat!(
     "recurring knowledge qualifies. Return every distinct finding that meets the impact and usefulness criteria; there is no findings count quota. Zero new lessons is valid. Use the exact structured output contract. Evidence may be explicitly truncated: absence",
     " from truncated evidence is not proof of absence. Existing lessons are supplied for deduplication, not as proof of new findings. ",
     "Every title is at most 96 UTF-8 bytes, recommendation 640 bytes, and reason/costly_recurring_reason 512 bytes. Each is one line. Use one concise sentence for the reason. ",
-    "References contain at most eight exact pointers. These limits apply to maintenance too; long explanations are rejected. Do not reproduce credentials or secret values.",
+    "References contain at most eight exact pointers TOTAL, including repository pointers. Prefer the minimum proof set; do not list every tool call. Copy current references exactly; repository:path pointers have no line suffix. ",
+    "Use stable file paths and identifiers in advice, not volatile file:line locations. These limits apply to maintenance too; long explanations are rejected. Do not reproduce credentials or secret values.",
 );
 
 pub(super) fn specialist_instruction(role: Role) -> String {
@@ -228,7 +234,6 @@ fn decision_type() -> Value {
     let mut fields = lesson_fields();
     fields.extend([
         ("id", string()),
-        ("revision", json!({"kind":"integer"})),
         (
             "action",
             json!({"kind":"enum","values":["keep","adapt","retire","defer"]}),

@@ -34,20 +34,21 @@
 
 Prompts are suggestions. Graphs are enforced.
 
+A skill can ask for a review, but the agent decides whether to listen. In a zeroshot graph, your QA
+process is enforced by code.
+
 zeroshot runs coding, independent review and repairs through the workflow you define.
 
 Choose the agents and models, define what must pass, and decide where rejected work goes for
 repair.
 
-For example, give a security reviewer the job of checking that users cannot access another account’s
-data. A rejection sends its findings back to the worker for repair, followed by another review. Save
-that workflow as a profile and reuse it.
-
 The engine enforces the graph’s review gates and retry limits. Each agent can use its own model and
 harness (Pi, Claude Code, Codex or Copilot).
 
-On 20 ProgramBench tasks, [a small model in a review loop](https://theopenengine.com/blog/review-loop/)
-matched a larger model's score at a median 58% of its cost.
+On 20 ProgramBench tasks, [a small model in a zeroshot loop](https://theopenengine.com/blog/review-loop/)
+matched a larger model's score at a median 58% of its cost. More examples on zeroshot.sh:
+[a flight game](https://zeroshot.sh/#flight-demo), [a landing page](https://zeroshot.sh/#design-reviewer)
+and [a research run](https://zeroshot.sh/#not-just-coding).
 
 The CLI is free and MIT licensed. Run locally, [self-host](#self-hosted-run-the-docker-target), or
 use [zeroshot Cloud](https://cloud.zeroshot.sh/docs).
@@ -64,6 +65,27 @@ use [zeroshot Cloud](https://cloud.zeroshot.sh/docs).
   <br>
   <em>Example custom workflow. <a href="https://zeroshot.sh/#topology">Explore the interactive graphs.</a></em>
 </div>
+
+## What users say
+
+> I used Zeroshot (my fork) for my last two contracts: a production line automation and control
+> system, and a multi-host sync and admin system for Webflow and Guesty. Very happy with it!
+>
+> — Mark Dingwall
+
+> Generally, I’m really happy with the results and the quality. I really like the mental models of
+> creating profiles.
+>
+> — Daniel Graungaard
+
+> Implemented support of pi.dev harness and it works pretty well (built with zeroshot BTW).
+>
+> — Andrey
+
+> you guys are solving this in a way that is more satisfying than the google ADK (to me) and it’s
+> fuckin google.
+>
+> — Fav
 
 ## Get started
 
@@ -120,7 +142,7 @@ Start the run. Add `--validate-only` to check the graph, runtime configuration, 
 ```bash
 zeroshot run \
   --title "Add JSON status output" \
-  --template software-change \
+  --template software-change --delivery none \
   --input input.json \
   --uniform-runtime-config runtime.json
 ```
@@ -248,14 +270,19 @@ review and exploration rules.
 
 ## Choose delivery and execution
 
-Runs keep the work local unless you pass a delivery flag:
+`software-change` defaults to PR delivery; `pr-review` and `issue-review` default to posting a comment.
+[PR review](docs/guides/review.md) classifies reproduction needs, exercises the full local stack when
+required, and checks code and linked issue coverage before posting a concise report.
+Use `--delivery none` to keep a software change local or return an issue review report without publication.
+For `software-change`:
 
-| Delivery         | Behavior                                         |
-| ---------------- | ------------------------------------------------ |
-| No delivery flag | Keep the work local                              |
-| `--push`         | Push the managed branch                          |
-| `--pr`           | Prepare a mergeable pull request without merging |
-| `--ship`         | Proceed through PR, CI, and merge                |
+| Delivery          | Behavior                                         |
+| ----------------- | ------------------------------------------------ |
+| No delivery flag  | Prepare a mergeable pull request without merging |
+| `--delivery none` | Keep the work local                              |
+| `--push`          | Push the managed branch                          |
+| `--pr`            | Prepare a mergeable pull request without merging |
+| `--ship`          | Proceed through PR, CI, and merge                |
 
 PR and ship runs address visible pull request review feedback by default; pass `--no-pr-feedback` to
 ignore it.
