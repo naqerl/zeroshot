@@ -140,6 +140,11 @@ impl RunHistoryService {
 struct LifecycleSummary {
     nodes: Vec<RunNodeDetail>,
     compactions: u64,
+    /// One per rejected structured response. The provider-failure detail line
+    /// (`final output rejected: ...`) is logged once per rejection, while an additional
+    /// `requesting correction` line may also be logged for the same rejection. Matching only
+    /// the failure-detail marker therefore counts each rejected response once without
+    /// double-counting that pair.
     format_rejections: u64,
 }
 
@@ -240,7 +245,7 @@ fn apply_lifecycle_event(
             if line.as_str().contains("Pi compacted the session context") {
                 summary.compactions = summary.compactions.saturating_add(1);
             }
-            if line.as_str().contains("final output rejected") {
+            if line.as_str().contains("final output rejected:") {
                 summary.format_rejections = summary.format_rejections.saturating_add(1);
             }
         }

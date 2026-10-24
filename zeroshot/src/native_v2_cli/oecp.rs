@@ -127,6 +127,21 @@ where
         })?;
         Ok(definition)
     }
+
+    async fn direct_run_status(
+        &self,
+        target: &str,
+        run_id: &RunId,
+    ) -> Result<CliRunStatusResult, NativeV2CliError> {
+        let transport = self.connector.connect(target, Some(run_id.clone())).await?;
+        ClusterClient::new(transport.as_ref())
+            .run_status(RunStatusParams {
+                run_id: run_id.clone(),
+            })
+            .await
+            .map(Into::into)
+            .map_err(protocol_error)
+    }
 }
 
 pub struct ChannelSubscription<E> {
@@ -458,9 +473,11 @@ where
     ) -> Result<RunReport, NativeV2CliError> {
         let target = require_named_target(target)?;
         let definition = self.remote_definition(target, &run_id).await?;
-        // Usage is already reported by status; a target that retains history without a live
-        // status path still gets a complete lifecycle report with unavailable usage.
-        let token_usage = self
+        // Status is the retained source of run-wide usage. A report must not silently turn a
+        // failed status read into `tokenUsage: null`; use the task's direct status when the
+        // advertised status path fails, and otherwise surface the original error. Null remains
+        // reserved for a successful status that genuinely carries no usage.
+        let status = match self
             .run_status(
                 Some(target),
                 RunStatusParams {
@@ -468,15 +485,17 @@ where
                 },
             )
             .await
-            .ok()
-            .and_then(|result| {
-                result.status.as_target().and_then(|status| match status {
-                    RunStatus::Finished { metadata, .. } => metadata.token_usage.clone(),
-                    RunStatus::Admitted {}
-                    | RunStatus::Running { .. }
-                    | RunStatus::Stopping { .. } => None,
-                })
-            });
+        {
+            Ok(status) => status,
+            Err(error) => match self.direct_run_status(target, &run_id).await {
+                Ok(status) => status,
+                Err(_) => return Err(error),
+            },
+        };
+        let token_usage = status.status.as_target().and_then(|status| match status {
+            RunStatus::Finished { metadata, .. } => metadata.token_usage.clone(),
+            RunStatus::Admitted {} | RunStatus::Running { .. } | RunStatus::Stopping { .. } => None,
+        });
         Ok(build_run_report(&definition, token_usage))
     }
 

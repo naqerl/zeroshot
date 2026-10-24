@@ -8,16 +8,21 @@ use openengine_cluster_client::{
 use openengine_cluster_protocol::{
     ConnectionKey, ConnectionScope, EnvironmentVariableName, ExecutionRef, IdempotencyKey,
     MergePlanSource, RequestId, RunId, RunProfileName, RunProfileScope, RunTitle, SourceBranchId,
-    SourceRepositoryId, StaticConnectionValues, SubscriptionCloseReason, SubscriptionId,
+    Sha256Digest, SourceRepositoryId, StaticConnectionValues, SubscriptionCloseReason,
+    SubscriptionId,
 };
 use openengine_cluster_testkit::assertions::{AssertError, AssertValue};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use super::*;
+use crate::native_v2_observability::history::{RunHistoryResponse, RunHistoryService};
+use crate::v2_run_ledger::fake::FakeRunLedger;
+use crate::v2_run_ledger::{CreateRun, RunLedger};
 
 struct FailingTransport {
     requests: Arc<Mutex<Vec<Value>>>,
+    direct_status: Option<CliRunStatusResult>,
 }
 
 impl FailingTransport {
@@ -37,6 +42,22 @@ impl FailingTransport {
 #[async_trait]
 impl JsonRpcTransport for FailingTransport {
     async fn request(&self, request: String) -> Result<String, TransportError> {
+        let parsed: Value = serde_json::from_str(&request).expect("valid request");
+        if parsed.get("method") == Some(&json!("run/status")) {
+            self.requests
+                .lock()
+                .expect("request lock")
+                .push(parsed.clone());
+            if let Some(status) = &self.direct_status {
+                return serde_json::to_string(&json!({
+                    "jsonrpc":"2.0",
+                    "id":parsed.get("id"),
+                    "result":status
+                }))
+                .map_err(|error| TransportError::Protocol(error.to_string()));
+            }
+            return Err(TransportError::Protocol("fixture refusal".to_owned()));
+        }
         Err(self.refusal(&request))
     }
 }
@@ -67,6 +88,8 @@ impl SubscriptionTransport for FailingTransport {
 struct StubConnector {
     transport: Arc<FailingTransport>,
     hosted_status: Option<CliRunStatusResult>,
+    hosted_status_failure: bool,
+    definition: Option<RunDefinition>,
 }
 
 impl StubConnector {
@@ -74,9 +97,20 @@ impl StubConnector {
         Self {
             transport: Arc::new(FailingTransport {
                 requests: Arc::new(Mutex::new(Vec::new())),
+                direct_status: None,
             }),
             hosted_status,
+            hosted_status_failure: false,
+            definition: None,
         }
+    }
+
+    fn with_direct_status(mut self, status: CliRunStatusResult) -> Self {
+        self.transport = Arc::new(FailingTransport {
+            requests: self.transport.requests.clone(),
+            direct_status: Some(status),
+        });
+        self
     }
 }
 
@@ -189,6 +223,9 @@ impl TargetConnector for StubConnector {
         _name: &str,
         _params: RunStatusParams,
     ) -> Result<Option<CliRunStatusResult>, NativeV2CliError> {
+        if self.hosted_status_failure {
+            return Err(called("hosted_run_status"));
+        }
         Ok(self.hosted_status.clone())
     }
 
@@ -215,6 +252,22 @@ impl TargetConnector for StubConnector {
     ) -> Result<Option<CliRunForceResult>, NativeV2CliError> {
         Ok(None)
     }
+
+    async fn run_history(
+        &self,
+        _name: &str,
+        _request: RunHistoryRequest,
+    ) -> Result<Option<RunHistoryResponse>, NativeV2CliError> {
+        self.definition
+            .as_ref()
+            .map(|definition| {
+                Ok(
+                    RunHistoryResponse::new(200, serde_json::to_vec(definition).assert_value())
+                        .assert_value(),
+                )
+            })
+            .transpose()
+    }
 }
 
 fn selector() -> RunProfileSelector {
@@ -238,6 +291,47 @@ fn status(phase: &str) -> CliRunStatusResult {
         "status":{"phase":phase}
     }))
     .assert_value()
+}
+
+fn finished_status(run_id: &RunId, token_usage: Option<Value>) -> CliRunStatusResult {
+    let mut value = json!({
+        "runId": run_id,
+        "title": "Contract",
+        "source": {
+            "repository": "owner/repository",
+            "branch": "main",
+            "revision": "0123456789abcdef0123456789abcdef01234567"
+        },
+        "size": "small",
+        "atCursor": "v2:3",
+        "status": {
+            "phase": "finished",
+            "terminalResult": {"status": "succeeded", "output": null},
+            "metadata": {}
+        }
+    });
+    if let Some(token_usage) = token_usage {
+        value["status"]["metadata"]["tokenUsage"] = token_usage;
+    }
+    serde_json::from_value(value).assert_value()
+}
+
+async fn report_definition(run_id: &RunId) -> RunDefinition {
+    let ledger = Arc::new(FakeRunLedger::new());
+    ledger
+        .create_or_get(CreateRun {
+            run_id: run_id.clone(),
+            submission_key: IdempotencyKey::new(format!("report-{}", run_id.as_str()))
+                .assert_value(),
+            submission_digest: Sha256Digest::new("a".repeat(64)).assert_value(),
+            admitted: crate::native_v2_runner::test_support::admitted(),
+        })
+        .await
+        .assert_value();
+    RunHistoryService::for_ledger(ledger)
+        .definition(run_id)
+        .await
+        .assert_value()
 }
 
 fn profile_set_request() -> RunProfileSetRequest {
@@ -559,6 +653,60 @@ async fn wave7_cli_contract_oecp_hosted_operations_and_task_cursors_fail_closed(
     );
     assert!(task_cursor(Some(Cursor::new("cloud:7"))).is_none());
     assert!(task_cursor(None).is_none());
+}
+
+/// A named target whose advertised status read fails still carries usage when the task's direct
+/// status is reachable. Before the fix `.ok()` returned a successful report with null usage; the
+/// report now recovers the status or surfaces the original error when neither read succeeds.
+#[tokio::test]
+async fn named_target_report_carries_status_token_usage() {
+    let run_id = RunId::new("018f5e78-7f95-7c22-8d98-3f15af20c982");
+    let token_usage = json!({
+        "inputTokens": 120,
+        "outputTokens": 30,
+        "cacheReadInputTokens": 10,
+        "complete": true
+    });
+    let mut connector = StubConnector::new(None)
+        .with_direct_status(finished_status(&run_id, Some(token_usage.clone())));
+    connector.hosted_status_failure = true;
+    connector.definition = Some(report_definition(&run_id).await);
+    let report = NamedTargetCliBackend::new(connector)
+        .run_report(Some("prod"), run_id)
+        .await
+        .assert_value();
+    let value = serde_json::to_value(report).assert_value();
+    assert_eq!(value["totals"]["tokenUsage"], token_usage);
+}
+
+#[tokio::test]
+async fn named_target_report_without_usage_is_complete_and_null() {
+    let run_id = RunId::new("018f5e78-7f95-7c22-8d98-3f15af20c983");
+    let mut connector = StubConnector::new(Some(finished_status(&run_id, None)));
+    connector.definition = Some(report_definition(&run_id).await);
+    let report = NamedTargetCliBackend::new(connector)
+        .run_report(Some("prod"), run_id)
+        .await
+        .assert_value();
+    let value = serde_json::to_value(report).assert_value();
+    assert_eq!(value["schema"], "zeroshot.run.report/v1");
+    assert_eq!(value["totals"]["tokenUsage"], Value::Null);
+}
+
+/// The unrecoverable Defect 2 regression: before the fix, `.ok()` swallowed this status failure
+/// and returned a report with null usage instead of surfacing the error. The direct status also
+/// fails here, so the report cannot recover retained usage.
+#[tokio::test]
+async fn named_target_report_surfaces_status_failure() {
+    let run_id = RunId::new("018f5e78-7f95-7c22-8d98-3f15af20c984");
+    let mut connector = StubConnector::new(None);
+    connector.definition = Some(report_definition(&run_id).await);
+    assert!(
+        NamedTargetCliBackend::new(connector)
+            .run_report(Some("prod"), run_id)
+            .await
+            .is_err()
+    );
 }
 
 async fn forward_watch_script(

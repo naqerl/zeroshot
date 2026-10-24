@@ -255,7 +255,16 @@ async fn history_definition_folds_node_lifecycle_and_counters() {
                     execution: None,
                     timestamp: timestamp(311),
                     stream: crate::v2_run_ledger::SafeLogStream::System,
-                    line: SafeLogLine::new("final output rejected: malformed").assert_value(),
+                    line: SafeLogLine::new("Pi provider failure: final output rejected: malformed")
+                        .assert_value(),
+                    diagnostic: None,
+                },
+                RunEvent::SafeLog {
+                    execution: None,
+                    timestamp: timestamp(312),
+                    stream: crate::v2_run_ledger::SafeLogStream::System,
+                    line: SafeLogLine::new("Pi final output rejected; requesting correction")
+                        .assert_value(),
                     diagnostic: None,
                 },
             ],
@@ -325,6 +334,38 @@ async fn history_definition_folds_node_lifecycle_and_counters() {
         assert_eq!(node["completedAt"], Value::Null);
         assert_eq!(node["durationMs"], Value::Null);
     }
+}
+
+#[tokio::test]
+async fn history_counts_each_rejection_pair_once() {
+    let (ledger, run_id) = ledger_run("018f5e78-7f95-7c22-8d98-3f15af20c982").await;
+    let timestamp = |value| UnixTimestampMillis::new(value).assert_value();
+    let mut events = vec![RunEvent::RunStarted];
+    for attempt in 0..3 {
+        events.push(RunEvent::SafeLog {
+            execution: None,
+            timestamp: timestamp(400 + attempt),
+            stream: crate::v2_run_ledger::SafeLogStream::Error,
+            line: SafeLogLine::new(format!(
+                "Claude provider failure: final output rejected: malformed {attempt}"
+            ))
+            .assert_value(),
+            diagnostic: None,
+        });
+        events.push(RunEvent::SafeLog {
+            execution: None,
+            timestamp: timestamp(500 + attempt),
+            stream: crate::v2_run_ledger::SafeLogStream::System,
+            line: SafeLogLine::new("Claude final output rejected; requesting correction")
+                .assert_value(),
+            diagnostic: None,
+        });
+    }
+    ledger.append(&run_id, events).await.assert_value();
+    let service = crate::native_v2_observability::history::RunHistoryService::for_ledger(ledger);
+    let definition = service.definition(&run_id).await.assert_value();
+    assert_eq!(definition.format_rejections, 3);
+    assert_eq!(definition.compactions, 0);
 }
 
 async fn finish_worker_run(ledger: &dyn RunLedger, worker: &ExecutionRef) {
