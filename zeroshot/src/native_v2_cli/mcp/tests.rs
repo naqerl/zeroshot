@@ -198,7 +198,7 @@ async fn handshake_lists_cli_tools() {
         status["description"]
             .as_str()
             .unwrap_or_default()
-            .contains("Read a run's current status as JSON.")
+            .contains("Read a run's current status as JSON")
     );
     assert_eq!(status["inputSchema"]["required"], json!(["runId"]));
 }
