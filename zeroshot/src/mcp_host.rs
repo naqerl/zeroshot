@@ -102,8 +102,8 @@ fn named_backend() -> Result<
     let registry = FileTargetRegistry::new(
         default_target_registry_path().map_err(|error| connector_failure(&error))?,
     );
-    let authority =
-        TargetHttpControlAuthority::production().map_err(|error| connector_failure(&error))?;
+    let authority = TargetHttpControlAuthority::production()
+        .map_err(|error| connector_failure(&TargetConnectorError::Authority(error)))?;
     let connector = NativeV2TargetConnector::new(registry, authority, TargetOecpWebSocketDialer);
     Ok(NamedTargetCliBackend::new(connector))
 }
