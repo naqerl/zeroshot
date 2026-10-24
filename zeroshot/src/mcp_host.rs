@@ -10,9 +10,7 @@ use openengine_cluster_protocol::{RunWatchParams, SubscriptionCloseReason};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use zeroshot_engine::native_v2_cli::local::LocalCliBackend;
-use zeroshot_engine::native_v2_cli::mcp::{
-    McpFailure, McpHost, WatchStream, serve as serve_session,
-};
+use zeroshot_engine::native_v2_cli::mcp::{McpFailure, McpHost, WatchStream, serve as serve_session};
 use zeroshot_engine::native_v2_cli::oecp::NamedTargetCliBackend;
 use zeroshot_engine::native_v2_cli::{
     CliRunWatchEventNotification, CliSubscription, CliSubscriptionItem, NativeV2CliBackend,
