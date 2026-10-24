@@ -407,7 +407,12 @@ fn push_run_flags(
     push_opt(argv, map, "graph", "--graph")?;
     push_opt(argv, map, "template", "--template")?;
     push_opt(argv, map, "runtimeConfig", "--runtime-config")?;
-    push_opt(argv, map, "uniformRuntimeConfig", "--uniform-runtime-config")?;
+    push_opt(
+        argv,
+        map,
+        "uniformRuntimeConfig",
+        "--uniform-runtime-config",
+    )?;
     push_opt(argv, map, "environment", "--environment")?;
     push_flag(argv, map, "noEnvironment", "--no-environment")?;
     push_opt(argv, map, "profile", "--profile")?;
@@ -471,11 +476,15 @@ fn push_repeat(
         return Ok(());
     };
     let Value::Array(items) = value else {
-        return Err(McpFailure::invalid(format!("{key} must be an array of strings")));
+        return Err(McpFailure::invalid(format!(
+            "{key} must be an array of strings"
+        )));
     };
     for item in items {
         let Value::String(item) = item else {
-            return Err(McpFailure::invalid(format!("{key} must be an array of strings")));
+            return Err(McpFailure::invalid(format!(
+                "{key} must be an array of strings"
+            )));
         };
         argv.push(flag.to_owned());
         argv.push(item.clone());
@@ -724,19 +733,34 @@ fn selector_properties() -> Vec<(&'static str, Value)> {
 
 fn run_properties() -> Vec<(&'static str, Value)> {
     vec![
-        ("title", string_prop("Human-readable title recorded with the run.")),
-        ("input", string_prop("JSON file of the graph's initial input.")),
-        ("graph", string_prop("Custom graph specification JSON file.")),
+        (
+            "title",
+            string_prop("Human-readable title recorded with the run."),
+        ),
+        (
+            "input",
+            string_prop("JSON file of the graph's initial input."),
+        ),
+        (
+            "graph",
+            string_prop("Custom graph specification JSON file."),
+        ),
         (
             "template",
             string_prop("Built-in template: single-worker, software-change, or auto-research."),
         ),
-        ("runtimeConfig", string_prop("Exact runtime plan JSON file.")),
+        (
+            "runtimeConfig",
+            string_prop("Exact runtime plan JSON file."),
+        ),
         (
             "uniformRuntimeConfig",
             string_prop("One agent runtime JSON file expanded across every executable node."),
         ),
-        ("environment", string_prop("Environment definition JSON file.")),
+        (
+            "environment",
+            string_prop("Environment definition JSON file."),
+        ),
         (
             "noEnvironment",
             bool_prop("Send an empty environment and bypass the target default."),
@@ -759,17 +783,35 @@ fn run_properties() -> Vec<(&'static str, Value)> {
             string_prop("GitHub owner/name or a credential-free Git URL. Requires target."),
         ),
         ("branch", string_prop("Source branch. Requires target.")),
-        ("revision", string_prop("Exact source commit SHA. Requires target.")),
-        ("submissionKey", string_prop("Stable idempotency key for retrying submission.")),
-        ("detach", bool_prop("Return after submission instead of following run events.")),
+        (
+            "revision",
+            string_prop("Exact source commit SHA. Requires target."),
+        ),
+        (
+            "submissionKey",
+            string_prop("Stable idempotency key for retrying submission."),
+        ),
+        (
+            "detach",
+            bool_prop("Return after submission instead of following run events."),
+        ),
         (
             "validateOnly",
             bool_prop("Validate and materialize the run without submitting it."),
         ),
         ("delivery", string_prop("Template-owned delivery mode.")),
-        ("push", bool_prop("Commit and push the managed branch without a pull request.")),
-        ("pr", bool_prop("Open a pull request for the software-change template.")),
-        ("ship", bool_prop("Merge delivery for the software-change template.")),
+        (
+            "push",
+            bool_prop("Commit and push the managed branch without a pull request."),
+        ),
+        (
+            "pr",
+            bool_prop("Open a pull request for the software-change template."),
+        ),
+        (
+            "ship",
+            bool_prop("Merge delivery for the software-change template."),
+        ),
         (
             "noPrFeedback",
             bool_prop("Do not route visible pull-request feedback through repair."),
@@ -779,8 +821,14 @@ fn run_properties() -> Vec<(&'static str, Value)> {
 
 fn placement_properties() -> Vec<(&'static str, Value)> {
     vec![
-        ("hub", string_prop("Hub context. Omit for ZEROSHOT_HUB, then the current context.")),
-        ("tag", string_array_prop("Member tags that must all match. Repeatable.")),
+        (
+            "hub",
+            string_prop("Hub context. Omit for ZEROSHOT_HUB, then the current context."),
+        ),
+        (
+            "tag",
+            string_array_prop("Member tags that must all match. Repeatable."),
+        ),
         (
             "strategy",
             string_prop("Choice among free members: first-free or least-loaded."),
@@ -799,7 +847,10 @@ fn status_schema() -> Value {
 
 fn logs_schema() -> Value {
     let mut properties = selector_properties();
-    properties.push(("after", string_prop("Resume strictly after this durable cursor.")));
+    properties.push((
+        "after",
+        string_prop("Resume strictly after this durable cursor."),
+    ));
     properties.push((
         "execution",
         string_prop("Return records only for this execution selector."),
@@ -809,7 +860,10 @@ fn logs_schema() -> Value {
 
 fn watch_schema() -> Value {
     let mut properties = selector_properties();
-    properties.push(("after", string_prop("Resume strictly after this durable cursor.")));
+    properties.push((
+        "after",
+        string_prop("Resume strictly after this durable cursor."),
+    ));
     object_schema(&["runId"], properties)
 }
 
@@ -848,7 +902,10 @@ fn hub_list_schema() -> Value {
                 "hub",
                 string_prop("Hub context. Omit for ZEROSHOT_HUB, then the current context."),
             ),
-            ("tag", string_array_prop("Only members carrying every listed tag.")),
+            (
+                "tag",
+                string_array_prop("Only members carrying every listed tag."),
+            ),
             (
                 "probe",
                 bool_prop("Contact targets for health. false reports stored members only."),
@@ -865,10 +922,19 @@ fn hub_ps_schema() -> Value {
                 "hub",
                 string_prop("Hub context. Omit for ZEROSHOT_HUB, then the current context."),
             ),
-            ("state", string_prop("Job state filter. Defaults to active.")),
+            (
+                "state",
+                string_prop("Job state filter. Defaults to active."),
+            ),
             ("target", string_prop("Only jobs placed on this member.")),
-            ("label", string_array_prop("Only jobs carrying every listed KEY=VALUE label.")),
-            ("limit", integer_prop("Maximum number of newest matching jobs.")),
+            (
+                "label",
+                string_array_prop("Only jobs carrying every listed KEY=VALUE label."),
+            ),
+            (
+                "limit",
+                integer_prop("Maximum number of newest matching jobs."),
+            ),
         ],
     )
 }
@@ -893,7 +959,10 @@ fn hub_logs_schema() -> Value {
     object_schema(
         &["job"],
         hub_job_properties(vec![
-            ("after", string_prop("Resume strictly after this durable cursor.")),
+            (
+                "after",
+                string_prop("Resume strictly after this durable cursor."),
+            ),
             (
                 "execution",
                 string_prop("Return records only for this execution selector."),
@@ -912,25 +981,44 @@ fn hub_submit_schema() -> Value {
             "oneOf": [{"type": "boolean"}, {"type": "string"}]
         }),
     ));
-    properties.push(("queue", bool_prop("Queue the job when every matching member is busy.")));
-    properties.extend(run_properties().into_iter().filter(|(name, _)| {
-        !matches!(*name, "validateOnly")
-    }));
+    properties.push((
+        "queue",
+        bool_prop("Queue the job when every matching member is busy."),
+    ));
+    properties.extend(
+        run_properties()
+            .into_iter()
+            .filter(|(name, _)| !matches!(*name, "validateOnly")),
+    );
     object_schema(&["title", "input"], properties)
 }
 
 fn hub_enqueue_schema() -> Value {
     let mut properties = placement_properties();
     properties.extend([
-        ("at", string_prop("Not before this RFC 3339 time or relative +DURATION.")),
-        ("cron", string_prop("Five-field cron expression. Each fire queues one job.")),
+        (
+            "at",
+            string_prop("Not before this RFC 3339 time or relative +DURATION."),
+        ),
+        (
+            "cron",
+            string_prop("Five-field cron expression. Each fire queues one job."),
+        ),
         ("cronTz", string_prop("IANA time zone for cron.")),
-        ("priority", integer_prop("Higher priority jobs are placed first.")),
-        ("expires", string_prop("Expire the queued job after a duration or at an RFC 3339 time.")),
+        (
+            "priority",
+            integer_prop("Higher priority jobs are placed first."),
+        ),
+        (
+            "expires",
+            string_prop("Expire the queued job after a duration or at an RFC 3339 time."),
+        ),
     ]);
-    properties.extend(run_properties().into_iter().filter(|(name, _)| {
-        !matches!(*name, "validateOnly" | "detach")
-    }));
+    properties.extend(
+        run_properties()
+            .into_iter()
+            .filter(|(name, _)| !matches!(*name, "validateOnly" | "detach")),
+    );
     object_schema(&["title", "input"], properties)
 }
 
@@ -946,8 +1034,14 @@ fn hub_stats_schema() -> Value {
                 "by",
                 string_array_prop("Group by target, model, project, day, or label:KEY."),
             ),
-            ("since", string_prop("Include jobs submitted at or after this time.")),
-            ("until", string_prop("Include jobs submitted before this time.")),
+            (
+                "since",
+                string_prop("Include jobs submitted at or after this time."),
+            ),
+            (
+                "until",
+                string_prop("Include jobs submitted before this time."),
+            ),
             ("prices", string_prop("JSON price table file.")),
         ],
     )

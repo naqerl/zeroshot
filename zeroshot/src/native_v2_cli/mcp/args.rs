@@ -2,10 +2,7 @@ use serde_json::{Map, Value};
 
 use super::host::McpFailure;
 
-pub(super) fn reject_unknown(
-    map: &Map<String, Value>,
-    allowed: &[&str],
-) -> Result<(), McpFailure> {
+pub(super) fn reject_unknown(map: &Map<String, Value>, allowed: &[&str]) -> Result<(), McpFailure> {
     if let Some(unknown) = map.keys().find(|key| !allowed.contains(&key.as_str())) {
         return Err(McpFailure::invalid(format!("unknown argument {unknown}")));
     }

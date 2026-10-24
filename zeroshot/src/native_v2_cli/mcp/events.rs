@@ -62,7 +62,7 @@ pub(super) fn list(params: &Value) -> Result<Value, EventError> {
         _ => {
             return Err(EventError::Invalid(McpFailure::invalid(
                 "params must be an object",
-            )))
+            )));
         }
     };
     if paged {
@@ -171,9 +171,11 @@ pub(super) fn rpc_error(error: EventError) -> (i64, &'static str, Value) {
     match error {
         EventError::Invalid(failure) => (-32602, "Invalid params", failure_data(failure)),
         EventError::NotFound => (-32023, "NotFound", json!({"kind": "event"})),
-        EventError::Unsupported { feature, value } => {
-            (-32026, "Unsupported", json!({"feature": feature, "value": value}))
-        }
+        EventError::Unsupported { feature, value } => (
+            -32026,
+            "Unsupported",
+            json!({"feature": feature, "value": value}),
+        ),
         EventError::Failed(failure) if failure.code == "run.not_found" => (
             -32023,
             "NotFound",
@@ -234,7 +236,7 @@ fn parse_subscription(params: &Value, capped: bool) -> Result<PollRequest, Event
         Some(_) => {
             return Err(EventError::Invalid(McpFailure::invalid(
                 "cursor must be a string or null",
-            )))
+            )));
         }
     };
     let arguments = match map.get("arguments") {
@@ -243,7 +245,7 @@ fn parse_subscription(params: &Value, capped: bool) -> Result<PollRequest, Event
         Some(_) => {
             return Err(EventError::Invalid(McpFailure::invalid(
                 "arguments must be an object",
-            )))
+            )));
         }
     };
     Ok(PollRequest {
@@ -257,7 +259,10 @@ fn max_events(map: &Map<String, Value>) -> Result<usize, EventError> {
     let Some(value) = map.get("maxEvents") else {
         return Ok(DEFAULT_MAX_EVENTS);
     };
-    let Some(count) = value.as_u64().filter(|count| (1..=MAX_EVENTS_LIMIT).contains(count)) else {
+    let Some(count) = value
+        .as_u64()
+        .filter(|count| (1..=MAX_EVENTS_LIMIT).contains(count))
+    else {
         return Err(EventError::Invalid(McpFailure::invalid(
             "maxEvents must be an integer from 1 to 1000",
         )));
@@ -286,7 +291,11 @@ async fn drain(stream: &mut WatchStream) -> Result<Vec<Value>, EventError> {
         if events.len() >= DRAIN_LIMIT {
             break;
         }
-        let wait = if events.is_empty() { FIRST_WAIT } else { IDLE_WAIT };
+        let wait = if events.is_empty() {
+            FIRST_WAIT
+        } else {
+            IDLE_WAIT
+        };
         let Some(event) = next_event(stream, wait).await? else {
             break;
         };
@@ -337,10 +346,7 @@ async fn collect_after(
     })
 }
 
-async fn next_event(
-    stream: &mut WatchStream,
-    wait: Duration,
-) -> Result<Option<Value>, EventError> {
+async fn next_event(stream: &mut WatchStream, wait: Duration) -> Result<Option<Value>, EventError> {
     match tokio::time::timeout(wait, stream.recv()).await {
         Ok(Some(Ok(value))) => Ok(Some(value)),
         Ok(Some(Err(failure))) => Err(classify(failure)),

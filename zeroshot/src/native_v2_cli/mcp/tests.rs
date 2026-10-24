@@ -151,9 +151,7 @@ async fn handshake_lists_cli_tools() {
     });
     initialize(&mut session).await;
     let listed = session.request(2, "tools/list", json!({})).await;
-    let tools = listed["result"]["tools"]
-        .as_array()
-        .expect("tools array");
+    let tools = listed["result"]["tools"].as_array().expect("tools array");
     let names = tools
         .iter()
         .map(|tool| tool["name"].as_str().unwrap_or_default())
@@ -191,10 +189,7 @@ async fn handshake_lists_cli_tools() {
             .unwrap_or_default()
             .contains("Read a run's current status as JSON.")
     );
-    assert_eq!(
-        status["inputSchema"]["required"],
-        json!(["runId"])
-    );
+    assert_eq!(status["inputSchema"]["required"], json!(["runId"]));
 }
 
 #[tokio::test]
@@ -262,9 +257,18 @@ async fn events_list_describes_poll_and_push_only() {
     assert!(event["inputSchema"]["properties"].get("target").is_some());
     assert_eq!(
         event["payloadSchema"]["required"],
-        json!(["subscriptionId", "runId", "title", "size", "cursor", "status"])
+        json!([
+            "subscriptionId",
+            "runId",
+            "title",
+            "size",
+            "cursor",
+            "status"
+        ])
     );
-    let next = session.request(3, "events/list", json!({"cursor": "1"})).await;
+    let next = session
+        .request(3, "events/list", json!({"cursor": "1"}))
+        .await;
     assert_eq!(next["result"]["events"], json!([]));
     let subscribe = session
         .request(4, "events/subscribe", json!({"name": "run.event"}))
@@ -294,8 +298,14 @@ async fn events_poll_advances_the_cursor() {
     assert_eq!(response["result"]["truncated"], json!(false));
     assert_eq!(response["result"]["hasMore"], json!(false));
     assert_eq!(response["result"]["nextPollMs"], json!(1000));
-    assert_eq!(response["result"]["events"][0]["eventId"], json!("run-public:v2:2"));
-    assert_eq!(response["result"]["events"][0]["data"]["cursor"], json!("v2:2"));
+    assert_eq!(
+        response["result"]["events"][0]["eventId"],
+        json!("run-public:v2:2")
+    );
+    assert_eq!(
+        response["result"]["events"][0]["data"]["cursor"],
+        json!("v2:2")
+    );
     assert!(response["result"]["events"][0].get("cursor").is_none());
 }
 
@@ -316,7 +326,10 @@ async fn events_poll_reports_a_skipped_window() {
         .await;
     assert_eq!(response["result"]["truncated"], json!(true));
     assert_eq!(response["result"]["cursor"], json!("v2:5"));
-    assert_eq!(response["result"]["events"][0]["data"]["cursor"], json!("v2:5"));
+    assert_eq!(
+        response["result"]["events"][0]["data"]["cursor"],
+        json!("v2:5")
+    );
 }
 
 #[tokio::test]

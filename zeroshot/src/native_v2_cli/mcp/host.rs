@@ -50,10 +50,7 @@ pub struct WatchStream {
 
 impl WatchStream {
     #[must_use]
-    pub fn new(
-        receiver: mpsc::Receiver<Result<Value, McpFailure>>,
-        task: JoinHandle<()>,
-    ) -> Self {
+    pub fn new(receiver: mpsc::Receiver<Result<Value, McpFailure>>, task: JoinHandle<()>) -> Self {
         Self { receiver, task }
     }
 
@@ -81,9 +78,7 @@ pub(super) fn parse_cli(argv: Vec<String>) -> Result<NativeV2CliCommand, McpFail
         .map_err(|error| McpFailure::from_cli(&error))?;
     match command {
         NativeV2CliCommand::Help(text) => Err(McpFailure::invalid(text)),
-        NativeV2CliCommand::Version => {
-            Err(McpFailure::invalid("version is not a tool result"))
-        }
+        NativeV2CliCommand::Version => Err(McpFailure::invalid("version is not a tool result")),
         command => Ok(command),
     }
 }

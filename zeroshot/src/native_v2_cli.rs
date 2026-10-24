@@ -96,9 +96,7 @@ pub use acp::{AcpServeError, serve_local_acp};
 mod tests;
 
 #[cfg(test)]
-pub(in crate::native_v2_cli) use tests::support::{
-    Call as CliTestCall, FakeBackend as CliTestBackend,
-};
+pub(in crate::native_v2_cli) use tests::support::{Call as CliTestCall, FakeBackend as CliTestBackend};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetAdd {

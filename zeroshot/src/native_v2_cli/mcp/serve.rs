@@ -58,8 +58,11 @@ where
         let message = match serde_json::from_str::<Value>(&line) {
             Ok(message) => message,
             Err(_) => {
-                write_message(&writer, &error_message(Value::Null, -32700, "Parse error", None))
-                    .await?;
+                write_message(
+                    &writer,
+                    &error_message(Value::Null, -32700, "Parse error", None),
+                )
+                .await?;
                 continue;
             }
         };
@@ -83,7 +86,11 @@ where
                 }
                 write_message(&writer, &ok_message(id, result)).await?;
             }
-            Action::Fail { code, message: text, data } => {
+            Action::Fail {
+                code,
+                message: text,
+                data,
+            } => {
                 write_message(&writer, &error_message(id, code, text, data)).await?;
             }
             Action::Stream(prepared) => {
