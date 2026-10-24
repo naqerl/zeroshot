@@ -305,7 +305,8 @@ Each row has these fields:
 - `--baseline VARIANT` compares against another variant of the run. `--baseline er_RUN[:VARIANT]`
   compares against another run's samples, matched by case. Use this to track a candidate against
   last week's champion.
-- `--table` prints a fixed-width summary instead of JSON.
+- `--table` prints the human-readable summary described in
+  [Human-readable table](#human-readable-table) instead of JSON.
 - `--wait[=DURATION]` polls until every sample is settled.
 
 | Exit code | Meaning (with `--fail-on-regression`) |
@@ -313,6 +314,35 @@ Each row has these fields:
 | 0 | complete, and no variant is `regressed` or `mixed` |
 | 3 | not complete yet; retry or use `--wait` |
 | 6 | a variant regressed in aggregate |
+
+#### Human-readable table
+
+`--table` only changes the rendering; the JSON report, its schema, and its field names stay the
+same. The title names the run, its baseline, and whether the run is complete. Aggregate rows are
+labelled `ALL CASES (aggregate)`. Deltas are absolute for pass rate and judge score and relative
+for tokens, cost, and duration; `-` means the metric is unavailable.
+
+```text
+Eval report er_4c1d0e9a7b2f3c51  baseline=er_4c1d0e9a7b2f3c51:baseline  complete=true
+CASE                  VARIANT  SAMPLES(count) PASS_RATE(0..1) JUDGE_SCORE(0..1)     TOKENS(tok)   COST_USD(USD) DURATION_MS(ms) VERDICT
+ALL CASES (aggregate) baseline              6            1.00              0.82          412300          0.0912           81234 baseline
+ALL CASES (aggregate) small                 6   1.00 (+0.000)     0.74 (-0.080) 298400 (-27.6%) 0.0660 (-27.6%)  70110 (-13.7%) regressed
+ec_4c1d0e9a7b2f3c51   baseline              3            1.00              0.80          400000          0.0880           80000 baseline
+ec_4c1d0e9a7b2f3c51   small                 3   1.00 (+0.000)     0.70 (-0.100) 300000 (-25.0%) 0.0660 (-25.0%)  70000 (-12.5%) regressed
+
+Legend: delta = candidate - baseline; absolute difference or relative % change
+  CASE         case id; ALL CASES (aggregate) covers every case
+  VARIANT      variant name; baseline rows print role=baseline, no delta
+  SAMPLES      samples counted, unit: samples; no delta
+  PASS_RATE    passing fraction, unit: 0..1; delta is absolute
+  JUDGE_SCORE  mean judge score, unit: 0..1 (pairwise -1..1); delta absolute
+  TOKENS       mean input+output per sample, unit: tokens; delta relative
+  COST_USD     mean cost from --prices, unit: USD; delta relative
+  DURATION_MS  mean wall-clock per sample, unit: ms; delta relative
+  VERDICT      improved/regressed/mixed/unchanged/insufficient/baseline
+  All variants are compared with the baseline; '-' means unavailable.
+improvements=1 regressions=1
+```
 
 ### Out of scope
 

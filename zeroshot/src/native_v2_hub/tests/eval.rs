@@ -19,7 +19,8 @@ use super::super::eval::judge::HostCommand;
 use super::super::eval::judge::{Ended, Finished};
 #[cfg(unix)]
 use zeroshot_engine::native_v2_cli::hub::HubEvalReport;
-use super::super::eval::report::{Against, Thresholds, report, stat};
+use super::super::eval::report::{Against, Thresholds, report, stat, table};
+use super::super::stats::ModelPrice;
 use super::super::eval::variant::{Change, Material, Request, merge_patch};
 use super::super::eval::{
     Baseline, Case, EvalRun, JudgeMode, Outcome, Sample, SampleState, Score, Verdict, canonical,
@@ -465,6 +466,162 @@ fn confidence_interval_is_a_normal_approximation() {
     let (low, high) = pair.ci95.expect("ci");
     // s = 0.7071, half = 1.96 * s / sqrt(2) = 0.98
     assert!((low - (0.5 - 0.98)).abs() < 1e-9 && (high - (0.5 + 0.98)).abs() < 1e-9);
+}
+
+/// A baseline and a cheaper variant over a short and a long case id.
+fn table_run() -> (EvalRun, BTreeMap<String, ModelPrice>) {
+    let long_case = "ec_0123456789abcdef_long_case_id";
+    let mut samples = vec![
+        sample("ec_a", "baseline", 1, (true, 1_000_000, 1000, Some(0.8))),
+        sample("ec_a", "baseline", 2, (true, 1_000_000, 1000, Some(0.8))),
+        sample(long_case, "baseline", 1, (true, 1_000_000, 1000, Some(0.8))),
+        sample(long_case, "baseline", 2, (true, 1_000_000, 1000, Some(0.8))),
+        // cheap: fails one long case, half the tokens, twice the wall clock.
+        sample("ec_a", "cheap", 1, (true, 500_000, 2000, Some(0.3))),
+        sample("ec_a", "cheap", 2, (true, 500_000, 2000, Some(0.3))),
+        sample(long_case, "cheap", 1, (false, 500_000, 2000, Some(0.3))),
+        sample(long_case, "cheap", 2, (true, 500_000, 2000, Some(0.3))),
+    ];
+    for sample in samples
+        .iter_mut()
+        .filter(|sample| sample.variant == "cheap")
+    {
+        sample.outcome.as_mut().expect("outcome").model = "n".to_owned();
+    }
+    let prices = BTreeMap::from([
+        (
+            "m".to_owned(),
+            ModelPrice {
+                input: 2.0,
+                ..ModelPrice::default()
+            },
+        ),
+        (
+            "n".to_owned(),
+            ModelPrice {
+                input: 3.0,
+                ..ModelPrice::default()
+            },
+        ),
+    ]);
+    (eval_run(samples, Some(JudgeMode::Absolute)), prices)
+}
+
+#[test]
+fn table_is_self_describing_and_names_units_and_delta_kinds() {
+    let (run, prices) = table_run();
+    let document = report(
+        &run,
+        Some(&own_baseline(&run)),
+        &Thresholds::default(),
+        Some(&prices),
+    );
+    let rendered = table(&document);
+    let mut lines = rendered.lines();
+    assert_eq!(
+        lines.next().expect("title"),
+        "Eval report er_1  baseline=er_1:baseline  complete=true"
+    );
+    let header = lines.next().expect("header");
+    for name in [
+        "CASE",
+        "VARIANT",
+        "SAMPLES(count)",
+        "PASS_RATE(0..1)",
+        "JUDGE_SCORE(0..1)",
+        "TOKENS(tok)",
+        "COST_USD(USD)",
+        "DURATION_MS(ms)",
+        "VERDICT",
+    ] {
+        assert!(header.contains(name), "{name} missing from {header}");
+    }
+    let data = lines
+        .by_ref()
+        .take_while(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    assert!(!data.is_empty());
+    let cheap = data
+        .iter()
+        .find(|line| line.contains("ALL CASES (aggregate)") && line.contains("cheap"))
+        .expect("cheap aggregate row");
+    // pass rate and judge score deltas are absolute, the rest are relative.
+    assert!(cheap.contains("0.75 (-0.250)"), "{cheap}");
+    assert!(cheap.contains("0.30 (-0.500)"), "{cheap}");
+    assert!(cheap.contains("500000 (-50.0%)"), "{cheap}");
+    assert!(cheap.contains("1.5000 (-25.0%)"), "{cheap}");
+    assert!(cheap.contains("2000 (+100.0%)"), "{cheap}");
+    // A long case id is truncated, so every row keeps the same column alignment.
+    let long = data
+        .iter()
+        .find(|line| line.contains("ec_0123456789abcdef") && line.contains("cheap"))
+        .expect("long case row");
+    assert!(!long.contains("ec_0123456789abcdef_long_case_id"), "{long}");
+    let column =
+        |line: &str, needle: &str| line[..line.find(needle).expect("column")].chars().count();
+    assert_eq!(
+        column(long, "cheap"),
+        column(cheap, "cheap"),
+        "{long}\n{cheap}"
+    );
+    assert_eq!(
+        column(long, "2000 (+100.0%)"),
+        column(cheap, "2000 (+100.0%)")
+    );
+    let legend = lines.collect::<Vec<_>>();
+    assert!(legend[0].starts_with("Legend:"), "{legend:?}");
+    assert!(
+        legend
+            .iter()
+            .any(|line| line.contains("PASS_RATE") && line.contains("absolute"))
+    );
+    assert!(
+        legend
+            .iter()
+            .any(|line| line.contains("TOKENS") && line.contains("relative"))
+    );
+    assert!(
+        legend
+            .iter()
+            .any(|line| line.contains("All variants are compared with the baseline"))
+    );
+    assert!(
+        legend
+            .iter()
+            .any(|line| line.contains("'-' means unavailable"))
+    );
+    for line in legend {
+        assert!(
+            line.chars().count() <= 80,
+            "{} columns: {line}",
+            line.chars().count()
+        );
+    }
+}
+
+#[test]
+fn table_prints_a_dash_for_a_missing_cost() {
+    let (run, _) = table_run();
+    let document = report(
+        &run,
+        Some(&own_baseline(&run)),
+        &Thresholds::default(),
+        None,
+    );
+    let rendered = table(&document);
+    let data = rendered
+        .lines()
+        .skip_while(|line| !line.starts_with("CASE"))
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    assert!(!data.is_empty());
+    for line in data {
+        assert!(
+            line.contains(" - "),
+            "missing cost not rendered as '-': {line}"
+        );
+    }
 }
 
 #[test]

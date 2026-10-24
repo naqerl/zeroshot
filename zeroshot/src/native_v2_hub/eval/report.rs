@@ -402,7 +402,51 @@ pub(crate) fn report(
     })
 }
 
-/// A fixed-width summary of a report document for people.
+const CASE_WIDTH: usize = 22;
+const VARIANT_WIDTH: usize = 16;
+
+/// Column headings of the human table, named with their unit, in report order.
+const HEADERS: [&str; 9] = [
+    "CASE",
+    "VARIANT",
+    "SAMPLES(count)",
+    "PASS_RATE(0..1)",
+    "JUDGE_SCORE(0..1)",
+    "TOKENS(tok)",
+    "COST_USD(USD)",
+    "DURATION_MS(ms)",
+    "VERDICT",
+];
+
+/// One compact line per column, then the comparison rule; each fits in 80 columns.
+const LEGEND: [&str; 11] = [
+    "Legend: delta = candidate - baseline; absolute difference or relative % change",
+    "  CASE         case id; ALL CASES (aggregate) covers every case",
+    "  VARIANT      variant name; baseline rows print role=baseline, no delta",
+    "  SAMPLES      samples counted, unit: samples; no delta",
+    "  PASS_RATE    passing fraction, unit: 0..1; delta is absolute",
+    "  JUDGE_SCORE  mean judge score, unit: 0..1 (pairwise -1..1); delta absolute",
+    "  TOKENS       mean input+output per sample, unit: tokens; delta relative",
+    "  COST_USD     mean cost from --prices, unit: USD; delta relative",
+    "  DURATION_MS  mean wall-clock per sample, unit: ms; delta relative",
+    "  VERDICT      improved/regressed/mixed/unchanged/insufficient/baseline",
+    "  All variants are compared with the baseline; '-' means unavailable.",
+];
+
+/// `text` padded or truncated to exactly `width` characters.
+fn fit(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return format!("{text:<width$}");
+    }
+    let mut fitted = text
+        .chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>();
+    fitted.push('…');
+    fitted
+}
+
+/// A self-describing summary of a report document for people.
 pub(crate) fn table(report: &Value) -> String {
     let number = |value: &Value, digits: usize| {
         value
@@ -422,34 +466,12 @@ pub(crate) fn table(report: &Value) -> String {
             },
         }
     };
-    let mut lines = vec![format!(
-        "eval run {}  complete={}  baseline={}",
-        report["runId"].as_str().unwrap_or("-"),
-        report["complete"],
-        report["baseline"]
-            .get("variant")
-            .and_then(Value::as_str)
-            .map_or_else(
-                || "-".to_owned(),
-                |variant| {
-                    format!(
-                        "{}:{variant}",
-                        report["baseline"]["runId"].as_str().unwrap_or("-")
-                    )
-                }
-            ),
-    )];
-    let header = format!(
-        "{:<22} {:<16} {:>4} {:<18} {:<18} {:<20} {:<20} {:<20} {}",
-        "CASE", "VARIANT", "N", "PASS", "JUDGE", "TOKENS", "COST_USD", "DURATION_MS", "VERDICT"
-    );
-    lines.push(header);
+    let mut rows = Vec::<[String; 9]>::new();
     let mut push = |case: &str, row: &Value| {
-        lines.push(format!(
-            "{:<22} {:<16} {:>4} {:<18} {:<18} {:<20} {:<20} {:<20} {}",
-            case,
-            row["variant"].as_str().unwrap_or("-"),
-            row["aggregate"]["samples"],
+        rows.push([
+            case.to_owned(),
+            row["variant"].as_str().unwrap_or("-").to_owned(),
+            row["aggregate"]["samples"].to_string(),
             cell(row, "passRate", 2),
             cell(row, "judgeScore", 2),
             cell(row, "tokens", 0),
@@ -458,17 +480,76 @@ pub(crate) fn table(report: &Value) -> String {
             row["verdict"]
                 .as_str()
                 .or_else(|| row["role"].as_str())
-                .unwrap_or("-"),
-        ));
+                .unwrap_or("-")
+                .to_owned(),
+        ]);
     };
     for row in report["variants"].as_array().into_iter().flatten() {
-        push("ALL", row);
+        push("ALL CASES (aggregate)", row);
     }
     for case in report["cases"].as_array().into_iter().flatten() {
         for row in case["variants"].as_array().into_iter().flatten() {
             push(case["caseId"].as_str().unwrap_or("-"), row);
         }
     }
+    let mut widths = HEADERS.map(|header| header.chars().count());
+    widths[0] = rows
+        .iter()
+        .map(|row| row[0].chars().count().min(CASE_WIDTH))
+        .max()
+        .unwrap_or(0)
+        .max(HEADERS[0].chars().count());
+    widths[1] = rows
+        .iter()
+        .map(|row| row[1].chars().count().min(VARIANT_WIDTH))
+        .max()
+        .unwrap_or(0)
+        .max(HEADERS[1].chars().count());
+    for row in &rows {
+        for (index, value) in row.iter().enumerate().skip(2) {
+            widths[index] = widths[index].max(value.chars().count());
+        }
+    }
+    let line = |cells: &[&str; 9]| {
+        let mut line = String::new();
+        for (index, cell) in cells.iter().enumerate() {
+            if index > 0 {
+                line.push(' ');
+            }
+            // Rendered columns are right-aligned; descriptive columns keep text left.
+            if (2..=7).contains(&index) {
+                line.push_str(&format!("{cell:>width$}", width = widths[index]));
+            } else {
+                line.push_str(&fit(cell, widths[index]));
+            }
+        }
+        line.trim_end().to_owned()
+    };
+    let baseline = report["baseline"]
+        .get("variant")
+        .and_then(Value::as_str)
+        .map_or_else(
+            || "-".to_owned(),
+            |variant| {
+                format!(
+                    "{}:{variant}",
+                    report["baseline"]["runId"].as_str().unwrap_or("-")
+                )
+            },
+        );
+    let mut lines = vec![
+        format!(
+            "Eval report {}  baseline={baseline}  complete={}",
+            report["runId"].as_str().unwrap_or("-"),
+            report["complete"],
+        ),
+        line(&HEADERS),
+    ];
+    for row in &rows {
+        lines.push(line(&std::array::from_fn(|index| row[index].as_str())));
+    }
+    lines.push(String::new());
+    lines.extend(LEGEND.map(str::to_owned));
     lines.push(format!(
         "improvements={} regressions={}",
         report["improvements"], report["regressions"]
