@@ -1074,6 +1074,7 @@ Commands:
   install     Install the hub daemon as a systemd unit or a Docker container and start it
   uninstall   Stop and remove the hub daemon service. Hub state is kept
   eval        Capture tasks as eval cases, rerun them under variants, judge, and compare
+  pool        Manage on-demand cloud server pools whose servers join the hub as members
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1904,6 +1905,9 @@ Options:
       --unconfirmed-limit <N>
           Fail a job after this many submissions its target did not confirm (timeouts, lost receipts) [default: 30]. Each is retried on the same member with the same key
 
+      --hetzner-token-file <FILE>
+          Hetzner Cloud API token file for pool servers [default: the HCLOUD_TOKEN environment variable]. The token is never logged or stored in hub state
+
   -h, --help
           Print help (see a summary with '-h')
 ```
@@ -2103,6 +2107,9 @@ Options:
 
       --unconfirmed-limit <N>
           Fail a job after this many submissions its target did not confirm (timeouts, lost receipts) [default: 30]. Each is retried on the same member with the same key
+
+      --hetzner-token-file <FILE>
+          Hetzner Cloud API token file for pool servers [default: the HCLOUD_TOKEN environment variable]. The token is never logged or stored in hub state
 
       --dry-run
           Print the generated service definition and steps without applying them
@@ -2709,6 +2716,142 @@ Commands:
   help    Print this message or the help of the given subcommand(s)
 ```
 
+#### `zeroshot hub pool`
+
+```text
+Manage on-demand cloud server pools whose servers join the hub as members.
+
+A pool with no live server still counts as eligible, so a matching job queues and the daemon creates a server for it (up to --max). Each server runs the pinned target image behind an SSH tunnel from the hub, is archived before it is deleted, and is torn down after --idle without jobs or at --ttl. Servers are billed while they exist.
+
+Usage: zeroshot hub pool [OPTIONS] <COMMAND>
+
+Commands:
+  add     Add a pool. The daemon needs a provider token (--hetzner-token-file or HCLOUD_TOKEN)
+  list    List pools and their servers as JSON [alias: ls]
+  remove  Remove a pool that has no servers left [alias: rm]
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+##### `zeroshot hub pool add`
+
+```text
+Add a pool. The daemon needs a provider token (--hetzner-token-file or HCLOUD_TOKEN)
+
+Usage: zeroshot hub pool add [OPTIONS] --type <TYPE> --location <LOCATION> --image <IMAGE> --target-image <IMAGE> --max <N> --ssh-key <FILE> --ssh-from <CIDR> <NAME>
+
+Arguments:
+  <NAME>
+          Pool name; servers are named zs-<job>
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+      --provider <PROVIDER>
+          Cloud provider
+
+          [default: hetzner]
+
+      --type <TYPE>
+          Server type, such as cx33
+
+      --location <LOCATION>
+          Location, such as fsn1
+
+      --image <IMAGE>
+          Server image: a snapshot id or a system image such as docker-ce
+
+      --target-image <IMAGE>
+          Pinned zeroshot target container image (a digest or a tag other than latest)
+
+      --max <N>
+          Most servers alive at once
+
+      --slots <N>
+          Concurrent runs per server
+
+          [default: 1]
+
+      --idle <DURATION>
+          Tear a server down after this long without jobs
+
+          [default: 10m]
+
+      --ttl <DURATION>
+          Tear a server down this long after creation, even while busy; it also shuts itself down shortly after as a backstop
+
+          [default: 2h]
+
+      --tag <TAG>
+          Placement tag servers join with. Repeat for several
+
+          [alias: --tags]
+
+      --ssh-key <FILE>
+          Private SSH key on the hub host; its .pub sibling is installed on servers
+
+      --ssh-from <CIDR>
+          CIDR allowed to reach servers over SSH (the hub's public address). Repeat for several
+
+  -h, --help
+          Print help
+```
+
+##### `zeroshot hub pool list`
+
+```text
+List pools and their servers as JSON
+
+Usage: zeroshot hub pool list [OPTIONS]
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help
+```
+
+##### `zeroshot hub pool remove`
+
+```text
+Remove a pool that has no servers left
+
+Usage: zeroshot hub pool remove [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>
+          Pool name
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help
+```
+
+##### `zeroshot hub pool help`
+
+```text
+Print this message or the help of the given subcommand(s)
+
+Usage: zeroshot hub pool help [COMMAND]
+
+Commands:
+  add     Add a pool. The daemon needs a provider token (--hetzner-token-file or HCLOUD_TOKEN)
+  list    List pools and their servers as JSON
+  remove  Remove a pool that has no servers left
+  help    Print this message or the help of the given subcommand(s)
+```
+
 #### `zeroshot hub help`
 
 ```text
@@ -2737,6 +2880,7 @@ Commands:
   install     Install the hub daemon as a systemd unit or a Docker container and start it
   uninstall   Stop and remove the hub daemon service. Hub state is kept
   eval        Capture tasks as eval cases, rerun them under variants, judge, and compare
+  pool        Manage on-demand cloud server pools whose servers join the hub as members
   help        Print this message or the help of the given subcommand(s)
 ```
 

@@ -178,6 +178,7 @@ struct Counters {
     requests: BTreeMap<(String, String, u16), u64>,
     latency: BTreeMap<(String, String), Histogram>,
     loads: BTreeMap<String, Load>,
+    pool_events: BTreeMap<&'static str, u64>,
 }
 
 /// In-memory counters of one daemon, plus the job label keys exported with token counters.
@@ -246,6 +247,22 @@ impl Metrics {
         });
     }
 
+    /// Count what one pool pass did.
+    pub(crate) fn record_pool_pass(&self, report: &super::lease::PoolReport) {
+        self.with(|counters| {
+            for (event, count) in [
+                ("started", report.started.len()),
+                ("teardown", report.teardowns.len()),
+                ("archived", report.archived.len()),
+                ("deleted", report.deleted.len()),
+                ("reaped", report.reaped.len()),
+                ("error", report.errors.len()),
+            ] {
+                *counters.pool_events.entry(event).or_default() += count as u64;
+            }
+        });
+    }
+
     pub(crate) fn record_loads(&self, loads: &BTreeMap<String, Load>) {
         self.with(|counters| {
             for (member, load) in loads {
@@ -296,6 +313,7 @@ impl Metrics {
         );
         render_jobs(&mut out, state, now_ms);
         render_members(&mut out, state, self);
+        render_pools(&mut out, state);
         render_job_histograms(&mut out, state);
         render_tokens(&mut out, state, &self.label_keys);
         let Ok(counters) = self.counters.lock() else {
@@ -354,6 +372,18 @@ impl Metrics {
             );
         }
         out.family(
+            "zeroshot_hub_pool_events_total",
+            "counter",
+            "Pool lease events (started, teardown, archived, deleted, reaped, error).",
+        );
+        for (event, count) in &counters.pool_events {
+            out.sample(
+                "zeroshot_hub_pool_events_total",
+                &[("event", event)],
+                *count as f64,
+            );
+        }
+        out.family(
             "zeroshot_hub_api_requests_total",
             "counter",
             "Hub API requests by route template, method, and status code.",
@@ -387,6 +417,35 @@ impl Metrics {
     fn load(&self, member: &str) -> Option<Load> {
         self.with(|counters| counters.loads.get(member).cloned())
             .flatten()
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn render_pools(out: &mut Exposition, state: &HubState) {
+    out.family(
+        "zeroshot_hub_pool_leases",
+        "gauge",
+        "Pool servers by pool and lease phase; every one is billed.",
+    );
+    let mut counts = BTreeMap::<(String, String), u64>::new();
+    for pool in &state.pools {
+        counts
+            .entry((pool.name.clone(), "active".to_owned()))
+            .or_default();
+    }
+    for lease in &state.leases {
+        let phase = serde_json::to_value(lease.phase)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        *counts.entry((lease.pool.clone(), phase)).or_default() += 1;
+    }
+    for ((pool, phase), count) in &counts {
+        out.sample(
+            "zeroshot_hub_pool_leases",
+            &[("pool", pool), ("phase", phase)],
+            *count as f64,
+        );
     }
 }
 

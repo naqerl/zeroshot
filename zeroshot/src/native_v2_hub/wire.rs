@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::model::{Job, MemberState, Schedule};
+use super::pool::Provider;
 
 /// `POST /v1/hub/members`.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -15,6 +16,25 @@ pub(crate) struct AddMember {
     pub slots: u32,
     #[serde(default)]
     pub priority: i32,
+}
+
+/// `POST /v1/hub/pools`. Paths are absolute paths on the hub host.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct AddPool {
+    pub name: String,
+    pub provider: Provider,
+    pub server_type: String,
+    pub location: String,
+    pub image: String,
+    pub target_image: String,
+    pub max: u32,
+    pub slots: u32,
+    pub idle_ms: u64,
+    pub ttl_ms: u64,
+    pub tags: Vec<String>,
+    pub ssh_key: std::path::PathBuf,
+    pub ssh_from: Vec<String>,
 }
 
 /// `PATCH /v1/hub/members/{name}`.

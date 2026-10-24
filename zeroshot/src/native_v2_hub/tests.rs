@@ -40,6 +40,9 @@ mod paths;
 #[path = "tests/usage.rs"]
 mod usage;
 
+#[path = "tests/pool.rs"]
+mod pool;
+
 pub(super) fn member(name: &str, tags: &[&str], slots: u32, priority: i32) -> Member {
     Member {
         tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
@@ -78,6 +81,8 @@ pub(super) fn job(id: &str, submitted_at_ms: u64) -> Job {
         error: None,
         schedule_id: None,
         output: None,
+        archive: None,
+        graph_hash: None,
     }
 }
 
@@ -284,6 +289,13 @@ pub(super) struct FakeDriver {
     pub submit_delay: Option<std::time::Duration>,
     /// Run IDs by submission key: the target's idempotency.
     pub accepted: Mutex<BTreeMap<String, String>>,
+    /// Archive captures: member and arguments.
+    pub captures: Mutex<Vec<(String, Vec<String>)>>,
+    /// Makes archive captures fail, like a target that went away.
+    pub capture_fails: std::sync::atomic::AtomicBool,
+    /// Discovery answer for members absent from `capabilities`, such as pool servers whose
+    /// names the hub chooses.
+    pub discover_any: Option<Vec<String>>,
 }
 
 impl FakeDriver {
@@ -373,10 +385,26 @@ impl HubDriver for FakeDriver {
         self.capabilities
             .get(member)
             .cloned()
+            .or_else(|| self.discover_any.clone())
             .ok_or_else(|| HubError::Target {
                 message: format!("{member} discovery failed"),
                 diagnostic: None,
             })
+    }
+
+    async fn capture(&self, member: &str, arguments: Vec<String>) -> Result<String, HubError> {
+        if self.capture_fails.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(HubError::Unanswered("capture failed".to_owned()));
+        }
+        let command = arguments.first().cloned().unwrap_or_default();
+        self.captures
+            .lock()
+            .expect("fake lock")
+            .push((member.to_owned(), arguments));
+        Ok(match command.as_str() {
+            "report" => json!({"run": {"authoredGraphHash": "sha256:graph"}}).to_string(),
+            other => format!("{{\"{other}\":1}}\n"),
+        })
     }
 }
 
@@ -773,3 +801,6 @@ async fn too_many_unconfirmed_submissions_fail_the_job_naming_its_key() {
     let loaded: Job = serde_json::from_value(fresh).expect("an earlier hub's job loads");
     assert_eq!(loaded.unconfirmed_submissions, 0);
 }
+
+#[path = "tests/hetzner.rs"]
+mod hetzner;

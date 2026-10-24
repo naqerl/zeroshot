@@ -8,7 +8,7 @@ use crate::native_v2_cli::NativeV2CliError;
 use crate::native_v2_cli::hub::{
     HubApiOptions, HubCommand, HubContextCommand, HubDaemonRun, HubEnqueue, HubInstall, HubJobSpec,
     HubLogs, HubManager, HubMemberAdd, HubMemberState, HubMemberUpdate, HubPs, HubStats,
-    HubStrategy, HubSubmit, HubTokenSource, HubUninstall,
+    HubPoolAdd, HubPoolCommand, HubStrategy, HubSubmit, HubTokenSource, HubUninstall,
 };
 
 #[derive(Debug, Subcommand)]
@@ -150,6 +150,123 @@ pub(super) enum HubCliCommand {
     /// Capture tasks as eval cases, rerun them under variants, judge, and compare.
     #[command(subcommand)]
     Eval(eval::HubEvalCliCommand),
+
+    /// Manage on-demand cloud server pools whose servers join the hub as members.
+    ///
+    /// A pool with no live server still counts as eligible, so a matching job queues and the
+    /// daemon creates a server for it (up to --max). Each server runs the pinned target image
+    /// behind an SSH tunnel from the hub, is archived before it is deleted, and is torn down
+    /// after --idle without jobs or at --ttl. Servers are billed while they exist.
+    #[command(subcommand)]
+    Pool(HubPoolCliCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum HubPoolCliCommand {
+    /// Add a pool. The daemon needs a provider token (--hetzner-token-file or HCLOUD_TOKEN).
+    Add(Box<HubPoolAddArgs>),
+
+    /// List pools and their servers as JSON.
+    #[command(visible_alias = "ls")]
+    List,
+
+    /// Remove a pool that has no servers left.
+    #[command(visible_alias = "rm")]
+    Remove(HubPoolNameArgs),
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubPoolNameArgs {
+    /// Pool name.
+    #[arg(value_name = "NAME")]
+    name: String,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubPoolAddArgs {
+    /// Pool name; servers are named zs-<job>.
+    #[arg(value_name = "NAME")]
+    name: String,
+
+    /// Cloud provider.
+    #[arg(long, value_name = "PROVIDER", default_value = "hetzner")]
+    provider: String,
+
+    /// Server type, such as cx33.
+    #[arg(long = "type", value_name = "TYPE")]
+    server_type: String,
+
+    /// Location, such as fsn1.
+    #[arg(long, value_name = "LOCATION")]
+    location: String,
+
+    /// Server image: a snapshot id or a system image such as docker-ce.
+    #[arg(long, value_name = "IMAGE")]
+    image: String,
+
+    /// Pinned zeroshot target container image (a digest or a tag other than latest).
+    #[arg(long, value_name = "IMAGE")]
+    target_image: String,
+
+    /// Most servers alive at once.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=100))]
+    max: u32,
+
+    /// Concurrent runs per server.
+    #[arg(long, value_name = "N", default_value_t = 1,
+          value_parser = clap::value_parser!(u32).range(1..=1024))]
+    slots: u32,
+
+    /// Tear a server down after this long without jobs.
+    #[arg(long, value_name = "DURATION", default_value = "10m")]
+    idle: String,
+
+    /// Tear a server down this long after creation, even while busy; it also shuts itself down
+    /// shortly after as a backstop.
+    #[arg(long, value_name = "DURATION", default_value = "2h")]
+    ttl: String,
+
+    /// Placement tag servers join with. Repeat for several.
+    #[arg(long = "tag", visible_alias = "tags", value_name = "TAG",
+          action = clap::ArgAction::Append, value_delimiter = ',')]
+    tags: Vec<String>,
+
+    /// Private SSH key on the hub host; its .pub sibling is installed on servers.
+    #[arg(long, value_name = "FILE")]
+    ssh_key: std::path::PathBuf,
+
+    /// CIDR allowed to reach servers over SSH (the hub's public address). Repeat for several.
+    #[arg(long, value_name = "CIDR", required = true, action = clap::ArgAction::Append)]
+    ssh_from: Vec<String>,
+}
+
+impl HubPoolCliCommand {
+    fn into_command(self) -> Result<HubPoolCommand, NativeV2CliError> {
+        Ok(match self {
+            Self::Add(args) => {
+                let args = *args;
+                HubPoolCommand::Add(Box::new(HubPoolAdd {
+                    name: member_name(args.name)?,
+                    provider: args.provider,
+                    server_type: args.server_type,
+                    location: args.location,
+                    image: args.image,
+                    target_image: args.target_image,
+                    max: args.max,
+                    slots: args.slots,
+                    idle: args.idle,
+                    ttl: args.ttl,
+                    tags: tags(args.tags)?,
+                    ssh_key: args.ssh_key,
+                    ssh_from: args.ssh_from,
+                }))
+            }
+            Self::List => HubPoolCommand::List,
+            Self::Remove(args) => HubPoolCommand::Remove {
+                name: member_name(args.name)?,
+            },
+        })
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -205,6 +322,11 @@ pub(super) struct HubApiArgs {
     /// receipts) [default: 30]. Each is retried on the same member with the same key.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     unconfirmed_limit: Option<u32>,
+
+    /// Hetzner Cloud API token file for pool servers [default: the HCLOUD_TOKEN environment
+    /// variable]. The token is never logged or stored in hub state.
+    #[arg(long, value_name = "FILE")]
+    hetzner_token_file: Option<std::path::PathBuf>,
 }
 
 impl HubApiArgs {
@@ -222,6 +344,7 @@ impl HubApiArgs {
             metrics_listen: self.metrics_listen,
             metrics_labels: self.metrics_labels,
             unconfirmed_limit: self.unconfirmed_limit,
+            hetzner_token_file: self.hetzner_token_file,
         })
     }
 }
@@ -620,6 +743,7 @@ impl HubCliCommand {
                 dry_run: args.dry_run,
             })),
             Self::Eval(command) => Ok(HubCommand::Eval(command.into_command()?)),
+            Self::Pool(command) => Ok(HubCommand::Pool(command.into_command()?)),
         }
     }
 }

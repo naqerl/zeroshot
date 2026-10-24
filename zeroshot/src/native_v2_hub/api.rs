@@ -26,8 +26,8 @@ use super::error::HubError;
 use super::eval::{AddCase, AddSuite, CaseQuery, CreateRun, ReportRequest, RunQuery};
 use super::service::HubService;
 use super::wire::{
-    AddMember, CreateSchedule, EnqueueJob, JobQuery, MemberQuery, StatsRequest, StreamFrame,
-    StreamRequest, SubmitJob, UpdateMember,
+    AddMember, AddPool, CreateSchedule, EnqueueJob, JobQuery, MemberQuery, StatsRequest,
+    StreamFrame, StreamRequest, SubmitJob, UpdateMember,
 };
 
 /// Response header carrying the CLI exit code of an error.
@@ -54,6 +54,8 @@ pub(crate) fn router(state: Arc<ApiState>) -> Router {
             "/v1/hub/members/{name}",
             patch(update_member).delete(remove_member),
         )
+        .route("/v1/hub/pools", get(list_pools).post(add_pool))
+        .route("/v1/hub/pools/{name}", delete(remove_pool))
         .route("/v1/hub/jobs", post(submit))
         .route("/v1/hub/jobs/query", post(ps))
         .route("/v1/hub/jobs/{id}", get(status).delete(dequeue))
@@ -239,6 +241,19 @@ async fn update_member(
 
 async fn remove_member(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Response {
     reply(state.service.remove(&name).await)
+}
+
+async fn add_pool(State(state): State<Arc<ApiState>>, bytes: Bytes) -> Response {
+    let result = async { state.service.add_pool(body::<AddPool>(&bytes)?).await }.await;
+    reply(result)
+}
+
+async fn list_pools(State(state): State<Arc<ApiState>>) -> Response {
+    reply(Ok(state.service.list_pools().await))
+}
+
+async fn remove_pool(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Response {
+    reply(state.service.remove_pool(&name).await)
 }
 
 async fn submit(State(state): State<Arc<ApiState>>, bytes: Bytes) -> Response {

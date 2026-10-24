@@ -88,6 +88,8 @@ pub(crate) fn new_job(spec: &HubJobSpec, now_ms: u64) -> Result<Job, HubError> {
         error: None,
         schedule_id: None,
         output: None,
+        archive: None,
+        graph_hash: None,
     })
 }
 

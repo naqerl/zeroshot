@@ -570,6 +570,7 @@ async fn stats_validate_dimensions_and_price_tables_on_the_client() {
 async fn machine_local_commands_are_refused_through_a_context() {
     let hub = hub_with(FakeDriver::default(), None).await;
     let api = HubApiOptions {
+        hetzner_token_file: None,
         listen: None,
         token_file: None,
         metrics_listen: None,

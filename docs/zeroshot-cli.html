@@ -109,6 +109,11 @@ section { margin-block: 2.5rem; }
 <li><a href="#zeroshot-hub-eval-status"><code>zeroshot hub eval status</code></a></li>
 <li><a href="#zeroshot-hub-eval-report"><code>zeroshot hub eval report</code></a></li>
 <li><a href="#zeroshot-hub-eval-help"><code>zeroshot hub eval help</code></a></li>
+<li><a href="#zeroshot-hub-pool"><code>zeroshot hub pool</code></a></li>
+<li><a href="#zeroshot-hub-pool-add"><code>zeroshot hub pool add</code></a></li>
+<li><a href="#zeroshot-hub-pool-list"><code>zeroshot hub pool list</code></a></li>
+<li><a href="#zeroshot-hub-pool-remove"><code>zeroshot hub pool remove</code></a></li>
+<li><a href="#zeroshot-hub-pool-help"><code>zeroshot hub pool help</code></a></li>
 <li><a href="#zeroshot-hub-help"><code>zeroshot hub help</code></a></li>
 <li><a href="#zeroshot-run"><code>zeroshot run</code></a></li>
 <li><a href="#zeroshot-update"><code>zeroshot update</code></a></li>
@@ -1013,6 +1018,7 @@ Commands:
   install     Install the hub daemon as a systemd unit or a Docker container and start it
   uninstall   Stop and remove the hub daemon service. Hub state is kept
   eval        Capture tasks as eval cases, rerun them under variants, judge, and compare
+  pool        Manage on-demand cloud server pools whose servers join the hub as members
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1775,6 +1781,9 @@ Options:
       --unconfirmed-limit &lt;N&gt;
           Fail a job after this many submissions its target did not confirm (timeouts, lost receipts) [default: 30]. Each is retried on the same member with the same key
 
+      --hetzner-token-file &lt;FILE&gt;
+          Hetzner Cloud API token file for pool servers [default: the HCLOUD_TOKEN environment variable]. The token is never logged or stored in hub state
+
   -h, --help
           Print help (see a summary with &#39;-h&#39;)</code></pre></section>
 <section id="zeroshot-hub-daemon-status"><h5><code>zeroshot hub daemon status</code></h5>
@@ -1938,6 +1947,9 @@ Options:
 
       --unconfirmed-limit &lt;N&gt;
           Fail a job after this many submissions its target did not confirm (timeouts, lost receipts) [default: 30]. Each is retried on the same member with the same key
+
+      --hetzner-token-file &lt;FILE&gt;
+          Hetzner Cloud API token file for pool servers [default: the HCLOUD_TOKEN environment variable]. The token is never logged or stored in hub state
 
       --dry-run
           Print the generated service definition and steps without applying them
@@ -2478,6 +2490,122 @@ Commands:
   status  Show one eval run with every sample&#39;s measurement and verdict as JSON
   report  Compare variants with the baseline per case and in aggregate
   help    Print this message or the help of the given subcommand(s)</code></pre></section>
+<section id="zeroshot-hub-pool"><h4><code>zeroshot hub pool</code></h4>
+<pre><code>Manage on-demand cloud server pools whose servers join the hub as members.
+
+A pool with no live server still counts as eligible, so a matching job queues and the daemon creates a server for it (up to --max). Each server runs the pinned target image behind an SSH tunnel from the hub, is archived before it is deleted, and is torn down after --idle without jobs or at --ttl. Servers are billed while they exist.
+
+Usage: zeroshot hub pool [OPTIONS] &lt;COMMAND&gt;
+
+Commands:
+  add     Add a pool. The daemon needs a provider token (--hetzner-token-file or HCLOUD_TOKEN)
+  list    List pools and their servers as JSON [alias: ls]
+  remove  Remove a pool that has no servers left [alias: rm]
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --hub &lt;CONTEXT&gt;
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help (see a summary with &#39;-h&#39;)</code></pre></section>
+<section id="zeroshot-hub-pool-add"><h5><code>zeroshot hub pool add</code></h5>
+<pre><code>Add a pool. The daemon needs a provider token (--hetzner-token-file or HCLOUD_TOKEN)
+
+Usage: zeroshot hub pool add [OPTIONS] --type &lt;TYPE&gt; --location &lt;LOCATION&gt; --image &lt;IMAGE&gt; --target-image &lt;IMAGE&gt; --max &lt;N&gt; --ssh-key &lt;FILE&gt; --ssh-from &lt;CIDR&gt; &lt;NAME&gt;
+
+Arguments:
+  &lt;NAME&gt;
+          Pool name; servers are named zs-&lt;job&gt;
+
+Options:
+      --hub &lt;CONTEXT&gt;
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+      --provider &lt;PROVIDER&gt;
+          Cloud provider
+
+          [default: hetzner]
+
+      --type &lt;TYPE&gt;
+          Server type, such as cx33
+
+      --location &lt;LOCATION&gt;
+          Location, such as fsn1
+
+      --image &lt;IMAGE&gt;
+          Server image: a snapshot id or a system image such as docker-ce
+
+      --target-image &lt;IMAGE&gt;
+          Pinned zeroshot target container image (a digest or a tag other than latest)
+
+      --max &lt;N&gt;
+          Most servers alive at once
+
+      --slots &lt;N&gt;
+          Concurrent runs per server
+
+          [default: 1]
+
+      --idle &lt;DURATION&gt;
+          Tear a server down after this long without jobs
+
+          [default: 10m]
+
+      --ttl &lt;DURATION&gt;
+          Tear a server down this long after creation, even while busy; it also shuts itself down shortly after as a backstop
+
+          [default: 2h]
+
+      --tag &lt;TAG&gt;
+          Placement tag servers join with. Repeat for several
+
+          [alias: --tags]
+
+      --ssh-key &lt;FILE&gt;
+          Private SSH key on the hub host; its .pub sibling is installed on servers
+
+      --ssh-from &lt;CIDR&gt;
+          CIDR allowed to reach servers over SSH (the hub&#39;s public address). Repeat for several
+
+  -h, --help
+          Print help</code></pre></section>
+<section id="zeroshot-hub-pool-list"><h5><code>zeroshot hub pool list</code></h5>
+<pre><code>List pools and their servers as JSON
+
+Usage: zeroshot hub pool list [OPTIONS]
+
+Options:
+      --hub &lt;CONTEXT&gt;
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help</code></pre></section>
+<section id="zeroshot-hub-pool-remove"><h5><code>zeroshot hub pool remove</code></h5>
+<pre><code>Remove a pool that has no servers left
+
+Usage: zeroshot hub pool remove [OPTIONS] &lt;NAME&gt;
+
+Arguments:
+  &lt;NAME&gt;
+          Pool name
+
+Options:
+      --hub &lt;CONTEXT&gt;
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help</code></pre></section>
+<section id="zeroshot-hub-pool-help"><h5><code>zeroshot hub pool help</code></h5>
+<pre><code>Print this message or the help of the given subcommand(s)
+
+Usage: zeroshot hub pool help [COMMAND]
+
+Commands:
+  add     Add a pool. The daemon needs a provider token (--hetzner-token-file or HCLOUD_TOKEN)
+  list    List pools and their servers as JSON
+  remove  Remove a pool that has no servers left
+  help    Print this message or the help of the given subcommand(s)</code></pre></section>
 <section id="zeroshot-hub-help"><h4><code>zeroshot hub help</code></h4>
 <pre><code>Print this message or the help of the given subcommand(s)
 
@@ -2504,6 +2632,7 @@ Commands:
   install     Install the hub daemon as a systemd unit or a Docker container and start it
   uninstall   Stop and remove the hub daemon service. Hub state is kept
   eval        Capture tasks as eval cases, rerun them under variants, judge, and compare
+  pool        Manage on-demand cloud server pools whose servers join the hub as members
   help        Print this message or the help of the given subcommand(s)</code></pre></section>
 <section id="zeroshot-run"><h3><code>zeroshot run</code></h3>
 <pre><code>Submit a graph run locally or to a named target.

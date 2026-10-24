@@ -509,6 +509,7 @@ async fn the_daemon_serves_the_api_dispatches_and_stops_on_shutdown() {
     let options = HubDaemonRun {
         interval: "1s".to_owned(),
         api: HubApiOptions {
+            hetzner_token_file: None,
             listen: Some("127.0.0.1:0".to_owned()),
             token_file: Some(token_file.clone()),
             metrics_listen: Some("127.0.0.1:0".to_owned()),
@@ -647,6 +648,7 @@ async fn the_daemon_refuses_bad_options_before_serving() {
     let options = |interval: &str, listen: &str, metrics: Option<&str>| HubDaemonRun {
         interval: interval.to_owned(),
         api: HubApiOptions {
+            hetzner_token_file: None,
             listen: Some(listen.to_owned()),
             token_file: Some(directory.path().join("token")),
             metrics_listen: metrics.map(str::to_owned),
@@ -739,6 +741,7 @@ async fn install_and_uninstall_print_plans_on_dry_runs() {
         volumes: vec![PathBuf::from("/srv/repos")],
         interval: "5s".to_owned(),
         api: HubApiOptions {
+            hetzner_token_file: None,
             listen: None,
             token_file: Some(PathBuf::from("relative-token")),
             metrics_listen: None,
@@ -932,6 +935,7 @@ async fn the_daemon_reports_failing_passes_and_keeps_serving() {
     let options = HubDaemonRun {
         interval: "1s".to_owned(),
         api: HubApiOptions {
+            hetzner_token_file: None,
             listen: Some("127.0.0.1:0".to_owned()),
             token_file: Some(directory.path().join("token")),
             metrics_listen: None,

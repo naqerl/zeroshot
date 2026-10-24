@@ -59,6 +59,7 @@ nav:
       - Build a review loop: guides/review-loop.md
       - Observe and control runs: guides/observe-and-control.md
       - Operate a hub: guides/hub-operations.md
+      - Run jobs on cloud servers: guides/hub-pools.md
       - Use a local graph as an ACP agent: guides/acp.md
       - Serve Zeroshot over MCP: guides/mcp.md
       - Python SDK: guides/python-sdk.md

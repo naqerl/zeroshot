@@ -75,6 +75,34 @@ pub enum HubCommand {
     Uninstall(HubUninstall),
     /// Evaluation suites, cases, runs, and reports.
     Eval(HubEvalCommand),
+    /// On-demand cloud server pools.
+    Pool(HubPoolCommand),
+}
+
+/// `hub pool`: on-demand cloud server pools whose servers become hub members.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HubPoolCommand {
+    Add(Box<HubPoolAdd>),
+    List,
+    Remove { name: String },
+}
+
+/// `hub pool add`. Durations stay text until the client parses them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HubPoolAdd {
+    pub name: String,
+    pub provider: String,
+    pub server_type: String,
+    pub location: String,
+    pub image: String,
+    pub target_image: String,
+    pub max: u32,
+    pub slots: u32,
+    pub idle: String,
+    pub ttl: String,
+    pub tags: Vec<String>,
+    pub ssh_key: PathBuf,
+    pub ssh_from: Vec<String>,
 }
 
 /// `hub daemon run` options.
@@ -98,6 +126,8 @@ pub struct HubApiOptions {
     /// Submissions a target may leave unconfirmed before the job fails; `None` uses the
     /// daemon's default.
     pub unconfirmed_limit: Option<u32>,
+    /// Hetzner Cloud API token file for pool servers; `None` reads `HCLOUD_TOKEN`.
+    pub hetzner_token_file: Option<PathBuf>,
 }
 
 /// `hub context`: named hub endpoints, docker-context style.

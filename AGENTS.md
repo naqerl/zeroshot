@@ -795,6 +795,17 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   bundled tzdb). Member capacity is hub-declared `slots`; load is the observed nonterminal runs.
   Dispatch submission keys are `hub-JOB_ID-ATTEMPT`. Exit code 3 means no capacity or an expired
   wait, and 4 means that no active member matches or supports the job.
+- Hub pools (`native_v2_hub/pool.rs` model and scaling, `lease.rs` per-pass lease steps,
+  `provision.rs` `Provisioner` trait plus cloud-init, `hetzner.rs` reqwest client, `tunnel.rs`
+  `ssh -N -L`, `archive.rs`) create Hetzner servers for queued jobs only a pool matches. An empty
+  pool is eligible, so such jobs queue rather than exit 4. A lease steps one phase per pass:
+  Creating, Booting, Connecting, Active, Draining, Deleting, Done. A server is deleted only after
+  each of its runs is terminal, has its postmortem, and is archived to `hub/archive/JOB_ID/`. The
+  reaper (start, then every 5 min) deletes resources labelled `zeroshot/hub=ID` that state does not
+  own or that are past `zeroshot/expires`. Failed boots pause the pool (5 min doubling to 1 h). The
+  API token comes from `--hetzner-token-file` or `HCLOUD_TOKEN` and is never stored. Labels carry
+  IDs only, and user data carries only the hub's public key. Tests use the fake provisioner in
+  `tests/pool.rs` and a local mock API in `tests/hetzner.rs`. Never call the real API from tests.
 - `zeroshot/src/private_file.rs` owns owner-only file replacement for the shipped CLI: a random
   `create_new` sibling with mode `0600`, fsync, rename over the destination, and cleanup on failure,
   so readers never see a partial file and a link is replaced rather than written through. The target
