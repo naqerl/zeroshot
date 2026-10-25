@@ -88,6 +88,9 @@ pub(crate) fn new_job(spec: &HubJobSpec, now_ms: u64) -> Result<Job, HubError> {
         error: None,
         schedule_id: None,
         output: None,
+        archive: None,
+        graph_hash: None,
+        pool_wait: None,
     })
 }
 
@@ -139,6 +142,7 @@ pub(crate) fn requirements(spec: &HubJobSpec, source: &SourceFacts<'_>) -> Requi
         capabilities,
         local_unsupported,
         remote_unsupported,
+        machine: None,
     }
 }
 

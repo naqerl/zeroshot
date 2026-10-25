@@ -8,7 +8,7 @@ use crate::native_v2_cli::NativeV2CliError;
 use crate::native_v2_cli::hub::{
     HubApiOptions, HubCommand, HubContextCommand, HubDaemonRun, HubEnqueue, HubInstall, HubJobSpec,
     HubLogs, HubManager, HubMemberAdd, HubMemberState, HubMemberUpdate, HubPs, HubStats,
-    HubStrategy, HubSubmit, HubTokenSource, HubUninstall,
+    HubPoolAdd, HubPoolCommand, HubPoolTag, HubStrategy, HubSubmit, HubTokenSource, HubUninstall,
 };
 
 #[derive(Debug, Subcommand)]
@@ -150,6 +150,284 @@ pub(super) enum HubCliCommand {
     /// Capture tasks as eval cases, rerun them under variants, judge, and compare.
     #[command(subcommand)]
     Eval(eval::HubEvalCliCommand),
+
+    /// Manage on-demand cloud server pools whose servers join the hub as members.
+    ///
+    /// A pool with no live server still counts as eligible, so a matching job queues and the
+    /// daemon creates a server for it (up to --max). Each server runs the pinned target image
+    /// behind an SSH tunnel from the hub, is archived before it is deleted, and is torn down
+    /// after --idle without jobs or at --ttl. Servers are billed while they exist.
+    #[command(subcommand)]
+    Pool(HubPoolCliCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum HubPoolCliCommand {
+    /// Add a pool. The daemon needs a provider token (--hetzner-token-file or HCLOUD_TOKEN).
+    Add(Box<HubPoolAddArgs>),
+
+    /// List pools and their servers as JSON.
+    #[command(visible_alias = "ls")]
+    List,
+
+    /// Remove a pool that has no servers left.
+    #[command(visible_alias = "rm")]
+    Remove(HubPoolNameArgs),
+
+    /// List the provider's current server types as JSON: vCPUs, memory, disk, architecture,
+    /// gross price per hour by location, and the locations that can create each one now.
+    ///
+    /// Asks the hub daemon, which reads the provider's catalog with its token.
+    Types,
+
+    /// Let a pool start servers again after it stopped on an account limit or a rejected
+    /// request, and retry a capacity shortage or a failed-boot pause now.
+    Resume(HubPoolNameArgs),
+
+    /// Prefer machines per job tag: set, list or remove a pool's tag profiles.
+    ///
+    /// A job's machine comes from, in order: its own --server-type/--min-vcpu/--min-ram, the
+    /// profile of one of its tags, then the pool's --type list. Among several profiled tags the
+    /// highest --priority wins, then the larger minimum vCPU, then memory; profiles that would
+    /// tie are rejected. A job runs on any live pool server at least as large as its profile
+    /// asks before a new one is created.
+    #[command(subcommand)]
+    Tag(HubPoolTagCliCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum HubPoolTagCliCommand {
+    /// Set (or replace) the machines the pool creates for jobs with TAG.
+    Set(Box<HubPoolTagArgs>),
+
+    /// List the pool's tag profiles as JSON.
+    #[command(visible_alias = "ls")]
+    List(HubPoolNameArgs),
+
+    /// Remove a tag profile; jobs with the tag fall back to the pool's types.
+    #[command(visible_alias = "rm")]
+    Remove(HubPoolTagNameArgs),
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubPoolTagNameArgs {
+    /// Pool name.
+    #[arg(value_name = "POOL")]
+    pool: String,
+
+    /// Job tag.
+    #[arg(value_name = "TAG")]
+    tag: String,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubPoolTagArgs {
+    /// Pool name.
+    #[arg(value_name = "POOL")]
+    pool: String,
+
+    /// Job tag the profile applies to; pool servers join with it.
+    #[arg(value_name = "TAG")]
+    tag: String,
+
+    /// Server types to create for the tag, best first, comma-separated; each a current type
+    /// from `hub pool types`. Default: the pool's types that meet --min-vcpu/--min-ram.
+    #[arg(long = "type", value_name = "TYPE,...",
+          action = clap::ArgAction::Append, value_delimiter = ',')]
+    server_types: Vec<String>,
+
+    /// Locations to try, in order, for each type, comma-separated. Default: the pool's.
+    #[arg(long = "location", value_name = "LOCATION,...",
+          action = clap::ArgAction::Append, value_delimiter = ',')]
+    locations: Vec<String>,
+
+    /// Least vCPUs a server for the tag needs; existing servers this large are reused.
+    /// Default: the smallest of the profile's types.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    min_vcpu: Option<u32>,
+
+    /// Least memory a server for the tag needs, in GB, such as 16 or 16G. Default: the
+    /// smallest of the profile's types.
+    #[arg(long, value_name = "SIZE", value_parser = memory_gb)]
+    min_ram: Option<u32>,
+
+    /// Concurrent runs per server created for the tag. Default: the pool's --slots.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=1024))]
+    slots: Option<u32>,
+
+    /// Wins over lower priorities when a job carries several profiled tags.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    priority: u32,
+}
+
+/// A memory size in GB: `16`, `16G` or `16GB`, any case.
+fn memory_gb(value: &str) -> Result<u32, String> {
+    let upper = value.trim().to_ascii_uppercase();
+    let digits = upper
+        .strip_suffix("GB")
+        .or_else(|| upper.strip_suffix('G'))
+        .unwrap_or(&upper);
+    match digits.parse::<u32>() {
+        Ok(gb) if gb > 0 => Ok(gb),
+        _ => Err(format!(
+            "{value:?} is not a memory size in GB, such as 16 or 16G"
+        )),
+    }
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubPoolNameArgs {
+    /// Pool name.
+    #[arg(value_name = "NAME")]
+    name: String,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubPoolAddArgs {
+    /// Pool name; servers are named zs-<job>.
+    #[arg(value_name = "NAME")]
+    name: String,
+
+    /// Cloud provider.
+    #[arg(long, value_name = "PROVIDER", default_value = "hetzner")]
+    provider: String,
+
+    /// Server types to create, best first, comma-separated. A job gets the first type that
+    /// fits its size request (`hub submit --server-type/--min-vcpu/--min-ram`) or its tag
+    /// profile (`hub pool tag set`). Each must be a current type from `hub pool types`; ARM
+    /// types need --multi-arch.
+    #[arg(long = "type", value_name = "TYPE,...", required = true,
+          action = clap::ArgAction::Append, value_delimiter = ',')]
+    server_types: Vec<String>,
+
+    /// Locations to try, in order, for each type, comma-separated. When a location has no
+    /// capacity the next one is tried, then the next type. Default: every location offering
+    /// one of the types.
+    #[arg(long = "location", value_name = "LOCATION,...",
+          action = clap::ArgAction::Append, value_delimiter = ',')]
+    locations: Vec<String>,
+
+    /// The target image runs on arm64 as well as amd64, so ARM server types are allowed.
+    #[arg(long)]
+    multi_arch: bool,
+
+    /// Expire a queued job this pool serves once it has waited this long for a server, such as
+    /// 30m; its error kind is pool_wait_timeout. Default: wait until the job's own expiry.
+    #[arg(long, value_name = "DURATION")]
+    wait_max: Option<String>,
+
+    /// Server image: a snapshot id or a system image such as docker-ce.
+    #[arg(long, value_name = "IMAGE")]
+    image: String,
+
+    /// Pinned zeroshot target container image (a digest or a tag other than latest).
+    #[arg(long, value_name = "IMAGE")]
+    target_image: String,
+
+    /// Most servers alive at once.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=100))]
+    max: u32,
+
+    /// Concurrent runs per server.
+    #[arg(long, value_name = "N", default_value_t = 1,
+          value_parser = clap::value_parser!(u32).range(1..=1024))]
+    slots: u32,
+
+    /// Tear a server down after this long without jobs.
+    #[arg(long, value_name = "DURATION", default_value = "10m")]
+    idle: String,
+
+    /// Tear a server down this long after creation, even while busy; it also shuts itself down
+    /// shortly after as a backstop.
+    #[arg(long, value_name = "DURATION", default_value = "2h")]
+    ttl: String,
+
+    /// Placement tag servers join with. Repeat for several.
+    #[arg(long = "tag", visible_alias = "tags", value_name = "TAG",
+          action = clap::ArgAction::Append, value_delimiter = ',')]
+    tags: Vec<String>,
+
+    /// Private SSH key on the hub host; its .pub sibling is installed on servers.
+    #[arg(long, value_name = "FILE")]
+    ssh_key: std::path::PathBuf,
+
+    /// CIDR allowed to reach servers over SSH (the hub's public address). Repeat for several.
+    #[arg(long, value_name = "CIDR", required = true, action = clap::ArgAction::Append)]
+    ssh_from: Vec<String>,
+
+    /// Filesystem of the servers' data folder. Zeroshot copies workspaces with reflinks, so
+    /// it must be copy-on-write: btrfs, formatted at boot.
+    #[arg(long, value_name = "FS", default_value = "btrfs", value_parser = ["btrfs"])]
+    data_fs: String,
+
+    /// Size of the btrfs data file on the server's local disk, in GB. Default: the free disk
+    /// after the target image, less 8 GB for Docker.
+    #[arg(long, value_name = "GB", conflicts_with = "data_volume",
+          value_parser = clap::value_parser!(u32).range(5..))]
+    data_size: Option<u32>,
+
+    /// Keep the data on a btrfs Hetzner Volume of this many GB, created with each server and
+    /// deleted with it, instead of a file on the local disk.
+    #[arg(long, value_name = "GB", value_parser = clap::value_parser!(u32).range(10..=10240))]
+    data_volume: Option<u32>,
+}
+
+impl HubPoolCliCommand {
+    fn into_command(self) -> Result<HubPoolCommand, NativeV2CliError> {
+        Ok(match self {
+            Self::Add(args) => {
+                let args = *args;
+                HubPoolCommand::Add(Box::new(HubPoolAdd {
+                    name: member_name(args.name)?,
+                    provider: args.provider,
+                    server_types: args.server_types,
+                    locations: args.locations,
+                    multi_arch: args.multi_arch,
+                    wait_max: args.wait_max,
+                    image: args.image,
+                    target_image: args.target_image,
+                    max: args.max,
+                    slots: args.slots,
+                    idle: args.idle,
+                    ttl: args.ttl,
+                    tags: tags(args.tags)?,
+                    ssh_key: args.ssh_key,
+                    ssh_from: args.ssh_from,
+                    data_fs: args.data_fs,
+                    data_size_gb: args.data_size,
+                    data_volume_gb: args.data_volume,
+                }))
+            }
+            Self::List => HubPoolCommand::List,
+            Self::Remove(args) => HubPoolCommand::Remove {
+                name: member_name(args.name)?,
+            },
+            Self::Types => HubPoolCommand::Types,
+            Self::Resume(args) => HubPoolCommand::Resume {
+                name: member_name(args.name)?,
+            },
+            Self::Tag(HubPoolTagCliCommand::Set(args)) => {
+                let args = *args;
+                HubPoolCommand::TagSet(Box::new(HubPoolTag {
+                    pool: member_name(args.pool)?,
+                    tag: profile_tag(args.tag)?,
+                    server_types: args.server_types,
+                    locations: args.locations,
+                    min_cores: args.min_vcpu,
+                    min_memory_gb: args.min_ram,
+                    slots: args.slots,
+                    priority: args.priority,
+                }))
+            }
+            Self::Tag(HubPoolTagCliCommand::List(args)) => HubPoolCommand::TagList {
+                name: member_name(args.name)?,
+            },
+            Self::Tag(HubPoolTagCliCommand::Remove(args)) => HubPoolCommand::TagRemove {
+                name: member_name(args.pool)?,
+                tag: profile_tag(args.tag)?,
+            },
+        })
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -205,6 +483,11 @@ pub(super) struct HubApiArgs {
     /// receipts) [default: 30]. Each is retried on the same member with the same key.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     unconfirmed_limit: Option<u32>,
+
+    /// Hetzner Cloud API token file for pool servers [default: the HCLOUD_TOKEN environment
+    /// variable]. The token is never logged or stored in hub state.
+    #[arg(long, value_name = "FILE")]
+    hetzner_token_file: Option<std::path::PathBuf>,
 }
 
 impl HubApiArgs {
@@ -222,6 +505,7 @@ impl HubApiArgs {
             metrics_listen: self.metrics_listen,
             metrics_labels: self.metrics_labels,
             unconfirmed_limit: self.unconfirmed_limit,
+            hetzner_token_file: self.hetzner_token_file,
         })
     }
 }
@@ -416,6 +700,21 @@ pub(super) struct HubPlacementArgs {
     /// Require this member tag. Repeat for several; all must match.
     #[arg(long, value_name = "TAG", action = clap::ArgAction::Append)]
     tag: Vec<String>,
+
+    /// Pool jobs: run on this server type (one the pool or a tag profile lists); overrides tag
+    /// profiles. Same as --tag server-type=TYPE.
+    #[arg(long, value_name = "TYPE")]
+    server_type: Option<String>,
+
+    /// Pool jobs: run on a server with at least N vCPUs; overrides tag profiles. Same as
+    /// --tag min-vcpu=N.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    min_vcpu: Option<u32>,
+
+    /// Pool jobs: run on a server with at least this much memory in GB, such as 16 or 16G;
+    /// overrides tag profiles. Same as --tag min-ram-gb=N.
+    #[arg(long, value_name = "SIZE", value_parser = memory_gb)]
+    min_ram: Option<u32>,
 
     /// Choice among free matching members.
     #[arg(
@@ -620,6 +919,7 @@ impl HubCliCommand {
                 dry_run: args.dry_run,
             })),
             Self::Eval(command) => Ok(HubCommand::Eval(command.into_command()?)),
+            Self::Pool(command) => Ok(HubCommand::Pool(command.into_command()?)),
         }
     }
 }
@@ -785,7 +1085,7 @@ fn job_spec(run: RunArgs, placement: HubPlacementArgs) -> Result<HubJobSpec, Nat
         title: run.title.clone(),
         run_args: run_arguments(&run)?,
         target,
-        tags: tags(placement.tag)?,
+        tags: tags(placement_tags(&placement))?,
         strategy: match placement.strategy {
             HubStrategyArg::FirstFree => HubStrategy::FirstFree,
             HubStrategyArg::LeastLoaded => HubStrategy::LeastLoaded,
@@ -800,6 +1100,24 @@ fn job_spec(run: RunArgs, placement: HubPlacementArgs) -> Result<HubJobSpec, Nat
         cwd: run.cwd.clone(),
         submission_key: run.submission_key.clone(),
     })
+}
+
+/// The job's tags, with size requests for pool servers added as size tags.
+fn placement_tags(placement: &HubPlacementArgs) -> Vec<String> {
+    let mut tags = placement.tag.clone();
+    tags.extend(
+        placement
+            .server_type
+            .iter()
+            .map(|name| format!("server-type={name}")),
+    );
+    tags.extend(placement.min_vcpu.map(|cores| format!("min-vcpu={cores}")));
+    tags.extend(
+        placement
+            .min_ram
+            .map(|memory| format!("min-ram-gb={memory}")),
+    );
+    tags
 }
 
 /// Rebuild the `zeroshot run` arguments that do not depend on placement.
@@ -886,6 +1204,20 @@ fn tags(values: Vec<String>) -> Result<Vec<String>, NativeV2CliError> {
     unique.sort();
     unique.dedup();
     Ok(unique)
+}
+
+/// A tag a pool profile applies to: an ordinary tag, not a size request.
+fn profile_tag(value: String) -> Result<String, NativeV2CliError> {
+    if ["server-type=", "min-vcpu=", "min-ram-gb="]
+        .iter()
+        .any(|prefix| value.starts_with(prefix))
+    {
+        return Err(usage(format!(
+            "{value:?} is a size request; profile an ordinary job tag"
+        )));
+    }
+    let mut checked = tags(vec![value])?;
+    Ok(checked.remove(0))
 }
 
 fn labels(values: Vec<String>) -> Result<Vec<(String, String)>, NativeV2CliError> {

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use fs2::FileExt;
 
 use super::error::HubError;
-use super::model::HubState;
+use super::model::{HubState, STATE_VERSION};
 use super::service::create_private_directory;
 
 const STATE_FILE: &str = "state.json";
@@ -88,8 +88,15 @@ impl HubStore {
     pub(crate) fn load(&self, _lock: &HubLock) -> Result<HubState, HubError> {
         let path = self.directory.join(STATE_FILE);
         match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
-                HubError::storage(&format!("{} is malformed", path.display()), error)
+            Ok(bytes) => migrate(&bytes).map_err(|error| match error {
+                Migration::Malformed(error) => {
+                    HubError::storage(&format!("{} is malformed", path.display()), error)
+                }
+                Migration::Newer(version) => HubError::Storage(format!(
+                    "{} has state version {version}, newer than this hub's {STATE_VERSION}; \
+                     upgrade zeroshot",
+                    path.display()
+                )),
             }),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HubState::default()),
             Err(error) => Err(HubError::storage("state could not be read", error)),
@@ -107,6 +114,33 @@ impl HubStore {
         crate::private_file::replace(&self.directory.join(name), bytes)
             .map_err(|error| HubError::storage("state could not be replaced", error))
     }
+}
+
+/// Why `state.json` could not be read as the current version.
+#[derive(Debug)]
+pub(crate) enum Migration {
+    Malformed(serde_json::Error),
+    /// Written by a newer hub; an older one must not drop fields it does not know.
+    Newer(u64),
+}
+
+/// Parse `state.json` of any supported version and upgrade it to [`STATE_VERSION`]. Version 1
+/// lacks pools, leases and job archives, which all default to empty, so its upgrade only bumps
+/// the version; strict field checking still applies to the result.
+pub(crate) fn migrate(bytes: &[u8]) -> Result<HubState, Migration> {
+    let mut document: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(Migration::Malformed)?;
+    let version = document
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1);
+    if version > u64::from(STATE_VERSION) {
+        return Err(Migration::Newer(version));
+    }
+    if let Some(object) = document.as_object_mut() {
+        object.insert("version".to_owned(), STATE_VERSION.into());
+    }
+    serde_json::from_value(document).map_err(Migration::Malformed)
 }
 
 fn private_options() -> OpenOptions {

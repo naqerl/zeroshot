@@ -5,12 +5,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeroshot_engine::native_v2_cli::hub::{HubMemberState, HubStrategy};
 
+use super::capacity::Machine;
 use super::clock::rfc3339;
 use super::eval::EvalState;
+use super::health::DataHealth;
+use super::pool::{Lease, Pool};
+use super::profile::Spec;
 use super::usage::JobUsage;
 
 /// Reserved member name for the local controller.
 pub(crate) const LOCAL_MEMBER: &str = "local";
+/// Version of `state.json` this hub writes. Version 2 added pools, leases and job archives;
+/// [`super::store`] upgrades version 1 files on load and refuses newer ones.
+pub(crate) const STATE_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -24,16 +31,27 @@ pub(crate) struct HubState {
     pub schedules: Vec<Schedule>,
     #[serde(default, skip_serializing_if = "EvalState::is_empty")]
     pub evals: EvalState,
+    /// Random ID labelling every cloud resource this hub creates; set with the first pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<Pool>,
+    /// Pool servers from creation until their deletion is confirmed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leases: Vec<Lease>,
 }
 
 impl Default for HubState {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: STATE_VERSION,
             members: Vec::new(),
             jobs: Vec::new(),
             schedules: Vec::new(),
             evals: EvalState::default(),
+            hub_id: None,
+            pools: Vec::new(),
+            leases: Vec::new(),
         }
     }
 }
@@ -62,6 +80,27 @@ pub(crate) struct Member {
     pub capabilities_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_error: Option<String>,
+    /// Pool that created this member's server; `None` for registered members.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+    /// Provider server ID of a pool member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<u64>,
+    /// When a pool member last became idle; `None` while it runs hub jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_since_ms: Option<u64>,
+    /// When a pool member's lease expires and it is torn down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+    /// Server type, location and size of a pool member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<Machine>,
+    /// The machine spec a pool member was created for: its tag profile and size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<Spec>,
+    /// The btrfs data folder a pool member passed its health check with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<DataHealth>,
 }
 
 impl Member {
@@ -77,6 +116,13 @@ impl Member {
             capabilities: None,
             capabilities_at_ms: None,
             capability_error: None,
+            pool: None,
+            server_id: None,
+            idle_since_ms: None,
+            expires_at_ms: None,
+            machine: None,
+            spec: None,
+            data: None,
         }
     }
 
@@ -91,7 +137,23 @@ impl Member {
             "capabilities": self.capabilities,
             "capabilitiesAt": self.capabilities_at_ms.map(rfc3339),
             "capabilityError": self.capability_error,
+            "pool": self.pool,
+            "serverId": self.server_id,
+            "idleSince": self.idle_since_ms.map(rfc3339),
+            "expiresAt": self.expires_at_ms.map(rfc3339),
+            "machine": self.machine.as_ref().map(Machine::view),
+            "spec": self.spec,
+            "data": self.data.as_ref().map(DataHealth::view),
         })
+    }
+
+    /// Whether the member carries a tag, or for a size tag, runs on a big enough server.
+    pub(crate) fn has_tag(&self, tag: &str) -> bool {
+        self.tags.iter().any(|own| own == tag)
+            || self
+                .machine
+                .as_ref()
+                .is_some_and(|machine| machine.meets(tag))
     }
 }
 
@@ -149,6 +211,10 @@ pub(crate) struct Requirements {
     /// Why named targets cannot run this job, if they cannot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_unsupported: Option<String>,
+    /// The machine a pool resolved for the job (see [`super::profile::resolve_spec`]); a
+    /// tag profile's minimum keeps the job off undersized pool members.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<Spec>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -230,6 +296,8 @@ pub(crate) enum JobErrorKind {
     /// Dequeued while placing. A run with its submission key may exist on the member; the hub
     /// does not follow or adopt it.
     DequeuedWhilePlacing,
+    /// Waited longer than its pool's `--wait-max` for a server; the job expired.
+    PoolWaitTimeout,
     /// Recorded as plain text by an earlier hub.
     Unclassified,
 }
@@ -323,6 +391,16 @@ pub(crate) struct Job {
     /// Terminal result output, kept only for eval judge jobs (`eval.role=judge`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<Value>,
+    /// Folder holding the run's report, status, watch replay and logs, saved before the pool
+    /// server that ran it was deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<PathBuf>,
+    /// `authoredGraphHash` from the archived run report, when the target reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_hash: Option<String>,
+    /// Why a queued job its pool serves has no server yet, such as a capacity shortage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_wait: Option<String>,
 }
 
 impl Job {
@@ -381,6 +459,10 @@ impl Job {
             "tokenUsage": self.token_usage,
             "error": self.error.as_ref().map(|error| &error.message),
             "errorKind": self.error.as_ref().map(|error| error.kind),
+            "archive": self.archive,
+            "graphHash": self.graph_hash,
+            "waiting": self.pool_wait,
+            "spec": self.requirements.machine,
         })
     }
 }

@@ -8,19 +8,23 @@ use futures_util::StreamExt;
 use reqwest::{Method, StatusCode};
 use serde::Serialize;
 use serde_json::{Value, json};
-use zeroshot_engine::native_v2_cli::hub::{HubCommand, HubEnqueue, HubPs, HubStats, HubSubmit};
+use zeroshot_engine::native_v2_cli::hub::{
+    HubCommand, HubEnqueue, HubPoolAdd, HubPoolCommand, HubPs, HubStats, HubSubmit,
+};
 
 use super::api::EXIT_CODE_HEADER;
 use super::clock::{now_ms, parse_duration_ms, parse_future_ms, parse_past_ms};
 use super::context::Resolved;
+use super::data::{DataFs, DataSettings};
 use super::cron;
 use super::error::HubError;
 use super::jobs;
 use super::model::{Job, Schedule, ScheduleState};
+use super::pool::Provider;
 use super::service::FILE_FLAGS;
 use super::wire::{
-    AddMember, CreateSchedule, EnqueueJob, JobFile, JobQuery, MemberQuery, StatsRequest,
-    StreamFrame, StreamRequest, SubmitJob, UpdateMember,
+    AddMember, AddPool, CreateSchedule, SetTagProfile, EnqueueJob, JobFile, JobQuery, MemberQuery,
+    StatsRequest, StreamFrame, StreamRequest, SubmitJob, UpdateMember,
 };
 use super::write_json;
 
@@ -319,6 +323,7 @@ async fn request_document(client: &HubClient, command: HubCommand) -> Result<Val
         }
         HubCommand::Dispatch => client.post(&["v1", "hub", "dispatch"], &json!({})).await,
         HubCommand::Stats(request) => client.post(&["v1", "hub", "stats"], &stats(request)?).await,
+        HubCommand::Pool(command) => pool_document(client, command).await,
         _ => Err(local_only()),
     }
 }
@@ -582,5 +587,100 @@ fn stats(request: HubStats) -> Result<StatsRequest, HubError> {
             .map(|until| parse_past_ms(until, now))
             .transpose()?,
         prices,
+    })
+}
+
+/// Add, list, or remove on-demand server pools.
+async fn pool_document(client: &HubClient, command: HubPoolCommand) -> Result<Value, HubError> {
+    match command {
+        HubPoolCommand::Add(request) => {
+            let body = add_pool(*request)?;
+            client.post(&["v1", "hub", "pools"], &body).await
+        }
+        HubPoolCommand::List => client.get(&["v1", "hub", "pools"]).await,
+        HubPoolCommand::Types => client.get(&["v1", "hub", "pools", "types"]).await,
+        HubPoolCommand::Resume { name } => {
+            client
+                .post(&["v1", "hub", "pools", &name, "resume"], &json!({}))
+                .await
+        }
+        HubPoolCommand::TagSet(request) => {
+            let request = *request;
+            let body = SetTagProfile {
+                server_types: request.server_types,
+                locations: request.locations,
+                min_cores: request.min_cores,
+                min_memory_gb: request.min_memory_gb,
+                slots: request.slots,
+                priority: request.priority,
+            };
+            client
+                .call(
+                    Method::PUT,
+                    &["v1", "hub", "pools", &request.pool, "tags", &request.tag],
+                    Some(&body),
+                )
+                .await
+        }
+        HubPoolCommand::TagList { name } => {
+            client.get(&["v1", "hub", "pools", &name, "tags"]).await
+        }
+        HubPoolCommand::TagRemove { name, tag } => {
+            client
+                .call(
+                    Method::DELETE,
+                    &["v1", "hub", "pools", &name, "tags", &tag],
+                    None::<&Value>,
+                )
+                .await
+        }
+        HubPoolCommand::Remove { name } => {
+            client
+                .call(
+                    Method::DELETE,
+                    &["v1", "hub", "pools", &name],
+                    None::<&Value>,
+                )
+                .await
+        }
+    }
+}
+
+/// The `POST /v1/hub/pools` body: durations parsed, the key path made absolute. The key is a
+/// path on the hub host; only its public half ever leaves it.
+pub(crate) fn add_pool(request: HubPoolAdd) -> Result<AddPool, HubError> {
+    let provider = match request.provider.as_str() {
+        "hetzner" => Provider::Hetzner,
+        other => {
+            return Err(HubError::Usage(format!(
+                "unknown pool provider {other:?}; supported: hetzner"
+            )));
+        }
+    };
+    Ok(AddPool {
+        name: request.name,
+        provider,
+        server_types: request.server_types,
+        locations: request.locations,
+        multi_arch: request.multi_arch,
+        wait_max_ms: request
+            .wait_max
+            .as_deref()
+            .map(parse_duration_ms)
+            .transpose()?,
+        image: request.image,
+        target_image: request.target_image,
+        max: request.max,
+        slots: request.slots,
+        idle_ms: parse_duration_ms(&request.idle)?,
+        ttl_ms: parse_duration_ms(&request.ttl)?,
+        tags: request.tags,
+        ssh_key: super::paths::absolute(&request.ssh_key)?,
+        ssh_from: request.ssh_from,
+        data: DataSettings {
+            fs: DataFs::parse(&request.data_fs)?,
+            size_gb: request.data_size_gb,
+            volume_gb: request.data_volume_gb,
+        },
     })
 }
