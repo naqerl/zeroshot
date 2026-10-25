@@ -1,23 +1,42 @@
 # Serve Zeroshot over MCP
 
-`zeroshot mcp serve` is a Model Context Protocol server. It serves Streamable HTTP on `POST /mcp`.
-Each tool runs the same command the CLI would, in this process. Run events come from the durable
-stream `zeroshot watch` already reads.
+The hub daemon is the Model Context Protocol server. It serves Streamable HTTP on `POST /mcp` on
+its normal API listener, alongside `/v1/hub/*`. Start it with `zeroshot hub daemon run` or install
+it as a service with `zeroshot hub install`; there is no separate MCP process. Each tool runs the
+same command the CLI would. Run events come from the durable stream `zeroshot watch` already
+reads.
 
-```bash
-# Streamable HTTP on http://127.0.0.1:3000/mcp
-zeroshot mcp serve --listen 127.0.0.1:3000
+The default endpoint is `http://127.0.0.1:7383/mcp`. MCP uses the same bearer token as the rest of
+the hub API: by default the contents of `~/.config/zeroshot/hub/api-token` (or the hub folder's
+`api-token` file, or the `--token-file` passed to the daemon). The daemon heartbeat also records
+the MCP URL as `mcp`.
+
+```yaml
+mcpServers:
+  zeroshot:
+    type: http
+    url: http://127.0.0.1:7383/mcp
+    headers:
+      Authorization: Bearer $(cat ~/.config/zeroshot/hub/api-token)
 ```
 
-An HTTP client connects to `http://127.0.0.1:3000/mcp` with JSON-RPC request bodies. The optional
+Substitute the token file's contents if your MCP client does not run shell command substitution.
+For example, a request can be made directly with:
+
+```bash
+curl -sS http://127.0.0.1:7383/mcp \
+  -H "Authorization: Bearer $(cat ~/.config/zeroshot/hub/api-token)" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
+```
+
+Requests without a valid `Authorization: Bearer <api-token>` header fail with `401` and the
+`hub.unauthorized` diagnostic. An HTTP client connects with JSON-RPC request bodies. The optional
 `Mcp-Session-Id` request header keeps separate initialization state per client; requests without it
 share the `default` session. Notifications return `202 Accepted` without a JSON-RPC body.
 `events/stream` returns `text/event-stream`; each SSE `data` line is one JSON-RPC notification or
-the final response. Earlier event polls and ordinary requests return JSON. The HTTP transport
-prints its listening URL to stderr.
-
-An HTTP client that only knows command-launched servers can be pointed at the URL instead; the
-server stops on Ctrl-C or SIGTERM.
+the final response. Earlier event polls and ordinary requests return JSON. The MCP worker stops
+with the hub daemon.
 
 ## Handshake
 

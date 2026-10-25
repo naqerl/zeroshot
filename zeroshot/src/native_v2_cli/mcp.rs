@@ -21,4 +21,4 @@ mod tools;
 mod tests;
 
 pub use host::{McpFailure, McpHost, WatchStream};
-pub use http::{serve_http, serve_http_listener};
+pub use http::{McpServer, serve_http, serve_http_listener};

@@ -324,10 +324,6 @@ pub enum NativeV2CliCommand {
     Acp {
         profile: RunProfileName,
     },
-    /// The process entrypoint owns the HTTP listen loop.
-    McpServe {
-        listen: SocketAddr,
-    },
     Update,
     TargetAdd(TargetAdd),
     TargetLogin {

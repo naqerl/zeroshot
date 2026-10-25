@@ -1,9 +1,8 @@
-//! Process host for `zeroshot mcp serve`.
+//! Production MCP host served by the hub daemon at `POST /mcp`.
 //!
 //! Tools run through the same public and hub executors as the CLI. Events read the same
 //! `run_watch` subscription `zeroshot watch` opens.
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,7 +10,7 @@ use openengine_cluster_protocol::{RunWatchParams, SubscriptionCloseReason};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use zeroshot_engine::native_v2_cli::local::LocalCliBackend;
-use zeroshot_engine::native_v2_cli::mcp::{McpFailure, McpHost, WatchStream};
+use zeroshot_engine::native_v2_cli::mcp::{McpFailure, McpHost, McpServer, WatchStream};
 use zeroshot_engine::native_v2_cli::oecp::NamedTargetCliBackend;
 use zeroshot_engine::native_v2_cli::{
     CliRunWatchEventNotification, CliSubscription, CliSubscriptionItem, NativeV2CliBackend,
@@ -24,10 +23,9 @@ use crate::native_v2_target::{
     TargetOecpWebSocketDialer, default_target_registry_path,
 };
 
-pub(super) async fn serve_http(listen: SocketAddr) -> Result<(), super::ProcessError> {
-    zeroshot_engine::native_v2_cli::mcp::serve_http(ProductionHost, listen)
-        .await
-        .map_err(super::ProcessError::from)
+/// Start the production MCP worker and return its router and shutdown handle.
+pub(crate) fn spawn_production_mcp() -> std::io::Result<(axum::Router, McpServer)> {
+    McpServer::spawn(ProductionHost)
 }
 
 struct ProductionHost;

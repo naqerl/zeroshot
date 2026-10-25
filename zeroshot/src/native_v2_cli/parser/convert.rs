@@ -8,10 +8,10 @@ use openengine_cluster_protocol::{
 };
 
 use super::{
-    AcpArgs, AttachArgs, Cli, CliCommand, ConnectionCommand, ConnectionScopeArg, McpCommand,
-    PlanCommand, PlanSelectorArgs, PlanSubmitArgs, RunArgs, RunCheckpointsArgs, RunResumeArgs,
-    RunLogsArgs, RunReportArgs, RunSelectorArgs, RunWatchArgs, TargetCommand, TemplateCommand,
-    TemplateName, UtilityCommand,
+    AcpArgs, AttachArgs, Cli, CliCommand, ConnectionCommand, ConnectionScopeArg, PlanCommand,
+    PlanSelectorArgs, PlanSubmitArgs, RunArgs, RunCheckpointsArgs, RunResumeArgs, RunLogsArgs,
+    RunReportArgs, RunSelectorArgs, RunWatchArgs, TargetCommand, TemplateCommand, TemplateName,
+    UtilityCommand,
 };
 use crate::native_v2_cli::{
     BuiltinGraphTemplate, ConnectionInput, ConnectionRoute, ConnectionSetCommand,
@@ -64,7 +64,6 @@ impl CliCommand {
         match self {
             Self::Memory { command } => Ok(NativeV2CliCommand::Memory(command)),
             Self::Interface(command) => command.into_command(),
-            Self::Mcp { command } => command.into_command(),
             Self::Target { command } => command.into_command(),
             command => command.into_execution_command(),
         }
@@ -86,14 +85,6 @@ impl CliCommand {
             Self::Run(args) => args.into_command(),
             Self::Utility(command) => command.into_command(),
             _ => Err(usage("expected an execution or management command")),
-        }
-    }
-}
-
-impl McpCommand {
-    fn into_command(self) -> Result<NativeV2CliCommand, NativeV2CliError> {
-        match self {
-            Self::Serve { listen } => Ok(NativeV2CliCommand::McpServe { listen }),
         }
     }
 }

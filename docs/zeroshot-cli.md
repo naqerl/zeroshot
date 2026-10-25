@@ -23,7 +23,6 @@ Commands:
   profile            Manage reusable graph/runtime profiles
   template           Inspect built-in graph templates
   plan               Validate, submit, and observe hosted merge plans
-  mcp                Serve Zeroshot tools and run events as an MCP server
   hub                Pool named targets and place, queue, and account for runs across them
   run                Submit a graph run locally or to a named target
   update             Update this executable and managed agent skills to the newest canonical release
@@ -1047,55 +1046,6 @@ Commands:
   watch       Poll a merge plan and stream changed snapshots as NDJSON
   force-stop  Force every nonterminal run in a merge plan to stop
   help        Print this message or the help of the given subcommand(s)
-```
-
-### `zeroshot mcp`
-
-```text
-Serve Zeroshot tools and run events as an MCP server.
-
-The Streamable HTTP transport listens on POST /mcp. Tools call the same commands as this CLI. Run events use the `io.modelcontextprotocol/events` extension and the durable stream `watch` already reads. Signed webhooks are unsupported.
-
-Usage: zeroshot mcp <COMMAND>
-
-Commands:
-  serve  Serve JSON-RPC MCP over Streamable HTTP on POST /mcp until stopped
-  help   Print this message or the help of the given subcommand(s)
-
-Options:
-  -h, --help
-          Print help (see a summary with '-h')
-```
-
-#### `zeroshot mcp serve`
-
-```text
-Serve JSON-RPC MCP over Streamable HTTP on POST /mcp until stopped.
-
-Each tool returns that command's JSON. A failing command is a tool error carrying the command's diagnostic code and message.
-
-Usage: zeroshot mcp serve [OPTIONS]
-
-Options:
-      --listen <LISTEN>
-          Address to listen on
-
-          [default: 127.0.0.1:3000]
-
-  -h, --help
-          Print help (see a summary with '-h')
-```
-
-#### `zeroshot mcp help`
-
-```text
-Print this message or the help of the given subcommand(s)
-
-Usage: zeroshot mcp help [COMMAND]
-
-Commands:
-  serve  Serve JSON-RPC MCP over Streamable HTTP on POST /mcp until stopped
-  help   Print this message or the help of the given subcommand(s)
 ```
 
 ### `zeroshot hub`
@@ -3257,7 +3207,6 @@ Commands:
   profile            Manage reusable graph/runtime profiles
   template           Inspect built-in graph templates
   plan               Validate, submit, and observe hosted merge plans
-  mcp                Serve Zeroshot tools and run events as an MCP server
   hub                Pool named targets and place, queue, and account for runs across them
   run                Submit a graph run locally or to a named target
   update             Update this executable and managed agent skills to the newest canonical release

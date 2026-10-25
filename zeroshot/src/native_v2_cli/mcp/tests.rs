@@ -5,7 +5,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
 use super::super::{CliTestBackend, CliTestCall, NeverDetach, RunWatchCommand};
-use super::{serve_http_listener, McpFailure, McpHost, WatchStream};
+use super::{McpFailure, McpHost, McpServer, WatchStream, serve_http_listener};
 use crate::native_v2_cli::{NativeV2CliCommand, execute_native_v2_cli};
 
 struct ToolHost {
@@ -82,6 +82,7 @@ impl Session {
                     .enable_all()
                     .build()
                     .expect("mcp test runtime");
+                let (router, server) = McpServer::spawn(host).expect("start MCP worker");
                 runtime.block_on(async move {
                     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                         .await
@@ -90,7 +91,8 @@ impl Session {
                     address_sender
                         .send(address)
                         .expect("report MCP test address");
-                    let _ = serve_http_listener(host, listener).await;
+                    let _ = axum::serve(listener, router).await;
+                    server.shutdown().await;
                 });
             })
             .expect("spawn MCP test server");

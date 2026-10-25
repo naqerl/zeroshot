@@ -47,6 +47,59 @@ struct HttpState {
     jobs: mpsc::UnboundedSender<Job>,
 }
 
+/// The mounted MCP router plus the worker that answers its requests.
+///
+/// The host is `!Send`, so [`McpServer::spawn`] owns a dedicated thread with a current-thread
+/// runtime and `LocalSet`; callers only keep this handle and merge the router into their own
+/// listener.
+pub struct McpServer {
+    stop: Option<oneshot::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl McpServer {
+    /// Start the MCP worker and return its router (`POST /mcp`) and shutdown handle.
+    pub fn spawn<H>(host: H) -> io::Result<(Router, Self)>
+    where
+        H: McpHost + 'static,
+    {
+        let (jobs, stop, worker) = spawn_worker(host)?;
+        let router = Router::new()
+            .route(
+                "/mcp",
+                post(mcp_handler).layer(DefaultBodyLimit::max(MAX_BODY)),
+            )
+            .with_state(HttpState { jobs });
+        Ok((
+            router,
+            Self {
+                stop: Some(stop),
+                worker: Some(worker),
+            },
+        ))
+    }
+
+    /// Stop the worker and wait for its sessions to shut down.
+    pub async fn shutdown(mut self) {
+        self.stop_worker();
+        if let Some(worker) = self.worker.take() {
+            let _ = tokio::task::spawn_blocking(move || worker.join()).await;
+        }
+    }
+
+    fn stop_worker(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
+}
+
+impl Drop for McpServer {
+    fn drop(&mut self) {
+        self.stop_worker();
+    }
+}
+
 /// Serve Streamable HTTP MCP on `POST /mcp` until the process is stopped.
 pub async fn serve_http<H>(host: H, listen: SocketAddr) -> io::Result<()>
 where
@@ -62,20 +115,13 @@ where
     H: McpHost + 'static,
 {
     let address = listener.local_addr()?;
-    let (jobs, stop, worker) = spawn_worker(host)?;
-    let router = Router::new()
-        .route(
-            "/mcp",
-            post(mcp_handler).layer(DefaultBodyLimit::max(MAX_BODY)),
-        )
-        .with_state(HttpState { jobs });
+    let (router, server) = McpServer::spawn(host)?;
     eprintln!("Zeroshot MCP: http://{address}/mcp");
     let result = tokio::select! {
         result = axum::serve(listener, router) => result,
         () = shutdown_signal() => Ok(()),
     };
-    let _ = stop.send(());
-    let _ = tokio::task::spawn_blocking(move || worker.join()).await;
+    server.shutdown().await;
     result
 }
 

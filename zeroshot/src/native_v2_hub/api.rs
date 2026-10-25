@@ -45,7 +45,17 @@ pub(crate) struct ApiState {
     pub executable: Option<std::path::PathBuf>,
 }
 
+#[cfg(test)]
 pub(crate) fn router(state: Arc<ApiState>) -> Router {
+    router_with_mcp(state, None)
+}
+
+/// The hub router with an optional MCP router (`POST /mcp`) mounted behind the same bearer-token
+/// authorization as `/v1/hub/*`.
+pub(crate) fn router_with_mcp(state: Arc<ApiState>, mcp: Option<Router>) -> Router {
+    // The MCP router already provides its own endpoint state; it only needs the hub's outer state
+    // type so the routers can be merged.
+    let mcp: Router<Arc<ApiState>> = mcp.unwrap_or_default().with_state(());
     let protected = Router::new()
         .route("/v1/hub/daemon", get(daemon))
         .route("/v1/hub/members", post(add_member))
@@ -71,6 +81,7 @@ pub(crate) fn router(state: Arc<ApiState>) -> Router {
         .route("/v1/hub/eval/runs/{id}", get(eval_run))
         .route("/v1/hub/eval/runs/{id}/report", post(eval_report))
         .route("/metrics", get(metrics))
+        .merge(mcp)
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
     Router::new()
         .route("/v1/hub/health", get(health))

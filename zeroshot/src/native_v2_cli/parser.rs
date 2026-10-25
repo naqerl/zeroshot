@@ -82,17 +82,6 @@ enum CliCommand {
         command: PlanCommand,
     },
 
-    /// Serve Zeroshot tools and run events as an MCP server.
-    ///
-    /// The Streamable HTTP transport listens on POST /mcp. Tools call the same commands as this
-    /// CLI.
-    /// Run events use the `io.modelcontextprotocol/events` extension and the durable stream
-    /// `watch` already reads. Signed webhooks are unsupported.
-    Mcp {
-        #[command(subcommand)]
-        command: McpCommand,
-    },
-
     /// Pool named targets and place, queue, and account for runs across them.
     ///
     /// A daemon installed with `zeroshot hub install` owns the hub and serves it over HTTP; hub
@@ -125,19 +114,6 @@ enum CliCommand {
 
     #[command(flatten)]
     Utility(UtilityCommand),
-}
-
-#[derive(Debug, Subcommand)]
-enum McpCommand {
-    /// Serve JSON-RPC MCP over Streamable HTTP on POST /mcp until stopped.
-    ///
-    /// Each tool returns that command's JSON. A failing command is a tool error carrying the
-    /// command's diagnostic code and message.
-    Serve {
-        /// Address to listen on.
-        #[arg(long, default_value = "127.0.0.1:3000")]
-        listen: SocketAddr,
-    },
 }
 
 #[derive(Debug, Subcommand)]
