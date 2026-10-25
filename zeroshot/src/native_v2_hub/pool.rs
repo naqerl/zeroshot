@@ -375,37 +375,40 @@ pub(crate) fn scale_up(state: &HubState, now: u64) -> Vec<Decision> {
                 serving(&state.pools, &job.placement, &job.requirements)
                     .is_some_and(|first| first.name == pool.name)
             })
-            .filter(|job| {
-                !state
-                    .leases
-                    .iter()
-                    .any(|lease| lease.id == lease_id(&job.job_id))
-            })
             .collect::<Vec<&Job>>();
-        let mut specs = BTreeMap::<Spec, Vec<&Job>>::new();
+        let held = state.leases.iter().filter(|lease| lease.pool == pool.name);
+        let starting = held.clone().filter(|lease| {
+            matches!(
+                lease.phase,
+                LeasePhase::Creating | LeasePhase::Booting | LeasePhase::Connecting
+            )
+        });
+        // Jobs without a lease of their own, and how many jobs starting leases already carry.
+        let mut specs = BTreeMap::<Spec, (Vec<&Job>, u64)>::new();
         for job in waiting {
             let spec = profile::resolve_spec(pool, &job.placement.tags);
-            if !capacity::short(pool, &spec, now) {
-                specs.entry(spec).or_default().push(job);
+            if capacity::short(pool, &spec, now) {
+                continue;
+            }
+            let entry = specs.entry(spec).or_default();
+            if starting
+                .clone()
+                .any(|lease| lease.id == lease_id(&job.job_id))
+            {
+                entry.1 += 1;
+            } else if !held.clone().any(|lease| lease.id == lease_id(&job.job_id)) {
+                entry.0.push(job);
             }
         }
-        let held = state.leases.iter().filter(|lease| lease.pool == pool.name);
         let mut room = u64::from(pool.max).saturating_sub(held.clone().count() as u64);
-        for (spec, jobs) in specs {
+        for (spec, (jobs, carried)) in specs {
             let slots = u64::from(profile::slots_for(pool, &spec));
-            let starting = held
-                .clone()
-                .filter(|lease| lease.spec == spec)
-                .filter(|lease| {
-                    matches!(
-                        lease.phase,
-                        LeasePhase::Creating | LeasePhase::Booting | LeasePhase::Connecting
-                    )
-                })
-                .count() as u64;
+            let free = (starting.clone().filter(|lease| lease.spec == spec).count() as u64)
+                .saturating_mul(slots)
+                .saturating_sub(carried);
             let needed = (jobs.len() as u64)
+                .saturating_sub(free)
                 .div_ceil(slots)
-                .saturating_sub(starting)
                 .min(room);
             room -= needed;
             decisions.extend(
