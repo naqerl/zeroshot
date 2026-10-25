@@ -874,7 +874,12 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   reaper (start, then every 5 min) deletes resources labelled `zeroshot/hub=ID` that state does not
   own or that are past `zeroshot/expires`. Failed boots pause the pool (5 min doubling to 1 h). The
   API token comes from `--hetzner-token-file` or `HCLOUD_TOKEN` and is never stored. Labels carry
-  IDs, server type and location only, and user data carries only the hub's public key. Pools take
+  IDs, server type and location only, and user data carries the hub's public key and the boot
+  script, never a secret. `data.rs` owns the btrfs data folder: pool `--data-fs btrfs` (only),
+  `--data-size` or `--data-volume` (a labelled Hetzner Volume deleted after its server), and the
+  idempotent, strict boot script (file or Volume, mkfs.btrfs, fstab, snapshot and reflink
+  probe, then the target). `health.rs` is the SSH check run in Connecting before registration;
+  its failure is a failed boot. zeroshot itself needs only reflinks (`FICLONE`). Pools take
   ordered `--type`/`--location` lists with no default type, checked against the provider catalog
   (`cax*` needs `--multi-arch`). `profile.rs` owns tag profiles and resolves a job's machine
   (`Spec`): job size tags (`server-type=`, `min-vcpu=`, `min-ram-gb=`), else the highest-ranked
@@ -883,7 +888,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   shortages (30 s doubling to 10 min, separate from the boot pause), blocking (quota/invalid until
   `hub pool resume`) and `--wait-max`. `placement.rs` never places a tag-profile job on an
   undersized member. Tests use the fake provisioner in `tests/pool.rs`, `tests/pool_capacity.rs`
-  and `tests/pool_profiles.rs`, and a local mock API in `tests/hetzner.rs`. Never call the real
+  `tests/pool_profiles.rs`, `tests/pool_data.rs` and `tests/pool_health.rs`, and a local mock API in `tests/hetzner.rs`. Never call the real
   API from tests.
 - `zeroshot/src/private_file.rs` owns owner-only file replacement for the shipped CLI: a random
   `create_new` sibling with mode `0600`, fsync, rename over the destination, and cleanup on failure,

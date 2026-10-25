@@ -66,9 +66,6 @@ section { margin-block: 2.5rem; }
 <li><a href="#zeroshot-plan-watch"><code>zeroshot plan watch</code></a></li>
 <li><a href="#zeroshot-plan-force-stop"><code>zeroshot plan force-stop</code></a></li>
 <li><a href="#zeroshot-plan-help"><code>zeroshot plan help</code></a></li>
-<li><a href="#zeroshot-mcp"><code>zeroshot mcp</code></a></li>
-<li><a href="#zeroshot-mcp-serve"><code>zeroshot mcp serve</code></a></li>
-<li><a href="#zeroshot-mcp-help"><code>zeroshot mcp help</code></a></li>
 <li><a href="#zeroshot-hub"><code>zeroshot hub</code></a></li>
 <li><a href="#zeroshot-hub-add"><code>zeroshot hub add</code></a></li>
 <li><a href="#zeroshot-hub-update"><code>zeroshot hub update</code></a></li>
@@ -157,7 +154,6 @@ Commands:
   profile            Manage reusable graph/runtime profiles
   template           Inspect built-in graph templates
   plan               Validate, submit, and observe hosted merge plans
-  mcp                Serve Zeroshot tools and run events as an MCP server on stdin and stdout
   hub                Pool named targets and place, queue, and account for runs across them
   run                Submit a graph run locally or to a named target
   update             Update this executable and managed agent skills to the newest canonical release
@@ -1005,38 +1001,6 @@ Commands:
   watch       Poll a merge plan and stream changed snapshots as NDJSON
   force-stop  Force every nonterminal run in a merge plan to stop
   help        Print this message or the help of the given subcommand(s)</code></pre></section>
-<section id="zeroshot-mcp"><h3><code>zeroshot mcp</code></h3>
-<pre><code>Serve Zeroshot tools and run events as an MCP server on stdin and stdout.
-
-Tools call the same commands as this CLI. Run events use the `io.modelcontextprotocol/events` extension and the durable stream `watch` already reads. Signed webhooks are unsupported. The process writes no banner.
-
-Usage: zeroshot mcp &lt;COMMAND&gt;
-
-Commands:
-  serve  Serve JSON-RPC MCP on stdin and stdout until the client closes stdin
-  help   Print this message or the help of the given subcommand(s)
-
-Options:
-  -h, --help
-          Print help (see a summary with &#39;-h&#39;)</code></pre></section>
-<section id="zeroshot-mcp-serve"><h4><code>zeroshot mcp serve</code></h4>
-<pre><code>Serve JSON-RPC MCP on stdin and stdout until the client closes stdin.
-
-One JSON-RPC message per line. Each tool returns that command&#39;s JSON. A failing command is a tool error carrying the command&#39;s diagnostic code and message.
-
-Usage: zeroshot mcp serve
-
-Options:
-  -h, --help
-          Print help (see a summary with &#39;-h&#39;)</code></pre></section>
-<section id="zeroshot-mcp-help"><h4><code>zeroshot mcp help</code></h4>
-<pre><code>Print this message or the help of the given subcommand(s)
-
-Usage: zeroshot mcp help [COMMAND]
-
-Commands:
-  serve  Serve JSON-RPC MCP on stdin and stdout until the client closes stdin
-  help   Print this message or the help of the given subcommand(s)</code></pre></section>
 <section id="zeroshot-hub"><h3><code>zeroshot hub</code></h3>
 <pre><code>Pool named targets and place, queue, and account for runs across them.
 
@@ -2666,6 +2630,18 @@ Options:
       --ssh-from &lt;CIDR&gt;
           CIDR allowed to reach servers over SSH (the hub&#39;s public address). Repeat for several
 
+      --data-fs &lt;FS&gt;
+          Filesystem of the servers&#39; data folder. Zeroshot copies workspaces with reflinks, so it must be copy-on-write: btrfs, formatted at boot
+
+          [default: btrfs]
+          [possible values: btrfs]
+
+      --data-size &lt;GB&gt;
+          Size of the btrfs data file on the server&#39;s local disk, in GB. Default: the free disk after the target image, less 8 GB for Docker
+
+      --data-volume &lt;GB&gt;
+          Keep the data on a btrfs Hetzner Volume of this many GB, created with each server and deleted with it, instead of a file on the local disk
+
   -h, --help
           Print help</code></pre></section>
 <section id="zeroshot-hub-pool-list"><h5><code>zeroshot hub pool list</code></h5>
@@ -3257,7 +3233,6 @@ Commands:
   profile            Manage reusable graph/runtime profiles
   template           Inspect built-in graph templates
   plan               Validate, submit, and observe hosted merge plans
-  mcp                Serve Zeroshot tools and run events as an MCP server on stdin and stdout
   hub                Pool named targets and place, queue, and account for runs across them
   run                Submit a graph run locally or to a named target
   update             Update this executable and managed agent skills to the newest canonical release

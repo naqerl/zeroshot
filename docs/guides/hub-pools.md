@@ -37,6 +37,13 @@ The type names above are only an example. There is no default type.
 - `--ssh-from` is the hub's public address. The server firewall allows SSH from it and nothing
   else.
 
+- `--data-fs` is the data folder's filesystem. Only `btrfs` (the default) is supported; see
+  [The btrfs data folder](#the-btrfs-data-folder).
+- `--data-size GB` sizes the btrfs data file on the server's local disk. Without it the file takes
+  the free disk after the target image, less 8 GB of headroom.
+- `--data-volume GB` puts the data folder on a Hetzner Volume of that size (10 to 10240 GB)
+  instead, created and deleted with the server. It excludes `--data-size`.
+
 The daemon needs an API token, from `hub daemon run --hetzner-token-file FILE` or `HCLOUD_TOKEN`
 in the daemon's environment. The token is sent only to the Hetzner API. It is never stored in hub
 state, labels, user data, or logs.
@@ -130,30 +137,73 @@ job waits until its own expiry.
    take, one per `--slots` jobs of the same machine choice, up to `--max`.
    The server is named `zs-<job>` and labelled `zeroshot/hub`, `zeroshot/lease`,
    `zeroshot/expires`, `zeroshot/server-type` and `zeroshot/location`, with no secrets.
-3. **Boot.** cloud-init installs Docker if needed and runs the target image on `127.0.0.1:8080`
-   with `/mnt/zs` mounted as its state. It also schedules `shutdown -h` shortly after the TTL as a
-   backstop.
-4. **Join.** The hub opens `ssh -N -L` to the server, reads target discovery through the tunnel,
+3. **Boot.** cloud-init schedules `shutdown -h` shortly after the TTL as a backstop, then runs
+   the boot script: it installs Docker and btrfs-progs if needed, pulls the target image,
+   mounts the btrfs data folder at `/mnt/zs`, and runs the target on `127.0.0.1:8080` with
+   `/mnt/zs` as its state.
+4. **Join.** The hub opens `ssh -N -L` to the server and runs the data health check over SSH.
+   Then it reads target discovery through the tunnel,
    registers the target, and adds it as a member with the pool's and its profiles' tags. A dropped tunnel is
    reopened. Host keys are trusted on first use into the pool's own `known_hosts`.
 5. **Teardown.** When a server is idle for `--idle` or reaches `--ttl`, the hub drains it. It
    waits until each run is terminal and its postmortem has finished, then archives the run. Next it
    removes the member and the target, closes the tunnel, deletes the server, waits for the delete
-   action, and finally deletes the firewall.
+   action, and finally deletes the Volume, if any, and the firewall.
 6. **Reaper.** On start and every five minutes, the hub lists resources labelled
-   `zeroshot/hub=<hub id>`. It deletes servers, primary IPs, and firewalls that state does not
+   `zeroshot/hub=<hub id>`. It deletes servers, Volumes, primary IPs, and firewalls that state does not
    know about or that are past `zeroshot/expires`.
 
 A server whose boot fails or times out is deleted. Its pool then pauses for 5 minutes, and the
 pause doubles on each further failure up to an hour, so a broken image does not keep creating
 billed servers.
 
+## The btrfs data folder
+
+The target keeps run workspaces, checkpoint staging and its Restic repository under its storage
+folder, and copies workspaces with reflinks (`FICLONE`). Hetzner root disks are ext4, which has no
+reflinks, so every pool server keeps its data on btrfs. zeroshot uses only reflinks: no
+subvolumes, no `btrfs` command, and no extra container privileges.
+
+The boot script is written by the hub into cloud-init user data, so any server image with
+Docker or apt/dnf works. No custom image is needed. The script runs with `set -eu`:
+
+- **File mode** (the default) allocates `/var/lib/zeroshot-data.btrfs` (mode 0600) with
+  `fallocate`. It formats the file with `mkfs.btrfs` and loop-mounts it at `/mnt/zs`.
+- **Volume mode** (`--data-volume`) waits for the attached Volume under
+  `/dev/disk/by-id/scsi-0HC_Volume_*`. It formats the Volume only if it holds no filesystem, and
+  fails if it holds a filesystem other than btrfs.
+- Both mount with `noatime,compress=zstd:1` and add a `nofail` line to `/etc/fstab`, so a reboot
+  remounts the folder. `/mnt/zs` is made immutable before the mount, so nothing can write to the
+  ext4 underneath.
+- The script then checks that `/mnt/zs` is btrfs. It creates a subvolume, takes a read-only
+  snapshot and makes a reflink copy, then starts the target. If any step fails, the target is not
+  started.
+- Rerunning the script never reformats: a mounted or formatted folder is reused. Its log and an
+  `ok` or `failed` marker are kept in `/var/lib/zeroshot-boot/`.
+
+Before the hub registers a server, it runs a health check as root over SSH:
+
+- the boot script finished (`ok`);
+- `stat -f` reports btrfs for `/mnt/zs`;
+- a subvolume snapshot works;
+- the running target can make a reflink copy inside its own `/var/lib/zeroshot`.
+
+The member then shows the checked filesystem, mode and size under `data` in `zeroshot hub list`.
+While the boot script still runs, or SSH fails, the check is retried until the boot deadline. A
+failed boot script or check counts as a failed boot: the server is deleted and the pool pauses.
+
+A Volume is created unformatted, in the server's location, with the same labels. It is attached
+when the server is created and deleted after the server, and the reaper deletes it if the hub no
+longer holds it. A Volume makes boots slower and is billed separately; see the provider's
+prices. The file mode needs no extra resource.
+
 ## Archives
 
 Before deletion, `hub/archive/<job id>/` receives `status.json`, `report.json`, `watch.ndjson`,
 and `logs.ndjson`. The job records the folder, plus the run's `authored_graph_hash` when the
 report has one. A server is never deleted while one of its runs is unarchived. A failed archive
-keeps the server and is retried on the next pass. Object Storage upload is not built in.
+keeps the server and is retried on the next pass. Archiving reads through the target's API,
+so it does not depend on the data folder's filesystem. Object Storage upload is not built in.
 
 ## Metrics
 
