@@ -42,6 +42,8 @@ pub(crate) fn binding(scope: SessionScope) -> NodeRuntimeBinding {
         lane: None,
         model: crate::worker_catalog::ModelId::new("gpt-5.6").assert_value(),
         effort: Some(ReasoningEffort::Max),
+        context_window: None,
+        max_tokens: None,
         session_scope: scope,
         connections: DeclaredConnections::empty(),
     }
@@ -193,6 +195,7 @@ pub(crate) fn node_started(
         },
         attempt: PositiveInteger::new(1).assert_value(),
         input,
+        timestamp: None,
     }
 }
 
@@ -418,7 +421,7 @@ impl NodeDriver for FakeDriver {
                         diagnostic: Value::Null,
                         artifacts: Vec::new(),
                     },
-                    NodeRole::Worker | NodeRole::GitDelivery => WorkerOutcome::Verified {
+                    NodeRole::Worker | NodeRole::GitDelivery | NodeRole::CommentDelivery => WorkerOutcome::Verified {
                         output: Value::Null,
                         artifacts: Vec::new(),
                     },

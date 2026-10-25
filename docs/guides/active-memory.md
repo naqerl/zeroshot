@@ -16,7 +16,8 @@ the same run, using an existing node's model, provider and connections. It has f
 
 Each maintenance specialist keeps, adapts, retires or defers every lesson in its scope. Large
 manifests are processed in complete batches bounded by serialized context size; every batch
-requires exactly one decision per supplied ID and revision. Missing delivery evidence makes the
+requires exactly one decision per supplied ID. The host binds that ID to its frozen supplied
+revision and owns revision increments; agents do not manage version counters. Missing delivery evidence makes the
 specialists abstain. Missing or duplicate decisions fail that specialist's reconciliation instead
 of reporting success.
 
@@ -29,6 +30,9 @@ lessons is valid. A lesson needs evidence of expensive failure or substantial ex
 a concrete recommendation and a reason to expect reuse. Task summaries, generic advice and facts
 obvious from nearby code do not qualify. Titles have at most 96 UTF-8 bytes; recommendations have
 at most 640. The store keeps evidence pointers and provenance separately from the injected card.
+Use stable paths and identifiers in advice. Admission detects common literal root-relative `file:line` pointers; semantic maintenance
+also checks other positional forms. Legacy cards remain readable; maintenance must adapt
+them to stable guidance or defer, rather than keep or merely renumber their source positions.
 
 Discovery checks observed main-run cost before accepting a proposal. Two timeout/crash completions
 or two provably rejected review-loop visits can qualify. Repository discovery also accepts
@@ -44,7 +48,14 @@ Repository discoveries also need a current file citation and a matching file, fo
 identifier association. These conservative checks establish cost;
 the specialist must still establish
 what was learned, why it recurs and whether current source supports it. Maintenance can update
-supplied lessons even when discovery has no eligible evidence.
+supplied lessons even when discovery has no eligible evidence. Rejected discovery proposals log the failed
+validation stage (including card field errors) without logging the proposed lesson text. Exploration
+proof must come from the cited hooks themselves, rather than uncited tools elsewhere in the run.
+Postmortem history is read in bounded pages; its fixed transcript budget reclaims old records
+from the execution consuming the most space, so a verbose late reviewer cannot displace all
+worker evidence. Reads stop between bounded pages on cancellation. Final context trimming shrinks
+the largest evidence array first and retains an excerpt per execution where the byte budget
+allows. Truncation remains explicit.
 
 ## Configuration
 

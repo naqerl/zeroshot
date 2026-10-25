@@ -82,6 +82,31 @@ enum CliCommand {
         command: PlanCommand,
     },
 
+    /// Serve Zeroshot tools and run events as an MCP server.
+    ///
+    /// The Streamable HTTP transport listens on POST /mcp. Tools call the same commands as this
+    /// CLI.
+    /// Run events use the `io.modelcontextprotocol/events` extension and the durable stream
+    /// `watch` already reads. Signed webhooks are unsupported.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+
+    /// Pool named targets and place, queue, and account for runs across them.
+    ///
+    /// A daemon installed with `zeroshot hub install` owns the hub and serves it over HTTP; hub
+    /// commands address it through a hub context. Members are targets registered with `zeroshot
+    /// target add`, plus `local`. Each placed job is an ordinary run on one target.
+    Hub {
+        /// Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local].
+        #[arg(long = "hub", value_name = "CONTEXT", global = true)]
+        hub: Option<String>,
+
+        #[command(subcommand)]
+        command: hub::HubCliCommand,
+    },
+
     /// Submit a graph run locally or to a named target.
     ///
     /// Local runs use --cwd or the invoking folder; Git worktrees use their root. Local Git delivery
@@ -100,6 +125,19 @@ enum CliCommand {
 
     #[command(flatten)]
     Utility(UtilityCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum McpCommand {
+    /// Serve JSON-RPC MCP over Streamable HTTP on POST /mcp until stopped.
+    ///
+    /// Each tool returns that command's JSON. A failing command is a tool error carrying the
+    /// command's diagnostic code and message.
+    Serve {
+        /// Address to listen on.
+        #[arg(long, default_value = "127.0.0.1:3000")]
+        listen: SocketAddr,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -150,6 +188,12 @@ enum UtilityCommand {
 
     /// Read a run's current status as JSON.
     Status(RunSelectorArgs),
+
+    /// Print one JSON lifecycle report for a run.
+    ///
+    /// Reads only retained run history; it never starts, resumes, or stops a run. Named targets
+    /// reuse their discovered run-history capability, while local runs read their local ledger.
+    Report(RunReportArgs),
 
     /// Follow a run's durable event stream as NDJSON.
     Watch(RunWatchArgs),
@@ -401,11 +445,17 @@ enum TemplateName {
 
     /// Research with ten iterations by default and independent evidence gates.
     AutoResearch,
+
+    /// Inspect an issue proposal and post a review report.
+    IssueReview,
+
+    /// Review a PR diff, conditionally reproduce behavior, and post a concise report.
+    PrReview,
 }
 
 #[derive(Debug, Args)]
 struct DeliveryArgs {
-    /// Materialize this template-owned delivery mode.
+    /// Template delivery mode. Defaults to pull_request for software-change, comment for issue-review and pr-review, otherwise none.
     #[arg(long, value_name = "MODE", conflicts_with_all = ["push", "pr", "ship"])]
     delivery: Option<String>,
 
@@ -491,7 +541,7 @@ struct TemplateShowArgs {
 
     The run-level harness and provider are the default lane. An agent binding may add
     "lane": {"harness": "claude", "provider": "anthropic"} to run that node on another accepted
-    pair; git_delivery bindings cannot. --uniform-runtime-config applies one lane to every agent
+    pair; git_delivery and comment_delivery bindings cannot. --uniform-runtime-config applies one lane to every agent
     node. Named targets must advertise per-node lane support (openengine.node-runtime-lanes/v1), and
     a local run first checks that each lane's executable (codex, claude, or copilot) is on PATH.
 
@@ -548,8 +598,17 @@ struct RunArgs {
     template: Option<TemplateName>,
 
     /// Load the graph's initial input from this JSON file.
-    #[arg(long, value_name = "FILE")]
-    input: PathBuf,
+    #[arg(
+        long,
+        value_name = "FILE",
+        required_unless_present = "task_from",
+        conflicts_with = "task_from"
+    )]
+    input: Option<PathBuf>,
+
+    /// Resolve a GitHub issue or pull-request URL into review input before starting.
+    #[arg(long, value_name = "URL", required_unless_present = "input")]
+    task_from: Option<String>,
 
     /// Load an exact secret-free runtime plan from this JSON file.
     #[arg(long, value_name = "FILE")]
@@ -674,6 +733,16 @@ struct RunSelectorArgs {
 }
 
 #[derive(Debug, Args)]
+struct RunReportArgs {
+    #[command(flatten)]
+    run: RunSelectorArgs,
+
+    /// Emit machine-readable JSON. This is the default and only report format.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 struct RunResumeArgs {
     #[command(flatten)]
     run: RunSelectorArgs,
@@ -738,6 +807,8 @@ struct AttachArgs {
 
 #[path = "parser/convert.rs"]
 mod convert;
+#[path = "parser/hub.rs"]
+mod hub;
 #[path = "parser/profiles.rs"]
 mod profiles;
 use profiles::{ProfileCommand, ProfileNameArgs, ProfileScopeArg};

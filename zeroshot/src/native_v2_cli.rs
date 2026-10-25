@@ -29,6 +29,7 @@ use thiserror::Error;
 pub use crate::active_memory::hooks::run_hook_helper as run_active_memory_hook;
 pub use crate::native_v2_contract::RunSubmissionIntent as TargetRunIntent;
 use crate::native_v2_admission::NativeV2AdmissionError;
+use crate::native_v2_observability::history::RunReport;
 use crate::native_v2_supervisor::RunEnvironmentError;
 
 #[path = "native_v2_templates.rs"]
@@ -59,6 +60,8 @@ pub use diagnostic::{ERROR_FORMAT_ENV, JSON_ERROR_FORMAT, NativeV2CliDiagnostic}
 mod parser;
 
 mod delegations;
+#[path = "native_v2_cli/hub.rs"]
+pub mod hub;
 mod profiles;
 pub use delegations::{DelegationAction, DelegationCommand, DelegationResult};
 pub(crate) use profiles::LocalRunProfileStore;
@@ -82,12 +85,18 @@ pub use execution::{
 };
 pub use parser::{Cli, parse_native_v2_args};
 
+#[path = "native_v2_cli/mcp.rs"]
+pub mod mcp;
+
 mod acp;
 pub use acp::{AcpServeError, serve_local_acp};
 
 #[cfg(test)]
 #[path = "native_v2_cli/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(in crate::native_v2_cli) use tests::support::{Call as CliTestCall, FakeBackend as CliTestBackend};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetAdd {
@@ -132,13 +141,35 @@ pub struct RunCommand {
     pub title: RunTitle,
     pub selection: RunSelection,
     pub environment: Option<RunEnvironmentInput>,
-    pub input: PathBuf,
+    pub input: RunInput,
     pub repository: Option<RunRepository>,
     pub branch: Option<SourceBranchId>,
     pub revision: Option<SourceRevisionId>,
     pub detach: bool,
     pub validate_only: bool,
     pub submission_key: Option<IdempotencyKey>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RunInput {
+    File(PathBuf),
+    TaskFrom(String),
+}
+
+impl From<PathBuf> for RunInput {
+    fn from(path: PathBuf) -> Self {
+        Self::File(path)
+    }
+}
+impl From<&str> for RunInput {
+    fn from(path: &str) -> Self {
+        Self::File(path.into())
+    }
+}
+impl From<String> for RunInput {
+    fn from(path: String) -> Self {
+        Self::File(path.into())
+    }
 }
 
 /// An explicit CLI source locator, before assigning a bounded repository identity.
@@ -293,6 +324,10 @@ pub enum NativeV2CliCommand {
     Acp {
         profile: RunProfileName,
     },
+    /// The process entrypoint owns the HTTP listen loop.
+    McpServe {
+        listen: SocketAddr,
+    },
     Update,
     TargetAdd(TargetAdd),
     TargetLogin {
@@ -341,6 +376,7 @@ pub enum NativeV2CliCommand {
         target: Option<String>,
     },
     Status(RunSelector),
+    Report(RunSelector),
     Watch(RunWatchCommand),
     Logs(RunLogsCommand),
     Attach {
@@ -351,6 +387,7 @@ pub enum NativeV2CliCommand {
     Resume(RunResumeCommand),
     Checkpoints(RunCheckpointsCommand),
     DiscardWorkspace(RunSelector),
+    Hub(hub::HubRequest),
 }
 
 impl NativeV2CliCommand {
@@ -520,6 +557,26 @@ pub trait NativeV2CliBackend: Send + Sync {
     async fn target_add(&self, request: TargetAdd) -> Result<(), NativeV2CliError>;
     async fn target_login(&self, name: &str) -> Result<(), NativeV2CliError>;
 
+    /// A secret-free namespace separating retry snapshots by execution authority.
+    /// Backends without a stable identity leave snapshots uncached.
+    async fn review_cache_namespace(
+        &self,
+        target: Option<&str>,
+    ) -> Result<Option<String>, NativeV2CliError> {
+        Ok(target.is_none().then(|| "local".to_owned()))
+    }
+
+    async fn resolve_review(
+        &self,
+        _target: Option<&str>,
+        _request: crate::native_v2_review::ReviewResolutionRequest,
+        _runtime: &openengine_cluster_protocol::RuntimePlan,
+    ) -> Result<crate::native_v2_review::PreparedReview, NativeV2CliError> {
+        Err(NativeV2CliError::Target(
+            "target does not advertise task resolution".to_owned(),
+        ))
+    }
+
     async fn default_resource_scope(
         &self,
         _target: Option<&str>,
@@ -681,6 +738,16 @@ pub trait NativeV2CliBackend: Send + Sync {
         target: Option<&str>,
         params: RunForceParams,
     ) -> Result<CliRunForceResult, NativeV2CliError>;
+    async fn run_report(
+        &self,
+        target: Option<&str>,
+        run_id: RunId,
+    ) -> Result<RunReport, NativeV2CliError> {
+        let _ = (target, run_id);
+        Err(NativeV2CliError::Target(
+            "target does not support run reports".to_owned(),
+        ))
+    }
     async fn authorize_resume_connection_requirements(
         &self,
         target: Option<&str>,

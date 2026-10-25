@@ -13,7 +13,7 @@ use openengine_cluster_protocol::{
     RunConnectionRequirements, RunLogEventNotification, RunLogsParams, RunProfile,
     RunProfileDefaultRequest, RunProfileDefaultResult, RunProfileDeleteResult,
     RunProfileListRequest, RunProfileListResult, RunProfileMutationResult, RunProfileSelector,
-    RunProfileSetRequest, RunStatus, RunStatusParams, RunSubmitResult, RunWatchParams,
+    RunProfileSetRequest, RunId, RunStatus, RunStatusParams, RunSubmitResult, RunWatchParams,
 };
 use tokio::sync::mpsc;
 
@@ -21,6 +21,9 @@ use super::{
     CliRunForceResult, CliRunListResult, CliRunStatus, CliRunStatusResult,
     CliRunWatchEventNotification, CliSubscription, CliSubscriptionItem, NativeV2CliBackend,
     NativeV2CliError, PreparedMergePlanRequest, PreparedRunRequest, TargetAdd,
+};
+use crate::native_v2_observability::history::{
+    RunDefinition, RunHistoryRequest, RunReport, build_run_report, validate_run_definition,
 };
 
 #[path = "oecp/errors.rs"]
@@ -95,6 +98,35 @@ where
             Some(_) => RunLocation::Cloud,
         })
     }
+
+    async fn remote_definition(
+        &self,
+        target: &str,
+        run_id: &RunId,
+    ) -> Result<RunDefinition, NativeV2CliError> {
+        let response = self
+            .connector
+            .run_history(target, RunHistoryRequest::detail(run_id.clone()))
+            .await?
+            .ok_or_else(|| {
+                NativeV2CliError::Target(
+                    "target does not advertise run history for reports".to_owned(),
+                )
+            })?;
+        let (status, body) = response.into_parts();
+        if !(200..300).contains(&status) {
+            return Err(NativeV2CliError::Target(
+                "target run history is unavailable for this run".to_owned(),
+            ));
+        }
+        let definition: RunDefinition = serde_json::from_slice(&body).map_err(|_| {
+            NativeV2CliError::Target("target run history response is invalid".to_owned())
+        })?;
+        validate_run_definition(&definition, run_id).map_err(|_| {
+            NativeV2CliError::Target("target run history response is invalid".to_owned())
+        })?;
+        Ok(definition)
+    }
 }
 
 pub struct ChannelSubscription<E> {
@@ -127,6 +159,26 @@ where
     type Watch = BoxedSubscription<CliRunWatchEventNotification>;
     type Logs = BoxedSubscription<RunLogEventNotification>;
     type Attach = BoxedSubscription<RunAttachEventNotification>;
+
+    async fn review_cache_namespace(
+        &self,
+        target: Option<&str>,
+    ) -> Result<Option<String>, NativeV2CliError> {
+        self.connector
+            .review_cache_namespace(require_named_target(target)?)
+            .await
+    }
+
+    async fn resolve_review(
+        &self,
+        target: Option<&str>,
+        request: crate::native_v2_review::ReviewResolutionRequest,
+        runtime: &openengine_cluster_protocol::RuntimePlan,
+    ) -> Result<crate::native_v2_review::PreparedReview, NativeV2CliError> {
+        self.connector
+            .resolve_review(require_named_target(target)?, request, runtime)
+            .await
+    }
 
     async fn target_add(&self, request: TargetAdd) -> Result<(), NativeV2CliError> {
         self.connector.add(request).await
@@ -417,6 +469,35 @@ where
             .await
             .map(Into::into)
             .map_err(protocol_error)
+    }
+
+    async fn run_report(
+        &self,
+        target: Option<&str>,
+        run_id: RunId,
+    ) -> Result<RunReport, NativeV2CliError> {
+        let target = require_named_target(target)?;
+        let definition = self.remote_definition(target, &run_id).await?;
+        // Usage is already reported by status; a target that retains history without a live
+        // status path still gets a complete lifecycle report with unavailable usage.
+        let token_usage = self
+            .run_status(
+                Some(target),
+                RunStatusParams {
+                    run_id: run_id.clone(),
+                },
+            )
+            .await
+            .ok()
+            .and_then(|result| {
+                result.status.as_target().and_then(|status| match status {
+                    RunStatus::Finished { metadata, .. } => metadata.token_usage.clone(),
+                    RunStatus::Admitted {}
+                    | RunStatus::Running { .. }
+                    | RunStatus::Stopping { .. } => None,
+                })
+            });
+        Ok(build_run_report(&definition, token_usage))
     }
 
     async fn authorize_resume_connection_requirements(

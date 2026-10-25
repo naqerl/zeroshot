@@ -24,6 +24,8 @@ mod connection_tests;
 mod delegation_tests;
 #[path = "tests/environment.rs"]
 mod environment_tests;
+#[path = "tests/hub.rs"]
+mod hub_tests;
 #[path = "tests/lifecycle.rs"]
 mod lifecycle_tests;
 #[path = "tests/management.rs"]
@@ -32,6 +34,8 @@ mod management_tests;
 mod outcome_tests;
 #[path = "tests/parser.rs"]
 mod parser_tests;
+#[path = "tests/review.rs"]
+mod review_tests;
 
 #[path = "tests/support.rs"]
 pub(in crate::native_v2_cli) mod support;
@@ -565,7 +569,13 @@ fn template_list_and_show_are_static_and_emit_ordinary_json() {
     assert_eq!(outcome, CliOutcome::Completed);
     assert_eq!(
         serde_json::from_slice::<Value>(&list_output).assert_value(),
-        json!(["single-worker", "software-change", "auto-research"])
+        json!([
+            "single-worker",
+            "software-change",
+            "auto-research",
+            "issue-review",
+            "pr-review"
+        ])
     );
 
     let mut show_output = Vec::new();

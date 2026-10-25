@@ -63,6 +63,7 @@ async fn seed_active_execution(ledger: &FakeRunLedger, run_id: &RunId) -> Execut
                     attempt: openengine_cluster_protocol::PositiveInteger::new(1)
                         .assert_value_with("attempt"),
                     input: Value::Null,
+                    timestamp: None,
                 },
             ],
         )

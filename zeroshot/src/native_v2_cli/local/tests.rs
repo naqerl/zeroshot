@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::io::Write as _;
 
 use openengine_cluster_protocol::{
-    Cursor, EnumLabel, NodeName, RunResumeParams, RunSize, RunStatus, RunStatusResult, RunTitle,
-    TerminalResult,
+    Cursor, EnumLabel, NodeName, PositiveInteger, RunResumeParams, RunSize, RunStatus,
+    RunStatusResult, RunTitle, TerminalResult, WorkerOutcome,
 };
 #[cfg(unix)]
 use openengine_cluster_testkit::assertions::AssertError;
@@ -12,6 +12,7 @@ use serde_json::json;
 
 use super::*;
 use crate::native_v2_candidate::test_support::{TestDirectory, full_graph, success_node};
+use crate::native_v2_contract::{ExecutionId, ExecutionRef, NodeCompletion, NodeInstanceId};
 #[cfg(unix)]
 use crate::native_v2_cli::TargetRunIntent;
 use crate::native_v2_local::PreparedLocalRun;
@@ -768,15 +769,42 @@ async fn observable_local_run(
     let run_id = RunId::new(run_id);
     let submission = contract_submission("observer-recovery");
     let ledger = create_contract_run(&backend, &run_id, &submission).await;
+    let reference = ExecutionRef {
+        run_id: run_id.clone(),
+        node: NodeName::new("worker").assert_value(),
+        node_instance: NodeInstanceId::new(7).assert_value(),
+        execution: ExecutionId::new(7).assert_value(),
+    };
     ledger
         .append(
             &run_id,
             vec![
                 crate::v2_run_ledger::RunEvent::RunStarted,
+                crate::v2_run_ledger::RunEvent::NodeStarted {
+                    reference: reference.clone(),
+                    occurrence: crate::full_v1_reducer::StructuralOccurrence {
+                        node: reference.node.clone(),
+                        map_indices: Vec::new(),
+                    },
+                    attempt: PositiveInteger::new(1).assert_value(),
+                    input: serde_json::Value::Null,
+                    timestamp: None,
+                },
+                crate::v2_run_ledger::RunEvent::NodeCompleted {
+                    completion: NodeCompletion {
+                        reference,
+                        outcome: WorkerOutcome::Verified {
+                            output: serde_json::Value::Null,
+                            artifacts: Vec::new(),
+                        },
+                    },
+                    timestamp: None,
+                },
                 crate::v2_run_ledger::RunEvent::Terminal {
                     result: TerminalResult::Succeeded {
                         output: serde_json::Value::Null,
                     },
+                    timestamp: None,
                 },
             ],
         )
@@ -797,6 +825,31 @@ async fn local_status_observes_a_durable_run_without_a_controller_process() {
     assert!(status.is_ok(), "observer status failed: {status:?}");
     let status = status.assert_value();
     assert_eq!(status.run_id, run_id);
+}
+
+#[tokio::test]
+async fn local_report_observes_a_durable_run_without_a_controller_process() {
+    let (_root, backend, run_id, _ledger) =
+        observable_local_run("l9r", "0199f33f-3b44-7d21-9000-000000000093").await;
+    let report = backend
+        .run_report(None, run_id.clone())
+        .await
+        .assert_value();
+    let value = serde_json::to_value(report).assert_value();
+    assert_eq!(value["schema"], "zeroshot.run.report/v1");
+    assert_eq!(value["run"]["runId"], run_id.as_str());
+    let nodes = value["nodes"].as_array().assert_value();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0]["name"], "worker");
+    assert_eq!(nodes[0]["nodeInstance"], "7");
+    assert_eq!(nodes[0]["attempts"], 1);
+    assert_eq!(nodes[0]["startedAt"], serde_json::Value::Null);
+    assert_eq!(nodes[0]["completedAt"], serde_json::Value::Null);
+    assert_eq!(nodes[0]["durationMs"], serde_json::Value::Null);
+    assert_eq!(nodes[0]["voided"], false);
+    assert_eq!(value["totals"]["wallClockMs"], serde_json::Value::Null);
+    assert_eq!(value["totals"]["nodeDurationMs"], 0);
+    assert_eq!(value["totals"]["unattributedMs"], serde_json::Value::Null);
 }
 
 #[tokio::test]

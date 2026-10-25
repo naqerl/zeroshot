@@ -312,7 +312,7 @@ async fn fatal_runtime_failure_logs_each_active_node_before_its_completion() {
         .await
         .assert_value();
     for (index, stored) in tail.events.iter().enumerate() {
-        if let RunEvent::NodeCompleted { completion } = &stored.event {
+        if let RunEvent::NodeCompleted { completion, .. } = &stored.event {
             assert!(matches!(&tail.events[index - 1].event,
                 RunEvent::SafeLog { execution: Some(execution), stream: SafeLogStream::Error, .. }
                     if *execution == completion.reference.execution));

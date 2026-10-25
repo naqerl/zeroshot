@@ -84,8 +84,9 @@ supply credentials.
 [Runtimes and connections](concepts/runtimes-and-connections.md) before choosing models or supplying
 credentials; [Observe and control runs](guides/observe-and-control.md) covers failed-run recovery,
 durable status, and log streams. [Use a local graph as an ACP agent](guides/acp.md) covers the
-experimental stdio endpoint. [Build a review loop](guides/review-loop.md) builds a custom graph and
-runtime plan step by step.
+experimental stdio endpoint. [Serve Zeroshot over MCP](guides/mcp.md) exposes the same CLI commands
+and the durable watch stream to an MCP client.
+[Build a review loop](guides/review-loop.md) builds a custom graph and runtime plan step by step.
 
 These reference pages are generated from product-owned definitions:
 

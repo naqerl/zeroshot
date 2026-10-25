@@ -12,6 +12,7 @@
 - Every run records its events in a durable SQLite ledger.
 - An `auto-research` graph runs ten bounded experiment iterations with independent review of evidence, method, and progress.
 - Experimental: expose a graph as an ACP agent with `zeroshot acp`.
+- Serve the same CLI commands and the durable watch stream over MCP with `zeroshot mcp serve`.
 
 ## When to use it
 
@@ -56,6 +57,7 @@ The installer needs Node.js 18+ and installs a verified native binary plus a Zer
 
 - [Prepare a runtime environment](https://zeroshot.sh/docs/current/guides/runtime-environments/)
 - [ACP agent preview](https://zeroshot.sh/docs/current/guides/acp/)
+- [MCP server](https://zeroshot.sh/docs/current/guides/mcp/)
 - [Python SDK](https://zeroshot.sh/docs/current/guides/python-sdk/)
 - [Source](https://github.com/the-open-engine/zeroshot)
 - [Discord community](https://theopenengine.com/discord)

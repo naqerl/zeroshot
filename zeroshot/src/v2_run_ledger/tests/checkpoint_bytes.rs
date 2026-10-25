@@ -98,6 +98,7 @@ async fn assert_large_prerequisite_replay(ledger: &dyn RunLedger) {
         result: TerminalResult::Succeeded {
             output: Value::Null,
         },
+        timestamp: None,
     });
     let expected = ledger
         .append(&successor, events)

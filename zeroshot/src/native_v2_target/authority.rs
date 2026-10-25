@@ -21,6 +21,7 @@ use zeroshot_engine::native_v2_cli::oecp::BoxedSubscription;
 use zeroshot_engine::native_v2_cli::{
     CliRunForceResult, CliRunListResult, CliRunStatusResult, CliRunWatchEventNotification,
 };
+use zeroshot_engine::native_v2_observability::history::{RunHistoryRequest, RunHistoryResponse};
 
 use super::{TargetAuthorityError, TargetOecpAccess, TargetRecord};
 
@@ -29,6 +30,24 @@ use super::{TargetAuthorityError, TargetOecpAccess, TargetRecord};
 pub trait TargetControlAuthority: Send + Sync {
     fn redact_error(&self, error: TargetAuthorityError) -> TargetAuthorityError {
         error
+    }
+
+    async fn review_cache_namespace(
+        &self,
+        _target: &TargetRecord,
+    ) -> Result<Option<String>, TargetAuthorityError> {
+        Ok(None)
+    }
+
+    async fn resolve_review(
+        &self,
+        _target: &TargetRecord,
+        _request: zeroshot_engine::native_v2_review::ReviewResolutionRequest,
+        _runtime: &openengine_cluster_protocol::RuntimePlan,
+    ) -> Result<zeroshot_engine::native_v2_review::PreparedReview, TargetAuthorityError> {
+        Err(TargetAuthorityError::new(
+            "target does not advertise task resolution",
+        ))
     }
 
     async fn discover(&self, target: &TargetRecord) -> Result<(), TargetAuthorityError>;
@@ -206,6 +225,15 @@ pub trait TargetControlAuthority: Send + Sync {
         target: &TargetRecord,
         params: RunForceParams,
     ) -> Result<CliRunForceResult, TargetAuthorityError>;
+    async fn run_history(
+        &self,
+        _target: &TargetRecord,
+        _request: RunHistoryRequest,
+    ) -> Result<RunHistoryResponse, TargetAuthorityError> {
+        Err(TargetAuthorityError::new(
+            "target does not advertise run history",
+        ))
+    }
 }
 
 fn merge_plan_unavailable<T>() -> Result<T, TargetAuthorityError> {

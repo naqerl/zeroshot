@@ -330,6 +330,23 @@ fn parser_exposes_workspace_recovery_commands() {
 }
 
 #[test]
+fn parser_exposes_read_only_run_report() {
+    for values in [
+        &["report", "run-9"][..],
+        &["report", "run-9", "--json"][..],
+        &["report", "run-9", "--target", "docker"][..],
+    ] {
+        let command = parse_native_v2_args(args(values)).assert_value();
+        assert!(matches!(
+            command,
+            NativeV2CliCommand::Report(RunSelector { target, run_id })
+                if target.as_deref() == (values.contains(&"--target").then_some("docker"))
+                    && run_id.as_str() == "run-9"
+        ));
+    }
+}
+
+#[test]
 fn checkpoint_selection_and_bounded_listing_preserve_opaque_ids() {
     let resume = parse_native_v2_args(args(&[
         "resume",
@@ -451,7 +468,6 @@ fn explicit_template_delivery_is_parsed_and_validated_by_rust() {
         "Repair checkout",
         "--template",
         "software-change",
-        "--pr",
         "--no-pr-feedback",
         "--input",
         "input.json",
@@ -479,7 +495,11 @@ fn explicit_template_delivery_is_parsed_and_validated_by_rust() {
         "--no-pr-feedback",
     ]))
     .assert_error();
-    assert!(error.to_string().contains("requires --pr or --ship"));
+    assert!(
+        error
+            .to_string()
+            .contains("requires pull-request or merge delivery")
+    );
 }
 
 #[test]

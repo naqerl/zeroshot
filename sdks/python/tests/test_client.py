@@ -265,6 +265,23 @@ def test_uniform_runtime_encodes_exact_connection_requirements() -> None:
     }
 
 
+def test_uniform_runtime_encodes_model_limits_only_when_set() -> None:
+    selected = UniformRuntime(
+        harness="pi",
+        provider="gateway",
+        model="caller-model",
+        context_window=1_000_000,
+        max_tokens=32_000,
+    )
+
+    encoded = selected.to_dict()
+    assert encoded["contextWindow"] == 1_000_000
+    assert encoded["maxTokens"] == 32_000
+    defaults = runtime().to_dict()
+    assert "contextWindow" not in defaults
+    assert "maxTokens" not in defaults
+
+
 def test_custom_graph_and_runtime_are_forwarded_unchanged(fake_native: Path) -> None:
     graph = {"profile": "openengine.graph.full/v1", "root": {"kind": "succeed"}}
     runtime_plan = {"harness": "codex", "provider": "openai", "size": "tiny", "nodes": {}}
@@ -322,12 +339,35 @@ def test_presets_are_read_from_executable(fake_native: Path) -> None:
     ] in arguments
 
 
+@pytest.mark.parametrize("delivery", [None, "none", "push", "pull_request", "merge"])
+def test_preset_defaults_are_native_and_explicit_delivery_is_preserved(
+    fake_native: Path, delivery: str | None
+) -> None:
+    async def exercise() -> None:
+        async with Client(
+            preset=Preset("software-change", delivery=delivery), runtime=runtime()
+        ) as client:
+            await client.get_preset("software-change", delivery=delivery)
+            await client.submit("inspect it")
+
+    asyncio.run(exercise())
+    arguments = [item["args"] for item in read_invocations(fake_native)]
+    selected = [
+        item for item in arguments if item[:2] == ["template", "show"] or item[:1] == ["run"]
+    ]
+    assert len(selected) == 3
+    for item in selected:
+        if delivery is None:
+            assert "--delivery" not in item
+        else:
+            assert item[item.index("--delivery") + 1] == delivery
+
+
 def test_preset_can_disable_pull_request_feedback(fake_native: Path) -> None:
     async def exercise() -> None:
         async with Client(
             preset=Preset(
                 "software-change",
-                delivery="pull_request",
                 pull_request_feedback="ignore",
             ),
             runtime=runtime(),

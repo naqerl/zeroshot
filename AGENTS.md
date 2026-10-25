@@ -60,10 +60,19 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   lessons. Maintenance contexts and mutation authority are partitioned by lesson scope, including
   repository-qualified graph lessons; each scope's opt-out disables its maintenance and discovery.
   Adaptation provenance names the responsible scoped maintenance specialist. Maintenance uses
-  complete byte-bounded batches and requires exactly one decision per supplied ID/revision; omitted
-  or duplicate decisions cannot count as completed reconciliation. Maintenance consolidates redundant
+  complete byte-bounded batches and requires exactly one decision per supplied ID, bound by the host to its frozen revision; omitted
+  or duplicate decisions cannot count as completed reconciliation. The host owns revision preconditions
+  and increments; agents do not echo or propose revision counters, while prior initialization responses
+  with an explicit revision remain accepted only when it matches the frozen supplied version. Maintenance consolidates redundant
   paraphrases only within the same repository or exact graph/node/repository-qualified scope, retaining
-  one canonical recommendation and all useful detail while deciding every supplied ID. Discovery has no findings count
+  one canonical recommendation and all useful detail while deciding every supplied ID. Rejected discovery proposals report a validation stage and host-owned card field names without echoing
+  proposal text. Repository advice admission detects common literal file:line positions for associated/cited source
+  while preserving ambiguous endpoint, URL and image references;
+  legacy cards remain readable but scoped maintenance must adapt or defer them rather than keep
+  or renumber volatile positions. Postmortem transcript collection scans bounded ledger pages and reclaims its fixed
+  byte budget from the largest execution tail, preserving earlier worker evidence under late reviewer
+  output rather than using a global last-record window. Replay observes cancellation between bounded
+  reads; final context trimming shrinks the largest arrays and retains per-execution transcript tails. Discovery has no findings count
   quota: impact, recurrence, current evidence and usefulness determine admission. Shared transactions
   are bounded by serialized bytes and store capacity rather than a mutation count quota. Their work runs
   before runner closure/cleanup, preserves the durably latched primary outcome and its failure
@@ -126,7 +135,10 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   durable replay. Final-round facts replace older facts when the loop returns to its parent.
 - Model identifiers are opaque provider-owned strings. Do not infer a harness from a provider/model,
   maintain runtime model catalogs, or validate provider availability. Admission may reject only known
-  incompatible harness/provider pairs.
+  incompatible harness/provider pairs. A caller may declare optional bounded `contextWindow` and
+  `maxTokens` on an agent binding; they are declarations rather than catalog knowledge, are written
+  only to the Pi gateway model entry when supplied, and stay absent so the provider keeps its own
+  defaults otherwise. Never infer either value from the model identifier.
 - Full-v1 loops may declare `maxIterationsInput` as an integer path in the initial input.
   Reusable profiles verify the authored default `maxIterations`; native-v2 run admission binds a
   present positive safe integer from caller input and re-verifies the concrete graph. An absent
@@ -247,6 +259,57 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   mutation. Pure remote identification uses each registered
   provider's `repository_from_remote` hook; CLI source selection has no separate forge catalog and
   rejects ambiguous matches and unsupported provider versions.
+- Conversation-comment delivery uses the same source registry's optional comment authority,
+  independently of Git transport and checkout. `builtin.comment-delivery.post@1` has a
+  `comment_delivery` binding with no model or lane. Its required inputs are `url` and `body`,
+  with optional `reviewScope`. Admission freezes destination/scope from required caller-input
+  bindings; the trusted publisher rechecks them before effects. At most one publisher runs,
+  outside loops/maps, after every other execution and cleanup, with no later executable work.
+  Native output and review results preserve the complete `receipt` record, including absent optional
+  provenance. Terminal success must contain that exact native output. Generic local comment graphs need no
+  Git source; contained placement requirements remain unchanged.
+- Comment publication is write-once per root delivery identity and node. A scoped publication
+  store durably records intent before POST and confirmation before a receipt. Local/direct
+  files live outside workspace/checkpoint rollback; `HostedWorkspace.comment_publications`
+  supplies host-owned persistence. Matching retries reuse the original comment; changed content
+  refuses. Lost responses reconcile exact marker, target, author and body hash; unresolved
+  publication never authorizes another blind POST. Comment credentials remain private to the
+  native adapter. Source-less receipts omit `sourceRevision`.
+- `--task-from` prepares a review before graph dispatch, resolving an issue/PR URL into ordinary
+  `url`/`context` input and exact source. Workers have no mandatory `task` field. Review context
+  always includes `reviewScope`: empty for an issue, complete base/head identity for a PR.
+  `issue-review` retains the basic issue-proposal report. `pr-review` requires complete PR scope
+  and `linkedIssues` captured from a bounded GitHub GraphQL snapshot, including manual and keyword
+  closing links. Incomplete/erroring linked metadata refuses preparation; plain mentions remain
+  narrative references. Its classifier returns zero or one `{plan}` task, a `maxItems: 1` map
+  runs the reproducer when required, and a final code checker authors a comment with a 150-word
+  instruction budget. Reproducer evidence begins with short `Reproduction:`/`Setup:` sentences
+  covering the actual workflow/result and startup failures or workarounds, even resolved ones;
+  the checker preserves them in the comment. PR headers omit a source revision already named
+  by their captured head. Classifier/checker are inspection-only verifiers; the reproducer is a step
+  that can prepare the full local stack and browser tests without repairing tracked source.
+  Mapped runtime failures and overflow stop before publication; failed checks and environment
+  blockers return evidence for the report. All model choices remain caller-authored; the supplied
+  PR runtime binds the three independent agents to `gpt-6.1-sol` with `xhigh`. Negative findings
+  are successful reviews. Selecting either review template defaults to comment
+  delivery. PR review currently requires comment delivery for comparison preparation; issue review
+  also supports `--delivery none`. Local review never switches/resets a worktree and rejects tracked changes or a
+  mismatched PR head. Explicit submission-key retries retain prepared input/source and authored
+  configuration within the selected target/credential identity. Human login attempts rotate a private
+  cache generation; OAuth refresh preserves it. Machine credentials and organization selection have
+  separate hashed namespaces; snapshot files contain no credentials. Target resolution uses an authenticated read-only route; hosted access uses
+  host-owned GitHub authority, while direct requests carry explicit ephemeral source authority.
+  PR preparation fetches the exact head/base, retaining the base under a private Git ref so
+  checkpoint normalization preserves comparison objects. It uses the admitted publisher's bound
+  URL/scope, leaving arbitrary caller input keys unreserved. Local fetch/ref writes run only under
+  the controller's workspace lease, after checkpoint restoration and before dispatch.
+  Targets advertise comment delivery and
+  task resolution through separate versioned discovery extensions.
+- Built-in template selection defaults to PR delivery for `software-change`, comment delivery for
+  `pr-review` and `issue-review`, and no delivery for the other templates. Explicit supported delivery choices override
+  these defaults. Run, profile creation, template export, and editor ordering agree; Python leaves
+  unspecified delivery to Rust rather than maintaining a second default catalog. Custom graphs and
+  saved profiles retain their authored delivery nodes and bindings.
 - Named targets store only endpoint, access mode, and login identity. Named runs resolve repository, branch, exact remote revision, and worktree dirtiness client-side from the selected Git worktree plus per-run overrides; target records never bind repositories.
 - `ZEROSHOT_API_KEY` selects hosted machine authentication for the whole target CLI. It stays in
   memory and HTTP Authorization, bypasses OAuth and the credential store, and never falls back to
@@ -301,7 +364,8 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   name the wire protocol (`openai-responses`, `openai-completions`, or `anthropic-messages`) and
   reach any endpoint Pi implements without probing it. The registered model entry carries the
   caller's identifier, the chosen protocol, and a `reasoning` flag mirroring the binding's authored
-  effort; context window, output limit, and cost stay Pi-owned defaults. The same file is Pi's only
+  effort. It carries `contextWindow` and `maxTokens` only when the caller declared them, so omitted
+  limits and cost stay Pi-owned defaults. The same file is Pi's only
   caller-owned-endpoint mechanism, which is why it also backs a declared or ambient
   `ANTHROPIC_BASE_URL` on the `anthropic` lane and `OPENAI_BASE_URL`/`OPENAI_API_BASE` on the
   `openai` lane: those overrides retarget the endpoint and keep each built-in provider's own
@@ -696,6 +760,14 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   loss terminalizes active work as `runtime_lost` and poisons the session. The local UI requires both
   per-run leases before treating an in-process ACP owner without a controller socket as live.
   Ordinary runs retain run-scoped session keys.
+- `zeroshot mcp serve` is a local MCP server with Streamable HTTP on `POST /mcp`.
+  Each tool builds the same command value as the
+  CLI and runs it through the existing public or hub executor. Tool parameters for graph, initial
+  input, exact or uniform runtime, and environment definitions are inline JSON values materialized
+  into private temporary files for the command's lifetime. The `io.modelcontextprotocol/events` extension exposes one
+  `run.event` type whose payload is the durable notification `watch` already emits; `events/poll`
+  and `events/stream` both open that `run_watch` subscription. Signed webhooks are unsupported.
+  The server does not itself start a run.
 
 ## CLI and target contracts
 
@@ -756,8 +828,89 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   plans have static inputs, no cross-node dataflow, and no retry-in-place. Agent runtime bindings
   cannot declare `GH_TOKEN`; the sole merge-delivery binding owns the GitHub write credential. A
   node's queue deadline is the earlier of plan expiry and seven days after readiness.
-- Read-only safe commands include `zeroshot list`, `zeroshot status`, and `zeroshot logs`.
-- Destructive commands such as `zeroshot force-stop` require explicit user intent.
+- `zeroshot hub` pools registered targets plus `local`. One daemon per hub folder (`hub daemon
+  run`, held by `hub/daemon.lock`, heartbeat in `hub/daemon.json`) owns the hub: it is the only
+  writer of `hub/state.json` (beside `targets.json`, or `ZEROSHOT_HUB_DIR`), dispatches
+  continuously, and serves the hub API (JSON over HTTP, default `127.0.0.1:7383`, bearer token in
+  `hub/api-token` or `--token-file`). State sits behind one in-memory lock that is never held across
+  target calls; a second lock serializes placement (passes and `submit`). `schedule::Dispatched` owns
+  dispatch outcome kinds: `Placed`; `Unconfirmed` when the driver returns `HubError::Unanswered`
+  (a timeout, no receipt, a transport or protocol failure), which keeps the job placing (running
+  without a run ID, `errorKind` `submission_unconfirmed`) on its member with no attempt counted,
+  so every pass resubmits it there with the same key, counted in `unconfirmed_submissions` apart
+  from `attempts`, until `--unconfirmed-limit` (default 30) fails it as `unconfirmed_limit`; and
+  `Rejected`, the only other kind that fails the job. `hub dequeue` also removes placing jobs
+  (`dequeued_while_placing`); a run the target accepts under their key is noted, never adopted. Jobs placing when a daemon stops stay on their member as unconfirmed. Hub-side job problems
+  are a typed `JobError` (plain strings from older state load as `unclassified`). API errors carry the
+  `zeroshot.error/v1` diagnostic plus `x-zeroshot-exit-code`; logs, watch, attach, and force-stop
+  stream NDJSON frames from a `zeroshot` child on the hub host. Every other hub command is a client
+  of the context chosen by `--hub`, `ZEROSHOT_HUB`, `hub context use`, then built-in `local` (this
+  machine's daemon via its heartbeat). `hub-contexts.json` in the config folder stores URLs and token
+  sources (`--token-file`/`--token-env`), never tokens. Clients upload `--input`, `--graph`,
+  `--runtime-config`, `--uniform-runtime-config`, and `--environment` files; the daemon spools them
+  in `hub/spool/ID/`. An unreachable hub is `hub.unreachable` (exit 5, details name the context and
+  URL); a wrong token is `hub.unauthorized`. `hub install --systemd` writes a user unit (`--system`
+  for a system unit) and `--docker` runs a host-network container named `zeroshot-hub`; both pin
+  `ZEROSHOT_CONFIG_DIR`, `ZEROSHOT_HUB_DIR`, and `ZEROSHOT_STATE_DIR` and pass `--listen` and
+  `--token-file` through. Every target operation is delegated to this executable's own `run
+  --detach`, `list`, `status`, `watch`, `logs`, `attach`, and `force-stop` in a child process
+  (`ZEROSHOT_HUB_EXECUTABLE` overrides it for tests and demos), so the hub never bypasses admission,
+  authentication, or observation contracts. Placement also matches each job's requirements
+  (explicit source or hooks exclude `local`, named targets need a pushed revision, generic Git
+  transport and per-node lanes need their discovery markers) against capability kinds cached from
+  `/.well-known/zeroshot-native-v2`. Cron schedules use `croner` with an explicit IANA zone (`jiff`
+  bundled tzdb). Member capacity is hub-declared `slots`; load is the observed nonterminal runs.
+  Dispatch submission keys are `hub-JOB_ID-ATTEMPT`. Exit code 3 means no capacity or an expired
+  wait, and 4 means that no active member matches or supports the job.
+- `zeroshot/src/private_file.rs` owns owner-only file replacement for the shipped CLI: a random
+  `create_new` sibling with mode `0600`, fsync, rename over the destination, and cleanup on failure,
+  so readers never see a partial file and a link is replaced rather than written through. The target
+  registry and every hub file (state, heartbeat, contexts, token, spool, eval blobs and work files,
+  installed units) go through it; hub code calls `service::replace_private` and
+  `service::create_private_directory`.
+- `native_v2_hub/usage.rs` owns token-usage completeness for `hub stats`, eval reports, and
+  `/metrics`. A job keeps the run's protocol `TokenUsage` as reported, or an explicit `invalid`
+  record when it cannot be read. Only complete usage is totalled or priced; incomplete and invalid
+  usage is counted separately (`jobsWithIncompleteUsage`, `jobsWithInvalidUsage`), cache totals are
+  claimed only when every counted job reported them, and an overflowing total is withheld
+  (`usageOverflowed`) rather than published partially.
+- Hub metrics: `GET /metrics` (Prometheus text 0.0.4, hand-rolled in `native_v2_hub/metrics.rs`)
+  needs the API token; `--metrics-listen` adds a token-free listener that must be loopback, and
+  `--metrics-label KEY` opts job label keys into token counters. State-derived series are
+  recomputed per scrape; pass, placement, and API series count since daemon start. Never label by
+  job, run, schedule, or eval ID; label values cap at 50 distinct (`_other`), removed members are
+  `_removed`, and routes use axum templates.
+- Hub evals (`hub eval`, `native_v2_hub/eval*`) store suites, cases, and runs in
+  `HubState.evals` and file contents in `hub/eval/blobs/SHA256`. Case IDs (`ec_`) hash the
+  captured request, run IDs (`er_`) hash the request plus `--key`, and sample job IDs hash run,
+  case, variant, and repeat, so retries never duplicate work. Samples are ordinary queued hub jobs
+  labeled `eval.*`. Variant overrides are a pure merge in `eval/variant.rs` (graph/template and the
+  two runtime flags replace each other; model/harness/provider/runtime-patch edit the runtime file).
+  The daemon's eval worker (claimed work spawned beside dispatch) measures finished samples, runs
+  checks with `sh -c` in `hub/eval/work/...`, and runs `cmd:` judges on the hub host or
+  `zeroshot:` judges as `eval.role=judge` hub jobs whose terminal output (`Job.output`, kept only
+  for judge jobs) is the verdict. `eval/judge.rs` `HostCommand::run` owns host commands: input
+  written and capped output read together inside the timeout, and a typed `Ended` (not started,
+  timed out, incomplete input, exited N). Only an exit after reading the whole request yields a
+  verdict, and a check the hub could not start records `error` and leaves the pass unmeasured
+  instead of failing the candidate. Reports are pure (`eval/report.rs`); `--fail-on-regression`
+  exits 6 on a regression and 3 while incomplete. Judge and report schemas are documented in
+  `docs/guides/hub-operations.md`; keep them in sync.
+- Read-only safe commands include `zeroshot list`, `zeroshot status`, `zeroshot report`,
+  `zeroshot logs`, `zeroshot hub list`, `zeroshot hub ps`, `zeroshot hub stats`,
+  `zeroshot hub daemon status`, `zeroshot hub eval report|status|list`, and
+  `zeroshot hub context list`. `zeroshot report RUN_ID` emits one
+  `zeroshot.run.report/v1` JSON document from retained history; it never starts, resumes, or stops
+  a run, and named targets reuse their discovered run-history capability. `zeroshot hub eval run`
+  enqueues real runs.
+  `zeroshot hub install` and `zeroshot hub uninstall` change system services and need explicit
+  user intent; prefer `--dry-run` first.
+  `zeroshot mcp serve` is a local HTTP server and does not itself start a run. Its read-only tools
+  are `status`, `logs`, `watch`, `list`, `report`, `hub_list`, `hub_ps`, `hub_stats`, `hub_logs`,
+  and `hub_daemon_status`. `watch`, `logs`, and `hub_logs` follow until the stream ends; live run
+  events use the events extension. `run`, `resume`, `hub_submit`, and `hub_enqueue` submit work.
+- Destructive commands such as `zeroshot force-stop` require explicit user intent. The MCP
+  `force-stop` tool is that command.
 
 ## Where to look
 
@@ -766,6 +919,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 | Canonical crate and CLI       | `zeroshot/`                                                                                                                                                                                       |
 | CLI grammar/help              | `zeroshot/src/native_v2_cli/parser.rs`                                                                                                                                                            |
 | CLI composition               | `zeroshot/src/native_v2_cli.rs`, `zeroshot/src/main.rs`                                                                                                                                           |
+| MCP server                    | `zeroshot/src/native_v2_cli/mcp.rs`, `zeroshot/src/mcp_host.rs`                                                                                                                                   |
 | CLI self-update               | `zeroshot/src/native_v2_cli/update.rs`                                                                                                                                                            |
 | Built-in templates            | `zeroshot/src/native_v2_templates.rs`, `zeroshot/src/native_v2_templates/`                                                                                                                        |
 | Local run composition         | `zeroshot/src/native_v2_local.rs`                                                                                                                                                                 |
@@ -774,10 +928,12 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 | Portable controller           | `zeroshot/src/native_v2_portable_controller.rs`, `zeroshot/src/native_v2_portable_controller/`                                                                                                    |
 | Provider/delivery composition | `zeroshot/src/native_v2_candidate.rs`, `zeroshot/src/native_v2_candidate/`                                                                                                                        |
 | Target server                 | `zeroshot/src/native_v2_target.rs`, `zeroshot/src/native_v2_target/`                                                                                                                              |
+| Hub (target pool and queue)   | `zeroshot/src/native_v2_cli/hub.rs`, `zeroshot/src/native_v2_cli/parser/hub.rs`, `zeroshot/src/native_v2_hub.rs`, `zeroshot/src/native_v2_hub/`                                                   |
 | Target authority/auth         | `zeroshot/src/native_v2_target_authority.rs`, `zeroshot/src/native_v2_target_authority/`                                                                                                          |
 | Contained execution           | `zeroshot/src/execution.rs`, `zeroshot/src/execution/`                                                                                                                                            |
 | Faults and redaction          | `zeroshot/src/fault.rs`, `zeroshot/src/fault/`                                                                                                                                                    |
 | Run ledger                    | `zeroshot/src/v2_run_ledger.rs`, `zeroshot/src/v2_run_ledger/`                                                                                                                                    |
+| Run history and report        | `zeroshot/src/native_v2_observability/history.rs`, `zeroshot/src/native_v2_observability/history/`                                                                                                |
 | Cluster protocol types        | `crates/openengine-cluster-protocol/`                                                                                                                                                             |
 | Cluster server                | `crates/openengine-cluster-server/`                                                                                                                                                               |
 | Cluster client                | `crates/openengine-cluster-client/`                                                                                                                                                               |
