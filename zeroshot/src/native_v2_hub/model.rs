@@ -8,6 +8,7 @@ use zeroshot_engine::native_v2_cli::hub::{HubMemberState, HubStrategy};
 use super::capacity::Machine;
 use super::clock::rfc3339;
 use super::eval::EvalState;
+use super::health::DataHealth;
 use super::pool::{Lease, Pool};
 use super::profile::Spec;
 use super::usage::JobUsage;
@@ -97,6 +98,9 @@ pub(crate) struct Member {
     /// The machine spec a pool member was created for: its tag profile and size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<Spec>,
+    /// The btrfs data folder a pool member passed its health check with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<DataHealth>,
 }
 
 impl Member {
@@ -118,6 +122,7 @@ impl Member {
             expires_at_ms: None,
             machine: None,
             spec: None,
+            data: None,
         }
     }
 
@@ -138,6 +143,7 @@ impl Member {
             "expiresAt": self.expires_at_ms.map(rfc3339),
             "machine": self.machine.as_ref().map(Machine::view),
             "spec": self.spec,
+            "data": self.data.as_ref().map(DataHealth::view),
         })
     }
 

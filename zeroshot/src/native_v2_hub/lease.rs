@@ -17,6 +17,7 @@ use super::capacity::{self, Machine, PoolType};
 use super::profile::{self, Spec};
 use super::clock::now_ms;
 use super::error::HubError;
+use super::health::{self, DataHealth, Health};
 use super::model::{HubState, Member, MemberState};
 use super::pool::{
     self, LABEL_HUB, LABEL_LEASE, LABEL_LOCATION, LABEL_SERVER_TYPE, Lease, LeasePhase, Pool,
@@ -505,15 +506,19 @@ impl HubService {
         }
     }
 
-    /// Tunnel to a booted server, register it as a direct target, check discovery through the
-    /// tunnel, and add it as a member with the pool's tags.
+    /// Tunnel to a booted server, check its btrfs data folder, register it as a direct target,
+    /// check discovery through the tunnel, and add it as a member with the pool's tags.
     async fn connect(
         &self,
         runtime: &PoolRuntime,
         pool: &Pool,
         lease: &mut Lease,
     ) -> Result<(), HubError> {
-        runtime.tunnels.open(&self.tunnel_spec(pool, lease)?)?;
+        let spec = self.tunnel_spec(pool, lease)?;
+        runtime.tunnels.open(&spec)?;
+        let Some(data) = check_data(runtime, spec, pool, lease).await? else {
+            return Ok(());
+        };
         let origin = format!("http://127.0.0.1:{}", lease.local_port);
         match self.registry().get(&lease.name) {
             Ok(record) if record.origin.trim_end_matches('/') == origin => {}
@@ -543,6 +548,7 @@ impl HubService {
             idle_since_ms: Some(now),
             capabilities: Some(capabilities),
             capabilities_at_ms: Some(now),
+            data: Some(data),
             ..Member::new(lease.name.clone(), now)
         };
         self.mutate(|state| {
@@ -665,6 +671,44 @@ fn begin_teardown(state: &mut HubState, name: &str, reason: TeardownReason) {
     }
     if let Some(member) = state.members.iter_mut().find(|member| member.name == name) {
         member.state = MemberState::Drain;
+    }
+}
+
+/// Run the data health check on the lease's server. `None` while its boot script runs, or once
+/// the check failed, which fails the boot: the lease drains and its server is deleted.
+async fn check_data(
+    runtime: &PoolRuntime,
+    spec: TunnelSpec,
+    pool: &Pool,
+    lease: &mut Lease,
+) -> Result<Option<DataHealth>, HubError> {
+    let tunnels = Arc::clone(&runtime.tunnels);
+    let script = health::health_script(provision::DATA_FOLDER);
+    let output = tokio::task::spawn_blocking(move || tunnels.run(&spec, &script))
+        .await
+        .map_err(|error| {
+            HubError::Unanswered(format!("the data health check stopped: {error}"))
+        })??;
+    match health::parse(&output)? {
+        Health::Pending => {
+            lease.retry(
+                now_ms(),
+                Some("the boot script is still running".to_owned()),
+            );
+            Ok(None)
+        }
+        Health::Failed(reason) => {
+            lease.reason = Some(TeardownReason::BootFailed);
+            lease.advance(LeasePhase::Draining);
+            lease.error = Some(format!("data health check: {reason}"));
+            Ok(None)
+        }
+        Health::Healthy { size_bytes } => Ok(Some(DataHealth {
+            fs: "btrfs".to_owned(),
+            mode: pool.data.mode(),
+            size_bytes,
+            checked_at_ms: now_ms(),
+        })),
     }
 }
 

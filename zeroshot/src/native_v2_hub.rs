@@ -30,6 +30,7 @@ mod data;
 mod driver;
 mod error;
 mod eval;
+mod health;
 mod hetzner;
 mod install;
 mod jobs;

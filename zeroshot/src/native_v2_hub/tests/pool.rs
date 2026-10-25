@@ -271,11 +271,14 @@ pub(super) fn catalog_fixture() -> Catalog {
     }
 }
 
-/// Tunnels that only record what is open.
+/// Tunnels that only record what is open, and answer every script with `health`, or a
+/// healthy 1 GiB btrfs data folder.
 #[derive(Default)]
 pub(super) struct FakeTunnels {
     open: Mutex<BTreeSet<String>>,
     opened: Mutex<Vec<TunnelSpec>>,
+    pub(super) health: Mutex<Option<Result<String, String>>>,
+    pub(super) scripts: Mutex<Vec<(String, String)>>,
 }
 
 impl Tunnels for FakeTunnels {
@@ -294,6 +297,19 @@ impl Tunnels for FakeTunnels {
 
     fn close(&self, name: &str) {
         self.open.lock().expect("tunnel lock").remove(name);
+    }
+
+    fn run(&self, spec: &TunnelSpec, script: &str) -> Result<String, HubError> {
+        self.scripts
+            .lock()
+            .expect("tunnel lock")
+            .push((spec.name.clone(), script.to_owned()));
+        self.health
+            .lock()
+            .expect("tunnel lock")
+            .clone()
+            .unwrap_or_else(|| Ok("ok btrfs 1073741824\n".to_owned()))
+            .map_err(HubError::Unanswered)
     }
 }
 

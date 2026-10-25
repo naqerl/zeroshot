@@ -53,6 +53,8 @@ mod pool_profiles;
 
 #[path = "tests/pool_data.rs"]
 mod pool_data;
+#[path = "tests/pool_health.rs"]
+mod pool_health;
 
 pub(super) fn member(name: &str, tags: &[&str], slots: u32, priority: i32) -> Member {
     Member {
