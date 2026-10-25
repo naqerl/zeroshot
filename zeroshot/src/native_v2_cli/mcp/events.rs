@@ -70,6 +70,8 @@ impl Filters {
             }
         }
         if let Some(nodes) = &self.nodes {
+            // A terminal record carries no active executions, so a node filter would
+            // otherwise swallow the one event that tells the caller the run ended.
             let matched = data
                 .pointer("/status/activeExecutions")
                 .and_then(Value::as_array)
@@ -81,7 +83,7 @@ impl Filters {
                             .is_some_and(|node| nodes.iter().any(|allowed| allowed == node))
                     })
                 });
-            if !matched {
+            if !matched && !terminal {
                 return false;
             }
         }

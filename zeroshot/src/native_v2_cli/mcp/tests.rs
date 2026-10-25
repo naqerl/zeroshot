@@ -809,6 +809,59 @@ async fn events_terminal_only_skips_nonterminal_events_and_advances_the_cursor()
 }
 
 #[tokio::test]
+async fn events_node_filter_keeps_the_terminal_event() {
+    let mut session = Session::spawn(EventHost::new(vec![
+        watch_event("run-public", "v2:2", running_status("worker")),
+        watch_event("run-public", "v2:3", running_status("acceptance")),
+        watch_event("run-public", "v2:4", finished_status()),
+    ]));
+    initialize(&mut session).await;
+    let response = session
+        .request(
+            2,
+            "events/poll",
+            json!({
+                "name": "run.event",
+                "arguments": {"runId": "run-public", "nodes": ["worker"]},
+                "cursor": "v2:1"
+            }),
+        )
+        .await;
+    let events = response["result"]["events"]
+        .as_array()
+        .expect("events array");
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["data"]["cursor"], json!("v2:2"));
+    assert_eq!(events[1]["data"]["cursor"], json!("v2:4"));
+    assert_eq!(events[1]["summary"]["terminal"], json!(true));
+    assert_eq!(response["result"]["cursor"], json!("v2:4"));
+
+    let phased = session
+        .request(
+            3,
+            "events/poll",
+            json!({
+                "name": "run.event",
+                "arguments": {
+                    "runId": "run-public",
+                    "nodes": ["worker"],
+                    "phases": ["running"]
+                },
+                "cursor": "v2:1"
+            }),
+        )
+        .await;
+    let events = phased["result"]["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["data"]["cursor"], json!("v2:2"));
+    assert!(
+        events
+            .iter()
+            .all(|event| event["summary"]["terminal"] != json!(true))
+    );
+}
+
+#[tokio::test]
 async fn events_phase_filter_drops_events_without_truncation() {
     let mut session = Session::spawn(EventHost::new(vec![
         watch_event("run-public", "v2:2", running_status("worker")),
