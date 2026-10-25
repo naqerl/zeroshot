@@ -2,9 +2,10 @@
 //! [`super::hetzner::Hetzner`] and by a fake in the tests, and the cloud-init document every
 //! server boots with.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use super::error::HubError;
 use super::pool::{Lease, Pool, Resource};
@@ -46,10 +47,109 @@ pub(crate) enum Progress {
     Failed(String),
 }
 
+/// What a refused or unanswered provider call means for the pool.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Refusal {
+    /// No capacity for this server type in this location right now, or the type is not offered
+    /// there: try the next location, then the next type.
+    Capacity,
+    /// An account limit or a permission: retrying cannot help, so the pool stops creating
+    /// servers until `hub pool resume`.
+    Quota,
+    /// The provider rejected the request itself; the pool stops as for [`Self::Quota`].
+    Invalid,
+    /// The provider's rate limit, or the local request budget, is spent: retry with backoff.
+    RateLimited,
+    /// A server error, a timeout or no answer: retry with backoff.
+    Transient,
+}
+
+/// A failed provider call with its classification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Failure {
+    pub refusal: Refusal,
+    pub message: String,
+}
+
+impl Failure {
+    pub(crate) fn new(refusal: Refusal, message: impl Into<String>) -> Self {
+        Self {
+            refusal,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl From<Failure> for HubError {
+    fn from(failure: Failure) -> Self {
+        Self::Provider(failure.message)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Architecture {
+    X86,
+    Arm,
+}
+
+/// One server type the provider offers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ServerType {
+    pub name: String,
+    pub cores: u32,
+    pub memory_mb: u64,
+    pub disk_gb: u64,
+    pub architecture: Architecture,
+    pub deprecated: bool,
+    /// Gross hourly price by location name, as the provider writes it.
+    pub hourly: BTreeMap<String, String>,
+}
+
+/// One location and the server types it offers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Location {
+    pub name: String,
+    /// Types the location offers at all.
+    pub supported: BTreeSet<String>,
+    /// Types the location can create right now.
+    pub available: BTreeSet<String>,
+}
+
+/// The provider's server types and locations.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Catalog {
+    pub types: Vec<ServerType>,
+    pub locations: Vec<Location>,
+}
+
+impl Catalog {
+    pub(crate) fn server_type(&self, name: &str) -> Option<&ServerType> {
+        self.types
+            .iter()
+            .find(|server_type| server_type.name == name)
+    }
+
+    pub(crate) fn location(&self, name: &str) -> Option<&Location> {
+        self.locations.iter().find(|location| location.name == name)
+    }
+}
+
 #[async_trait]
 pub(crate) trait Provisioner: Send + Sync {
-    /// Create a firewall admitting only SSH from `ssh_from`, then the server behind it.
-    async fn create(&self, request: &ServerRequest) -> Result<Created, HubError>;
+    /// Create a firewall admitting only SSH from `ssh_from`, then the server behind it. A
+    /// failure leaves nothing behind that the provider confirmed; anything it could not remove
+    /// carries the lease's labels for the caller's cleanup and the reaper.
+    async fn create(&self, request: &ServerRequest) -> Result<Created, Failure>;
+    /// Server types, with prices, and locations, with the types each can create now.
+    async fn catalog(&self) -> Result<Catalog, HubError>;
     /// One readiness check: the creation action succeeded and the server is running.
     async fn wait_ready(
         &self,

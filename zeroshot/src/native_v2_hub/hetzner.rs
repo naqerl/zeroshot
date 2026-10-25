@@ -4,8 +4,12 @@
 //! `Authorization` header, never logged, labelled, put in user data or stored in hub state.
 //! Every response's `RateLimit-Remaining` and `RateLimit-Reset` headers are kept, and no request
 //! is sent while the hourly budget (3600 requests) is spent.
+//!
+//! Every failed call is classified ([`classify`]) so the pool can tell a capacity shortage
+//! (try another location or type, then wait) from an account limit or a bad request (stop)
+//! and from a transient failure (retry).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -16,7 +20,10 @@ use serde_json::{Value, json};
 
 use super::error::HubError;
 use super::pool::{Resource, ResourceKind};
-use super::provision::{Created, Progress, Provisioner, ServerRequest};
+use super::provision::{
+    Architecture, Catalog, Created, Failure, Location, Progress, Provisioner, Refusal,
+    ServerRequest, ServerType,
+};
 
 pub(crate) const API: &str = "https://api.hetzner.cloud/v1";
 /// Environment variable holding the token when no token file is configured.
@@ -98,22 +105,25 @@ impl Hetzner {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// One API call. `Ok(None)` is a 404; every other non-success is a typed error.
+    /// One API call. `Ok(None)` is a 404; every other non-success is a classified failure.
     async fn call(
         &self,
         method: Method,
         path: &str,
         body: Option<&Value>,
-    ) -> Result<Option<Value>, HubError> {
+    ) -> Result<Option<Value>, Failure> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
         let limit = self.rate_limit();
         if limit.remaining == Some(0) && limit.reset.is_some_and(|reset| reset > now) {
-            return Err(HubError::Provider(format!(
-                "Hetzner rate limit is spent until Unix second {}",
-                limit.reset.unwrap_or_default()
-            )));
+            return Err(Failure::new(
+                Refusal::RateLimited,
+                format!(
+                    "Hetzner rate limit is spent until Unix second {}",
+                    limit.reset.unwrap_or_default()
+                ),
+            ));
         }
         let mut request = self
             .client
@@ -123,10 +133,13 @@ impl Hetzner {
             request = request.json(body);
         }
         let response = request.send().await.map_err(|error| {
-            HubError::Provider(format!(
-                "Hetzner {method} {path} was not answered: {}",
-                error.without_url()
-            ))
+            Failure::new(
+                Refusal::Transient,
+                format!(
+                    "Hetzner {method} {path} was not answered: {}",
+                    error.without_url()
+                ),
+            )
         })?;
         self.remember(response.headers());
         let status = response.status();
@@ -137,11 +150,14 @@ impl Hetzner {
             return Ok(Some(Value::Null));
         }
         let document = response.json::<Value>().await.map_err(|error| {
-            HubError::Provider(format!(
-                "Hetzner {method} {path} returned HTTP {} without JSON: {}",
-                status.as_u16(),
-                error.without_url()
-            ))
+            Failure::new(
+                classify(status.as_u16(), "", ""),
+                format!(
+                    "Hetzner {method} {path} returned HTTP {} without JSON: {}",
+                    status.as_u16(),
+                    error.without_url()
+                ),
+            )
         })?;
         if !status.is_success() {
             let code = document
@@ -152,10 +168,13 @@ impl Hetzner {
                 .pointer("/error/message")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            return Err(HubError::Provider(format!(
-                "Hetzner {method} {path} failed with HTTP {} {code}: {message}",
-                status.as_u16()
-            )));
+            return Err(Failure::new(
+                classify(status.as_u16(), code, message),
+                format!(
+                    "Hetzner {method} {path} failed with HTTP {} {code}: {message}",
+                    status.as_u16()
+                ),
+            ));
         }
         Ok(Some(document))
     }
@@ -181,25 +200,32 @@ impl Hetzner {
 
     async fn list(&self, kind: ResourceKind, selector: &str) -> Result<Vec<Resource>, HubError> {
         let collection = collection(kind);
+        let query = format!("label_selector={}&", encode(selector));
+        self.pages(collection, &query)
+            .await?
+            .iter()
+            .map(|item| resource(kind, item))
+            .collect()
+    }
+
+    /// Every item of a paginated collection; `query` is empty or ends with `&`.
+    async fn pages(&self, collection: &str, query: &str) -> Result<Vec<Value>, HubError> {
         let mut found = Vec::new();
         let mut page = 1_u64;
         loop {
-            let path = format!(
-                "/{collection}?label_selector={}&page={page}&per_page={PAGE_SIZE}",
-                encode(selector)
-            );
+            let path = format!("/{collection}?{query}page={page}&per_page={PAGE_SIZE}");
             let document = self
                 .call(Method::GET, &path, None)
                 .await?
                 .ok_or_else(|| HubError::Provider(format!("Hetzner GET /{collection} is 404")))?;
-            for item in document
-                .get(collection)
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                found.push(resource(kind, item)?);
-            }
+            found.extend(
+                document
+                    .get(collection)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            );
             match document
                 .pointer("/meta/pagination/next_page")
                 .and_then(Value::as_u64)
@@ -209,6 +235,121 @@ impl Hetzner {
             }
         }
     }
+}
+
+/// What a failed call means, from its HTTP status and Hetzner error code. A server type the
+/// location does not offer, or no longer has room for, is a capacity shortage like
+/// `resource_unavailable` and `placement_error`, so the next location or type is tried.
+pub(crate) fn classify(status: u16, code: &str, message: &str) -> Refusal {
+    let lowered = message.to_ascii_lowercase();
+    let not_offered_here = [
+        "not available",
+        "unavailable",
+        "unsupported location",
+        "sold out",
+    ]
+    .iter()
+    .any(|phrase| lowered.contains(phrase));
+    match code {
+        "resource_unavailable" | "placement_error" | "unavailable" | "maintenance" => {
+            Refusal::Capacity
+        }
+        "invalid_input" | "invalid_server_type" | "unsupported_error" if not_offered_here => {
+            Refusal::Capacity
+        }
+        "resource_limit_exceeded"
+        | "server_limit_exceeded"
+        | "limit_exceeded"
+        | "forbidden"
+        | "unauthorized"
+        | "token_readonly" => Refusal::Quota,
+        "rate_limit_exceeded" => Refusal::RateLimited,
+        "invalid_input"
+        | "invalid_server_type"
+        | "unsupported_error"
+        | "json_error"
+        | "not_found"
+        | "deprecated_api_endpoint" => Refusal::Invalid,
+        _ => match status {
+            429 => Refusal::RateLimited,
+            401 | 403 => Refusal::Quota,
+            400..=499 if !matches!(status, 408 | 409 | 423) => Refusal::Invalid,
+            _ => Refusal::Transient,
+        },
+    }
+}
+
+fn server_type(item: &Value) -> Option<(u64, ServerType)> {
+    let number = |key: &str| item.get(key).and_then(Value::as_u64);
+    let hourly = item
+        .get("prices")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|price| {
+            Some((
+                price.get("location")?.as_str()?.to_owned(),
+                price.pointer("/price_hourly/gross")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect();
+    let memory_gb = item.get("memory").and_then(Value::as_f64).unwrap_or(0.0);
+    let deprecated = item.get("deprecated").and_then(Value::as_bool) == Some(true)
+        || item
+            .get("deprecation")
+            .is_some_and(|value| !value.is_null());
+    Some((
+        number("id")?,
+        ServerType {
+            name: item.get("name")?.as_str()?.to_owned(),
+            cores: u32::try_from(number("cores")?).ok()?,
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            memory_mb: (memory_gb * 1024.0).round().max(0.0) as u64,
+            disk_gb: number("disk").unwrap_or(0),
+            architecture: if item.get("architecture").and_then(Value::as_str) == Some("arm") {
+                Architecture::Arm
+            } else {
+                Architecture::X86
+            },
+            deprecated,
+            hourly,
+        },
+    ))
+}
+
+/// Locations from datacenters: a location offers, and has room for, the union of its
+/// datacenters' server types.
+fn locations(datacenters: &[Value], names: &BTreeMap<u64, String>) -> Vec<Location> {
+    let mut found: Vec<Location> = Vec::new();
+    for datacenter in datacenters {
+        let Some(name) = datacenter.pointer("/location/name").and_then(Value::as_str) else {
+            continue;
+        };
+        let types = |key: &str| {
+            datacenter
+                .pointer(&format!("/server_types/{key}"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|id| names.get(&id.as_u64()?).cloned())
+                .collect::<BTreeSet<_>>()
+        };
+        let index = found
+            .iter()
+            .position(|location| location.name == name)
+            .unwrap_or_else(|| {
+                found.push(Location {
+                    name: name.to_owned(),
+                    supported: BTreeSet::new(),
+                    available: BTreeSet::new(),
+                });
+                found.len() - 1
+            });
+        let location = &mut found[index];
+        location.supported.extend(types("supported"));
+        location.available.extend(types("available"));
+    }
+    found
 }
 
 const fn collection(kind: ResourceKind) -> &'static str {
@@ -275,7 +416,7 @@ fn action_progress(document: &Value) -> Progress {
 
 #[async_trait]
 impl Provisioner for Hetzner {
-    async fn create(&self, request: &ServerRequest) -> Result<Created, HubError> {
+    async fn create(&self, request: &ServerRequest) -> Result<Created, Failure> {
         let firewall = self
             .call(
                 Method::POST,
@@ -294,7 +435,7 @@ impl Provisioner for Hetzner {
             )
             .await?
             .and_then(|document| document.pointer("/firewall/id").and_then(Value::as_u64))
-            .ok_or_else(|| HubError::Provider("Hetzner created no firewall".to_owned()))?;
+            .ok_or_else(|| Failure::new(Refusal::Transient, "Hetzner created no firewall"))?;
         let created = self
             .call(
                 Method::POST,
@@ -316,24 +457,48 @@ impl Provisioner for Hetzner {
         let document = match created {
             Ok(Some(document)) => document,
             outcome => {
-                // Best effort: a firewall still attached to a server that was created after
-                // all is refused here and removed with its lease or by the reaper.
-                let _ = self
+                let mut failure = outcome.err().unwrap_or_else(|| {
+                    Failure::new(Refusal::Invalid, "Hetzner POST /servers is 404")
+                });
+                // A firewall still attached to a server that was created after all is refused
+                // here; it carries the lease's labels, so the lease's cleanup or the reaper
+                // removes it.
+                if let Err(left) = self
                     .call(Method::DELETE, &format!("/firewalls/{firewall}"), None)
-                    .await;
-                return Err(outcome.err().unwrap_or_else(|| {
-                    HubError::Provider("Hetzner POST /servers is 404".to_owned())
-                }));
+                    .await
+                {
+                    failure.message = format!(
+                        "{}; firewall {firewall} left for cleanup: {left}",
+                        failure.message
+                    );
+                }
+                return Err(failure);
             }
         };
         let server_id = document
             .pointer("/server/id")
             .and_then(Value::as_u64)
-            .ok_or_else(|| HubError::Provider("Hetzner created no server ID".to_owned()))?;
+            .ok_or_else(|| Failure::new(Refusal::Transient, "Hetzner created no server ID"))?;
         Ok(Created {
             server_id,
             firewall_id: Some(firewall),
             action_id: document.pointer("/action/id").and_then(Value::as_u64),
+        })
+    }
+
+    async fn catalog(&self) -> Result<Catalog, HubError> {
+        let mut names = BTreeMap::new();
+        let mut types = Vec::new();
+        for item in self.pages("server_types", "").await? {
+            if let Some((id, server_type)) = server_type(&item) {
+                names.insert(id, server_type.name.clone());
+                types.push(server_type);
+            }
+        }
+        let datacenters = self.pages("datacenters", "").await?;
+        Ok(Catalog {
+            types,
+            locations: locations(&datacenters, &names),
         })
     }
 

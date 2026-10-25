@@ -9,9 +9,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
-use super::super::hetzner::{Hetzner, Token};
+use super::super::hetzner::{Hetzner, Token, classify};
 use super::super::pool::{Resource, ResourceKind};
-use super::super::provision::{Progress, Provisioner, ServerRequest};
+use super::super::provision::{Architecture, Progress, Provisioner, Refusal, ServerRequest};
 
 const SECRET: &str = "test-token-not-real";
 
@@ -112,7 +112,7 @@ async fn serve() -> (Hetzner, Arc<Mock>) {
 fn request() -> ServerRequest {
     ServerRequest {
         name: "zs-one".to_owned(),
-        server_type: "cx33".to_owned(),
+        server_type: "cpx31".to_owned(),
         location: "fsn1".to_owned(),
         image: "docker-ce".to_owned(),
         user_data: "#cloud-config\n".to_owned(),
@@ -162,7 +162,7 @@ async fn create_puts_an_ssh_only_firewall_in_front_of_the_labelled_server() {
     assert_eq!(seen[0].body["rules"].as_array().map(Vec::len), Some(1));
     let server = &seen[1].body;
     assert_eq!(server["name"], json!("zs-one"));
-    assert_eq!(server["server_type"], json!("cx33"));
+    assert_eq!(server["server_type"], json!("cpx31"));
     assert_eq!(server["firewalls"], json!([{"firewall": 11}]));
     assert_eq!(server["labels"]["zeroshot/hub"], json!("h1"));
     for call in &seen {
@@ -194,6 +194,7 @@ async fn a_refused_server_create_removes_its_firewall_and_reports_the_error() {
         },
     );
     let error = hetzner.create(&request()).await.expect_err("refused");
+    assert_eq!(error.refusal, Refusal::Quota);
     let message = error.to_string();
     assert!(
         message.contains("HTTP 403 resource_limit_exceeded: server limit"),
@@ -201,6 +202,32 @@ async fn a_refused_server_create_removes_its_firewall_and_reports_the_error() {
     );
     assert!(!message.contains(SECRET));
     assert_eq!(mock.seen()[2].method, "DELETE");
+
+    mock.on(
+        "POST /v1/firewalls",
+        answer(201, json!({"firewall": {"id": 14}})),
+    );
+    mock.on(
+        "POST /v1/servers",
+        answer(
+            412,
+            json!({"error": {"code": "resource_unavailable", "message": "no room"}}),
+        ),
+    );
+    mock.on(
+        "DELETE /v1/firewalls/14",
+        answer(
+            409,
+            json!({"error": {"code": "resource_in_use", "message": "attached"}}),
+        ),
+    );
+    let error = hetzner.create(&request()).await.expect_err("no capacity");
+    assert_eq!(error.refusal, Refusal::Capacity);
+    assert!(
+        error.message.contains("firewall 14 left for cleanup"),
+        "{}",
+        error.message
+    );
 
     mock.on(
         "POST /v1/firewalls",
@@ -415,10 +442,21 @@ async fn a_spent_rate_limit_stops_requests_until_it_resets() {
     );
     let error = hetzner.action(1).await.expect_err("limited");
     assert!(error.to_string().contains("rate_limit_exceeded"), "{error}");
+    mock.on(
+        "POST /v1/firewalls",
+        answer(201, json!({"firewall": {"id": 1}})),
+    );
+    let held = hetzner.create(&request()).await.expect_err("held back");
+    assert_eq!(held.refusal, Refusal::RateLimited);
     assert_eq!(hetzner.rate_limit().remaining, Some(0));
     assert_eq!(hetzner.rate_limit().reset, Some(reset));
     let error = hetzner.action(1).await.expect_err("held back");
     assert!(error.to_string().contains("rate limit is spent"), "{error}");
+    assert!(
+        held.message.contains("rate limit is spent"),
+        "{}",
+        held.message
+    );
     assert_eq!(mock.seen().len(), 1, "no request while the budget is spent");
 }
 
@@ -431,6 +469,138 @@ async fn an_unreachable_api_is_a_typed_provider_error() {
     let error = hetzner.action(1).await.expect_err("refused");
     assert!(error.to_string().contains("was not answered"), "{error}");
     assert!(!error.to_string().contains(SECRET));
+    let failure = hetzner.create(&request()).await.expect_err("refused");
+    assert_eq!(failure.refusal, Refusal::Transient);
+}
+
+#[test]
+fn create_failures_are_classified_by_code_status_and_message() {
+    let cases = [
+        (412, "resource_unavailable", "", Refusal::Capacity),
+        (422, "placement_error", "", Refusal::Capacity),
+        (503, "unavailable", "", Refusal::Capacity),
+        (503, "maintenance", "", Refusal::Capacity),
+        (
+            422,
+            "invalid_input",
+            "server type cpx31 is not available in location hel1",
+            Refusal::Capacity,
+        ),
+        (
+            422,
+            "unsupported_error",
+            "unsupported location for server type",
+            Refusal::Capacity,
+        ),
+        (403, "resource_limit_exceeded", "", Refusal::Quota),
+        (403, "server_limit_exceeded", "", Refusal::Quota),
+        (403, "limit_exceeded", "", Refusal::Quota),
+        (403, "forbidden", "", Refusal::Quota),
+        (401, "unauthorized", "", Refusal::Quota),
+        (403, "token_readonly", "", Refusal::Quota),
+        (403, "", "", Refusal::Quota),
+        (429, "rate_limit_exceeded", "", Refusal::RateLimited),
+        (429, "", "", Refusal::RateLimited),
+        (400, "invalid_input", "invalid image", Refusal::Invalid),
+        (400, "json_error", "", Refusal::Invalid),
+        (404, "not_found", "", Refusal::Invalid),
+        (422, "invalid_server_type", "unknown type", Refusal::Invalid),
+        (400, "", "", Refusal::Invalid),
+        (500, "service_error", "", Refusal::Transient),
+        (502, "", "", Refusal::Transient),
+        (504, "timeout", "", Refusal::Transient),
+        (409, "conflict", "", Refusal::Transient),
+        (423, "locked", "", Refusal::Transient),
+        (200, "", "", Refusal::Transient),
+    ];
+    for (status, code, message, expected) in cases {
+        assert_eq!(
+            classify(status, code, message),
+            expected,
+            "{status} {code} {message}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_catalog_joins_types_prices_and_datacenters_by_location() {
+    let (hetzner, mock) = serve().await;
+    let price = |location: &str, gross: &str| json!({"location": location, "price_hourly": {"net": "0", "gross": gross}});
+    mock.on(
+        "GET /v1/server_types",
+        answer(
+            200,
+            json!({"server_types": [
+                {"id": 1, "name": "cx23", "cores": 2, "memory": 4.0, "disk": 40,
+                 "architecture": "x86", "deprecation": null,
+                 "prices": [price("fsn1", "0.0071"), price("nbg1", "0.0071")]},
+                {"id": 2, "name": "cax21", "cores": 4, "memory": 8.0, "disk": 80,
+                 "architecture": "arm", "prices": []}
+            ], "meta": {"pagination": {"next_page": 2}}}),
+        ),
+    );
+    mock.on(
+        "GET /v1/server_types",
+        answer(
+            200,
+            json!({"server_types": [
+                {"id": 3, "name": "cx11", "cores": 1, "memory": 2.0, "disk": 20,
+                 "architecture": "x86", "deprecation": {"announced": "2024-01-01"}},
+                {"name": "no id"}
+            ]}),
+        ),
+    );
+    mock.on(
+        "GET /v1/datacenters",
+        answer(
+            200,
+            json!({"datacenters": [
+                {"location": {"name": "fsn1"},
+                 "server_types": {"supported": [1, 2, 3], "available": [1]}},
+                {"location": {"name": "fsn1"},
+                 "server_types": {"supported": [1], "available": [2, 99]}},
+                {"location": {"name": "nbg1"},
+                 "server_types": {"supported": [1], "available": []}},
+                {"name": "no location"}
+            ]}),
+        ),
+    );
+    let catalog = hetzner.catalog().await.expect("catalog");
+    let names = catalog
+        .types
+        .iter()
+        .map(|server_type| server_type.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["cx23", "cax21", "cx11"]);
+    let cx23 = catalog.server_type("cx23").expect("cx23");
+    assert_eq!((cx23.cores, cx23.memory_mb, cx23.disk_gb), (2, 4096, 40));
+    assert_eq!(cx23.architecture, Architecture::X86);
+    assert!(!cx23.deprecated);
+    assert_eq!(cx23.hourly.get("nbg1").map(String::as_str), Some("0.0071"));
+    assert_eq!(
+        catalog.server_type("cax21").map(|t| t.architecture),
+        Some(Architecture::Arm)
+    );
+    assert!(catalog.server_type("cx11").expect("cx11").deprecated);
+    let fsn1 = catalog.location("fsn1").expect("fsn1");
+    assert_eq!(
+        fsn1.supported
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["cax21", "cx11", "cx23"]
+    );
+    assert_eq!(
+        fsn1.available
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["cax21", "cx23"]
+    );
+    assert!(catalog.location("nbg1").expect("nbg1").available.is_empty());
+    assert_eq!(catalog.locations.len(), 2);
+    assert!(mock.seen()[1].uri.contains("page=2"));
+    assert!(hetzner.catalog().await.is_err(), "404 collection");
 }
 
 #[test]

@@ -18,7 +18,10 @@ use super::super::pool::{
     LABEL_HUB, LABEL_LEASE, Lease, LeasePhase, Pool, Provider, Resource, ResourceKind,
     TeardownReason,
 };
-use super::super::provision::{self, Created, Progress, Provisioner, ServerRequest};
+use super::super::provision::{
+    self, Architecture, Catalog, Created, Failure, Location, Progress, Provisioner, Refusal,
+    ServerRequest, ServerType,
+};
 use super::super::service::HubService;
 use super::super::store::{HubStore, migrate};
 use super::super::tunnel::{TunnelSpec, Tunnels, ssh_arguments};
@@ -44,7 +47,17 @@ struct Cloud {
     lists: Vec<String>,
     /// Readiness answer; `None` means running with an address.
     ready: Option<Progress>,
-    fail_create: bool,
+    /// Refuse every create with this.
+    refuse_all: Option<Refusal>,
+    /// Refuse creates of a server type in a location.
+    refuse: BTreeMap<(String, String), Refusal>,
+    /// A refused create leaves its labelled firewall behind, as a half-done create can.
+    leave_partial: bool,
+    /// Every create attempted, as (server type, location), refused or not.
+    attempts: Vec<(String, String)>,
+    /// The catalog; `None` serves [`catalog_fixture`].
+    catalog: Option<Catalog>,
+    catalog_fails: bool,
     /// Delete actions still pending before they succeed.
     pending_deletes: u32,
 }
@@ -92,10 +105,31 @@ impl FakeCloud {
 
 #[async_trait]
 impl Provisioner for FakeCloud {
-    async fn create(&self, request: &ServerRequest) -> Result<Created, HubError> {
+    async fn create(&self, request: &ServerRequest) -> Result<Created, Failure> {
         self.with(|cloud| {
-            if cloud.fail_create {
-                return Err(HubError::Provider("create refused".to_owned()));
+            let place = (request.server_type.clone(), request.location.clone());
+            cloud.attempts.push(place.clone());
+            if let Some(refusal) = cloud
+                .refuse_all
+                .or_else(|| cloud.refuse.get(&place).copied())
+            {
+                if cloud.leave_partial {
+                    cloud.next_id += 1;
+                    let id = cloud.next_id;
+                    cloud.resources.insert(
+                        (ResourceKind::Firewall, id),
+                        Resource {
+                            kind: ResourceKind::Firewall,
+                            id,
+                            name: request.name.clone(),
+                            labels: request.labels.clone(),
+                        },
+                    );
+                }
+                return Err(Failure::new(
+                    refusal,
+                    format!("create refused: {refusal:?} for {} in {}", place.0, place.1),
+                ));
             }
             cloud.created.push(request.clone());
             let mut ids = Vec::new();
@@ -117,6 +151,15 @@ impl Provisioner for FakeCloud {
                 firewall_id: Some(ids[0]),
                 action_id: Some(ids[1] + 1000),
             })
+        })
+    }
+
+    async fn catalog(&self) -> Result<Catalog, HubError> {
+        self.with(|cloud| {
+            if cloud.catalog_fails {
+                return Err(HubError::Provider("catalog unavailable".to_owned()));
+            }
+            Ok(cloud.catalog.clone().unwrap_or_else(catalog_fixture))
         })
     }
 
@@ -170,6 +213,49 @@ impl Provisioner for FakeCloud {
                 .cloned()
                 .collect()
         }))
+    }
+}
+
+fn offered(name: &str, cores: u32, memory_gb: u64, architecture: Architecture) -> ServerType {
+    ServerType {
+        name: name.to_owned(),
+        cores,
+        memory_mb: memory_gb * 1024,
+        disk_gb: memory_gb * 10,
+        architecture,
+        deprecated: false,
+        hourly: ["fsn1", "nbg1", "hel1"]
+            .into_iter()
+            .map(|location| (location.to_owned(), format!("0.{:04}", cores * 37)))
+            .collect(),
+    }
+}
+
+/// Four current types and one deprecated, all offered and available in three locations.
+fn catalog_fixture() -> Catalog {
+    let mut old = offered("cx11", 1, 2, Architecture::X86);
+    old.deprecated = true;
+    let types = vec![
+        offered("cx23", 2, 4, Architecture::X86),
+        offered("cpx31", 4, 8, Architecture::X86),
+        offered("cx43", 8, 16, Architecture::X86),
+        offered("cax21", 4, 8, Architecture::Arm),
+        old,
+    ];
+    let names = types
+        .iter()
+        .map(|server_type| server_type.name.clone())
+        .collect::<BTreeSet<_>>();
+    Catalog {
+        locations: ["fsn1", "nbg1", "hel1"]
+            .into_iter()
+            .map(|name| Location {
+                name: name.to_owned(),
+                supported: names.clone(),
+                available: names.clone(),
+            })
+            .collect(),
+        types,
     }
 }
 
@@ -711,7 +797,7 @@ async fn an_unconfirmed_create_is_adopted_instead_of_duplicated() {
 #[tokio::test]
 async fn provider_failures_back_off_and_a_failed_boot_tears_down() {
     let cloud = FakeCloud::default();
-    cloud.with(|cloud| cloud.fail_create = true);
+    cloud.with(|cloud| cloud.refuse_all = Some(Refusal::Transient));
     let rig = rig_with(cloud);
     rig.add_pool(1).await;
     rig.enqueue("hj_one").await;
@@ -725,7 +811,7 @@ async fn provider_failures_back_off_and_a_failed_boot_tears_down() {
     assert_eq!(rig.lease().await.attempts, 1, "backoff not elapsed");
 
     rig.cloud.with(|cloud| {
-        cloud.fail_create = false;
+        cloud.refuse_all = None;
         cloud.ready = Some(Progress::Failed("server error".to_owned()));
     });
     rig.pass().await;
