@@ -30,45 +30,45 @@ use super::super::wire::AddPool;
 use super::{FakeDriver, job, spec};
 use crate::native_v2_target::{FileTargetRegistry, TargetRegistry};
 
-const TAG: &str = "hetzner";
-const IMAGE: &str = "ghcr.io/the-open-engine/zeroshot-target:0.9.0";
+pub(super) const TAG: &str = "hetzner";
+pub(super) const IMAGE: &str = "ghcr.io/the-open-engine/zeroshot-target:0.9.0";
 
 /// A provider in memory: resources by kind and ID, plus every call it saw.
 #[derive(Default)]
-struct FakeCloud {
+pub(super) struct FakeCloud {
     inner: Mutex<Cloud>,
 }
 
 #[derive(Default)]
-struct Cloud {
-    next_id: u64,
-    resources: BTreeMap<(ResourceKind, u64), Resource>,
-    created: Vec<ServerRequest>,
-    destroyed: Vec<(ResourceKind, u64)>,
-    lists: Vec<String>,
+pub(super) struct Cloud {
+    pub(super) next_id: u64,
+    pub(super) resources: BTreeMap<(ResourceKind, u64), Resource>,
+    pub(super) created: Vec<ServerRequest>,
+    pub(super) destroyed: Vec<(ResourceKind, u64)>,
+    pub(super) lists: Vec<String>,
     /// Readiness answer; `None` means running with an address.
-    ready: Option<Progress>,
+    pub(super) ready: Option<Progress>,
     /// Refuse every create with this.
-    refuse_all: Option<Refusal>,
+    pub(super) refuse_all: Option<Refusal>,
     /// Refuse creates of a server type in a location.
-    refuse: BTreeMap<(String, String), Refusal>,
+    pub(super) refuse: BTreeMap<(String, String), Refusal>,
     /// A refused create leaves its labelled firewall behind, as a half-done create can.
-    leave_partial: bool,
+    pub(super) leave_partial: bool,
     /// Every create attempted, as (server type, location), refused or not.
-    attempts: Vec<(String, String)>,
+    pub(super) attempts: Vec<(String, String)>,
     /// The catalog; `None` serves [`catalog_fixture`].
-    catalog: Option<Catalog>,
-    catalog_fails: bool,
+    pub(super) catalog: Option<Catalog>,
+    pub(super) catalog_fails: bool,
     /// Delete actions still pending before they succeed.
-    pending_deletes: u32,
+    pub(super) pending_deletes: u32,
 }
 
 impl FakeCloud {
-    fn with<R>(&self, read: impl FnOnce(&mut Cloud) -> R) -> R {
+    pub(super) fn with<R>(&self, read: impl FnOnce(&mut Cloud) -> R) -> R {
         read(&mut self.inner.lock().expect("cloud lock"))
     }
 
-    fn servers(&self) -> usize {
+    pub(super) fn servers(&self) -> usize {
         self.with(|cloud| {
             cloud
                 .resources
@@ -78,11 +78,11 @@ impl FakeCloud {
         })
     }
 
-    fn holds(&self, kind: ResourceKind, id: u64) -> bool {
+    pub(super) fn holds(&self, kind: ResourceKind, id: u64) -> bool {
         self.with(|cloud| cloud.resources.contains_key(&(kind, id)))
     }
 
-    fn plant(&self, kind: ResourceKind, labels: &[(&str, &str)]) -> u64 {
+    pub(super) fn plant(&self, kind: ResourceKind, labels: &[(&str, &str)]) -> u64 {
         self.with(|cloud| {
             cloud.next_id += 1;
             let id = cloud.next_id;
@@ -217,7 +217,12 @@ impl Provisioner for FakeCloud {
     }
 }
 
-fn offered(name: &str, cores: u32, memory_gb: u64, architecture: Architecture) -> ServerType {
+pub(super) fn offered(
+    name: &str,
+    cores: u32,
+    memory_gb: u64,
+    architecture: Architecture,
+) -> ServerType {
     ServerType {
         name: name.to_owned(),
         cores,
@@ -233,7 +238,7 @@ fn offered(name: &str, cores: u32, memory_gb: u64, architecture: Architecture) -
 }
 
 /// Four current types and one deprecated, all offered and available in three locations.
-fn catalog_fixture() -> Catalog {
+pub(super) fn catalog_fixture() -> Catalog {
     let mut old = offered("cx11", 1, 2, Architecture::X86);
     old.deprecated = true;
     let types = vec![
@@ -262,7 +267,7 @@ fn catalog_fixture() -> Catalog {
 
 /// Tunnels that only record what is open.
 #[derive(Default)]
-struct FakeTunnels {
+pub(super) struct FakeTunnels {
     open: Mutex<BTreeSet<String>>,
     opened: Mutex<Vec<TunnelSpec>>,
 }
@@ -286,15 +291,15 @@ impl Tunnels for FakeTunnels {
     }
 }
 
-struct Rig {
-    service: HubService,
-    driver: Arc<FakeDriver>,
-    cloud: Arc<FakeCloud>,
-    tunnels: Arc<FakeTunnels>,
-    directory: tempfile::TempDir,
+pub(super) struct Rig {
+    pub(super) service: HubService,
+    pub(super) driver: Arc<FakeDriver>,
+    pub(super) cloud: Arc<FakeCloud>,
+    pub(super) tunnels: Arc<FakeTunnels>,
+    pub(super) directory: tempfile::TempDir,
 }
 
-fn rig_with(cloud: FakeCloud) -> Rig {
+pub(super) fn rig_with(cloud: FakeCloud) -> Rig {
     let directory = tempfile::tempdir().expect("tempdir");
     let driver = Arc::new(FakeDriver {
         discover_any: Some(Vec::new()),
@@ -318,11 +323,11 @@ fn rig_with(cloud: FakeCloud) -> Rig {
     }
 }
 
-fn rig() -> Rig {
+pub(super) fn rig() -> Rig {
     rig_with(FakeCloud::default())
 }
 
-fn add_request(folder: &Path, max: u32) -> AddPool {
+pub(super) fn add_request(folder: &Path, max: u32) -> AddPool {
     let key = folder.join("id_ed25519");
     std::fs::write(&key, "private").expect("key");
     std::fs::write(
@@ -349,21 +354,21 @@ fn add_request(folder: &Path, max: u32) -> AddPool {
     }
 }
 
-fn tagged(id: &str) -> Job {
+pub(super) fn tagged(id: &str) -> Job {
     let mut queued = job(id, 1);
     queued.placement = spec(None, &[TAG], Strategy::FirstFree);
     queued
 }
 
 impl Rig {
-    async fn add_pool(&self, max: u32) {
+    pub(super) async fn add_pool(&self, max: u32) {
         self.service
             .add_pool(add_request(self.directory.path(), max))
             .await
             .expect("add pool");
     }
 
-    async fn enqueue(&self, id: &str) {
+    pub(super) async fn enqueue(&self, id: &str) {
         self.service
             .enqueue(tagged(id), Vec::new())
             .await
@@ -371,7 +376,7 @@ impl Rig {
     }
 
     /// One daemon pass with every lease's backoff elapsed.
-    async fn pass(&self) -> serde_json::Value {
+    pub(super) async fn pass(&self) -> serde_json::Value {
         self.set(|state| {
             for lease in &mut state.leases {
                 lease.next_attempt_ms = None;
@@ -381,15 +386,15 @@ impl Rig {
         self.service.pass().await.expect("pass").1
     }
 
-    async fn state(&self) -> HubState {
+    pub(super) async fn state(&self) -> HubState {
         self.service.snapshot().await
     }
 
-    async fn lease(&self) -> Lease {
+    pub(super) async fn lease(&self) -> Lease {
         self.state().await.leases.first().cloned().expect("a lease")
     }
 
-    async fn set(&self, change: impl FnOnce(&mut HubState)) {
+    pub(super) async fn set(&self, change: impl FnOnce(&mut HubState)) {
         self.service
             .mutate(|state| {
                 change(state);
@@ -400,7 +405,7 @@ impl Rig {
     }
 
     /// Enqueue `hj_one`, bring its server up and place the job there.
-    async fn running_job_on_server(&self) -> Lease {
+    pub(super) async fn running_job_on_server(&self) -> Lease {
         self.add_pool(1).await;
         self.enqueue("hj_one").await;
         for _ in 0..4 {
@@ -417,7 +422,7 @@ impl Rig {
     }
 
     /// As [`Self::running_job_on_server`], then let the run finish.
-    async fn finished_job_on_server(&self) -> Lease {
+    pub(super) async fn finished_job_on_server(&self) -> Lease {
         let lease = self.running_job_on_server().await;
         self.driver.finish_all();
         self.pass().await;
@@ -429,7 +434,7 @@ impl Rig {
     }
 }
 
-fn job_named<'a>(state: &'a HubState, id: &str) -> &'a Job {
+pub(super) fn job_named<'a>(state: &'a HubState, id: &str) -> &'a Job {
     state
         .jobs
         .iter()
@@ -437,7 +442,7 @@ fn job_named<'a>(state: &'a HubState, id: &str) -> &'a Job {
         .expect("job present")
 }
 
-fn first_error(view: &serde_json::Value) -> String {
+pub(super) fn first_error(view: &serde_json::Value) -> String {
     view["pools"]["errors"][0]
         .as_str()
         .unwrap_or_default()
