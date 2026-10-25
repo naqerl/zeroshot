@@ -31,9 +31,12 @@ curl -sS http://127.0.0.1:7383/mcp \
 ```
 
 Requests without a valid `Authorization: Bearer <api-token>` header fail with `401` and the
-`hub.unauthorized` diagnostic. An HTTP client connects with JSON-RPC request bodies. The optional
-`Mcp-Session-Id` request header keeps separate initialization state per client; requests without it
-share the `default` session. Notifications return `202 Accepted` without a JSON-RPC body.
+`hub.unauthorized` diagnostic. An HTTP client connects with JSON-RPC request bodies. An
+`initialize` request without an `Mcp-Session-Id` header mints a new session and returns its id in
+the `Mcp-Session-Id` response header. Later requests must send that id; a missing, unknown, or
+expired id fails with `-32600` and `data.code` `mcp.session_required`. Calling `initialize` again
+with an existing id resets that session so a client can recover after a dropped connection. Idle
+sessions are discarded after 30 minutes. Notifications return `202 Accepted` without a JSON-RPC body.
 `events/stream` returns `text/event-stream`; each SSE `data` line is one JSON-RPC notification or
 the final response. Earlier event polls and ordinary requests return JSON. The MCP worker stops
 with the hub daemon.

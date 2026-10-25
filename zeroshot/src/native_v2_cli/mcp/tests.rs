@@ -70,6 +70,7 @@ struct Session {
     client: reqwest::Client,
     url: String,
     frames: std::collections::VecDeque<Value>,
+    session: Option<String>,
 }
 
 impl Session {
@@ -101,6 +102,7 @@ impl Session {
             client: reqwest::Client::new(),
             url: format!("http://{address}/mcp"),
             frames: std::collections::VecDeque::new(),
+            session: None,
         }
     }
 
@@ -116,14 +118,29 @@ impl Session {
     }
 
     /// Posts one message. Server-sent events are queued for `read`.
-    async fn send(&mut self, message: &Value) {
-        let response = self
-            .client
-            .post(&self.url)
-            .json(message)
-            .send()
-            .await
-            .expect("post MCP message");
+    async fn send(&mut self, message: &Value) -> Option<String> {
+        self.post(message, self.session.clone()).await
+    }
+
+    /// Posts one message without a session header, ignoring any stored session.
+    async fn send_without_session(&mut self, message: &Value) -> Option<String> {
+        self.post(message, None).await
+    }
+
+    async fn post(&mut self, message: &Value, session: Option<String>) -> Option<String> {
+        let mut request = self.client.post(&self.url).json(message);
+        if let Some(session) = session {
+            request = request.header("mcp-session-id", session);
+        }
+        let response = request.send().await.expect("post MCP message");
+        let session = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        if let Some(id) = &session {
+            self.session = Some(id.clone());
+        }
         if response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -142,13 +159,14 @@ impl Session {
                 self.frames
                     .push_back(serde_json::from_str(data).expect("event stream data is JSON"));
             }
-            return;
+            return session;
         }
         if response.status() == reqwest::StatusCode::ACCEPTED {
-            return;
+            return session;
         }
         let value: Value = response.json().await.expect("MCP response JSON");
         self.frames.push_back(value);
+        session
     }
 
     async fn read(&mut self) -> Value {
@@ -178,6 +196,94 @@ async fn initialize(session: &mut Session) {
         response["result"]["capabilities"]["extensions"]
             .get("io.modelcontextprotocol/events")
             .is_some()
+    );
+}
+
+fn initialize_message(id: i64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0"}
+        }
+    })
+}
+
+fn assert_session_id(id: &str) {
+    assert_eq!(id.len(), 32, "session id is 32 characters");
+    assert!(
+        id.bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "session id is lowercase hex: {id}"
+    );
+}
+
+#[tokio::test]
+async fn initialize_mints_a_fresh_session_for_each_headerless_client() {
+    let mut session = Session::spawn(ScriptHost);
+    let first = session
+        .send_without_session(&initialize_message(1))
+        .await
+        .expect("first session id");
+    assert_session_id(&first);
+    assert_eq!(
+        session.read().await["result"]["serverInfo"]["name"],
+        json!("zeroshot")
+    );
+    let second = session
+        .send_without_session(&initialize_message(2))
+        .await
+        .expect("second session id");
+    assert_session_id(&second);
+    assert_eq!(
+        session.read().await["result"]["serverInfo"]["name"],
+        json!("zeroshot")
+    );
+    assert_ne!(first, second);
+}
+
+#[tokio::test]
+async fn requests_without_a_session_are_rejected() {
+    let mut session = Session::spawn(ScriptHost);
+    let header = session
+        .send_without_session(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .await;
+    assert!(header.is_none());
+    let response = session.read().await;
+    assert_eq!(response["id"], json!(1));
+    assert_eq!(response["error"]["code"], json!(-32600));
+    assert_eq!(
+        response["error"]["data"]["code"],
+        json!("mcp.session_required")
+    );
+}
+
+#[tokio::test]
+async fn initialize_with_an_existing_session_resets_it() {
+    let mut session = Session::spawn(ScriptHost);
+    initialize(&mut session).await;
+    let existing = session.session.clone().expect("initial session id");
+    let returned = session.send(&initialize_message(2)).await;
+    assert_eq!(returned.as_deref(), Some(existing.as_str()));
+    let response = session.read().await;
+    assert_eq!(response["id"], json!(2));
+    assert!(response.get("error").is_none());
+    assert_eq!(response["result"]["serverInfo"]["name"], json!("zeroshot"));
+    let listed = session.request(3, "tools/list", json!({})).await;
+    assert!(
+        listed["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .any(|tool| tool["name"] == "run")
     );
 }
 
@@ -482,13 +588,13 @@ async fn http_transport_handshakes_and_answers_notifications() {
         .await
         .expect("initialize over HTTP");
     assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get("mcp-session-id")
-            .and_then(|value| value.to_str().ok()),
-        Some("default")
-    );
+    let session = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("initialize returns a session id")
+        .to_owned();
+    assert!(!session.is_empty());
     let initialized: Value = response.json().await.expect("initialize response JSON");
     assert_eq!(
         initialized["result"]["serverInfo"]["name"],
@@ -497,6 +603,7 @@ async fn http_transport_handshakes_and_answers_notifications() {
 
     let response = client
         .post(&url)
+        .header("mcp-session-id", &session)
         .json(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
         .send()
         .await
@@ -512,6 +619,7 @@ async fn http_transport_handshakes_and_answers_notifications() {
 
     let response = client
         .post(&url)
+        .header("mcp-session-id", &session)
         .json(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
         .send()
         .await
@@ -553,9 +661,16 @@ async fn http_transport_streams_events_as_server_sent_events() {
         .await
         .expect("initialize over HTTP");
     assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let session = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("initialize returns a session id")
+        .to_owned();
 
     let response = client
         .post(&url)
+        .header("mcp-session-id", &session)
         .json(&json!({
             "jsonrpc": "2.0",
             "id": 7,

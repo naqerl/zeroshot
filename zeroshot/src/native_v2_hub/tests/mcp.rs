@@ -75,12 +75,13 @@ async fn daemon_router_requires_auth_and_serves_mcp() {
         .await
         .expect("authenticated MCP request");
     assert_eq!(authorized.status(), 200);
-    assert_eq!(
+    assert!(
         authorized
             .headers()
             .get("mcp-session-id")
-            .and_then(|value| value.to_str().ok()),
-        Some("default")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| !value.is_empty()),
+        "initialize returns a non-empty session id"
     );
     let body: Value = authorized.json().await.expect("initialize JSON");
     assert_eq!(body["result"]["serverInfo"]["name"], json!("zeroshot"));

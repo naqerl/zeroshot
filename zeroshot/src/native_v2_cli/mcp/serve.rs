@@ -54,6 +54,11 @@ impl SessionState {
         self.initialized = true;
     }
 
+    pub(super) fn reset_for_initialize(&mut self) {
+        self.shutdown();
+        self.initialized = false;
+    }
+
     pub(super) fn handle_notification(&mut self, message: &Value) {
         handle_notification(message, &mut self.cancellations);
     }
@@ -141,13 +146,6 @@ where
         };
     }
     if method == "initialize" {
-        if initialized {
-            return Action::Fail {
-                code: -32600,
-                message: "Invalid Request",
-                data: None,
-            };
-        }
         return match negotiate(&params) {
             Ok(version) => Action::Reply(initialize_result(version)),
             Err(failure) => invalid_params(failure),
