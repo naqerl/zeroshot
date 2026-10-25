@@ -12,7 +12,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::capacity::{self, Machine, PoolType, Shortage, SizeRequest};
+use super::capacity::{self, Machine, PoolType, Shortage};
+use super::profile::{self, Spec, TagProfile};
 use super::clock::rfc3339;
 use super::model::{HubState, Job, JobState, PlacementSpec, Requirements};
 
@@ -81,9 +82,13 @@ pub(crate) struct Pool {
     /// Account limit or rejected request: no server starts until `hub pool resume`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<String>,
-    /// Every candidate was out of capacity: the pool retries with backoff.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shortage: Option<Shortage>,
+    /// Machines every candidate was out of capacity for, by [`Spec::key`]: jobs needing them
+    /// retry with backoff.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shortages: BTreeMap<String, Shortage>,
+    /// Machines for jobs with a given tag (`hub pool tag set`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<TagProfile>,
     /// Capacity refusals by server type and location.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub unavailable: BTreeMap<String, BTreeMap<String, u64>>,
@@ -114,15 +119,16 @@ pub(crate) fn record_boot(state: &mut HubState, pool: &str, failed: bool, now: u
 
 impl Pool {
     /// Whether this pool can run a job: the job names at least one tag besides size requests,
-    /// every one of them is a pool tag, one of the pool's server types fits its size request,
-    /// it pins no target, and named targets can run it.
+    /// every one of them is a pool tag or a profiled tag, a server type fits its machine (see
+    /// [`profile::resolve_spec`]), it pins no target, and named targets can run it.
     pub(crate) fn serves(&self, spec: &PlacementSpec, requirements: &Requirements) -> bool {
+        let known = profile::member_tags(self);
         let mut tags = capacity::ordinary_tags(&spec.tags).peekable();
         tags.peek().is_some()
             && spec.target.is_none()
             && requirements.remote_unsupported.is_none()
-            && tags.all(|tag| self.tags.contains(tag))
-            && !capacity::candidates(self, &SizeRequest::from_tags(&spec.tags)).is_empty()
+            && tags.all(|tag| known.contains(tag))
+            && !capacity::candidates(self, &profile::resolve_spec(self, &spec.tags)).is_empty()
     }
 
     pub(crate) fn view(&self, leases: &[Lease], now: u64) -> Value {
@@ -151,8 +157,9 @@ impl Pool {
             "bootFailures": self.boot_failures,
             "pausedUntil": self.paused_until_ms.map(rfc3339),
             "blocked": self.blocked,
-            "shortage": self.shortage,
-            "waiting": capacity::hold_reason(self, now),
+            "shortages": self.shortages,
+            "waiting": capacity::hold_reason(self, None, now),
+            "profiles": self.profiles.iter().map(TagProfile::view).collect::<Vec<_>>(),
             "unavailable": self.unavailable,
             "leases": mine,
         })
@@ -229,9 +236,9 @@ pub(crate) struct Lease {
     pub next_attempt_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// The size the job that started this lease asked for.
-    #[serde(default, skip_serializing_if = "SizeRequest::is_empty")]
-    pub want: SizeRequest,
+    /// The machine the job that started this lease needs, and why.
+    #[serde(default)]
+    pub spec: Spec,
     /// The server type and location the provider accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<Machine>,
@@ -262,7 +269,7 @@ impl Lease {
             attempts: 0,
             next_attempt_ms: None,
             error: None,
-            want: SizeRequest::default(),
+            spec: Spec::default(),
             machine: None,
         }
     }
@@ -320,7 +327,7 @@ impl Lease {
             "reason": self.reason,
             "attempts": self.attempts,
             "error": self.error,
-            "want": self.want,
+            "spec": self.spec,
             "machine": self.machine.as_ref().map(Machine::view),
         })
     }
@@ -345,13 +352,14 @@ pub(crate) fn lease_id(job_id: &str) -> String {
     }
 }
 
-/// A server to start: its pool, the job it is for, and the size that job asks for.
-pub(crate) type Decision = (String, String, SizeRequest);
+/// A server to start: its pool, the job it is for, and the machine that job needs.
+pub(crate) type Decision = (String, String, Spec);
 
 /// Servers to start. Demand is the queued, due jobs the pool serves (each counted for its first
-/// serving pool only) that are still queued after placement, in slots, per requested size;
-/// supply is leases of that size still starting. Every lease the pool holds counts toward `max`,
-/// since every one of them is billed. A blocked, boot-paused or capacity-short pool starts none.
+/// serving pool only) that are still queued after placement, in slots, per machine spec;
+/// supply is leases of that spec still starting. Every lease the pool holds counts toward `max`,
+/// since every one of them is billed. A blocked or boot-paused pool starts none; a capacity
+/// shortage holds only the jobs of its spec.
 pub(crate) fn scale_up(state: &HubState, now: u64) -> Vec<Decision> {
     let mut decisions = Vec::new();
     for pool in &state.pools {
@@ -374,20 +382,20 @@ pub(crate) fn scale_up(state: &HubState, now: u64) -> Vec<Decision> {
                     .any(|lease| lease.id == lease_id(&job.job_id))
             })
             .collect::<Vec<&Job>>();
-        let mut sizes = BTreeMap::<SizeRequest, Vec<&Job>>::new();
+        let mut specs = BTreeMap::<Spec, Vec<&Job>>::new();
         for job in waiting {
-            sizes
-                .entry(SizeRequest::from_tags(&job.placement.tags))
-                .or_default()
-                .push(job);
+            let spec = profile::resolve_spec(pool, &job.placement.tags);
+            if !capacity::short(pool, &spec, now) {
+                specs.entry(spec).or_default().push(job);
+            }
         }
-        let slots = u64::from(pool.slots.max(1));
         let held = state.leases.iter().filter(|lease| lease.pool == pool.name);
         let mut room = u64::from(pool.max).saturating_sub(held.clone().count() as u64);
-        for (want, jobs) in sizes {
+        for (spec, jobs) in specs {
+            let slots = u64::from(profile::slots_for(pool, &spec));
             let starting = held
                 .clone()
-                .filter(|lease| lease.want == want)
+                .filter(|lease| lease.spec == spec)
                 .filter(|lease| {
                     matches!(
                         lease.phase,
@@ -404,7 +412,7 @@ pub(crate) fn scale_up(state: &HubState, now: u64) -> Vec<Decision> {
                 jobs.iter()
                     .step_by(usize::try_from(slots).unwrap_or(1))
                     .take(usize::try_from(needed).unwrap_or(0))
-                    .map(|job| (pool.name.clone(), job.job_id.clone(), want.clone())),
+                    .map(|job| (pool.name.clone(), job.job_id.clone(), spec.clone())),
             );
         }
     }

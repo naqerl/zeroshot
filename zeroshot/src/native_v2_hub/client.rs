@@ -22,8 +22,8 @@ use super::model::{Job, Schedule, ScheduleState};
 use super::pool::Provider;
 use super::service::FILE_FLAGS;
 use super::wire::{
-    AddMember, AddPool, CreateSchedule, EnqueueJob, JobFile, JobQuery, MemberQuery, StatsRequest,
-    StreamFrame, StreamRequest, SubmitJob, UpdateMember,
+    AddMember, AddPool, CreateSchedule, SetTagProfile, EnqueueJob, JobFile, JobQuery, MemberQuery,
+    StatsRequest, StreamFrame, StreamRequest, SubmitJob, UpdateMember,
 };
 use super::write_json;
 
@@ -601,6 +601,36 @@ async fn pool_document(client: &HubClient, command: HubPoolCommand) -> Result<Va
         HubPoolCommand::Resume { name } => {
             client
                 .post(&["v1", "hub", "pools", &name, "resume"], &json!({}))
+                .await
+        }
+        HubPoolCommand::TagSet(request) => {
+            let request = *request;
+            let body = SetTagProfile {
+                server_types: request.server_types,
+                locations: request.locations,
+                min_cores: request.min_cores,
+                min_memory_gb: request.min_memory_gb,
+                slots: request.slots,
+                priority: request.priority,
+            };
+            client
+                .call(
+                    Method::PUT,
+                    &["v1", "hub", "pools", &request.pool, "tags", &request.tag],
+                    Some(&body),
+                )
+                .await
+        }
+        HubPoolCommand::TagList { name } => {
+            client.get(&["v1", "hub", "pools", &name, "tags"]).await
+        }
+        HubPoolCommand::TagRemove { name, tag } => {
+            client
+                .call(
+                    Method::DELETE,
+                    &["v1", "hub", "pools", &name, "tags", &tag],
+                    None::<&Value>,
+                )
                 .await
         }
         HubPoolCommand::Remove { name } => {

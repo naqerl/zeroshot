@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::model::{LOCAL_MEMBER, Member, MemberState, PlacementSpec, Requirements, Strategy};
+use super::profile::SpecSource;
 
 /// Observed reachability and active runs of one member.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -53,8 +54,12 @@ pub(crate) fn matching_members<'a>(members: &'a [Member], spec: &PlacementSpec) 
 }
 
 /// Capability match of one member. The local controller runs in-process and is not gated on
-/// discovery markers; named targets must advertise every required discovery kind.
+/// discovery markers; named targets must advertise every required discovery kind. A pool
+/// member smaller than the job's tag profile asks for never fits; a bigger one does.
 pub(crate) fn fit(member: &Member, requirements: &Requirements) -> Fit {
+    if let Some(reason) = undersized(member, requirements) {
+        return Fit::Unsupported(reason);
+    }
     if member.name == LOCAL_MEMBER {
         return requirements
             .local_unsupported
@@ -81,6 +86,27 @@ pub(crate) fn fit(member: &Member, requirements: &Requirements) -> Fit {
     } else {
         Fit::Unsupported(format!("target does not advertise {}", missing.join(", ")))
     }
+}
+
+fn undersized(member: &Member, requirements: &Requirements) -> Option<String> {
+    let spec = requirements
+        .machine
+        .as_ref()
+        .filter(|spec| spec.source == SpecSource::Tag)?;
+    let machine = member.machine.as_ref()?;
+    (!spec
+        .want
+        .fits(&machine.server_type, machine.cores, machine.memory_mb))
+    .then(|| {
+        format!(
+            "{} ({} vCPU, {} GB) is smaller than tag {} needs ({})",
+            machine.server_type,
+            machine.cores,
+            machine.memory_mb / 1024,
+            spec.tag.as_deref().unwrap_or_default(),
+            spec.want.describe()
+        )
+    })
 }
 
 /// Members matching the selector that are known not to support the job. `None` when at least

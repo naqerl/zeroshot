@@ -142,6 +142,7 @@ pub(crate) fn requirements(spec: &HubJobSpec, source: &SourceFacts<'_>) -> Requi
         capabilities,
         local_unsupported,
         remote_unsupported,
+        machine: None,
     }
 }
 

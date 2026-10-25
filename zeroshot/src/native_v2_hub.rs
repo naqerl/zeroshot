@@ -38,6 +38,7 @@ mod model;
 mod paths;
 mod placement;
 mod pool;
+mod profile;
 mod provision;
 mod schedule;
 mod service;

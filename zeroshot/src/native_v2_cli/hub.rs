@@ -93,6 +93,32 @@ pub enum HubPoolCommand {
     Resume {
         name: String,
     },
+    /// Set the machines a pool creates for jobs with a tag.
+    TagSet(Box<HubPoolTag>),
+    /// List a pool's tag profiles.
+    TagList {
+        name: String,
+    },
+    /// Remove a tag profile; jobs with the tag fall back to the pool's types.
+    TagRemove {
+        name: String,
+        tag: String,
+    },
+}
+
+/// `hub pool tag set`: the machines a pool creates for jobs carrying `tag`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HubPoolTag {
+    pub pool: String,
+    pub tag: String,
+    /// Server types, best first; empty means the pool's types that meet the minimum.
+    pub server_types: Vec<String>,
+    /// Locations in order; empty means the pool's locations.
+    pub locations: Vec<String>,
+    pub min_cores: Option<u32>,
+    pub min_memory_gb: Option<u32>,
+    pub slots: Option<u32>,
+    pub priority: u32,
 }
 
 /// `hub pool add`. Durations stay text until the client parses them.

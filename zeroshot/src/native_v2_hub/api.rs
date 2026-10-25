@@ -14,7 +14,7 @@ use axum::extract::{MatchedPath, Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -27,7 +27,7 @@ use super::eval::{AddCase, AddSuite, CaseQuery, CreateRun, ReportRequest, RunQue
 use super::service::HubService;
 use super::wire::{
     AddMember, AddPool, CreateSchedule, EnqueueJob, JobQuery, MemberQuery, StatsRequest,
-    StreamFrame, StreamRequest, SubmitJob, UpdateMember,
+    SetTagProfile, StreamFrame, StreamRequest, SubmitJob, UpdateMember,
 };
 
 /// Response header carrying the CLI exit code of an error.
@@ -58,6 +58,11 @@ pub(crate) fn router(state: Arc<ApiState>) -> Router {
         .route("/v1/hub/pools/types", get(pool_types))
         .route("/v1/hub/pools/{name}", delete(remove_pool))
         .route("/v1/hub/pools/{name}/resume", post(resume_pool))
+        .route("/v1/hub/pools/{name}/tags", get(list_tag_profiles))
+        .route(
+            "/v1/hub/pools/{name}/tags/{tag}",
+            put(set_tag_profile).delete(remove_tag_profile),
+        )
         .route("/v1/hub/jobs", post(submit))
         .route("/v1/hub/jobs/query", post(ps))
         .route("/v1/hub/jobs/{id}", get(status).delete(dequeue))
@@ -260,6 +265,33 @@ async fn remove_pool(State(state): State<Arc<ApiState>>, Path(name): Path<String
 
 async fn pool_types(State(state): State<Arc<ApiState>>) -> Response {
     reply(state.service.pool_types().await)
+}
+
+async fn list_tag_profiles(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+) -> Response {
+    reply(state.service.list_tag_profiles(&name).await)
+}
+
+async fn set_tag_profile(
+    State(state): State<Arc<ApiState>>,
+    Path((name, tag)): Path<(String, String)>,
+    bytes: Bytes,
+) -> Response {
+    let result = async {
+        let request = body::<SetTagProfile>(&bytes)?;
+        state.service.set_tag_profile((&name, &tag), request).await
+    }
+    .await;
+    reply(result)
+}
+
+async fn remove_tag_profile(
+    State(state): State<Arc<ApiState>>,
+    Path((name, tag)): Path<(String, String)>,
+) -> Response {
+    reply(state.service.remove_tag_profile(&name, &tag).await)
 }
 
 async fn resume_pool(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Response {

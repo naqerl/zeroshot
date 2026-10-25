@@ -9,6 +9,7 @@ use super::capacity::Machine;
 use super::clock::rfc3339;
 use super::eval::EvalState;
 use super::pool::{Lease, Pool};
+use super::profile::Spec;
 use super::usage::JobUsage;
 
 /// Reserved member name for the local controller.
@@ -93,6 +94,9 @@ pub(crate) struct Member {
     /// Server type, location and size of a pool member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<Machine>,
+    /// The machine spec a pool member was created for: its tag profile and size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<Spec>,
 }
 
 impl Member {
@@ -113,6 +117,7 @@ impl Member {
             idle_since_ms: None,
             expires_at_ms: None,
             machine: None,
+            spec: None,
         }
     }
 
@@ -132,6 +137,7 @@ impl Member {
             "idleSince": self.idle_since_ms.map(rfc3339),
             "expiresAt": self.expires_at_ms.map(rfc3339),
             "machine": self.machine.as_ref().map(Machine::view),
+            "spec": self.spec,
         })
     }
 
@@ -199,6 +205,10 @@ pub(crate) struct Requirements {
     /// Why named targets cannot run this job, if they cannot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_unsupported: Option<String>,
+    /// The machine a pool resolved for the job (see [`super::profile::resolve_spec`]); a
+    /// tag profile's minimum keeps the job off undersized pool members.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<Spec>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -446,6 +456,7 @@ impl Job {
             "archive": self.archive,
             "graphHash": self.graph_hash,
             "waiting": self.pool_wait,
+            "spec": self.requirements.machine,
         })
     }
 }

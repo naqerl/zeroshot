@@ -1,10 +1,12 @@
 //! Which server a pool job needs, where to try creating it, and what a pool is waiting for.
 //!
-//! A pool holds an ordered list of server types and locations. A job may ask for a size with
-//! the tags `server-type=NAME`, `min-cpu=N` and `min-ram-gb=N` (or the matching `hub submit`
-//! flags); the pool tries the first type that fits, in each of its locations in order, then the
-//! next type. Capacity refusals move on to the next candidate; when none is left the pool waits
-//! with backoff, apart from the pause after failed boots, since a shortage is not a broken image.
+//! A pool holds an ordered list of server types and locations, and tag profiles may hold their
+//! own (see [`super::profile`]). A job may ask for a size with the tags `server-type=NAME`,
+//! `min-vcpu=N` and `min-ram-gb=N` (the `hub submit` flags `--server-type`, `--min-vcpu` and
+//! `--min-ram`); the pool tries the first type that fits, in each of its locations in order,
+//! then the next type. Capacity refusals move on to the next candidate; when none is left, jobs
+//! asking for the same machines wait with backoff, apart from the pause after failed boots,
+//! since a shortage is not a broken image.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,10 +17,11 @@ use super::clock::rfc3339;
 use super::error::HubError;
 use super::model::{HubState, JobError, JobErrorKind, JobState};
 use super::pool::{Lease, Pool, serving};
+use super::profile::{self, Spec};
 use super::provision::{Architecture, Catalog};
 
 const TAG_SERVER_TYPE: &str = "server-type=";
-const TAG_MIN_CPU: &str = "min-cpu=";
+const TAG_MIN_CPU: &str = "min-vcpu=";
 const TAG_MIN_RAM_GB: &str = "min-ram-gb=";
 
 /// First wait after every candidate was out of capacity; it doubles up to [`MAX_SHORTAGE_MS`].
@@ -67,6 +70,21 @@ impl SizeRequest {
 
     pub(crate) fn is_empty(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// The request as size tags, such as `min-vcpu=8,min-ram-gb=16`.
+    pub(crate) fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(name) = &self.server_type {
+            parts.push(format!("{TAG_SERVER_TYPE}{name}"));
+        }
+        if let Some(cores) = self.min_cores {
+            parts.push(format!("{TAG_MIN_CPU}{cores}"));
+        }
+        if let Some(memory) = self.min_memory_gb {
+            parts.push(format!("{TAG_MIN_RAM_GB}{memory}"));
+        }
+        parts.join(",")
     }
 
     /// Whether a server of this type, size and memory is enough.
@@ -141,14 +159,11 @@ impl Machine {
     }
 }
 
-/// Where to try a job's server, best first: each fitting type in the pool's order, in each of
-/// its locations in the pool's order.
-pub(crate) fn candidates<'a>(pool: &'a Pool, want: &SizeRequest) -> Vec<(&'a PoolType, &'a str)> {
-    pool.server_types
-        .iter()
-        .filter(|server_type| {
-            want.fits(&server_type.name, server_type.cores, server_type.memory_mb)
-        })
+/// Where to try a job's server, best first: each type of its spec in order (see
+/// [`profile::types_for`]), in each of that type's locations in order.
+pub(crate) fn candidates<'a>(pool: &'a Pool, spec: &Spec) -> Vec<(&'a PoolType, &'a str)> {
+    profile::types_for(pool, spec)
+        .into_iter()
         .flat_map(|server_type| {
             server_type
                 .locations
@@ -170,23 +185,32 @@ pub(crate) struct Shortage {
     pub retry_at_ms: u64,
 }
 
-/// Record that no candidate had capacity: the pool retries after a doubling wait.
-pub(crate) fn record_shortage(pool: &mut Pool, tried: &[(String, String)], now: u64) {
-    let reason = shortage_reason(tried);
-    let rounds = pool.shortage.as_ref().map_or(0, |shortage| shortage.rounds) + 1;
+/// Record that no candidate of a spec had capacity: jobs of that spec retry after a doubling
+/// wait, while jobs needing other machines go on.
+pub(crate) fn record_shortage(pool: &mut Pool, spec: &Spec, tried: &[(String, String)], now: u64) {
+    let reason = shortage_reason(spec, tried);
+    let earlier = pool.shortages.get(&spec.key());
+    let rounds = earlier.map_or(0, |shortage| shortage.rounds) + 1;
     let wait = FIRST_SHORTAGE_MS
         .saturating_mul(1 << (rounds - 1).min(8))
         .min(MAX_SHORTAGE_MS);
-    let since_ms = pool
-        .shortage
-        .as_ref()
-        .map_or(now, |shortage| shortage.since_ms);
-    pool.shortage = Some(Shortage {
-        reason,
-        since_ms,
-        rounds,
-        retry_at_ms: now.saturating_add(wait),
-    });
+    let since_ms = earlier.map_or(now, |shortage| shortage.since_ms);
+    pool.shortages.insert(
+        spec.key(),
+        Shortage {
+            reason,
+            since_ms,
+            rounds,
+            retry_at_ms: now.saturating_add(wait),
+        },
+    );
+}
+
+/// Whether jobs of this spec wait out a shortage now.
+pub(crate) fn short(pool: &Pool, spec: &Spec, now: u64) -> bool {
+    pool.shortages
+        .get(&spec.key())
+        .is_some_and(|shortage| now < shortage.retry_at_ms)
 }
 
 /// Count capacity refusals per type and location, for metrics.
@@ -202,7 +226,7 @@ pub(crate) fn count_unavailable(pool: &mut Pool, tried: &[(String, String)]) {
     }
 }
 
-fn shortage_reason(tried: &[(String, String)]) -> String {
+fn shortage_reason(spec: &Spec, tried: &[(String, String)]) -> String {
     let mut types = Vec::new();
     let mut locations = Vec::new();
     for (server_type, location) in tried {
@@ -213,28 +237,43 @@ fn shortage_reason(tried: &[(String, String)]) -> String {
             locations.push(location.clone());
         }
     }
-    format!(
-        "waiting: no capacity for {} in {}",
-        types.join("/"),
-        locations.join("/")
-    )
+    match spec.asker() {
+        Some(asker) => format!(
+            "waiting: {asker} needs {}, no capacity in {}",
+            types.join("/"),
+            locations.join("/")
+        ),
+        None => format!(
+            "waiting: no capacity for {} in {}",
+            types.join("/"),
+            locations.join("/")
+        ),
+    }
 }
 
-/// Why the pool creates no server now: stopped by an account or request error, waiting out a
-/// capacity shortage, or paused after failed boots.
-pub(crate) fn hold_reason(pool: &Pool, now: u64) -> Option<String> {
+/// Why the pool creates no server now for jobs of `spec` (any spec when `None`): stopped by an
+/// account or request error, waiting out a capacity shortage, or paused after failed boots.
+pub(crate) fn hold_reason(pool: &Pool, spec: Option<&Spec>, now: u64) -> Option<String> {
     if let Some(blocked) = &pool.blocked {
         return Some(format!(
             "blocked: {blocked}; fix it, then run `zeroshot hub pool resume {}`",
             pool.name
         ));
     }
-    if let Some(shortage) = &pool.shortage {
-        return Some(format!(
-            "{}; next try at {}",
-            shortage.reason,
-            rfc3339(shortage.retry_at_ms.max(now))
-        ));
+    let shortages = pool
+        .shortages
+        .iter()
+        .filter(|(key, _)| spec.is_none_or(|spec| spec.key() == **key))
+        .map(|(_, shortage)| {
+            format!(
+                "{}; next try at {}",
+                shortage.reason,
+                rfc3339(shortage.retry_at_ms.max(now))
+            )
+        })
+        .collect::<Vec<_>>();
+    if !shortages.is_empty() {
+        return Some(shortages.join("; "));
     }
     pool.paused_until_ms
         .filter(|until| now < *until)
@@ -247,18 +286,13 @@ pub(crate) fn hold_reason(pool: &Pool, now: u64) -> Option<String> {
         })
 }
 
-/// Whether the pool may start servers now.
+/// Whether the pool may start servers now; a shortage holds only the jobs of its spec.
 pub(crate) fn may_start(pool: &Pool, now: u64) -> bool {
-    pool.blocked.is_none()
-        && pool.paused_until_ms.is_none_or(|until| now >= until)
-        && pool
-            .shortage
-            .as_ref()
-            .is_none_or(|shortage| now >= shortage.retry_at_ms)
+    pool.blocked.is_none() && pool.paused_until_ms.is_none_or(|until| now >= until)
 }
 
-/// Show each queued pool job why it waits, and expire those past their pool's `--wait-max`.
-/// Returns the expired job IDs.
+/// Resolve the machine of each queued pool job, show it why it waits, and expire those past
+/// their pool's `--wait-max`. Returns the expired job IDs.
 pub(crate) fn note_waiting(state: &mut HubState, now: u64) -> Vec<String> {
     let mut expired = Vec::new();
     let pools = state.pools.clone();
@@ -270,9 +304,12 @@ pub(crate) fn note_waiting(state: &mut HubState, now: u64) -> Vec<String> {
         }
         let Some(pool) = serving(&pools, &job.placement, &job.requirements) else {
             job.pool_wait = None;
+            job.requirements.machine = None;
             continue;
         };
-        let reason = hold_reason(pool, now).or_else(|| at_max(pool, &leases));
+        let spec = profile::resolve_spec(pool, &job.placement.tags);
+        let reason = hold_reason(pool, Some(&spec), now).or_else(|| at_max(pool, &leases));
+        job.requirements.machine = Some(spec);
         let queued_since = job.not_before_ms.unwrap_or(0).max(job.submitted_at_ms);
         if let Some(limit) = pool.wait_max_ms
             && now >= queued_since.saturating_add(limit)

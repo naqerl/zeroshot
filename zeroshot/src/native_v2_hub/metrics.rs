@@ -14,6 +14,8 @@ use std::sync::Mutex;
 use super::eval::SampleState;
 use super::model::{HubState, Job, JobState, MemberState, ScheduleState};
 use super::placement::{Load, Rejection};
+use super::pool;
+use super::profile::{self, Spec, SpecSource};
 use super::usage::{TOKEN_KINDS, Tokens};
 
 /// Distinct values kept per bounded label before the rest collapse into `_other`.
@@ -487,7 +489,7 @@ fn render_capacity(out: &mut Exposition, state: &HubState, now_ms: u64) {
         let paused = pool.paused_until_ms.is_some_and(|until| now_ms < until);
         for (reason, holding) in [
             ("blocked", pool.blocked.is_some()),
-            ("capacity", pool.shortage.is_some()),
+            ("capacity", !pool.shortages.is_empty()),
             ("boot_failures", paused),
         ] {
             out.sample(
@@ -504,17 +506,64 @@ fn render_capacity(out: &mut Exposition, state: &HubState, now_ms: u64) {
     );
     for member in &state.members {
         if let Some(machine) = &member.machine {
+            let (source, profile) = spec_labels(member.spec.as_ref());
             out.sample(
                 "zeroshot_hub_member_machine_info",
                 &[
                     ("member", &member.name),
                     ("server_type", &machine.server_type),
                     ("location", &machine.location),
+                    ("source", source),
+                    ("profile", &profile),
                 ],
                 1.0,
             );
         }
     }
+    render_queued(out, state);
+}
+
+/// Queued jobs a pool serves, by the source of their machine spec and the tag profile chosen.
+#[allow(clippy::cast_precision_loss)]
+fn render_queued(out: &mut Exposition, state: &HubState) {
+    out.family(
+        "zeroshot_hub_pool_queued_jobs",
+        "gauge",
+        "Queued jobs a pool serves, by machine source (pool, tag or job) and tag profile.",
+    );
+    let mut counts = BTreeMap::<(String, &'static str, String), u64>::new();
+    for job in state
+        .jobs
+        .iter()
+        .filter(|job| job.state == JobState::Queued)
+    {
+        if let Some(pool) = pool::serving(&state.pools, &job.placement, &job.requirements) {
+            let spec = profile::resolve_spec(pool, &job.placement.tags);
+            let (source, profile) = spec_labels(Some(&spec));
+            *counts
+                .entry((pool.name.clone(), source, profile))
+                .or_default() += 1;
+        }
+    }
+    for ((pool, source, profile), count) in &counts {
+        out.sample(
+            "zeroshot_hub_pool_queued_jobs",
+            &[("pool", pool), ("source", source), ("profile", profile)],
+            *count as f64,
+        );
+    }
+}
+
+fn spec_labels(spec: Option<&Spec>) -> (&'static str, String) {
+    let Some(spec) = spec else {
+        return ("pool", String::new());
+    };
+    let source = match spec.source {
+        SpecSource::Job => "job",
+        SpecSource::Tag => "tag",
+        SpecSource::Pool => "pool",
+    };
+    (source, spec.tag.clone().unwrap_or_default())
 }
 
 const JOB_STATES: [&str; 7] = [

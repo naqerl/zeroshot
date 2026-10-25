@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 use super::archive;
 use super::capacity::{self, Machine, PoolType};
+use super::profile::{self, Spec};
 use super::clock::now_ms;
 use super::error::HubError;
 use super::model::{HubState, Member, MemberState};
@@ -254,14 +255,14 @@ impl HubService {
             pool::update_idle(state, now);
             let expired = capacity::note_waiting(state, now);
             let mut started = Vec::new();
-            for ((pool_name, job_id, want), port) in
+            for ((pool_name, job_id, spec), port) in
                 pool::scale_up(state, now).into_iter().zip(ports)
             {
                 let Some(pool) = state.pools.iter().find(|pool| pool.name == pool_name) else {
                     continue;
                 };
                 let lease = Lease {
-                    want,
+                    spec,
                     ..Lease::new(pool, &job_id, port, now)
                 };
                 started.push(lease.name.clone());
@@ -304,7 +305,9 @@ impl HubService {
                     Creation::Created(false) => {}
                     Creation::Created(true) => self.sweep(runtime, &lease, report).await,
                     Creation::Short(tried) => {
-                        let reason = self.hold(&lease.pool, Hold::Short(&tried)).await?;
+                        let reason = self
+                            .hold(&lease.pool, Hold::Short(&lease.spec, &tried))
+                            .await?;
                         report.shortages.push((lease.name.clone(), reason));
                         return Ok(Step::Abandoned(Box::new(lease)));
                     }
@@ -375,7 +378,7 @@ impl HubService {
         let public_key = read_public_key(pool)?;
         let mut tried = Vec::new();
         let mut refused = false;
-        for (server_type, location) in capacity::candidates(pool, &lease.want) {
+        for (server_type, location) in capacity::candidates(pool, &lease.spec) {
             if !available(&catalog, &server_type.name, location) {
                 tried.push((server_type.name.clone(), location.to_owned()));
                 continue;
@@ -399,7 +402,8 @@ impl HubService {
                     lease.action_id = created.action_id;
                     lease.machine = Some(machine(server_type, location));
                     lease.advance(LeasePhase::Booting);
-                    self.hold(&pool.name, Hold::Clear(&tried)).await?;
+                    self.hold(&pool.name, Hold::Clear(&lease.spec, &tried))
+                        .await?;
                     return Ok(Creation::Created(refused));
                 }
                 Err(failure) => {
@@ -434,22 +438,23 @@ impl HubService {
                 return Ok(String::new());
             };
             match hold {
-                Hold::Clear(tried) => {
+                Hold::Clear(spec, tried) => {
                     capacity::count_unavailable(pool, tried);
-                    pool.shortage = None;
+                    pool.shortages.remove(&spec.key());
                 }
                 Hold::Count(tried) => capacity::count_unavailable(pool, tried),
-                Hold::Short(tried) => {
+                Hold::Short(spec, tried) => {
                     capacity::count_unavailable(pool, tried);
-                    capacity::record_shortage(pool, tried, now);
+                    capacity::record_shortage(pool, spec, tried, now);
+                    return Ok(pool
+                        .shortages
+                        .get(&spec.key())
+                        .map(|shortage| shortage.reason.clone())
+                        .unwrap_or_default());
                 }
                 Hold::Blocked(error) => pool.blocked = Some(error.to_owned()),
             }
-            Ok(pool
-                .shortage
-                .as_ref()
-                .map(|shortage| shortage.reason.clone())
-                .unwrap_or_default())
+            Ok(String::new())
         })
         .await
     }
@@ -521,9 +526,10 @@ impl HubService {
         let capabilities = self.driver().capabilities(&lease.name).await?;
         let now = now_ms();
         let member = Member {
-            tags: pool.tags.clone(),
+            tags: profile::member_tags(pool),
             machine: lease.machine.clone(),
-            slots: pool.slots.max(1),
+            spec: Some(lease.spec.clone()),
+            slots: profile::slots_for(pool, &lease.spec),
             pool: Some(pool.name.clone()),
             server_id: lease.server_id,
             expires_at_ms: Some(lease.expires_at_ms),
@@ -720,12 +726,12 @@ async fn delete(runtime: &PoolRuntime, lease: &mut Lease) -> Result<bool, HubErr
 
 /// What a create attempt learned about a pool.
 enum Hold<'a> {
-    /// A server was created after these candidates were out of capacity.
-    Clear(&'a [(String, String)]),
+    /// A server of this spec was created after these candidates were out of capacity.
+    Clear(&'a Spec, &'a [(String, String)]),
     /// These candidates were out of capacity before a retryable error.
     Count(&'a [(String, String)]),
-    /// Every candidate was out of capacity.
-    Short(&'a [(String, String)]),
+    /// Every candidate of this spec was out of capacity.
+    Short(&'a Spec, &'a [(String, String)]),
     /// The provider refused for a reason only the operator can fix.
     Blocked(&'a str),
 }
@@ -757,6 +763,11 @@ fn adopted_machine(pool: &Pool, server: &Resource) -> Option<Machine> {
     let location = server.labels.get(LABEL_LOCATION)?;
     pool.server_types
         .iter()
+        .chain(
+            pool.profiles
+                .iter()
+                .flat_map(|profile| &profile.server_types),
+        )
         .find(|known| known.name == *server_type)
         .map(|known| machine(known, location))
 }
@@ -816,7 +827,8 @@ impl HubService {
             boot_failures: 0,
             paused_until_ms: None,
             blocked: None,
-            shortage: None,
+            shortages: std::collections::BTreeMap::new(),
+            profiles: Vec::new(),
             unavailable: std::collections::BTreeMap::new(),
         };
         read_public_key(&pool)?;
@@ -860,7 +872,7 @@ impl HubService {
         Ok(capacity::types_document(&self.catalog().await?))
     }
 
-    async fn catalog(&self) -> Result<Catalog, HubError> {
+    pub(super) async fn catalog(&self) -> Result<Catalog, HubError> {
         let runtime = self.pool_runtime().ok_or_else(|| {
             HubError::Usage("hub pools need a provider token; set HCLOUD_TOKEN".to_owned())
         })?;
@@ -877,7 +889,7 @@ impl HubService {
                 .find(|pool| pool.name == name)
                 .ok_or_else(|| HubError::Usage(format!("pool {name} does not exist")))?;
             pool.blocked = None;
-            pool.shortage = None;
+            pool.shortages.clear();
             pool.boot_failures = 0;
             pool.paused_until_ms = None;
             let pool = pool.clone();

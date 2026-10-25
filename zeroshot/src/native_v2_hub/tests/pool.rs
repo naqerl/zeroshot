@@ -1146,7 +1146,8 @@ fn pool_fixture() -> Pool {
         boot_failures: 0,
         paused_until_ms: None,
         blocked: None,
-        shortage: None,
+        shortages: std::collections::BTreeMap::new(),
+        profiles: Vec::new(),
         unavailable: BTreeMap::new(),
     }
 }

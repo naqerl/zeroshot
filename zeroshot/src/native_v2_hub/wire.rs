@@ -44,6 +44,26 @@ pub(crate) struct AddPool {
     pub ssh_from: Vec<String>,
 }
 
+/// `PUT /v1/hub/pools/{name}/tags/{tag}`: the machines a pool creates for jobs with a tag.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct SetTagProfile {
+    /// Server types, best first; empty means the pool's types that meet the minimum.
+    #[serde(default)]
+    pub server_types: Vec<String>,
+    /// Locations in order; empty means the pool's.
+    #[serde(default)]
+    pub locations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_cores: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_memory_gb: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slots: Option<u32>,
+    #[serde(default)]
+    pub priority: u32,
+}
+
 /// `PATCH /v1/hub/members/{name}`.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]

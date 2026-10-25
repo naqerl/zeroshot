@@ -25,6 +25,7 @@ use super::model::{
 use super::placement::{Fit, Placement, Rejection, describe, fit, matching_members, place, rejections};
 use super::lease::{PoolReport, PoolRuntime};
 use super::pool;
+use super::profile;
 use super::schedule::{self, Dispatched, TickReport};
 use super::stats;
 use super::store::HubStore;
@@ -412,6 +413,8 @@ impl HubService {
                 Ok(state.clone())
             })
             .await?;
+        job.requirements.machine =
+            profile::machine_for(&state.pools, &job.placement, &job.requirements);
         if let Some(rejected) = unplaceable(&state, &job.placement, &job.requirements) {
             self.metrics.record_rejection(Some(&rejected));
             return Err(HubError::no_eligible(describe(&job.placement), rejected));
@@ -522,6 +525,8 @@ impl HubService {
             if let Some(existing) = idempotent(state, &job) {
                 return Ok(job_document(&existing, now));
             }
+            job.requirements.machine =
+                profile::machine_for(&state.pools, &job.placement, &job.requirements);
             if let Some(rejected) = unplaceable(state, &job.placement, &job.requirements) {
                 self.metrics.record_rejection(Some(&rejected));
                 return Err(HubError::no_eligible(describe(&job.placement), rejected));

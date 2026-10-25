@@ -8,7 +8,7 @@ use crate::native_v2_cli::NativeV2CliError;
 use crate::native_v2_cli::hub::{
     HubApiOptions, HubCommand, HubContextCommand, HubDaemonRun, HubEnqueue, HubInstall, HubJobSpec,
     HubLogs, HubManager, HubMemberAdd, HubMemberState, HubMemberUpdate, HubPs, HubStats,
-    HubPoolAdd, HubPoolCommand, HubStrategy, HubSubmit, HubTokenSource, HubUninstall,
+    HubPoolAdd, HubPoolCommand, HubPoolTag, HubStrategy, HubSubmit, HubTokenSource, HubUninstall,
 };
 
 #[derive(Debug, Subcommand)]
@@ -183,6 +183,96 @@ pub(super) enum HubPoolCliCommand {
     /// Let a pool start servers again after it stopped on an account limit or a rejected
     /// request, and retry a capacity shortage or a failed-boot pause now.
     Resume(HubPoolNameArgs),
+
+    /// Prefer machines per job tag: set, list or remove a pool's tag profiles.
+    ///
+    /// A job's machine comes from, in order: its own --server-type/--min-vcpu/--min-ram, the
+    /// profile of one of its tags, then the pool's --type list. Among several profiled tags the
+    /// highest --priority wins, then the larger minimum vCPU, then memory; profiles that would
+    /// tie are rejected. A job runs on any live pool server at least as large as its profile
+    /// asks before a new one is created.
+    #[command(subcommand)]
+    Tag(HubPoolTagCliCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum HubPoolTagCliCommand {
+    /// Set (or replace) the machines the pool creates for jobs with TAG.
+    Set(Box<HubPoolTagArgs>),
+
+    /// List the pool's tag profiles as JSON.
+    #[command(visible_alias = "ls")]
+    List(HubPoolNameArgs),
+
+    /// Remove a tag profile; jobs with the tag fall back to the pool's types.
+    #[command(visible_alias = "rm")]
+    Remove(HubPoolTagNameArgs),
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubPoolTagNameArgs {
+    /// Pool name.
+    #[arg(value_name = "POOL")]
+    pool: String,
+
+    /// Job tag.
+    #[arg(value_name = "TAG")]
+    tag: String,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubPoolTagArgs {
+    /// Pool name.
+    #[arg(value_name = "POOL")]
+    pool: String,
+
+    /// Job tag the profile applies to; pool servers join with it.
+    #[arg(value_name = "TAG")]
+    tag: String,
+
+    /// Server types to create for the tag, best first, comma-separated; each a current type
+    /// from `hub pool types`. Default: the pool's types that meet --min-vcpu/--min-ram.
+    #[arg(long = "type", value_name = "TYPE,...",
+          action = clap::ArgAction::Append, value_delimiter = ',')]
+    server_types: Vec<String>,
+
+    /// Locations to try, in order, for each type, comma-separated. Default: the pool's.
+    #[arg(long = "location", value_name = "LOCATION,...",
+          action = clap::ArgAction::Append, value_delimiter = ',')]
+    locations: Vec<String>,
+
+    /// Least vCPUs a server for the tag needs; existing servers this large are reused.
+    /// Default: the smallest of the profile's types.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    min_vcpu: Option<u32>,
+
+    /// Least memory a server for the tag needs, in GB, such as 16 or 16G. Default: the
+    /// smallest of the profile's types.
+    #[arg(long, value_name = "SIZE", value_parser = memory_gb)]
+    min_ram: Option<u32>,
+
+    /// Concurrent runs per server created for the tag. Default: the pool's --slots.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=1024))]
+    slots: Option<u32>,
+
+    /// Wins over lower priorities when a job carries several profiled tags.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    priority: u32,
+}
+
+/// A memory size in GB: `16`, `16G` or `16GB`, any case.
+fn memory_gb(value: &str) -> Result<u32, String> {
+    let upper = value.trim().to_ascii_uppercase();
+    let digits = upper
+        .strip_suffix("GB")
+        .or_else(|| upper.strip_suffix('G'))
+        .unwrap_or(&upper);
+    match digits.parse::<u32>() {
+        Ok(gb) if gb > 0 => Ok(gb),
+        _ => Err(format!(
+            "{value:?} is not a memory size in GB, such as 16 or 16G"
+        )),
+    }
 }
 
 #[derive(Debug, Args)]
@@ -203,8 +293,9 @@ pub(super) struct HubPoolAddArgs {
     provider: String,
 
     /// Server types to create, best first, comma-separated. A job gets the first type that
-    /// fits its size request (`hub submit --server-type/--min-cpu/--min-ram-gb`). Each must be
-    /// a current type from `hub pool types`; ARM types need --multi-arch.
+    /// fits its size request (`hub submit --server-type/--min-vcpu/--min-ram`) or its tag
+    /// profile (`hub pool tag set`). Each must be a current type from `hub pool types`; ARM
+    /// types need --multi-arch.
     #[arg(long = "type", value_name = "TYPE,...", required = true,
           action = clap::ArgAction::Append, value_delimiter = ',')]
     server_types: Vec<String>,
@@ -295,6 +386,26 @@ impl HubPoolCliCommand {
             Self::Types => HubPoolCommand::Types,
             Self::Resume(args) => HubPoolCommand::Resume {
                 name: member_name(args.name)?,
+            },
+            Self::Tag(HubPoolTagCliCommand::Set(args)) => {
+                let args = *args;
+                HubPoolCommand::TagSet(Box::new(HubPoolTag {
+                    pool: member_name(args.pool)?,
+                    tag: profile_tag(args.tag)?,
+                    server_types: args.server_types,
+                    locations: args.locations,
+                    min_cores: args.min_vcpu,
+                    min_memory_gb: args.min_ram,
+                    slots: args.slots,
+                    priority: args.priority,
+                }))
+            }
+            Self::Tag(HubPoolTagCliCommand::List(args)) => HubPoolCommand::TagList {
+                name: member_name(args.name)?,
+            },
+            Self::Tag(HubPoolTagCliCommand::Remove(args)) => HubPoolCommand::TagRemove {
+                name: member_name(args.pool)?,
+                tag: profile_tag(args.tag)?,
             },
         })
     }
@@ -571,17 +682,20 @@ pub(super) struct HubPlacementArgs {
     #[arg(long, value_name = "TAG", action = clap::ArgAction::Append)]
     tag: Vec<String>,
 
-    /// Pool jobs: run on this server type (one the pool lists). Same as --tag server-type=TYPE.
+    /// Pool jobs: run on this server type (one the pool or a tag profile lists); overrides tag
+    /// profiles. Same as --tag server-type=TYPE.
     #[arg(long, value_name = "TYPE")]
     server_type: Option<String>,
 
-    /// Pool jobs: run on a server with at least N vCPUs. Same as --tag min-cpu=N.
+    /// Pool jobs: run on a server with at least N vCPUs; overrides tag profiles. Same as
+    /// --tag min-vcpu=N.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
-    min_cpu: Option<u32>,
+    min_vcpu: Option<u32>,
 
-    /// Pool jobs: run on a server with at least N GB of RAM. Same as --tag min-ram-gb=N.
-    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
-    min_ram_gb: Option<u32>,
+    /// Pool jobs: run on a server with at least this much memory in GB, such as 16 or 16G;
+    /// overrides tag profiles. Same as --tag min-ram-gb=N.
+    #[arg(long, value_name = "SIZE", value_parser = memory_gb)]
+    min_ram: Option<u32>,
 
     /// Choice among free matching members.
     #[arg(
@@ -978,10 +1092,10 @@ fn placement_tags(placement: &HubPlacementArgs) -> Vec<String> {
             .iter()
             .map(|name| format!("server-type={name}")),
     );
-    tags.extend(placement.min_cpu.map(|cores| format!("min-cpu={cores}")));
+    tags.extend(placement.min_vcpu.map(|cores| format!("min-vcpu={cores}")));
     tags.extend(
         placement
-            .min_ram_gb
+            .min_ram
             .map(|memory| format!("min-ram-gb={memory}")),
     );
     tags
@@ -1071,6 +1185,20 @@ fn tags(values: Vec<String>) -> Result<Vec<String>, NativeV2CliError> {
     unique.sort();
     unique.dedup();
     Ok(unique)
+}
+
+/// A tag a pool profile applies to: an ordinary tag, not a size request.
+fn profile_tag(value: String) -> Result<String, NativeV2CliError> {
+    if ["server-type=", "min-vcpu=", "min-ram-gb="]
+        .iter()
+        .any(|prefix| value.starts_with(prefix))
+    {
+        return Err(usage(format!(
+            "{value:?} is a size request; profile an ordinary job tag"
+        )));
+    }
+    let mut checked = tags(vec![value])?;
+    Ok(checked.remove(0))
 }
 
 fn labels(values: Vec<String>) -> Result<Vec<(String, String)>, NativeV2CliError> {
