@@ -60,7 +60,6 @@ async fn dispatch(command: NativeV2CliCommand) -> Result<(), ProcessError> {
         NativeV2CliCommand::Acp { profile } => {
             serve_local_acp(profile).await.map_err(ProcessError::from)
         }
-        NativeV2CliCommand::McpServe => mcp_host::serve().await,
         NativeV2CliCommand::Ui { listen, target } => serve_ui(listen, target).await,
         NativeV2CliCommand::TargetServe(config) => serve_direct_target(config)
             .await

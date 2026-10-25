@@ -1,19 +1,45 @@
 # Serve Zeroshot over MCP
 
-`zeroshot mcp serve` is a Model Context Protocol server on stdin and stdout. It speaks one
-JSON-RPC 2.0 message per line. Each tool runs the same command the CLI would, in this process.
-Run events come from the durable stream `zeroshot watch` already reads.
+The hub daemon is the Model Context Protocol server. It serves Streamable HTTP on `POST /mcp` on
+its normal API listener, alongside `/v1/hub/*`. Start it with `zeroshot hub daemon run` or install
+it as a service with `zeroshot hub install`; there is no separate MCP process. Each tool runs the
+same command the CLI would. Run events come from the durable stream `zeroshot watch` already
+reads.
 
-A client starts it as:
+The default endpoint is `http://127.0.0.1:7383/mcp`. MCP uses the same bearer token as the rest of
+the hub API: by default the contents of `~/.config/zeroshot/hub/api-token` (or the hub folder's
+`api-token` file, or the `--token-file` passed to the daemon). The daemon heartbeat also records
+the MCP URL as `mcp`.
 
-```json
-{
-  "command": "zeroshot",
-  "args": ["mcp", "serve"]
-}
+```yaml
+mcpServers:
+  zeroshot:
+    type: http
+    url: http://127.0.0.1:7383/mcp
+    headers:
+      Authorization: Bearer $(cat ~/.config/zeroshot/hub/api-token)
 ```
 
-The process writes no banner. It exits when the client closes stdin.
+Substitute the token file's contents if your MCP client does not run shell command substitution.
+For example, a request can be made directly with:
+
+```bash
+curl -sS http://127.0.0.1:7383/mcp \
+  -H "Authorization: Bearer $(cat ~/.config/zeroshot/hub/api-token)" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
+```
+
+Requests without a valid `Authorization: Bearer <api-token>` header fail with `401` and the
+`hub.unauthorized` diagnostic. An HTTP client connects with JSON-RPC request bodies. An
+`initialize` request without an `Mcp-Session-Id` header mints a new session and returns its id in
+the `Mcp-Session-Id` response header. Later requests must send that id; a missing, unknown, or
+expired id fails with `-32600` and `data.code` `mcp.session_required`. Calling `initialize` again
+with an existing id resets that session so a client can recover after a dropped connection. Idle
+sessions are discarded after 30 minutes. Notifications return `202 Accepted` without a JSON-RPC body.
+`events/stream` returns `text/event-stream`; each SSE `data` line is one JSON-RPC notification or
+the final response. Earlier event polls and ordinary requests return JSON. The MCP worker stops
+with the hub daemon.
 
 ## Handshake
 
@@ -33,6 +59,27 @@ stdout as a text content block and, when that stdout is one JSON value or NDJSON
 `structuredContent`. A failing command is still a JSON-RPC success, with `isError: true`.
 `structuredContent.code` and `message` are the CLI diagnostic (`zeroshot.error/v1`). An unknown
 tool name is a JSON-RPC invalid-params error.
+
+`input`, `graph`, `runtimeConfig`, `uniformRuntimeConfig`, and `environment` are inline JSON
+values, not file paths. `input` may be any JSON value; the other four are JSON objects. The server
+writes each supplied value to a private temporary file for the duration of that command, then
+removes it. For example:
+
+```json
+{
+  "name": "run",
+  "arguments": {
+    "title": "Fix the parser",
+    "template": "software-change",
+    "input": {"task": "Fix the parser"},
+    "runtimeConfig": {
+      "agents": {
+        "worker": {"harness": "codex", "provider": "openai", "model": "gpt-5"}
+      }
+    }
+  }
+}
+```
 
 | Tool                | Command                      | What it does                                      |
 | ------------------- | ---------------------------- | ------------------------------------------------- |

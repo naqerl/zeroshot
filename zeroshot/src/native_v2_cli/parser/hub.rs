@@ -1104,7 +1104,7 @@ fn placement_tags(placement: &HubPlacementArgs) -> Vec<String> {
 /// Rebuild the `zeroshot run` arguments that do not depend on placement.
 fn run_arguments(run: &RunArgs) -> Result<Vec<String>, NativeV2CliError> {
     let mut arguments = vec!["--title".to_owned(), run.title.clone()];
-    arguments.extend(path_argument("--input", Some(&run.input))?);
+    arguments.extend(path_argument("--input", run.input.as_ref())?);
     for (flag, path) in [
         ("--graph", &run.graph),
         ("--runtime-config", &run.runtime_config),

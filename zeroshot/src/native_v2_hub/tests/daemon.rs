@@ -615,6 +615,10 @@ async fn the_daemon_serves_the_api_dispatches_and_stops_on_shutdown() {
     result.expect("daemon");
     assert_eq!(heartbeat["manager"], json!("foreground"));
     assert_eq!(heartbeat["tokenFile"], json!(token_file));
+    assert_eq!(
+        heartbeat["mcp"],
+        json!(format!("{}/mcp", heartbeat["url"].as_str().expect("url")))
+    );
     let events = String::from_utf8(output).expect("utf8");
     let lines = events
         .lines()

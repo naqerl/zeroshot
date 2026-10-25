@@ -1,4 +1,4 @@
-//! Process host for `zeroshot mcp serve`.
+//! Production MCP host served by the hub daemon at `POST /mcp`.
 //!
 //! Tools run through the same public and hub executors as the CLI. Events read the same
 //! `run_watch` subscription `zeroshot watch` opens.
@@ -10,7 +10,7 @@ use openengine_cluster_protocol::{RunWatchParams, SubscriptionCloseReason};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use zeroshot_engine::native_v2_cli::local::LocalCliBackend;
-use zeroshot_engine::native_v2_cli::mcp::{McpFailure, McpHost, WatchStream, serve as serve_session};
+use zeroshot_engine::native_v2_cli::mcp::{McpFailure, McpHost, McpServer, WatchStream};
 use zeroshot_engine::native_v2_cli::oecp::NamedTargetCliBackend;
 use zeroshot_engine::native_v2_cli::{
     CliRunWatchEventNotification, CliSubscription, CliSubscriptionItem, NativeV2CliBackend,
@@ -23,15 +23,9 @@ use crate::native_v2_target::{
     TargetOecpWebSocketDialer, default_target_registry_path,
 };
 
-pub(super) async fn serve() -> Result<(), super::ProcessError> {
-    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    let stdout = tokio::io::stdout();
-    // The watch pump is not Send. A LocalSet runs it beside this stdio loop.
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(serve_session(ProductionHost, stdin, stdout))
-        .await
-        .map_err(super::ProcessError::from)
+/// Start the production MCP worker and return its router and shutdown handle.
+pub(crate) fn spawn_production_mcp() -> std::io::Result<(axum::Router, McpServer)> {
+    McpServer::spawn(ProductionHost)
 }
 
 struct ProductionHost;
@@ -51,7 +45,7 @@ impl McpHost for ProductionHost {
             from_cursor: command.after.clone(),
         };
         let (sender, receiver) = mpsc::channel(64);
-        // Backend watch futures are not Send. `serve` polls this task on its LocalSet.
+        // Backend watch futures are not Send. The HTTP worker polls this task on its LocalSet.
         let task = if command.run.target.is_none() {
             let backend =
                 LocalCliBackend::production().map_err(|error| McpFailure::from_cli(&error))?;

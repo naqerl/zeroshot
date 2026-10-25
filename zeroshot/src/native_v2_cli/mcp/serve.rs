@@ -1,10 +1,9 @@
 use std::collections::HashMap;
-use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
 
@@ -12,7 +11,6 @@ use super::events::{self, Prepared, EXTENSION_ID};
 use super::host::{McpFailure, McpHost};
 use super::tools;
 
-const MAX_LINE: usize = 16 * 1024 * 1024;
 const KNOWN_VERSIONS: &[&str] = &[
     "2024-11-05",
     "2025-03-26",
@@ -26,7 +24,7 @@ struct StreamCancel {
     handle: AbortHandle,
 }
 
-enum Action {
+pub(super) enum Action {
     Reply(Value),
     Fail {
         code: i64,
@@ -36,79 +34,59 @@ enum Action {
     Stream(Prepared),
 }
 
-/// Serve newline-delimited JSON-RPC MCP on `reader` and `writer` until stdin closes.
-pub async fn serve<H, R, W>(host: H, mut reader: R, writer: W) -> io::Result<()>
-where
-    H: McpHost + 'static,
-    R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin + Send + 'static,
-{
-    let host = Arc::new(host);
-    let writer = Arc::new(Mutex::new(writer));
-    let mut cancellations: HashMap<String, StreamCancel> = HashMap::new();
-    let mut initialized = false;
-    loop {
-        let Some(line) = read_line(&mut reader).await? else {
-            break;
-        };
-        if line.is_empty() {
-            continue;
-        }
-        let message = match serde_json::from_str::<Value>(&line) {
-            Ok(message) => message,
-            Err(_) => {
-                write_message(
-                    &writer,
-                    &error_message(Value::Null, -32700, "Parse error", None),
-                )
-                .await?;
-                continue;
-            }
-        };
-        if message.get("id").is_none() {
-            handle_notification(&message, &mut cancellations);
-            continue;
-        }
-        let id = message.get("id").cloned().unwrap_or(Value::Null);
-        if !valid_id(&id) {
-            write_message(
-                &writer,
-                &error_message(Value::Null, -32600, "Invalid Request", None),
-            )
-            .await?;
-            continue;
-        }
-        match dispatch(&host, &message, initialized).await {
-            Action::Reply(result) => {
-                if message.get("method").and_then(Value::as_str) == Some("initialize") {
-                    initialized = true;
-                }
-                write_message(&writer, &ok_message(id, result)).await?;
-            }
-            Action::Fail {
-                code,
-                message: text,
-                data,
-            } => {
-                write_message(&writer, &error_message(id, code, text, data)).await?;
-            }
-            Action::Stream(prepared) => {
-                spawn_stream(prepared, id, &writer, &mut cancellations);
-            }
-        }
-    }
-    for cancel in cancellations.values() {
-        cancel.flag.store(true, Ordering::Relaxed);
-        cancel.handle.abort();
-    }
-    Ok(())
+/// Per-session MCP state held by the HTTP transport worker.
+#[derive(Default)]
+pub(super) struct SessionState {
+    initialized: bool,
+    cancellations: HashMap<String, StreamCancel>,
 }
 
-pub(super) async fn write_message<W>(writer: &Mutex<W>, message: &Value) -> io::Result<()>
+impl SessionState {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn initialized(&self) -> bool {
+        self.initialized
+    }
+
+    pub(super) fn mark_initialized(&mut self) {
+        self.initialized = true;
+    }
+
+    pub(super) fn reset_for_initialize(&mut self) {
+        self.shutdown();
+        self.initialized = false;
+    }
+
+    pub(super) fn handle_notification(&mut self, message: &Value) {
+        handle_notification(message, &mut self.cancellations);
+    }
+
+    pub(super) fn spawn_stream<W>(&mut self, prepared: Prepared, id: Value, writer: &Arc<Mutex<W>>)
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        spawn_stream(prepared, id, writer, &mut self.cancellations);
+    }
+
+    pub(super) fn shutdown(&mut self) {
+        for cancel in self.cancellations.values() {
+            cancel.flag.store(true, Ordering::Relaxed);
+            cancel.handle.abort();
+        }
+        self.cancellations.clear();
+    }
+}
+
+/// Handles one complete JSON-RPC message without transport-specific I/O.
+/// Writes one newline-delimited JSON-RPC message. The HTTP transport turns those lines
+/// into server-sent event data frames.
+pub(super) async fn write_message<W>(writer: &Mutex<W>, message: &Value) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let mut bytes = serde_json::to_vec(message).map_err(io::Error::other)?;
+    let mut bytes = serde_json::to_vec(message).map_err(std::io::Error::other)?;
     bytes.push(b'\n');
     let mut writer = writer.lock().await;
     writer.write_all(&bytes).await?;
@@ -141,7 +119,7 @@ fn spawn_stream<W>(
     }
 }
 
-async fn dispatch<H>(host: &Arc<H>, message: &Value, initialized: bool) -> Action
+pub(super) async fn dispatch<H>(host: &H, message: &Value, initialized: bool) -> Action
 where
     H: McpHost + 'static,
 {
@@ -168,13 +146,6 @@ where
         };
     }
     if method == "initialize" {
-        if initialized {
-            return Action::Fail {
-                code: -32600,
-                message: "Invalid Request",
-                data: None,
-            };
-        }
         return match negotiate(&params) {
             Ok(version) => Action::Reply(initialize_result(version)),
             Err(failure) => invalid_params(failure),
@@ -193,7 +164,7 @@ where
             Ok(result) => Action::Reply(result),
             Err(failure) => invalid_params(failure),
         },
-        "tools/call" => match tools::call(host.as_ref(), &params).await {
+        "tools/call" => match tools::call(host, &params).await {
             Ok(result) => Action::Reply(result),
             Err(failure) => invalid_params(failure),
         },
@@ -201,11 +172,11 @@ where
             Ok(result) => Action::Reply(result),
             Err(error) => event_failure(error),
         },
-        "events/poll" => match events::poll(host.as_ref(), &params).await {
+        "events/poll" => match events::poll(host, &params).await {
             Ok(result) => Action::Reply(result),
             Err(error) => event_failure(error),
         },
-        "events/stream" => match events::prepare(host.as_ref(), &params).await {
+        "events/stream" => match events::prepare(host, &params).await {
             Ok(prepared) => Action::Stream(prepared),
             Err(error) => event_failure(error),
         },
@@ -280,7 +251,7 @@ fn initialize_result(protocol_version: String) -> Value {
     result
 }
 
-fn valid_id(id: &Value) -> bool {
+pub(super) fn valid_id(id: &Value) -> bool {
     id.is_number() || id.is_string()
 }
 
@@ -288,62 +259,14 @@ fn id_key(id: &Value) -> String {
     serde_json::to_string(id).unwrap_or_default()
 }
 
-fn ok_message(id: Value, result: Value) -> Value {
+pub(super) fn ok_message(id: Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
-fn error_message(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
+pub(super) fn error_message(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
     let mut error = json!({"code": code, "message": message});
     if let Some(data) = data {
         error["data"] = data;
     }
     json!({"jsonrpc": "2.0", "id": id, "error": error})
-}
-
-async fn read_line<R>(reader: &mut R) -> io::Result<Option<String>>
-where
-    R: AsyncBufRead + Unpin,
-{
-    let mut line = Vec::new();
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            if line.is_empty() {
-                return Ok(None);
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "unterminated JSON-RPC line",
-            ));
-        }
-        if let Some(position) = available.iter().position(|byte| *byte == b'\n') {
-            if line.len().saturating_add(position) > MAX_LINE {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "JSON-RPC line exceeds 16 MiB",
-                ));
-            }
-            line.extend_from_slice(&available[..=position]);
-            reader.consume(position + 1);
-            break;
-        }
-        if line.len().saturating_add(available.len()) > MAX_LINE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "JSON-RPC line exceeds 16 MiB",
-            ));
-        }
-        let consumed = available.len();
-        line.extend_from_slice(available);
-        reader.consume(consumed);
-    }
-    if line.last() == Some(&b'\n') {
-        line.pop();
-    }
-    if line.last() == Some(&b'\r') {
-        line.pop();
-    }
-    String::from_utf8(line)
-        .map(Some)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }

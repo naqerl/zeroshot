@@ -40,6 +40,14 @@ pub(super) fn string_prop(description: &str) -> Value {
     serde_json::json!({"type": "string", "description": description})
 }
 
+pub(super) fn inline_json_prop(description: &str) -> Value {
+    serde_json::json!({"description": description})
+}
+
+pub(super) fn inline_object_prop(description: &str) -> Value {
+    serde_json::json!({"type": "object", "description": description})
+}
+
 pub(super) fn bool_prop(description: &str) -> Value {
     serde_json::json!({"type": "boolean", "description": description})
 }

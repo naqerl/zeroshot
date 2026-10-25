@@ -9,7 +9,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use zeroshot_engine::native_v2_cli::hub::HubDaemonRun;
 
-use super::api::{ApiState, metrics_router, router};
+use super::api::{ApiState, metrics_router, router_with_mcp};
 use super::clock::{now_ms, parse_duration_ms, rfc3339};
 use super::error::HubError;
 use super::paths::absolute;
@@ -135,6 +135,8 @@ pub(crate) async fn run_until<W: Write>(
             .with_metric_labels(options.api.metrics_labels.clone())
             .with_unconfirmed_limit(options.api.unconfirmed_limit),
     );
+    let (mcp_router, mcp) = crate::mcp_host::spawn_production_mcp()
+        .map_err(|error| HubError::storage("the MCP worker could not start", error))?;
     let manager = std::env::var(MANAGER_ENV).unwrap_or_else(|_| "foreground".to_owned());
     let mut heartbeat = json!({
         "schema": "zeroshot.hub.daemon/v1",
@@ -144,6 +146,7 @@ pub(crate) async fn run_until<W: Write>(
         "hubDirectory": service.store().directory(),
         "listen": address.to_string(),
         "url": client_url(address),
+        "mcp": format!("{}/mcp", client_url(address)),
         "tokenFile": token_file,
         "metricsListen": metrics_listener
             .as_ref()
@@ -177,7 +180,7 @@ pub(crate) async fn run_until<W: Write>(
     }
     let server = tokio::spawn(async move {
         let mut stopped = stopped;
-        axum::serve(listener, router(api))
+        axum::serve(listener, router_with_mcp(api, Some(mcp_router)))
             .with_graceful_shutdown(async move {
                 let _ = stopped.changed().await;
             })
@@ -230,6 +233,7 @@ pub(crate) async fn run_until<W: Write>(
     }
     let _ = stop.send(true);
     let _ = tokio::time::timeout(SHUTDOWN_GRACE, server).await;
+    mcp.shutdown().await;
     heartbeat["stoppedAt"] = json!(rfc3339(now_ms()));
     publish(&service, &shared, &heartbeat)?;
     let mut event = heartbeat;

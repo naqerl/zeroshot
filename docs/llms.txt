@@ -12,7 +12,7 @@
 - Every run records its events in a durable SQLite ledger.
 - An `auto-research` graph runs ten bounded experiment iterations with independent review of evidence, method, and progress.
 - Experimental: expose a graph as an ACP agent with `zeroshot acp`.
-- Serve the same CLI commands and the durable watch stream over MCP with `zeroshot mcp serve`.
+- Serve the same CLI commands and the durable watch stream over MCP from the hub daemon at `POST /mcp`.
 
 ## When to use it
 

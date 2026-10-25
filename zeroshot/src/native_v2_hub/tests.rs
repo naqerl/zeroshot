@@ -33,6 +33,8 @@ mod eval;
 mod eval_flows;
 #[path = "tests/flows.rs"]
 mod flows;
+#[path = "tests/mcp.rs"]
+mod mcp;
 #[path = "tests/metrics.rs"]
 mod metrics;
 #[path = "tests/paths.rs"]

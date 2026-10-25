@@ -1,9 +1,12 @@
+use std::fs;
+use std::io::Write;
+
 use clap::CommandFactory;
 use serde_json::{Map, Value, json};
 
 use super::args::{
-    bool_prop, integer_prop, object_schema, optional_string, reject_unknown, string_array_prop,
-    string_prop,
+    bool_prop, inline_json_prop, inline_object_prop, integer_prop, object_schema, optional_string,
+    reject_unknown, string_array_prop, string_prop,
 };
 use super::host::{parse_cli, McpFailure, McpHost};
 use super::super::hub::HubCommand;
@@ -19,6 +22,14 @@ struct Tool {
     schema: fn() -> Value,
     argv: ToolArgv,
 }
+
+const INLINE_KEYS: &[&str] = &[
+    "input",
+    "graph",
+    "runtimeConfig",
+    "uniformRuntimeConfig",
+    "environment",
+];
 
 const RUN_KEYS: &[&str] = &[
     "title",
@@ -260,16 +271,72 @@ pub(super) async fn call(host: &impl McpHost, params: &Value) -> Result<Value, M
     let Some(tool) = TOOLS.iter().find(|tool| tool.name == name) else {
         return Err(McpFailure::invalid(format!("unknown tool {name}")));
     };
-    let arguments = arguments_object(params)?;
+    let mut arguments = arguments_object(params)?;
     reject_unknown(&arguments, tool.allowed)?;
+    let materialized = materialize_inline(&mut arguments)?;
     let command = match command_for(name, (tool.argv)(&arguments)?) {
         Ok(command) => command,
         Err(failure) => return Ok(tool_error(&failure)),
     };
-    match host.execute(command).await {
+    let result = host.execute(command).await;
+    drop(materialized);
+    match result {
         Ok(stdout) => Ok(tool_success(stdout)),
         Err(failure) => Ok(tool_error(&failure)),
     }
+}
+
+pub(super) fn materialize_inline(
+    arguments: &mut Map<String, Value>,
+) -> Result<Option<tempfile::TempDir>, McpFailure> {
+    let mut directory = None;
+    for key in INLINE_KEYS {
+        let Some(value) = arguments.get_mut(*key) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        if directory.is_none() {
+            directory = Some(
+                tempfile::Builder::new()
+                    .prefix("zeroshot-mcp-")
+                    .tempdir()
+                    .map_err(|error| {
+                        McpFailure::invalid(format!(
+                            "could not create temporary directory: {error}"
+                        ))
+                    })?,
+            );
+        }
+        let path = directory
+            .as_ref()
+            .expect("temporary directory exists")
+            .path()
+            .join(format!("{key}.json"));
+        let bytes = serde_json::to_vec(&*value)
+            .map_err(|error| McpFailure::invalid(format!("could not encode {key}: {error}")))?;
+        write_private_inline_file(&path, &bytes).map_err(|error| {
+            McpFailure::invalid(format!(
+                "could not write inline {key} to a temporary file: {error}"
+            ))
+        })?;
+        *value = Value::String(path.to_string_lossy().into_owned());
+    }
+    Ok(directory)
+}
+
+fn write_private_inline_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.flush()
 }
 
 fn arguments_object(params: &Value) -> Result<Map<String, Value>, McpFailure> {
@@ -742,11 +809,11 @@ fn run_properties() -> Vec<(&'static str, Value)> {
         ),
         (
             "input",
-            string_prop("JSON file of the graph's initial input."),
+            inline_json_prop("Inline JSON value for the graph's initial input."),
         ),
         (
             "graph",
-            string_prop("Custom graph specification JSON file."),
+            inline_object_prop("Inline graph specification JSON object."),
         ),
         (
             "template",
@@ -754,15 +821,17 @@ fn run_properties() -> Vec<(&'static str, Value)> {
         ),
         (
             "runtimeConfig",
-            string_prop("Exact runtime plan JSON file."),
+            inline_object_prop("Inline exact runtime plan JSON object."),
         ),
         (
             "uniformRuntimeConfig",
-            string_prop("One agent runtime JSON file expanded across every executable node."),
+            inline_object_prop(
+                "Inline agent runtime JSON object expanded across every executable node.",
+            ),
         ),
         (
             "environment",
-            string_prop("Environment definition JSON file."),
+            inline_object_prop("Inline environment definition JSON object."),
         ),
         (
             "noEnvironment",

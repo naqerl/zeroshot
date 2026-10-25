@@ -1,12 +1,11 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
 use super::super::{CliTestBackend, CliTestCall, NeverDetach, RunWatchCommand};
-use super::{serve, McpFailure, McpHost, WatchStream};
+use super::{McpFailure, McpHost, McpServer, WatchStream, serve_http_listener};
 use crate::native_v2_cli::{NativeV2CliCommand, execute_native_v2_cli};
 
 struct ToolHost {
@@ -65,33 +64,45 @@ impl McpHost for ScriptHost {
     }
 }
 
+/// Drives the real HTTP transport on an ephemeral port. The host is `!Send`, so the
+/// server owns its own thread and current-thread runtime.
 struct Session {
-    input: tokio::io::DuplexStream,
-    output: BufReader<tokio::io::DuplexStream>,
+    client: reqwest::Client,
+    url: String,
+    frames: std::collections::VecDeque<Value>,
+    session: Option<String>,
 }
 
 impl Session {
     fn spawn(host: impl McpHost + 'static) -> Self {
-        let (client_input, server_input) = tokio::io::duplex(1 << 20);
-        let (server_output, client_output) = tokio::io::duplex(1 << 20);
-        // The CLI executor future is not Send, so the server runs on its own
-        // current-thread runtime.
-        let _thread = std::thread::Builder::new()
+        let (address_sender, address_receiver) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
             .name("mcp-test-server".to_owned())
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .expect("mcp test runtime");
+                let (router, server) = McpServer::spawn(host).expect("start MCP worker");
                 runtime.block_on(async move {
-                    let reader = BufReader::new(server_input);
-                    let _ = serve(host, reader, server_output).await;
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                        .await
+                        .expect("bind MCP test listener");
+                    let address = listener.local_addr().expect("MCP test address");
+                    address_sender
+                        .send(address)
+                        .expect("report MCP test address");
+                    let _ = axum::serve(listener, router).await;
+                    server.shutdown().await;
                 });
             })
-            .expect("spawn mcp test server");
+            .expect("spawn MCP test server");
+        let address = address_receiver.recv().expect("MCP test address");
         Self {
-            input: client_input,
-            output: BufReader::new(client_output),
+            client: reqwest::Client::new(),
+            url: format!("http://{address}/mcp"),
+            frames: std::collections::VecDeque::new(),
+            session: None,
         }
     }
 
@@ -106,31 +117,64 @@ impl Session {
         self.read().await
     }
 
-    async fn send(&mut self, message: &Value) {
-        let mut bytes = serde_json::to_vec(message).expect("request json");
-        bytes.push(b'\n');
-        self.input.write_all(&bytes).await.expect("write request");
+    /// Posts one message. Server-sent events are queued for `read`.
+    async fn send(&mut self, message: &Value) -> Option<String> {
+        self.post(message, self.session.clone()).await
+    }
+
+    /// Posts one message without a session header, ignoring any stored session.
+    async fn send_without_session(&mut self, message: &Value) -> Option<String> {
+        self.post(message, None).await
+    }
+
+    async fn post(&mut self, message: &Value, session: Option<String>) -> Option<String> {
+        let mut request = self.client.post(&self.url).json(message);
+        if let Some(session) = session {
+            request = request.header("mcp-session-id", session);
+        }
+        let response = request.send().await.expect("post MCP message");
+        let session = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        if let Some(id) = &session {
+            self.session = Some(id.clone());
+        }
+        if response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .starts_with("text/event-stream")
+        {
+            let body = tokio::time::timeout(Duration::from_secs(5), response.text())
+                .await
+                .expect("timed out reading the MCP event stream")
+                .expect("MCP event stream body");
+            for line in body.lines() {
+                let Some(data) = line.strip_prefix("data: ") else {
+                    continue;
+                };
+                self.frames
+                    .push_back(serde_json::from_str(data).expect("event stream data is JSON"));
+            }
+            return session;
+        }
+        if response.status() == reqwest::StatusCode::ACCEPTED {
+            return session;
+        }
+        let value: Value = response.json().await.expect("MCP response JSON");
+        self.frames.push_back(value);
+        session
     }
 
     async fn read(&mut self) -> Value {
-        let line = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut self.output))
-            .await
-            .expect("timed out waiting for MCP output")
-            .expect("read MCP output");
-        serde_json::from_str(&line).expect("MCP output is JSON")
+        if self.frames.is_empty() {
+            panic!("no MCP frame was produced");
+        }
+        self.frames.pop_front().expect("queued MCP frame")
     }
-}
-
-async fn read_frame(output: &mut BufReader<tokio::io::DuplexStream>) -> std::io::Result<String> {
-    let mut line = String::new();
-    let read = output.read_line(&mut line).await?;
-    if read == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "closed",
-        ));
-    }
-    Ok(line)
 }
 
 async fn initialize(session: &mut Session) {
@@ -152,6 +196,94 @@ async fn initialize(session: &mut Session) {
         response["result"]["capabilities"]["extensions"]
             .get("io.modelcontextprotocol/events")
             .is_some()
+    );
+}
+
+fn initialize_message(id: i64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0"}
+        }
+    })
+}
+
+fn assert_session_id(id: &str) {
+    assert_eq!(id.len(), 32, "session id is 32 characters");
+    assert!(
+        id.bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "session id is lowercase hex: {id}"
+    );
+}
+
+#[tokio::test]
+async fn initialize_mints_a_fresh_session_for_each_headerless_client() {
+    let mut session = Session::spawn(ScriptHost);
+    let first = session
+        .send_without_session(&initialize_message(1))
+        .await
+        .expect("first session id");
+    assert_session_id(&first);
+    assert_eq!(
+        session.read().await["result"]["serverInfo"]["name"],
+        json!("zeroshot")
+    );
+    let second = session
+        .send_without_session(&initialize_message(2))
+        .await
+        .expect("second session id");
+    assert_session_id(&second);
+    assert_eq!(
+        session.read().await["result"]["serverInfo"]["name"],
+        json!("zeroshot")
+    );
+    assert_ne!(first, second);
+}
+
+#[tokio::test]
+async fn requests_without_a_session_are_rejected() {
+    let mut session = Session::spawn(ScriptHost);
+    let header = session
+        .send_without_session(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .await;
+    assert!(header.is_none());
+    let response = session.read().await;
+    assert_eq!(response["id"], json!(1));
+    assert_eq!(response["error"]["code"], json!(-32600));
+    assert_eq!(
+        response["error"]["data"]["code"],
+        json!("mcp.session_required")
+    );
+}
+
+#[tokio::test]
+async fn initialize_with_an_existing_session_resets_it() {
+    let mut session = Session::spawn(ScriptHost);
+    initialize(&mut session).await;
+    let existing = session.session.clone().expect("initial session id");
+    let returned = session.send(&initialize_message(2)).await;
+    assert_eq!(returned.as_deref(), Some(existing.as_str()));
+    let response = session.read().await;
+    assert_eq!(response["id"], json!(2));
+    assert!(response.get("error").is_none());
+    assert_eq!(response["result"]["serverInfo"]["name"], json!("zeroshot"));
+    let listed = session.request(3, "tools/list", json!({})).await;
+    assert!(
+        listed["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .any(|tool| tool["name"] == "run")
     );
 }
 
@@ -381,4 +513,192 @@ async fn events_stream_pushes_a_notification() {
         }
     }
     assert!(saw_event);
+}
+
+#[test]
+fn inline_tool_data_is_materialized_for_the_command() {
+    let original = json!({
+        "input": {"task": "Fix the parser"},
+        "graph": {"profile": "openengine.graph.full/v1"},
+        "runtimeConfig": {"agents": {}},
+        "uniformRuntimeConfig": {"harness": "codex"},
+        "environment": {"variables": {"MODE": "test"}},
+    });
+    let mut arguments: Map<String, Value> = original
+        .as_object()
+        .expect("inline fixture is an object")
+        .clone();
+    let directory = super::tools::materialize_inline(&mut arguments)
+        .expect("inline data materializes")
+        .expect("inline data creates a temporary directory");
+    let root = directory.path().to_path_buf();
+    for key in [
+        "input",
+        "graph",
+        "runtimeConfig",
+        "uniformRuntimeConfig",
+        "environment",
+    ] {
+        let path = arguments[key].as_str().expect("argument became a path");
+        let stored: Value =
+            serde_json::from_slice(&std::fs::read(path).expect("temporary command input exists"))
+                .expect("temporary command input is JSON");
+        assert_eq!(stored, original[key], "{key} round trips");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path)
+                .expect("temporary command input metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{key} is private");
+        }
+    }
+    drop(directory);
+    assert!(!root.exists(), "temporary command inputs are removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_transport_handshakes_and_answers_notifications() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind MCP HTTP test listener");
+    let address = listener.local_addr().expect("MCP HTTP test address");
+    let server = tokio::spawn(serve_http_listener(
+        ToolHost {
+            backend: CliTestBackend::default(),
+        },
+        listener,
+    ));
+    let url = format!("http://{address}/mcp");
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0"}
+            }
+        }))
+        .send()
+        .await
+        .expect("initialize over HTTP");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let session = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("initialize returns a session id")
+        .to_owned();
+    assert!(!session.is_empty());
+    let initialized: Value = response.json().await.expect("initialize response JSON");
+    assert_eq!(
+        initialized["result"]["serverInfo"]["name"],
+        json!("zeroshot")
+    );
+
+    let response = client
+        .post(&url)
+        .header("mcp-session-id", &session)
+        .json(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        .send()
+        .await
+        .expect("notification over HTTP");
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    assert!(
+        response
+            .bytes()
+            .await
+            .expect("notification body")
+            .is_empty()
+    );
+
+    let response = client
+        .post(&url)
+        .header("mcp-session-id", &session)
+        .json(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
+        .send()
+        .await
+        .expect("tools/list over HTTP");
+    let listed: Value = response.json().await.expect("tools/list response JSON");
+    assert_eq!(listed["id"], json!(2));
+    assert!(
+        listed["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .any(|tool| tool["name"] == "run")
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_transport_streams_events_as_server_sent_events() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind MCP HTTP test listener");
+    let address = listener.local_addr().expect("MCP HTTP test address");
+    let server = tokio::spawn(serve_http_listener(ScriptHost, listener));
+    let url = format!("http://{address}/mcp");
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0"}
+            }
+        }))
+        .send()
+        .await
+        .expect("initialize over HTTP");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let session = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("initialize returns a session id")
+        .to_owned();
+
+    let response = client
+        .post(&url)
+        .header("mcp-session-id", &session)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "events/stream",
+            "params": {
+                "name": "run.event",
+                "arguments": {"runId": "run-public"},
+                "cursor": "v2:1"
+            }
+        }))
+        .send()
+        .await
+        .expect("events/stream over HTTP");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .starts_with("text/event-stream")
+    );
+    let body = tokio::time::timeout(Duration::from_secs(5), response.text())
+        .await
+        .expect("events/stream ends")
+        .expect("events/stream body");
+    assert!(body.contains("notifications/events/active"));
+    assert!(body.contains("notifications/events/event"));
+    assert!(body.contains("\"resultType\":\"complete\""));
+    server.abort();
 }

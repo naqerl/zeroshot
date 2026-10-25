@@ -684,6 +684,8 @@ Options:
           - single-worker:   A single general-purpose worker
           - software-change: A review, validation, and optional delivery workflow for code changes
           - auto-research:   Research with ten iterations by default and independent evidence gates
+          - issue-review:    Inspect an issue proposal and post a review report
+          - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
 
       --runtime-config <FILE>
 
@@ -695,7 +697,7 @@ Options:
 
 
       --delivery <MODE>
-          Materialize this template-owned delivery mode
+          Template delivery mode. Defaults to pull_request for software-change, comment for issue-review and pr-review, otherwise none
 
       --push
           Commit and push the managed run branch without opening a pull request
@@ -853,10 +855,12 @@ Arguments:
           - single-worker:   A single general-purpose worker
           - software-change: A review, validation, and optional delivery workflow for code changes
           - auto-research:   Research with ten iterations by default and independent evidence gates
+          - issue-review:    Inspect an issue proposal and post a review report
+          - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
 
 Options:
       --delivery <MODE>
-          Materialize this template-owned delivery mode
+          Template delivery mode. Defaults to pull_request for software-change, comment for issue-review and pr-review, otherwise none
 
       --push
           Commit and push the managed run branch without opening a pull request
@@ -1295,7 +1299,7 @@ Place a run on a free member now.
 
 Fails with exit code 3 when every matching member is busy, unless --wait or --queue is given. Without --detach, follows the placed run's events as NDJSON.
 
-Usage: zeroshot hub submit [OPTIONS] --title <TITLE> --input <FILE>
+Usage: zeroshot hub submit [OPTIONS] --title <TITLE>
 
 Options:
       --hub <CONTEXT>
@@ -1344,9 +1348,14 @@ Options:
           - single-worker:   A single general-purpose worker
           - software-change: A review, validation, and optional delivery workflow for code changes
           - auto-research:   Research with ten iterations by default and independent evidence gates
+          - issue-review:    Inspect an issue proposal and post a review report
+          - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
 
       --input <FILE>
           Load the graph's initial input from this JSON file
+
+      --task-from <URL>
+          Resolve a GitHub issue or pull-request URL into review input before starting
 
       --runtime-config <FILE>
           Load an exact secret-free runtime plan from this JSON file
@@ -1392,7 +1401,7 @@ Options:
           Return after submission instead of following NDJSON run events
 
       --delivery <MODE>
-          Materialize this template-owned delivery mode
+          Template delivery mode. Defaults to pull_request for software-change, comment for issue-review and pr-review, otherwise none
 
       --push
           Commit and push the managed run branch without opening a pull request
@@ -1451,7 +1460,7 @@ RUNTIME CONFIGURATION
 
     The run-level harness and provider are the default lane. An agent binding may add
     "lane": {"harness": "claude", "provider": "anthropic"} to run that node on another accepted
-    pair; git_delivery bindings cannot. --uniform-runtime-config applies one lane to every agent
+    pair; git_delivery and comment_delivery bindings cannot. --uniform-runtime-config applies one lane to every agent
     node. Named targets must advertise per-node lane support (openengine.node-runtime-lanes/v1), and
     a local run first checks that each lane's executable (codex, claude, or copilot) is on PATH.
 
@@ -1503,7 +1512,7 @@ Accept a run into the hub queue for later placement, once or on a cron schedule.
 
 --cron creates a recurring schedule (`hs_…`); the hub daemon queues one job per fire. Cron fields use the --cron-tz zone, stored with the schedule, so daylight-saving changes follow that zone wherever the daemon runs. Missed fires collapse into one catch-up fire, and a fire is skipped while the schedule's previous job is still queued.
 
-Usage: zeroshot hub enqueue [OPTIONS] --title <TITLE> --input <FILE>
+Usage: zeroshot hub enqueue [OPTIONS] --title <TITLE>
 
 Options:
       --hub <CONTEXT>
@@ -1563,9 +1572,14 @@ Options:
           - single-worker:   A single general-purpose worker
           - software-change: A review, validation, and optional delivery workflow for code changes
           - auto-research:   Research with ten iterations by default and independent evidence gates
+          - issue-review:    Inspect an issue proposal and post a review report
+          - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
 
       --input <FILE>
           Load the graph's initial input from this JSON file
+
+      --task-from <URL>
+          Resolve a GitHub issue or pull-request URL into review input before starting
 
       --runtime-config <FILE>
           Load an exact secret-free runtime plan from this JSON file
@@ -1608,7 +1622,7 @@ Options:
           Stable idempotency key for safely retrying submission
 
       --delivery <MODE>
-          Materialize this template-owned delivery mode
+          Template delivery mode. Defaults to pull_request for software-change, comment for issue-review and pr-review, otherwise none
 
       --push
           Commit and push the managed run branch without opening a pull request
@@ -1667,7 +1681,7 @@ RUNTIME CONFIGURATION
 
     The run-level harness and provider are the default lane. An agent binding may add
     "lane": {"harness": "claude", "provider": "anthropic"} to run that node on another accepted
-    pair; git_delivery bindings cannot. --uniform-runtime-config applies one lane to every agent
+    pair; git_delivery and comment_delivery bindings cannot. --uniform-runtime-config applies one lane to every agent
     node. Named targets must advertise per-node lane support (openengine.node-runtime-lanes/v1), and
     a local run first checks that each lane's executable (codex, claude, or copilot) is on PATH.
 
@@ -2394,9 +2408,14 @@ Options:
           - single-worker:   A single general-purpose worker
           - software-change: A review, validation, and optional delivery workflow for code changes
           - auto-research:   Research with ten iterations by default and independent evidence gates
+          - issue-review:    Inspect an issue proposal and post a review report
+          - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
 
       --input <FILE>
           Load the graph's initial input from this JSON file
+
+      --task-from <URL>
+          Resolve a GitHub issue or pull-request URL into review input before starting
 
       --runtime-config <FILE>
           Load an exact secret-free runtime plan from this JSON file
@@ -2439,7 +2458,7 @@ Options:
           Stable idempotency key for safely retrying submission
 
       --delivery <MODE>
-          Materialize this template-owned delivery mode
+          Template delivery mode. Defaults to pull_request for software-change, comment for issue-review and pr-review, otherwise none
 
       --push
           Commit and push the managed run branch without opening a pull request
@@ -2531,7 +2550,7 @@ RUNTIME CONFIGURATION
 
     The run-level harness and provider are the default lane. An agent binding may add
     "lane": {"harness": "claude", "provider": "anthropic"} to run that node on another accepted
-    pair; git_delivery bindings cannot. --uniform-runtime-config applies one lane to every agent
+    pair; git_delivery and comment_delivery bindings cannot. --uniform-runtime-config applies one lane to every agent
     node. Named targets must advertise per-node lane support (openengine.node-runtime-lanes/v1), and
     a local run first checks that each lane's executable (codex, claude, or copilot) is on PATH.
 
@@ -3133,7 +3152,7 @@ Local runs use --cwd or the invoking folder; Git worktrees use their root. Local
 
 A foreground run follows NDJSON events until completion. --detach returns after submission. Ctrl-C before the submission attempt begins cancels the command; once it begins, Ctrl-C waits for the receipt and then detaches. During observation, Ctrl-C detaches without stopping the run.
 
-Usage: zeroshot run [OPTIONS] --title <TITLE> --input <FILE>
+Usage: zeroshot run [OPTIONS] --title <TITLE>
 
 Options:
       --title <TITLE>
@@ -3149,9 +3168,14 @@ Options:
           - single-worker:   A single general-purpose worker
           - software-change: A review, validation, and optional delivery workflow for code changes
           - auto-research:   Research with ten iterations by default and independent evidence gates
+          - issue-review:    Inspect an issue proposal and post a review report
+          - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
 
       --input <FILE>
           Load the graph's initial input from this JSON file
+
+      --task-from <URL>
+          Resolve a GitHub issue or pull-request URL into review input before starting
 
       --runtime-config <FILE>
           Load an exact secret-free runtime plan from this JSON file
@@ -3202,7 +3226,7 @@ Options:
           Remote profiles still require target access. This does not check dependency installation or connection availability.
 
       --delivery <MODE>
-          Materialize this template-owned delivery mode
+          Template delivery mode. Defaults to pull_request for software-change, comment for issue-review and pr-review, otherwise none
 
       --push
           Commit and push the managed run branch without opening a pull request
@@ -3261,7 +3285,7 @@ RUNTIME CONFIGURATION
 
     The run-level harness and provider are the default lane. An agent binding may add
     "lane": {"harness": "claude", "provider": "anthropic"} to run that node on another accepted
-    pair; git_delivery bindings cannot. --uniform-runtime-config applies one lane to every agent
+    pair; git_delivery and comment_delivery bindings cannot. --uniform-runtime-config applies one lane to every agent
     node. Named targets must advertise per-node lane support (openengine.node-runtime-lanes/v1), and
     a local run first checks that each lane's executable (codex, claude, or copilot) is on PATH.
 
