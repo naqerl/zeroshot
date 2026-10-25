@@ -51,6 +51,9 @@ mod pool_capacity;
 #[path = "tests/pool_profiles.rs"]
 mod pool_profiles;
 
+#[path = "tests/pool_data.rs"]
+mod pool_data;
+
 pub(super) fn member(name: &str, tags: &[&str], slots: u32, priority: i32) -> Member {
     Member {
         tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),

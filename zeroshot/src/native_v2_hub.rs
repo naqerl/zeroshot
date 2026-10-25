@@ -26,6 +26,7 @@ mod clock;
 mod context;
 mod cron;
 mod daemon;
+mod data;
 mod driver;
 mod error;
 mod eval;

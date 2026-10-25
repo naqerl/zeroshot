@@ -42,6 +42,9 @@ pub(crate) struct AddPool {
     pub tags: Vec<String>,
     pub ssh_key: std::path::PathBuf,
     pub ssh_from: Vec<String>,
+    /// The servers' btrfs data folder; default: a file on the local disk.
+    #[serde(default)]
+    pub data: super::data::DataSettings,
 }
 
 /// `PUT /v1/hub/pools/{name}/tags/{tag}`: the machines a pool creates for jobs with a tag.

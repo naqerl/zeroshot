@@ -15,6 +15,7 @@ use zeroshot_engine::native_v2_cli::hub::{
 use super::api::EXIT_CODE_HEADER;
 use super::clock::{now_ms, parse_duration_ms, parse_future_ms, parse_past_ms};
 use super::context::Resolved;
+use super::data::{DataFs, DataSettings};
 use super::cron;
 use super::error::HubError;
 use super::jobs;
@@ -676,5 +677,10 @@ pub(crate) fn add_pool(request: HubPoolAdd) -> Result<AddPool, HubError> {
         tags: request.tags,
         ssh_key: super::paths::absolute(&request.ssh_key)?,
         ssh_from: request.ssh_from,
+        data: DataSettings {
+            fs: DataFs::parse(&request.data_fs)?,
+            size_gb: request.data_size_gb,
+            volume_gb: request.data_volume_gb,
+        },
     })
 }

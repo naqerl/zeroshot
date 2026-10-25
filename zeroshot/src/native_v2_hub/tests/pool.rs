@@ -11,6 +11,7 @@ use serde_json::json;
 use super::super::archive::{self, FILES};
 use super::super::capacity;
 use super::super::clock::now_ms;
+use super::super::data::DataSettings;
 use super::super::error::{EXIT_NO_CAPACITY, EXIT_NO_ELIGIBLE_TARGET, HubError};
 use super::super::lease::{PoolRuntime, REAP_INTERVAL_MS, production_runtime};
 use super::super::model::{HubState, Job, JobState, MemberState, STATE_VERSION, Strategy};
@@ -351,6 +352,7 @@ pub(super) fn add_request(folder: &Path, max: u32) -> AddPool {
         tags: vec![TAG.to_owned()],
         ssh_key: key,
         ssh_from: vec!["198.51.100.7/32".to_owned()],
+        data: DataSettings::default(),
     }
 }
 
@@ -1124,7 +1126,7 @@ fn ssh_tunnels_forward_loopback_only_with_pinned_host_keys() {
     );
 }
 
-fn pool_fixture() -> Pool {
+pub(super) fn pool_fixture() -> Pool {
     Pool {
         name: "burst".to_owned(),
         provider: Provider::Hetzner,
@@ -1154,6 +1156,7 @@ fn pool_fixture() -> Pool {
         shortages: std::collections::BTreeMap::new(),
         profiles: Vec::new(),
         unavailable: BTreeMap::new(),
+        data: DataSettings::default(),
     }
 }
 

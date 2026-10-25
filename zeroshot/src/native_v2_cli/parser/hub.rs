@@ -354,6 +354,22 @@ pub(super) struct HubPoolAddArgs {
     /// CIDR allowed to reach servers over SSH (the hub's public address). Repeat for several.
     #[arg(long, value_name = "CIDR", required = true, action = clap::ArgAction::Append)]
     ssh_from: Vec<String>,
+
+    /// Filesystem of the servers' data folder. Zeroshot copies workspaces with reflinks, so
+    /// it must be copy-on-write: btrfs, formatted at boot.
+    #[arg(long, value_name = "FS", default_value = "btrfs", value_parser = ["btrfs"])]
+    data_fs: String,
+
+    /// Size of the btrfs data file on the server's local disk, in GB. Default: the free disk
+    /// after the target image, less 8 GB for Docker.
+    #[arg(long, value_name = "GB", conflicts_with = "data_volume",
+          value_parser = clap::value_parser!(u32).range(5..))]
+    data_size: Option<u32>,
+
+    /// Keep the data on a btrfs Hetzner Volume of this many GB, created with each server and
+    /// deleted with it, instead of a file on the local disk.
+    #[arg(long, value_name = "GB", value_parser = clap::value_parser!(u32).range(10..=10240))]
+    data_volume: Option<u32>,
 }
 
 impl HubPoolCliCommand {
@@ -377,6 +393,9 @@ impl HubPoolCliCommand {
                     tags: tags(args.tags)?,
                     ssh_key: args.ssh_key,
                     ssh_from: args.ssh_from,
+                    data_fs: args.data_fs,
+                    data_size_gb: args.data_size,
+                    data_volume_gb: args.data_volume,
                 }))
             }
             Self::List => HubPoolCommand::List,

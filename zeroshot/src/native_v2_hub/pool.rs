@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use super::capacity::{self, Machine, PoolType, Shortage};
 use super::profile::{self, Spec, TagProfile};
 use super::clock::rfc3339;
+use super::data::DataSettings;
 use super::model::{HubState, Job, JobState, PlacementSpec, Requirements};
 
 /// Label naming the hub that owns a provider resource.
@@ -92,6 +93,9 @@ pub(crate) struct Pool {
     /// Capacity refusals by server type and location.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub unavailable: BTreeMap<String, BTreeMap<String, u64>>,
+    /// The servers' btrfs data folder (`--data-fs`, `--data-size`, `--data-volume`).
+    #[serde(default)]
+    pub data: DataSettings,
 }
 
 /// First pause after a failed boot; it doubles per further failure up to [`MAX_PAUSE_MS`].
@@ -161,6 +165,7 @@ impl Pool {
             "waiting": capacity::hold_reason(self, None, now),
             "profiles": self.profiles.iter().map(TagProfile::view).collect::<Vec<_>>(),
             "unavailable": self.unavailable,
+            "data": self.data.view(),
             "leases": mine,
         })
     }

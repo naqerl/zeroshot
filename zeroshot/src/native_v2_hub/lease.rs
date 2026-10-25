@@ -830,6 +830,7 @@ impl HubService {
             shortages: std::collections::BTreeMap::new(),
             profiles: Vec::new(),
             unavailable: std::collections::BTreeMap::new(),
+            data: request.data,
         };
         read_public_key(&pool)?;
         self.mutate(|state| {
@@ -975,7 +976,7 @@ fn validate_pool(request: &AddPool) -> Result<(), HubError> {
     if let Some(0) = request.wait_max_ms {
         return usage("--wait-max must be positive".to_owned());
     }
-    Ok(())
+    request.data.validate()
 }
 
 fn valid_cidr(cidr: &str) -> bool {
