@@ -82,11 +82,12 @@ enum CliCommand {
         command: PlanCommand,
     },
 
-    /// Serve Zeroshot tools and run events as an MCP server on stdin and stdout.
+    /// Serve Zeroshot tools and run events as an MCP server.
     ///
-    /// Tools call the same commands as this CLI. Run events use the
-    /// `io.modelcontextprotocol/events` extension and the durable stream `watch` already reads.
-    /// Signed webhooks are unsupported. The process writes no banner.
+    /// The Streamable HTTP transport listens on POST /mcp by default. Use --transport stdio for
+    /// the original newline-delimited stdio transport. Tools call the same commands as this CLI.
+    /// Run events use the `io.modelcontextprotocol/events` extension and the durable stream
+    /// `watch` already reads. Signed webhooks are unsupported.
     Mcp {
         #[command(subcommand)]
         command: McpCommand,
@@ -126,13 +127,30 @@ enum CliCommand {
     Utility(UtilityCommand),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum McpTransport {
+    /// Streamable HTTP with one POST /mcp endpoint.
+    Http,
+    /// Newline-delimited JSON-RPC on stdin and stdout.
+    Stdio,
+}
+
 #[derive(Debug, Subcommand)]
 enum McpCommand {
-    /// Serve JSON-RPC MCP on stdin and stdout until the client closes stdin.
+    /// Serve JSON-RPC MCP until the selected transport stops.
     ///
-    /// One JSON-RPC message per line. Each tool returns that command's JSON. A failing command is
-    /// a tool error carrying the command's diagnostic code and message.
-    Serve,
+    /// HTTP is the default and serves Streamable HTTP at POST /mcp. Stdio reads one JSON-RPC
+    /// message per line from stdin until the client closes it. Each tool returns that command's
+    /// JSON. A failing command is a tool error carrying the command's diagnostic code and message.
+    Serve {
+        /// Transport to serve.
+        #[arg(long, value_enum, default_value = "http")]
+        transport: McpTransport,
+
+        /// Address for the HTTP transport. Ignored by stdio.
+        #[arg(long, default_value = "127.0.0.1:3000")]
+        listen: SocketAddr,
+    },
 }
 
 #[derive(Debug, Subcommand)]

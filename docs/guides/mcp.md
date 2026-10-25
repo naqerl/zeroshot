@@ -1,19 +1,36 @@
 # Serve Zeroshot over MCP
 
-`zeroshot mcp serve` is a Model Context Protocol server on stdin and stdout. It speaks one
-JSON-RPC 2.0 message per line. Each tool runs the same command the CLI would, in this process.
-Run events come from the durable stream `zeroshot watch` already reads.
+`zeroshot mcp serve` is a Model Context Protocol server. By default it serves Streamable HTTP on
+`POST /mcp`; `--transport stdio` selects newline-delimited JSON-RPC on stdin and stdout. Each tool
+runs the same command the CLI would, in this process. Run events come from the durable stream
+`zeroshot watch` already reads.
 
-A client starts it as:
+```bash
+# Streamable HTTP on http://127.0.0.1:3000/mcp (the default)
+zeroshot mcp serve --listen 127.0.0.1:3000
+
+# Newline-delimited stdio fallback
+zeroshot mcp serve --transport stdio
+```
+
+An HTTP client connects to `http://127.0.0.1:3000/mcp` with JSON-RPC request bodies. The optional
+`Mcp-Session-Id` request header keeps separate initialization state per client; requests without it
+share the `default` session. Notifications return `202 Accepted` without a JSON-RPC body.
+`events/stream` returns `text/event-stream`; each SSE `data` line is one JSON-RPC notification or
+the final response. Earlier event polls and ordinary requests return JSON. The HTTP transport
+prints its listening URL to stderr.
+
+A stdio client starts it as:
 
 ```json
 {
   "command": "zeroshot",
-  "args": ["mcp", "serve"]
+  "args": ["mcp", "serve", "--transport", "stdio"]
 }
 ```
 
-The process writes no banner. It exits when the client closes stdin.
+Stdio writes no banner and exits when the client closes stdin. An HTTP server stops on Ctrl-C or
+SIGTERM.
 
 ## Handshake
 
@@ -33,6 +50,27 @@ stdout as a text content block and, when that stdout is one JSON value or NDJSON
 `structuredContent`. A failing command is still a JSON-RPC success, with `isError: true`.
 `structuredContent.code` and `message` are the CLI diagnostic (`zeroshot.error/v1`). An unknown
 tool name is a JSON-RPC invalid-params error.
+
+`input`, `graph`, `runtimeConfig`, `uniformRuntimeConfig`, and `environment` are inline JSON
+values, not file paths. `input` may be any JSON value; the other four are JSON objects. The server
+writes each supplied value to a private temporary file for the duration of that command, then
+removes it. For example:
+
+```json
+{
+  "name": "run",
+  "arguments": {
+    "title": "Fix the parser",
+    "template": "software-change",
+    "input": {"task": "Fix the parser"},
+    "runtimeConfig": {
+      "agents": {
+        "worker": {"harness": "codex", "provider": "openai", "model": "gpt-5"}
+      }
+    }
+  }
+}
+```
 
 | Tool                | Command                      | What it does                                      |
 | ------------------- | ---------------------------- | ------------------------------------------------- |

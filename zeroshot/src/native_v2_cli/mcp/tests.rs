@@ -1,12 +1,12 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use super::super::{CliTestBackend, CliTestCall, NeverDetach, RunWatchCommand};
-use super::{serve, McpFailure, McpHost, WatchStream};
+use super::{serve, serve_http_listener, McpFailure, McpHost, WatchStream};
 use crate::native_v2_cli::{NativeV2CliCommand, execute_native_v2_cli};
 
 struct ToolHost {
@@ -381,4 +381,183 @@ async fn events_stream_pushes_a_notification() {
         }
     }
     assert!(saw_event);
+}
+
+#[test]
+fn inline_tool_data_is_materialized_for_the_command() {
+    let original = json!({
+        "input": {"task": "Fix the parser"},
+        "graph": {"profile": "openengine.graph.full/v1"},
+        "runtimeConfig": {"agents": {}},
+        "uniformRuntimeConfig": {"harness": "codex"},
+        "environment": {"variables": {"MODE": "test"}},
+    });
+    let mut arguments: Map<String, Value> = original
+        .as_object()
+        .expect("inline fixture is an object")
+        .clone();
+    let directory = super::tools::materialize_inline(&mut arguments)
+        .expect("inline data materializes")
+        .expect("inline data creates a temporary directory");
+    let root = directory.path().to_path_buf();
+    for key in [
+        "input",
+        "graph",
+        "runtimeConfig",
+        "uniformRuntimeConfig",
+        "environment",
+    ] {
+        let path = arguments[key].as_str().expect("argument became a path");
+        let stored: Value =
+            serde_json::from_slice(&std::fs::read(path).expect("temporary command input exists"))
+                .expect("temporary command input is JSON");
+        assert_eq!(stored, original[key], "{key} round trips");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path)
+                .expect("temporary command input metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{key} is private");
+        }
+    }
+    drop(directory);
+    assert!(!root.exists(), "temporary command inputs are removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_transport_handshakes_and_answers_notifications() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind MCP HTTP test listener");
+    let address = listener.local_addr().expect("MCP HTTP test address");
+    let server = tokio::spawn(serve_http_listener(
+        ToolHost {
+            backend: CliTestBackend::default(),
+        },
+        listener,
+    ));
+    let url = format!("http://{address}/mcp");
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0"}
+            }
+        }))
+        .send()
+        .await
+        .expect("initialize over HTTP");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("default")
+    );
+    let initialized: Value = response.json().await.expect("initialize response JSON");
+    assert_eq!(
+        initialized["result"]["serverInfo"]["name"],
+        json!("zeroshot")
+    );
+
+    let response = client
+        .post(&url)
+        .json(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        .send()
+        .await
+        .expect("notification over HTTP");
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    assert!(
+        response
+            .bytes()
+            .await
+            .expect("notification body")
+            .is_empty()
+    );
+
+    let response = client
+        .post(&url)
+        .json(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
+        .send()
+        .await
+        .expect("tools/list over HTTP");
+    let listed: Value = response.json().await.expect("tools/list response JSON");
+    assert_eq!(listed["id"], json!(2));
+    assert!(
+        listed["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .any(|tool| tool["name"] == "run")
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_transport_streams_events_as_server_sent_events() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind MCP HTTP test listener");
+    let address = listener.local_addr().expect("MCP HTTP test address");
+    let server = tokio::spawn(serve_http_listener(ScriptHost, listener));
+    let url = format!("http://{address}/mcp");
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0"}
+            }
+        }))
+        .send()
+        .await
+        .expect("initialize over HTTP");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let response = client
+        .post(&url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "events/stream",
+            "params": {
+                "name": "run.event",
+                "arguments": {"runId": "run-public"},
+                "cursor": "v2:1"
+            }
+        }))
+        .send()
+        .await
+        .expect("events/stream over HTTP");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .starts_with("text/event-stream")
+    );
+    let body = tokio::time::timeout(Duration::from_secs(5), response.text())
+        .await
+        .expect("events/stream ends")
+        .expect("events/stream body");
+    assert!(body.contains("notifications/events/active"));
+    assert!(body.contains("notifications/events/event"));
+    assert!(body.contains("\"resultType\":\"complete\""));
+    server.abort();
 }

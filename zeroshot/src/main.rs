@@ -13,9 +13,9 @@ use zeroshot_engine::native_v2_cli::local::{LOCAL_CONTROLLER_MODE, LocalCliBacke
 use zeroshot_engine::native_v2_cli::oecp::NamedTargetCliBackend;
 use zeroshot_engine::native_v2_cli::{
     execute_native_v2_cli, parse_native_v2_args, try_execute_native_v2_preflight, serve_local_acp,
-    try_execute_native_v2_static, AcpServeError, CtrlCDetachSignal, NativeV2CliBackend,
-    NativeV2CliCommand, NativeV2CliDiagnostic, NativeV2CliError, ERROR_FORMAT_ENV,
-    JSON_ERROR_FORMAT,
+    try_execute_native_v2_static, AcpServeError, CtrlCDetachSignal, McpTransport,
+    NativeV2CliBackend, NativeV2CliCommand, NativeV2CliDiagnostic, NativeV2CliError,
+    ERROR_FORMAT_ENV, JSON_ERROR_FORMAT,
 };
 use zeroshot_engine::native_v2_portable_controller::{
     PortableControllerError, guard_controller_process, record_unloaded_startup_failure,
@@ -60,7 +60,10 @@ async fn dispatch(command: NativeV2CliCommand) -> Result<(), ProcessError> {
         NativeV2CliCommand::Acp { profile } => {
             serve_local_acp(profile).await.map_err(ProcessError::from)
         }
-        NativeV2CliCommand::McpServe => mcp_host::serve().await,
+        NativeV2CliCommand::McpServe { transport, listen } => match transport {
+            McpTransport::Http => mcp_host::serve_http(listen).await,
+            McpTransport::Stdio => mcp_host::serve_stdio().await,
+        },
         NativeV2CliCommand::Ui { listen, target } => serve_ui(listen, target).await,
         NativeV2CliCommand::TargetServe(config) => serve_direct_target(config)
             .await

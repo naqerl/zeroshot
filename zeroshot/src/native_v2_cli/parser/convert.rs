@@ -8,10 +8,10 @@ use openengine_cluster_protocol::{
 };
 
 use super::{
-    AcpArgs, AttachArgs, Cli, CliCommand, ConnectionCommand, ConnectionScopeArg, PlanCommand,
-    PlanSelectorArgs, PlanSubmitArgs, RunArgs, RunCheckpointsArgs, RunResumeArgs, RunLogsArgs,
-    RunReportArgs, RunSelectorArgs, RunWatchArgs, TargetCommand, TemplateCommand, TemplateName,
-    UtilityCommand,
+    AcpArgs, AttachArgs, Cli, CliCommand, ConnectionCommand, ConnectionScopeArg, McpCommand,
+    McpTransport, PlanCommand, PlanSelectorArgs, PlanSubmitArgs, RunArgs, RunCheckpointsArgs,
+    RunResumeArgs, RunLogsArgs, RunReportArgs, RunSelectorArgs, RunWatchArgs, TargetCommand,
+    TemplateCommand, TemplateName, UtilityCommand,
 };
 use crate::native_v2_cli::{
     BuiltinGraphTemplate, ConnectionInput, ConnectionRoute, ConnectionSetCommand,
@@ -90,10 +90,16 @@ impl CliCommand {
     }
 }
 
-impl super::McpCommand {
+impl McpCommand {
     fn into_command(self) -> Result<NativeV2CliCommand, NativeV2CliError> {
         match self {
-            Self::Serve => Ok(NativeV2CliCommand::McpServe),
+            Self::Serve { transport, listen } => Ok(NativeV2CliCommand::McpServe {
+                transport: match transport {
+                    McpTransport::Http => crate::native_v2_cli::McpTransport::Http,
+                    McpTransport::Stdio => crate::native_v2_cli::McpTransport::Stdio,
+                },
+                listen,
+            }),
         }
     }
 }

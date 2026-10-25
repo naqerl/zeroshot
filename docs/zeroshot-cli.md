@@ -23,6 +23,7 @@ Commands:
   profile            Manage reusable graph/runtime profiles
   template           Inspect built-in graph templates
   plan               Validate, submit, and observe hosted merge plans
+  mcp                Serve Zeroshot tools and run events as an MCP server
   hub                Pool named targets and place, queue, and account for runs across them
   run                Submit a graph run locally or to a named target
   update             Update this executable and managed agent skills to the newest canonical release
@@ -1048,6 +1049,64 @@ Commands:
   help        Print this message or the help of the given subcommand(s)
 ```
 
+### `zeroshot mcp`
+
+```text
+Serve Zeroshot tools and run events as an MCP server.
+
+The Streamable HTTP transport listens on POST /mcp by default. Use --transport stdio for the original newline-delimited stdio transport. Tools call the same commands as this CLI. Run events use the `io.modelcontextprotocol/events` extension and the durable stream `watch` already reads. Signed webhooks are unsupported.
+
+Usage: zeroshot mcp <COMMAND>
+
+Commands:
+  serve  Serve JSON-RPC MCP until the selected transport stops
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+#### `zeroshot mcp serve`
+
+```text
+Serve JSON-RPC MCP until the selected transport stops.
+
+HTTP is the default and serves Streamable HTTP at POST /mcp. Stdio reads one JSON-RPC message per line from stdin until the client closes it. Each tool returns that command's JSON. A failing command is a tool error carrying the command's diagnostic code and message.
+
+Usage: zeroshot mcp serve [OPTIONS]
+
+Options:
+      --transport <TRANSPORT>
+          Transport to serve
+
+          Possible values:
+          - http:  Streamable HTTP with one POST /mcp endpoint
+          - stdio: Newline-delimited JSON-RPC on stdin and stdout
+
+          [default: http]
+
+      --listen <LISTEN>
+          Address for the HTTP transport. Ignored by stdio
+
+          [default: 127.0.0.1:3000]
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+#### `zeroshot mcp help`
+
+```text
+Print this message or the help of the given subcommand(s)
+
+Usage: zeroshot mcp help [COMMAND]
+
+Commands:
+  serve  Serve JSON-RPC MCP until the selected transport stops
+  help   Print this message or the help of the given subcommand(s)
+```
+
 ### `zeroshot hub`
 
 ```text
@@ -1253,7 +1312,7 @@ Place a run on a free member now.
 
 Fails with exit code 3 when every matching member is busy, unless --wait or --queue is given. Without --detach, follows the placed run's events as NDJSON.
 
-Usage: zeroshot hub submit [OPTIONS] --title <TITLE> --input <FILE>
+Usage: zeroshot hub submit [OPTIONS] --title <TITLE>
 
 Options:
       --hub <CONTEXT>
@@ -1293,9 +1352,14 @@ Options:
           - single-worker:   A single general-purpose worker
           - software-change: A review, validation, and optional delivery workflow for code changes
           - auto-research:   Research with ten iterations by default and independent evidence gates
+          - issue-review:    Inspect an issue proposal and post a review report
+          - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
 
       --input <FILE>
           Load the graph's initial input from this JSON file
+
+      --task-from <URL>
+          Resolve a GitHub issue or pull-request URL into review input before starting
 
       --runtime-config <FILE>
           Load an exact secret-free runtime plan from this JSON file
@@ -1341,7 +1405,7 @@ Options:
           Return after submission instead of following NDJSON run events
 
       --delivery <MODE>
-          Materialize this template-owned delivery mode
+          Template delivery mode. Defaults to pull_request for software-change, comment for issue-review and pr-review, otherwise none
 
       --push
           Commit and push the managed run branch without opening a pull request
@@ -1400,7 +1464,7 @@ RUNTIME CONFIGURATION
 
     The run-level harness and provider are the default lane. An agent binding may add
     "lane": {"harness": "claude", "provider": "anthropic"} to run that node on another accepted
-    pair; git_delivery bindings cannot. --uniform-runtime-config applies one lane to every agent
+    pair; git_delivery and comment_delivery bindings cannot. --uniform-runtime-config applies one lane to every agent
     node. Named targets must advertise per-node lane support (openengine.node-runtime-lanes/v1), and
     a local run first checks that each lane's executable (codex, claude, or copilot) is on PATH.
 
@@ -1452,7 +1516,7 @@ Accept a run into the hub queue for later placement, once or on a cron schedule.
 
 --cron creates a recurring schedule (`hs_…`); the hub daemon queues one job per fire. Cron fields use the --cron-tz zone, stored with the schedule, so daylight-saving changes follow that zone wherever the daemon runs. Missed fires collapse into one catch-up fire, and a fire is skipped while the schedule's previous job is still queued.
 
-Usage: zeroshot hub enqueue [OPTIONS] --title <TITLE> --input <FILE>
+Usage: zeroshot hub enqueue [OPTIONS] --title <TITLE>
 
 Options:
       --hub <CONTEXT>
@@ -1503,9 +1567,14 @@ Options:
           - single-worker:   A single general-purpose worker
           - software-change: A review, validation, and optional delivery workflow for code changes
           - auto-research:   Research with ten iterations by default and independent evidence gates
+          - issue-review:    Inspect an issue proposal and post a review report
+          - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
 
       --input <FILE>
           Load the graph's initial input from this JSON file
+
+      --task-from <URL>
+          Resolve a GitHub issue or pull-request URL into review input before starting
 
       --runtime-config <FILE>
           Load an exact secret-free runtime plan from this JSON file
@@ -1548,7 +1617,7 @@ Options:
           Stable idempotency key for safely retrying submission
 
       --delivery <MODE>
-          Materialize this template-owned delivery mode
+          Template delivery mode. Defaults to pull_request for software-change, comment for issue-review and pr-review, otherwise none
 
       --push
           Commit and push the managed run branch without opening a pull request
@@ -1607,7 +1676,7 @@ RUNTIME CONFIGURATION
 
     The run-level harness and provider are the default lane. An agent binding may add
     "lane": {"harness": "claude", "provider": "anthropic"} to run that node on another accepted
-    pair; git_delivery bindings cannot. --uniform-runtime-config applies one lane to every agent
+    pair; git_delivery and comment_delivery bindings cannot. --uniform-runtime-config applies one lane to every agent
     node. Named targets must advertise per-node lane support (openengine.node-runtime-lanes/v1), and
     a local run first checks that each lane's executable (codex, claude, or copilot) is on PATH.
 
@@ -2328,9 +2397,14 @@ Options:
           - single-worker:   A single general-purpose worker
           - software-change: A review, validation, and optional delivery workflow for code changes
           - auto-research:   Research with ten iterations by default and independent evidence gates
+          - issue-review:    Inspect an issue proposal and post a review report
+          - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
 
       --input <FILE>
           Load the graph's initial input from this JSON file
+
+      --task-from <URL>
+          Resolve a GitHub issue or pull-request URL into review input before starting
 
       --runtime-config <FILE>
           Load an exact secret-free runtime plan from this JSON file
@@ -2373,7 +2447,7 @@ Options:
           Stable idempotency key for safely retrying submission
 
       --delivery <MODE>
-          Materialize this template-owned delivery mode
+          Template delivery mode. Defaults to pull_request for software-change, comment for issue-review and pr-review, otherwise none
 
       --push
           Commit and push the managed run branch without opening a pull request
@@ -2456,7 +2530,7 @@ RUNTIME CONFIGURATION
 
     The run-level harness and provider are the default lane. An agent binding may add
     "lane": {"harness": "claude", "provider": "anthropic"} to run that node on another accepted
-    pair; git_delivery bindings cannot. --uniform-runtime-config applies one lane to every agent
+    pair; git_delivery and comment_delivery bindings cannot. --uniform-runtime-config applies one lane to every agent
     node. Named targets must advertise per-node lane support (openengine.node-runtime-lanes/v1), and
     a local run first checks that each lane's executable (codex, claude, or copilot) is on PATH.
 
@@ -3192,6 +3266,7 @@ Commands:
   profile            Manage reusable graph/runtime profiles
   template           Inspect built-in graph templates
   plan               Validate, submit, and observe hosted merge plans
+  mcp                Serve Zeroshot tools and run events as an MCP server
   hub                Pool named targets and place, queue, and account for runs across them
   run                Submit a graph run locally or to a named target
   update             Update this executable and managed agent skills to the newest canonical release

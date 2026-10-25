@@ -167,7 +167,7 @@ fn main_event(
             execution: Some(execution),
             ..
         } => main_execution(request, *execution).then_some(*execution),
-        RunEvent::NodeCompleted { completion } => {
+        RunEvent::NodeCompleted { completion, .. } => {
             main_execution(request, completion.reference.execution)
                 .then_some(completion.reference.execution)
         }

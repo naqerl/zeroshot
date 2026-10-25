@@ -26,7 +26,7 @@ struct StreamCancel {
     handle: AbortHandle,
 }
 
-enum Action {
+pub(super) enum Action {
     Reply(Value),
     Fail {
         code: i64,
@@ -36,6 +36,52 @@ enum Action {
     Stream(Prepared),
 }
 
+pub(super) enum Handled {
+    None,
+    Reply(Value),
+    Stream { id: Value, prepared: Prepared },
+}
+
+/// Per-session MCP state shared by the stdio loop and HTTP transport workers.
+#[derive(Default)]
+pub(super) struct SessionState {
+    initialized: bool,
+    cancellations: HashMap<String, StreamCancel>,
+}
+
+impl SessionState {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn initialized(&self) -> bool {
+        self.initialized
+    }
+
+    pub(super) fn mark_initialized(&mut self) {
+        self.initialized = true;
+    }
+
+    pub(super) fn handle_notification(&mut self, message: &Value) {
+        handle_notification(message, &mut self.cancellations);
+    }
+
+    pub(super) fn spawn_stream<W>(&mut self, prepared: Prepared, id: Value, writer: &Arc<Mutex<W>>)
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        spawn_stream(prepared, id, writer, &mut self.cancellations);
+    }
+
+    pub(super) fn shutdown(&mut self) {
+        for cancel in self.cancellations.values() {
+            cancel.flag.store(true, Ordering::Relaxed);
+            cancel.handle.abort();
+        }
+        self.cancellations.clear();
+    }
+}
+
 /// Serve newline-delimited JSON-RPC MCP on `reader` and `writer` until stdin closes.
 pub async fn serve<H, R, W>(host: H, mut reader: R, writer: W) -> io::Result<()>
 where
@@ -43,10 +89,8 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let host = Arc::new(host);
     let writer = Arc::new(Mutex::new(writer));
-    let mut cancellations: HashMap<String, StreamCancel> = HashMap::new();
-    let mut initialized = false;
+    let mut session = SessionState::new();
     loop {
         let Some(line) = read_line(&mut reader).await? else {
             break;
@@ -65,43 +109,43 @@ where
                 continue;
             }
         };
-        if message.get("id").is_none() {
-            handle_notification(&message, &mut cancellations);
-            continue;
-        }
-        let id = message.get("id").cloned().unwrap_or(Value::Null);
-        if !valid_id(&id) {
-            write_message(
-                &writer,
-                &error_message(Value::Null, -32600, "Invalid Request", None),
-            )
-            .await?;
-            continue;
-        }
-        match dispatch(&host, &message, initialized).await {
-            Action::Reply(result) => {
-                if message.get("method").and_then(Value::as_str) == Some("initialize") {
-                    initialized = true;
-                }
-                write_message(&writer, &ok_message(id, result)).await?;
-            }
-            Action::Fail {
-                code,
-                message: text,
-                data,
-            } => {
-                write_message(&writer, &error_message(id, code, text, data)).await?;
-            }
-            Action::Stream(prepared) => {
-                spawn_stream(prepared, id, &writer, &mut cancellations);
-            }
+        match handle(&host, &mut session, &message).await {
+            Handled::None => {}
+            Handled::Reply(reply) => write_message(&writer, &reply).await?,
+            Handled::Stream { id, prepared } => session.spawn_stream(prepared, id, &writer),
         }
     }
-    for cancel in cancellations.values() {
-        cancel.flag.store(true, Ordering::Relaxed);
-        cancel.handle.abort();
-    }
+    session.shutdown();
     Ok(())
+}
+
+/// Handles one complete JSON-RPC message without transport-specific I/O.
+pub(super) async fn handle<H>(host: &H, session: &mut SessionState, message: &Value) -> Handled
+where
+    H: McpHost + 'static,
+{
+    if message.get("id").is_none() {
+        handle_notification(message, &mut session.cancellations);
+        return Handled::None;
+    }
+    let id = message.get("id").cloned().unwrap_or(Value::Null);
+    if !valid_id(&id) {
+        return Handled::Reply(error_message(Value::Null, -32600, "Invalid Request", None));
+    }
+    match dispatch(host, message, session.initialized).await {
+        Action::Reply(result) => {
+            if message.get("method").and_then(Value::as_str) == Some("initialize") {
+                session.initialized = true;
+            }
+            Handled::Reply(ok_message(id, result))
+        }
+        Action::Fail {
+            code,
+            message: text,
+            data,
+        } => Handled::Reply(error_message(id, code, text, data)),
+        Action::Stream(prepared) => Handled::Stream { id, prepared },
+    }
 }
 
 pub(super) async fn write_message<W>(writer: &Mutex<W>, message: &Value) -> io::Result<()>
@@ -141,7 +185,7 @@ fn spawn_stream<W>(
     }
 }
 
-async fn dispatch<H>(host: &Arc<H>, message: &Value, initialized: bool) -> Action
+pub(super) async fn dispatch<H>(host: &H, message: &Value, initialized: bool) -> Action
 where
     H: McpHost + 'static,
 {
@@ -193,7 +237,7 @@ where
             Ok(result) => Action::Reply(result),
             Err(failure) => invalid_params(failure),
         },
-        "tools/call" => match tools::call(host.as_ref(), &params).await {
+        "tools/call" => match tools::call(host, &params).await {
             Ok(result) => Action::Reply(result),
             Err(failure) => invalid_params(failure),
         },
@@ -201,11 +245,11 @@ where
             Ok(result) => Action::Reply(result),
             Err(error) => event_failure(error),
         },
-        "events/poll" => match events::poll(host.as_ref(), &params).await {
+        "events/poll" => match events::poll(host, &params).await {
             Ok(result) => Action::Reply(result),
             Err(error) => event_failure(error),
         },
-        "events/stream" => match events::prepare(host.as_ref(), &params).await {
+        "events/stream" => match events::prepare(host, &params).await {
             Ok(prepared) => Action::Stream(prepared),
             Err(error) => event_failure(error),
         },
@@ -280,7 +324,7 @@ fn initialize_result(protocol_version: String) -> Value {
     result
 }
 
-fn valid_id(id: &Value) -> bool {
+pub(super) fn valid_id(id: &Value) -> bool {
     id.is_number() || id.is_string()
 }
 
@@ -288,11 +332,11 @@ fn id_key(id: &Value) -> String {
     serde_json::to_string(id).unwrap_or_default()
 }
 
-fn ok_message(id: Value, result: Value) -> Value {
+pub(super) fn ok_message(id: Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
-fn error_message(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
+pub(super) fn error_message(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
     let mut error = json!({"code": code, "message": message});
     if let Some(data) = data {
         error["data"] = data;

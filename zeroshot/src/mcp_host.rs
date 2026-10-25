@@ -3,6 +3,7 @@
 //! Tools run through the same public and hub executors as the CLI. Events read the same
 //! `run_watch` subscription `zeroshot watch` opens.
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -23,13 +24,19 @@ use crate::native_v2_target::{
     TargetOecpWebSocketDialer, default_target_registry_path,
 };
 
-pub(super) async fn serve() -> Result<(), super::ProcessError> {
+pub(super) async fn serve_stdio() -> Result<(), super::ProcessError> {
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let stdout = tokio::io::stdout();
     // The watch pump is not Send. A LocalSet runs it beside this stdio loop.
     let local = tokio::task::LocalSet::new();
     local
         .run_until(serve_session(ProductionHost, stdin, stdout))
+        .await
+        .map_err(super::ProcessError::from)
+}
+
+pub(super) async fn serve_http(listen: SocketAddr) -> Result<(), super::ProcessError> {
+    zeroshot_engine::native_v2_cli::mcp::serve_http(ProductionHost, listen)
         .await
         .map_err(super::ProcessError::from)
 }

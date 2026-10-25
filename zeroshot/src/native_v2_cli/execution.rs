@@ -83,7 +83,7 @@ where
         | NativeV2CliCommand::TargetServe(_)
         | NativeV2CliCommand::Ui { .. }
         | NativeV2CliCommand::Hub(_)
-        | NativeV2CliCommand::McpServe => Err(NativeV2CliError::ProcessCommand),
+        | NativeV2CliCommand::McpServe { .. } => Err(NativeV2CliError::ProcessCommand),
         command => execute_run_operation(command, context, signal, output).await,
     }
 }
