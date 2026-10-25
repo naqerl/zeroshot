@@ -20,6 +20,7 @@ use crate::native_v2_target::{FileTargetRegistry, default_target_registry_path};
 
 mod api;
 mod archive;
+mod capacity;
 mod client;
 mod clock;
 mod context;

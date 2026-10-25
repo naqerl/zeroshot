@@ -55,7 +55,9 @@ pub(crate) fn router(state: Arc<ApiState>) -> Router {
             patch(update_member).delete(remove_member),
         )
         .route("/v1/hub/pools", get(list_pools).post(add_pool))
+        .route("/v1/hub/pools/types", get(pool_types))
         .route("/v1/hub/pools/{name}", delete(remove_pool))
+        .route("/v1/hub/pools/{name}/resume", post(resume_pool))
         .route("/v1/hub/jobs", post(submit))
         .route("/v1/hub/jobs/query", post(ps))
         .route("/v1/hub/jobs/{id}", get(status).delete(dequeue))
@@ -254,6 +256,14 @@ async fn list_pools(State(state): State<Arc<ApiState>>) -> Response {
 
 async fn remove_pool(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Response {
     reply(state.service.remove_pool(&name).await)
+}
+
+async fn pool_types(State(state): State<Arc<ApiState>>) -> Response {
+    reply(state.service.pool_types().await)
+}
+
+async fn resume_pool(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Response {
+    reply(state.service.resume_pool(&name).await)
 }
 
 async fn submit(State(state): State<Arc<ApiState>>, bytes: Bytes) -> Response {

@@ -24,8 +24,15 @@ pub(crate) struct AddMember {
 pub(crate) struct AddPool {
     pub name: String,
     pub provider: Provider,
-    pub server_type: String,
-    pub location: String,
+    /// Server types, best first.
+    pub server_types: Vec<String>,
+    /// Locations, in order; empty means every location offering one of the types.
+    #[serde(default)]
+    pub locations: Vec<String>,
+    #[serde(default)]
+    pub multi_arch: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_max_ms: Option<u64>,
     pub image: String,
     pub target_image: String,
     pub max: u32,

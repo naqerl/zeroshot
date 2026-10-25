@@ -287,7 +287,7 @@ impl HubService {
             let probed = state
                 .members
                 .iter()
-                .filter(|member| query.tags.iter().all(|tag| member.tags.contains(tag)))
+                .filter(|member| query.tags.iter().all(|tag| member.has_tag(tag)))
                 .filter(|member| member.state != MemberState::Disabled)
                 .collect::<Vec<_>>();
             let loads = schedule::probe(&probed, &state.jobs, self.driver()).await;
@@ -300,7 +300,7 @@ impl HubService {
         let targets = state
             .members
             .iter()
-            .filter(|member| query.tags.iter().all(|tag| member.tags.contains(tag)))
+            .filter(|member| query.tags.iter().all(|tag| member.has_tag(tag)))
             .map(|member| {
                 let mut view = member.view();
                 let (kind, origin) = self.member_kind(&member.name);

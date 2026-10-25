@@ -48,7 +48,7 @@ pub(crate) fn matching_members<'a>(members: &'a [Member], spec: &PlacementSpec) 
                 .as_ref()
                 .is_none_or(|target| *target == member.name)
         })
-        .filter(|member| spec.tags.iter().all(|tag| member.tags.contains(tag)))
+        .filter(|member| spec.tags.iter().all(|tag| member.has_tag(tag)))
         .collect()
 }
 

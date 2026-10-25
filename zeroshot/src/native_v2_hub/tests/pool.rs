@@ -9,14 +9,15 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use super::super::archive::{self, FILES};
+use super::super::capacity;
 use super::super::clock::now_ms;
 use super::super::error::{EXIT_NO_CAPACITY, EXIT_NO_ELIGIBLE_TARGET, HubError};
 use super::super::lease::{PoolRuntime, REAP_INTERVAL_MS, production_runtime};
 use super::super::model::{HubState, Job, JobState, MemberState, STATE_VERSION, Strategy};
 use super::super::pool::{
     self, BACKSTOP_GRACE_MS, BOOT_DEADLINE_MS, FIRST_PAUSE_MS, MAX_PAUSE_MS, LABEL_EXPIRES,
-    LABEL_HUB, LABEL_LEASE, Lease, LeasePhase, Pool, Provider, Resource, ResourceKind,
-    TeardownReason,
+    LABEL_HUB, LABEL_LEASE, LABEL_LOCATION, LABEL_SERVER_TYPE, Lease, LeasePhase, Pool, Provider,
+    Resource, ResourceKind, TeardownReason,
 };
 use super::super::provision::{
     self, Architecture, Catalog, Created, Failure, Location, Progress, Provisioner, Refusal,
@@ -332,8 +333,10 @@ fn add_request(folder: &Path, max: u32) -> AddPool {
     AddPool {
         name: "burst".to_owned(),
         provider: Provider::Hetzner,
-        server_type: "cx33".to_owned(),
-        location: "fsn1".to_owned(),
+        server_types: vec!["cpx31".to_owned(), "cx43".to_owned()],
+        locations: vec!["fsn1".to_owned(), "nbg1".to_owned()],
+        multi_arch: false,
+        wait_max_ms: None,
         image: "docker-ce".to_owned(),
         target_image: IMAGE.to_owned(),
         max,
@@ -483,7 +486,12 @@ async fn a_queued_job_creates_a_server_that_joins_as_a_member_and_runs_it() {
     assert_eq!(rig.lease().await.phase, LeasePhase::Booting);
     let request = rig.cloud.with(|cloud| cloud.created[0].clone());
     assert_eq!(request.name, "zs-one");
-    assert_eq!(request.server_type, "cx33");
+    assert_eq!(
+        (request.server_type.as_str(), request.location.as_str()),
+        ("cpx31", "fsn1")
+    );
+    assert_eq!(request.labels[LABEL_SERVER_TYPE], "cpx31");
+    assert_eq!(request.labels[LABEL_LOCATION], "fsn1");
     assert_eq!(request.ssh_from, ["198.51.100.7/32"]);
     let hub_id = rig.state().await.hub_id.expect("hub id");
     assert_eq!(request.labels[LABEL_HUB], hub_id);
@@ -514,6 +522,10 @@ async fn a_queued_job_creates_a_server_that_joins_as_a_member_and_runs_it() {
     assert_eq!(member.server_id, lease.server_id);
     assert_eq!(member.expires_at_ms, Some(lease.expires_at_ms));
     assert_eq!(member.tags, [TAG]);
+    let machine = member.machine.as_ref().expect("machine");
+    assert_eq!((machine.cores, machine.memory_mb), (4, 8192));
+    assert_eq!(member.view()["machine"]["serverType"], json!("cpx31"));
+    assert_eq!(member.view()["machine"]["location"], json!("fsn1"));
 
     rig.pass().await;
     let state = rig.state().await;
@@ -952,7 +964,9 @@ async fn pool_config_is_validated_listed_and_unique() {
         ("--ssh-from", |request| {
             request.ssh_from = vec!["::1/129".to_owned()];
         }),
-        ("--location", |request| request.location = "f sn".to_owned()),
+        ("--location", |request| {
+            request.locations = vec!["f sn".to_owned()]
+        }),
     ];
     for (message, change) in cases {
         let mut request = add_request(folder, 1);
@@ -994,10 +1008,19 @@ async fn a_hub_without_a_provider_token_reports_its_pools_as_stuck() {
     )
     .expect("service");
     assert_eq!(service.pool_pass().await.expect("no pools").errors.len(), 0);
-    service
+    let error = service
         .add_pool(add_request(directory.path(), 1))
         .await
-        .expect("add pool");
+        .expect_err("the catalog needs the token");
+    assert!(error.to_string().contains("HCLOUD_TOKEN"), "{error}");
+    assert!(service.pool_types().await.is_err());
+    service
+        .mutate(|state| {
+            state.pools.push(pool_fixture());
+            Ok(())
+        })
+        .await
+        .expect("pool added before the token went away");
     let report = service.pool_pass().await.expect("pass");
     assert!(report.errors[0].contains("HCLOUD_TOKEN"));
     if std::env::var_os("HCLOUD_TOKEN").is_none() {
@@ -1100,8 +1123,16 @@ fn pool_fixture() -> Pool {
     Pool {
         name: "burst".to_owned(),
         provider: Provider::Hetzner,
-        server_type: "cx33".to_owned(),
-        location: "fsn1".to_owned(),
+        server_types: capacity::resolve(
+            (&["cpx31".to_owned()], &["fsn1".to_owned()]),
+            false,
+            &catalog_fixture(),
+        )
+        .expect("cpx31 in fsn1")
+        .0,
+        locations: vec!["fsn1".to_owned()],
+        multi_arch: false,
+        wait_max_ms: None,
         image: "docker-ce".to_owned(),
         target_image: IMAGE.to_owned(),
         max: 1,
@@ -1114,6 +1145,9 @@ fn pool_fixture() -> Pool {
         created_at_ms: 0,
         boot_failures: 0,
         paused_until_ms: None,
+        blocked: None,
+        shortage: None,
+        unavailable: BTreeMap::new(),
     }
 }
 

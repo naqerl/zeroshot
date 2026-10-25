@@ -84,7 +84,15 @@ pub enum HubCommand {
 pub enum HubPoolCommand {
     Add(Box<HubPoolAdd>),
     List,
-    Remove { name: String },
+    Remove {
+        name: String,
+    },
+    /// List the provider's server types with prices.
+    Types,
+    /// Clear a blocked, capacity-waiting or boot-paused pool so it starts servers again.
+    Resume {
+        name: String,
+    },
 }
 
 /// `hub pool add`. Durations stay text until the client parses them.
@@ -92,8 +100,12 @@ pub enum HubPoolCommand {
 pub struct HubPoolAdd {
     pub name: String,
     pub provider: String,
-    pub server_type: String,
-    pub location: String,
+    /// Server types, best first.
+    pub server_types: Vec<String>,
+    /// Locations in order; empty means every location offering one of the types.
+    pub locations: Vec<String>,
+    pub multi_arch: bool,
+    pub wait_max: Option<String>,
     pub image: String,
     pub target_image: String,
     pub max: u32,

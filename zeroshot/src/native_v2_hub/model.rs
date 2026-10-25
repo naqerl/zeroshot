@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeroshot_engine::native_v2_cli::hub::{HubMemberState, HubStrategy};
 
+use super::capacity::Machine;
 use super::clock::rfc3339;
 use super::eval::EvalState;
 use super::pool::{Lease, Pool};
@@ -89,6 +90,9 @@ pub(crate) struct Member {
     /// When a pool member's lease expires and it is torn down.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_ms: Option<u64>,
+    /// Server type, location and size of a pool member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<Machine>,
 }
 
 impl Member {
@@ -108,6 +112,7 @@ impl Member {
             server_id: None,
             idle_since_ms: None,
             expires_at_ms: None,
+            machine: None,
         }
     }
 
@@ -126,7 +131,17 @@ impl Member {
             "serverId": self.server_id,
             "idleSince": self.idle_since_ms.map(rfc3339),
             "expiresAt": self.expires_at_ms.map(rfc3339),
+            "machine": self.machine.as_ref().map(Machine::view),
         })
+    }
+
+    /// Whether the member carries a tag, or for a size tag, runs on a big enough server.
+    pub(crate) fn has_tag(&self, tag: &str) -> bool {
+        self.tags.iter().any(|own| own == tag)
+            || self
+                .machine
+                .as_ref()
+                .is_some_and(|machine| machine.meets(tag))
     }
 }
 
@@ -265,6 +280,8 @@ pub(crate) enum JobErrorKind {
     /// Dequeued while placing. A run with its submission key may exist on the member; the hub
     /// does not follow or adopt it.
     DequeuedWhilePlacing,
+    /// Waited longer than its pool's `--wait-max` for a server; the job expired.
+    PoolWaitTimeout,
     /// Recorded as plain text by an earlier hub.
     Unclassified,
 }
@@ -365,6 +382,9 @@ pub(crate) struct Job {
     /// `authoredGraphHash` from the archived run report, when the target reported one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_hash: Option<String>,
+    /// Why a queued job its pool serves has no server yet, such as a capacity shortage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_wait: Option<String>,
 }
 
 impl Job {
@@ -425,6 +445,7 @@ impl Job {
             "errorKind": self.error.as_ref().map(|error| error.kind),
             "archive": self.archive,
             "graphHash": self.graph_hash,
+            "waiting": self.pool_wait,
         })
     }
 }

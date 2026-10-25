@@ -173,6 +173,16 @@ pub(super) enum HubPoolCliCommand {
     /// Remove a pool that has no servers left.
     #[command(visible_alias = "rm")]
     Remove(HubPoolNameArgs),
+
+    /// List the provider's current server types as JSON: vCPUs, memory, disk, architecture,
+    /// gross price per hour by location, and the locations that can create each one now.
+    ///
+    /// Asks the hub daemon, which reads the provider's catalog with its token.
+    Types,
+
+    /// Let a pool start servers again after it stopped on an account limit or a rejected
+    /// request, and retry a capacity shortage or a failed-boot pause now.
+    Resume(HubPoolNameArgs),
 }
 
 #[derive(Debug, Args)]
@@ -192,13 +202,28 @@ pub(super) struct HubPoolAddArgs {
     #[arg(long, value_name = "PROVIDER", default_value = "hetzner")]
     provider: String,
 
-    /// Server type, such as cx33.
-    #[arg(long = "type", value_name = "TYPE")]
-    server_type: String,
+    /// Server types to create, best first, comma-separated. A job gets the first type that
+    /// fits its size request (`hub submit --server-type/--min-cpu/--min-ram-gb`). Each must be
+    /// a current type from `hub pool types`; ARM types need --multi-arch.
+    #[arg(long = "type", value_name = "TYPE,...", required = true,
+          action = clap::ArgAction::Append, value_delimiter = ',')]
+    server_types: Vec<String>,
 
-    /// Location, such as fsn1.
-    #[arg(long, value_name = "LOCATION")]
-    location: String,
+    /// Locations to try, in order, for each type, comma-separated. When a location has no
+    /// capacity the next one is tried, then the next type. Default: every location offering
+    /// one of the types.
+    #[arg(long = "location", value_name = "LOCATION,...",
+          action = clap::ArgAction::Append, value_delimiter = ',')]
+    locations: Vec<String>,
+
+    /// The target image runs on arm64 as well as amd64, so ARM server types are allowed.
+    #[arg(long)]
+    multi_arch: bool,
+
+    /// Expire a queued job this pool serves once it has waited this long for a server, such as
+    /// 30m; its error kind is pool_wait_timeout. Default: wait until the job's own expiry.
+    #[arg(long, value_name = "DURATION")]
+    wait_max: Option<String>,
 
     /// Server image: a snapshot id or a system image such as docker-ce.
     #[arg(long, value_name = "IMAGE")]
@@ -248,8 +273,10 @@ impl HubPoolCliCommand {
                 HubPoolCommand::Add(Box::new(HubPoolAdd {
                     name: member_name(args.name)?,
                     provider: args.provider,
-                    server_type: args.server_type,
-                    location: args.location,
+                    server_types: args.server_types,
+                    locations: args.locations,
+                    multi_arch: args.multi_arch,
+                    wait_max: args.wait_max,
                     image: args.image,
                     target_image: args.target_image,
                     max: args.max,
@@ -263,6 +290,10 @@ impl HubPoolCliCommand {
             }
             Self::List => HubPoolCommand::List,
             Self::Remove(args) => HubPoolCommand::Remove {
+                name: member_name(args.name)?,
+            },
+            Self::Types => HubPoolCommand::Types,
+            Self::Resume(args) => HubPoolCommand::Resume {
                 name: member_name(args.name)?,
             },
         })
@@ -539,6 +570,18 @@ pub(super) struct HubPlacementArgs {
     /// Require this member tag. Repeat for several; all must match.
     #[arg(long, value_name = "TAG", action = clap::ArgAction::Append)]
     tag: Vec<String>,
+
+    /// Pool jobs: run on this server type (one the pool lists). Same as --tag server-type=TYPE.
+    #[arg(long, value_name = "TYPE")]
+    server_type: Option<String>,
+
+    /// Pool jobs: run on a server with at least N vCPUs. Same as --tag min-cpu=N.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    min_cpu: Option<u32>,
+
+    /// Pool jobs: run on a server with at least N GB of RAM. Same as --tag min-ram-gb=N.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    min_ram_gb: Option<u32>,
 
     /// Choice among free matching members.
     #[arg(
@@ -909,7 +952,7 @@ fn job_spec(run: RunArgs, placement: HubPlacementArgs) -> Result<HubJobSpec, Nat
         title: run.title.clone(),
         run_args: run_arguments(&run)?,
         target,
-        tags: tags(placement.tag)?,
+        tags: tags(placement_tags(&placement))?,
         strategy: match placement.strategy {
             HubStrategyArg::FirstFree => HubStrategy::FirstFree,
             HubStrategyArg::LeastLoaded => HubStrategy::LeastLoaded,
@@ -924,6 +967,24 @@ fn job_spec(run: RunArgs, placement: HubPlacementArgs) -> Result<HubJobSpec, Nat
         cwd: run.cwd.clone(),
         submission_key: run.submission_key.clone(),
     })
+}
+
+/// The job's tags, with size requests for pool servers added as size tags.
+fn placement_tags(placement: &HubPlacementArgs) -> Vec<String> {
+    let mut tags = placement.tag.clone();
+    tags.extend(
+        placement
+            .server_type
+            .iter()
+            .map(|name| format!("server-type={name}")),
+    );
+    tags.extend(placement.min_cpu.map(|cores| format!("min-cpu={cores}")));
+    tags.extend(
+        placement
+            .min_ram_gb
+            .map(|memory| format!("min-ram-gb={memory}")),
+    );
+    tags
 }
 
 /// Rebuild the `zeroshot run` arguments that do not depend on placement.

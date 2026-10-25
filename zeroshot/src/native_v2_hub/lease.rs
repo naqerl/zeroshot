@@ -13,13 +13,15 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use super::archive;
+use super::capacity::{self, Machine, PoolType};
 use super::clock::now_ms;
 use super::error::HubError;
 use super::model::{HubState, Member, MemberState};
 use super::pool::{
-    self, LABEL_HUB, LABEL_LEASE, Lease, LeasePhase, Pool, Resource, ResourceKind, TeardownReason,
+    self, LABEL_HUB, LABEL_LEASE, LABEL_LOCATION, LABEL_SERVER_TYPE, Lease, LeasePhase, Pool,
+    Resource, ResourceKind, TeardownReason,
 };
-use super::provision::{self, Progress, Provisioner, ServerRequest};
+use super::provision::{self, Catalog, Progress, Provisioner, Refusal, ServerRequest};
 use super::service::HubService;
 use super::tunnel::{self, TunnelSpec, Tunnels};
 use super::wire::AddPool;
@@ -87,6 +89,12 @@ pub(crate) struct PoolReport {
     pub archived: Vec<String>,
     pub deleted: Vec<String>,
     pub reaped: Vec<(ResourceKind, u64)>,
+    /// Leases given up because no candidate had capacity: `(lease, reason)`.
+    pub shortages: Vec<(String, String)>,
+    /// Pools stopped on an account limit or a rejected request: `(pool, error)`.
+    pub blocked: Vec<(String, String)>,
+    /// Jobs that waited longer than their pool's `--wait-max`.
+    pub expired: Vec<String>,
     pub errors: Vec<String>,
 }
 
@@ -104,6 +112,15 @@ impl PoolReport {
                 "kind": format!("{kind:?}"),
                 "id": id,
             })).collect::<Vec<_>>(),
+            "shortages": self.shortages.iter().map(|(lease, reason)| json!({
+                "lease": lease,
+                "reason": reason,
+            })).collect::<Vec<_>>(),
+            "blocked": self.blocked.iter().map(|(pool, error)| json!({
+                "pool": pool,
+                "error": error,
+            })).collect::<Vec<_>>(),
+            "expired": self.expired,
             "errors": self.errors,
         })
     }
@@ -113,8 +130,22 @@ impl PoolReport {
 enum Step {
     /// Replace the lease with this record.
     Update(Box<Lease>),
-    /// The lease is finished and removed.
-    Done,
+    /// The lease is finished and removed, after cleaning up anything a refused create attempt
+    /// left under its label.
+    Done(Box<Lease>),
+    /// The lease never got a server; it is removed after cleaning up what its attempts left.
+    Abandoned(Box<Lease>),
+}
+
+/// How creating a lease's server ended.
+enum Creation {
+    /// The provider accepted a server, or an earlier unconfirmed create left one; `true` when
+    /// refused attempts came first and may have left resources behind.
+    Created(bool),
+    /// No candidate had capacity; these `(type, location)` pairs were tried.
+    Short(Vec<(String, String)>),
+    /// The provider refused for a reason a retry cannot fix.
+    Blocked(String),
 }
 
 impl HubService {
@@ -134,8 +165,9 @@ impl HubService {
         };
         self.reap(runtime, &mut report).await;
         let now = now_ms();
-        let started = self.scale(now).await?;
+        let (started, expired) = self.scale(now).await?;
         report.started = started;
+        report.expired = expired;
         report.teardowns = self.begin_teardowns(now).await?;
         for lease in self.snapshot().await.leases {
             if !lease.due(now_ms()) {
@@ -150,7 +182,8 @@ impl HubService {
             let pool_name = lease.pool.clone();
             match self.step(runtime, lease, &mut report).await {
                 Ok(Step::Update(next)) => self.store_lease(*next).await?,
-                Ok(Step::Done) => {
+                Ok(Step::Done(lease)) => {
+                    self.sweep(runtime, &lease, &mut report).await;
                     self.mutate(|state| {
                         state.leases.retain(|lease| lease.name != name);
                         if failed_boot {
@@ -160,6 +193,14 @@ impl HubService {
                     })
                     .await?;
                     report.deleted.push(name);
+                }
+                Ok(Step::Abandoned(lease)) => {
+                    self.sweep(runtime, &lease, &mut report).await;
+                    self.mutate(|state| {
+                        state.leases.retain(|slot| slot.name != name);
+                        Ok(())
+                    })
+                    .await?;
                 }
                 Err(error) => {
                     report.errors.push(format!("{name}: {error}"));
@@ -200,8 +241,10 @@ impl HubService {
         .await
     }
 
-    /// Track idleness and record a lease for every server the queue needs.
-    async fn scale(&self, now: u64) -> Result<Vec<String>, HubError> {
+    /// Track idleness, record a lease for every server the queue needs, and tell queued pool
+    /// jobs why they wait, expiring those past their pool's `--wait-max`. Returns the started
+    /// leases and the expired jobs.
+    async fn scale(&self, now: u64) -> Result<(Vec<String>, Vec<String>), HubError> {
         let mut ports = Vec::new();
         for _ in pool::scale_up(&self.snapshot().await, now) {
             ports.push(tunnel::free_port()?);
@@ -209,16 +252,22 @@ impl HubService {
         let _placing = self.placement_lock().await;
         self.mutate(|state| {
             pool::update_idle(state, now);
+            let expired = capacity::note_waiting(state, now);
             let mut started = Vec::new();
-            for ((pool_name, job_id), port) in pool::scale_up(state, now).into_iter().zip(ports) {
+            for ((pool_name, job_id, want), port) in
+                pool::scale_up(state, now).into_iter().zip(ports)
+            {
                 let Some(pool) = state.pools.iter().find(|pool| pool.name == pool_name) else {
                     continue;
                 };
-                let lease = Lease::new(pool, &job_id, port, now);
+                let lease = Lease {
+                    want,
+                    ..Lease::new(pool, &job_id, port, now)
+                };
                 started.push(lease.name.clone());
                 state.leases.push(lease);
             }
-            Ok(started)
+            Ok((started, expired))
         })
         .await
     }
@@ -251,7 +300,20 @@ impl HubService {
                 let hub_id = state.hub_id.as_deref().ok_or_else(|| {
                     HubError::InvalidState("hub state has no hub ID for pool labels".to_owned())
                 })?;
-                self.create(runtime, (pool, hub_id), &mut lease).await?;
+                match self.create(runtime, (pool, hub_id), &mut lease).await? {
+                    Creation::Created(false) => {}
+                    Creation::Created(true) => self.sweep(runtime, &lease, report).await,
+                    Creation::Short(tried) => {
+                        let reason = self.hold(&lease.pool, Hold::Short(&tried)).await?;
+                        report.shortages.push((lease.name.clone(), reason));
+                        return Ok(Step::Abandoned(Box::new(lease)));
+                    }
+                    Creation::Blocked(error) => {
+                        self.hold(&lease.pool, Hold::Blocked(&error)).await?;
+                        report.blocked.push((lease.pool.clone(), error));
+                        return Ok(Step::Abandoned(Box::new(lease)));
+                    }
+                }
             }
             LeasePhase::Booting => boot(runtime, &mut lease).await?,
             LeasePhase::Connecting => {
@@ -275,52 +337,160 @@ impl HubService {
             }
             LeasePhase::Deleting => {
                 if delete(runtime, &mut lease).await? {
-                    return Ok(Step::Done);
+                    return Ok(Step::Done(Box::new(lease)));
                 }
             }
         }
         Ok(Step::Update(Box::new(lease)))
     }
 
-    /// Create the lease's server, or adopt the one an earlier unconfirmed create made.
+    /// Create the lease's server, or adopt the one an earlier unconfirmed create made. Tries
+    /// each fitting type of the pool in each of its locations, best first, skipping those the
+    /// catalog shows unavailable and moving on after each capacity refusal. Account limits and
+    /// rejected requests block the pool; rate limits, timeouts and server errors are retried.
     async fn create(
         &self,
         runtime: &PoolRuntime,
         (pool, hub_id): (&Pool, &str),
         lease: &mut Lease,
-    ) -> Result<(), HubError> {
+    ) -> Result<Creation, HubError> {
         let existing = runtime
             .provisioner
-            .list_by_label(&format!("{LABEL_HUB}={hub_id},{LABEL_LEASE}={}", lease.id))
+            .list_by_label(&lease_selector(hub_id, lease))
             .await?;
-        let find = |kind| {
-            existing
+        if let Some(server) = existing
+            .iter()
+            .find(|resource| resource.kind == ResourceKind::Server)
+        {
+            lease.server_id = Some(server.id);
+            lease.firewall_id = existing
                 .iter()
-                .find(|resource| resource.kind == kind)
-                .map(|resource| resource.id)
-        };
-        if let Some(server_id) = find(ResourceKind::Server) {
-            lease.server_id = Some(server_id);
-            lease.firewall_id = find(ResourceKind::Firewall);
+                .find(|resource| resource.kind == ResourceKind::Firewall)
+                .map(|resource| resource.id);
+            lease.machine = adopted_machine(pool, server);
             lease.advance(LeasePhase::Booting);
-            return Ok(());
+            return Ok(Creation::Created(false));
         }
+        let catalog = runtime.provisioner.catalog().await?;
         let public_key = read_public_key(pool)?;
-        let request = ServerRequest {
-            name: lease.name.clone(),
-            server_type: pool.server_type.clone(),
-            location: pool.location.clone(),
-            image: pool.image.clone(),
-            user_data: provision::user_data(pool, lease, &public_key)?,
-            labels: lease.labels(hub_id),
-            ssh_from: pool.ssh_from.clone(),
+        let mut tried = Vec::new();
+        let mut refused = false;
+        for (server_type, location) in capacity::candidates(pool, &lease.want) {
+            if !available(&catalog, &server_type.name, location) {
+                tried.push((server_type.name.clone(), location.to_owned()));
+                continue;
+            }
+            let mut labels = lease.labels(hub_id);
+            labels.insert(LABEL_SERVER_TYPE.to_owned(), server_type.name.clone());
+            labels.insert(LABEL_LOCATION.to_owned(), location.to_owned());
+            let request = ServerRequest {
+                name: lease.name.clone(),
+                server_type: server_type.name.clone(),
+                location: location.to_owned(),
+                image: pool.image.clone(),
+                user_data: provision::user_data(pool, lease, &public_key)?,
+                labels,
+                ssh_from: pool.ssh_from.clone(),
+            };
+            match runtime.provisioner.create(&request).await {
+                Ok(created) => {
+                    lease.server_id = Some(created.server_id);
+                    lease.firewall_id = created.firewall_id;
+                    lease.action_id = created.action_id;
+                    lease.machine = Some(machine(server_type, location));
+                    lease.advance(LeasePhase::Booting);
+                    self.hold(&pool.name, Hold::Clear(&tried)).await?;
+                    return Ok(Creation::Created(refused));
+                }
+                Err(failure) => {
+                    refused = true;
+                    match failure.refusal {
+                        Refusal::Capacity => {
+                            tried.push((server_type.name.clone(), location.to_owned()));
+                        }
+                        Refusal::Quota | Refusal::Invalid => {
+                            return Ok(Creation::Blocked(format!(
+                                "{} in {location}: {}",
+                                server_type.name, failure.message
+                            )));
+                        }
+                        Refusal::RateLimited | Refusal::Transient => {
+                            self.hold(&pool.name, Hold::Count(&tried)).await?;
+                            return Err(failure.into());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Creation::Short(tried))
+    }
+
+    /// Record what a create attempt learned about the pool's capacity, under the state lock.
+    /// Returns the shortage reason for [`Hold::Short`].
+    async fn hold(&self, pool_name: &str, hold: Hold<'_>) -> Result<String, HubError> {
+        let now = now_ms();
+        self.mutate(|state| {
+            let Some(pool) = state.pools.iter_mut().find(|pool| pool.name == pool_name) else {
+                return Ok(String::new());
+            };
+            match hold {
+                Hold::Clear(tried) => {
+                    capacity::count_unavailable(pool, tried);
+                    pool.shortage = None;
+                }
+                Hold::Count(tried) => capacity::count_unavailable(pool, tried),
+                Hold::Short(tried) => {
+                    capacity::count_unavailable(pool, tried);
+                    capacity::record_shortage(pool, tried, now);
+                }
+                Hold::Blocked(error) => pool.blocked = Some(error.to_owned()),
+            }
+            Ok(pool
+                .shortage
+                .as_ref()
+                .map(|shortage| shortage.reason.clone())
+                .unwrap_or_default())
+        })
+        .await
+    }
+
+    /// Delete whatever refused create attempts of a lease left behind, servers first, keeping
+    /// the server and firewall the lease holds. What fails here stays labelled for the reaper.
+    async fn sweep(&self, runtime: &PoolRuntime, lease: &Lease, report: &mut PoolReport) {
+        let Some(hub_id) = self.snapshot().await.hub_id else {
+            return;
         };
-        let created = runtime.provisioner.create(&request).await?;
-        lease.server_id = Some(created.server_id);
-        lease.firewall_id = created.firewall_id;
-        lease.action_id = created.action_id;
-        lease.advance(LeasePhase::Booting);
-        Ok(())
+        let mut left = match runtime
+            .provisioner
+            .list_by_label(&lease_selector(&hub_id, lease))
+            .await
+        {
+            Ok(left) => left,
+            Err(error) => {
+                report
+                    .errors
+                    .push(format!("{}: cleanup: {error}", lease.name));
+                return;
+            }
+        };
+        left.retain(|resource| {
+            let held = match resource.kind {
+                ResourceKind::Server => lease.server_id,
+                ResourceKind::Firewall => lease.firewall_id,
+                ResourceKind::PrimaryIp => None,
+            };
+            held != Some(resource.id)
+        });
+        left.sort_by_key(|resource| resource.kind);
+        for resource in &left {
+            match runtime.provisioner.destroy(resource).await {
+                Ok(_) => report.reaped.push((resource.kind, resource.id)),
+                Err(error) => report.errors.push(format!(
+                    "{}: cleanup of {:?} {}: {error}",
+                    lease.name, resource.kind, resource.id
+                )),
+            }
+        }
     }
 
     /// Tunnel to a booted server, register it as a direct target, check discovery through the
@@ -352,6 +522,7 @@ impl HubService {
         let now = now_ms();
         let member = Member {
             tags: pool.tags.clone(),
+            machine: lease.machine.clone(),
             slots: pool.slots.max(1),
             pool: Some(pool.name.clone()),
             server_id: lease.server_id,
@@ -547,6 +718,49 @@ async fn delete(runtime: &PoolRuntime, lease: &mut Lease) -> Result<bool, HubErr
     Ok(true)
 }
 
+/// What a create attempt learned about a pool.
+enum Hold<'a> {
+    /// A server was created after these candidates were out of capacity.
+    Clear(&'a [(String, String)]),
+    /// These candidates were out of capacity before a retryable error.
+    Count(&'a [(String, String)]),
+    /// Every candidate was out of capacity.
+    Short(&'a [(String, String)]),
+    /// The provider refused for a reason only the operator can fix.
+    Blocked(&'a str),
+}
+
+fn lease_selector(hub_id: &str, lease: &Lease) -> String {
+    format!("{LABEL_HUB}={hub_id},{LABEL_LEASE}={}", lease.id)
+}
+
+/// Whether the catalog shows `server_type` creatable in `location` now. A location missing
+/// from the catalog is tried anyway; the provider has the last word.
+fn available(catalog: &Catalog, server_type: &str, location: &str) -> bool {
+    catalog
+        .location(location)
+        .is_none_or(|location| location.available.contains(server_type))
+}
+
+fn machine(server_type: &PoolType, location: &str) -> Machine {
+    Machine {
+        server_type: server_type.name.clone(),
+        location: location.to_owned(),
+        cores: server_type.cores,
+        memory_mb: server_type.memory_mb,
+    }
+}
+
+/// The machine of a server an earlier, unconfirmed create left, from its labels.
+fn adopted_machine(pool: &Pool, server: &Resource) -> Option<Machine> {
+    let server_type = server.labels.get(LABEL_SERVER_TYPE)?;
+    let location = server.labels.get(LABEL_LOCATION)?;
+    pool.server_types
+        .iter()
+        .find(|known| known.name == *server_type)
+        .map(|known| machine(known, location))
+}
+
 fn resource(kind: ResourceKind, id: u64, lease: &Lease) -> Resource {
     Resource {
         kind,
@@ -572,13 +786,23 @@ fn target_registry(error: impl std::fmt::Display) -> HubError {
 }
 
 impl HubService {
+    /// Add a pool after checking its server types and locations against the provider's
+    /// catalog, which needs the provider token.
     pub(crate) async fn add_pool(&self, request: AddPool) -> Result<Value, HubError> {
         validate_pool(&request)?;
+        let catalog = self.catalog().await?;
+        let (server_types, locations) = capacity::resolve(
+            (&request.server_types, &request.locations),
+            request.multi_arch,
+            &catalog,
+        )?;
         let pool = Pool {
             name: request.name,
             provider: request.provider,
-            server_type: request.server_type,
-            location: request.location,
+            server_types,
+            locations,
+            multi_arch: request.multi_arch,
+            wait_max_ms: request.wait_max_ms,
             image: request.image,
             target_image: request.target_image,
             max: request.max,
@@ -591,6 +815,9 @@ impl HubService {
             created_at_ms: now_ms(),
             boot_failures: 0,
             paused_until_ms: None,
+            blocked: None,
+            shortage: None,
+            unavailable: std::collections::BTreeMap::new(),
         };
         read_public_key(&pool)?;
         self.mutate(|state| {
@@ -616,11 +843,47 @@ impl HubService {
 
     pub(crate) async fn list_pools(&self) -> Value {
         let state = self.snapshot().await;
+        let now = now_ms();
         json!({
             "schema": "zeroshot.hub.pools/v1",
             "hubId": state.hub_id,
-            "pools": state.pools.iter().map(|pool| pool.view(&state.leases)).collect::<Vec<_>>(),
+            "pools": state
+                .pools
+                .iter()
+                .map(|pool| pool.view(&state.leases, now))
+                .collect::<Vec<_>>(),
         })
+    }
+
+    /// The provider's server types, prices and locations.
+    pub(crate) async fn pool_types(&self) -> Result<Value, HubError> {
+        Ok(capacity::types_document(&self.catalog().await?))
+    }
+
+    async fn catalog(&self) -> Result<Catalog, HubError> {
+        let runtime = self.pool_runtime().ok_or_else(|| {
+            HubError::Usage("hub pools need a provider token; set HCLOUD_TOKEN".to_owned())
+        })?;
+        runtime.provisioner.catalog().await
+    }
+
+    /// Let a pool start servers again: clear an account or request block, a capacity
+    /// shortage and a failed-boot pause.
+    pub(crate) async fn resume_pool(&self, name: &str) -> Result<Value, HubError> {
+        self.mutate(|state| {
+            let pool = state
+                .pools
+                .iter_mut()
+                .find(|pool| pool.name == name)
+                .ok_or_else(|| HubError::Usage(format!("pool {name} does not exist")))?;
+            pool.blocked = None;
+            pool.shortage = None;
+            pool.boot_failures = 0;
+            pool.paused_until_ms = None;
+            let pool = pool.clone();
+            Ok(pool_document(&pool, &state.leases))
+        })
+        .await
     }
 
     /// Remove a pool. Its servers are drained, archived and deleted by the next passes.
@@ -647,7 +910,7 @@ impl HubService {
 }
 
 fn pool_document(pool: &Pool, leases: &[Lease]) -> Value {
-    json!({ "schema": "zeroshot.hub.pool/v1", "pool": pool.view(leases) })
+    json!({ "schema": "zeroshot.hub.pool/v1", "pool": pool.view(leases, now_ms()) })
 }
 
 fn validate_pool(request: &AddPool) -> Result<(), HubError> {
@@ -686,14 +949,19 @@ fn validate_pool(request: &AddPool) -> Result<(), HubError> {
             "--ssh-from needs the hub's public address as CIDRs, such as 203.0.113.7/32".to_owned(),
         );
     }
-    for (flag, value) in [
-        ("--type", &request.server_type),
-        ("--location", &request.location),
-        ("--image", &request.image),
-    ] {
+    let identifiers = request
+        .server_types
+        .iter()
+        .map(|value| ("--type", value))
+        .chain(request.locations.iter().map(|value| ("--location", value)))
+        .chain([("--image", &request.image)]);
+    for (flag, value) in identifiers {
         if value.is_empty() || !value.chars().all(|character| character.is_ascii_graphic()) {
             return usage(format!("{flag} {value:?} is not a provider identifier"));
         }
+    }
+    if let Some(0) = request.wait_max_ms {
+        return usage("--wait-max must be positive".to_owned());
     }
     Ok(())
 }

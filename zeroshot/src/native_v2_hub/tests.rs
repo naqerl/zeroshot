@@ -83,6 +83,7 @@ pub(super) fn job(id: &str, submitted_at_ms: u64) -> Job {
         output: None,
         archive: None,
         graph_hash: None,
+        pool_wait: None,
     }
 }
 

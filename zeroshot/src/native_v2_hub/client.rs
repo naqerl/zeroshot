@@ -597,6 +597,12 @@ async fn pool_document(client: &HubClient, command: HubPoolCommand) -> Result<Va
             client.post(&["v1", "hub", "pools"], &body).await
         }
         HubPoolCommand::List => client.get(&["v1", "hub", "pools"]).await,
+        HubPoolCommand::Types => client.get(&["v1", "hub", "pools", "types"]).await,
+        HubPoolCommand::Resume { name } => {
+            client
+                .post(&["v1", "hub", "pools", &name, "resume"], &json!({}))
+                .await
+        }
         HubPoolCommand::Remove { name } => {
             client
                 .call(
@@ -623,8 +629,14 @@ pub(crate) fn add_pool(request: HubPoolAdd) -> Result<AddPool, HubError> {
     Ok(AddPool {
         name: request.name,
         provider,
-        server_type: request.server_type,
-        location: request.location,
+        server_types: request.server_types,
+        locations: request.locations,
+        multi_arch: request.multi_arch,
+        wait_max_ms: request
+            .wait_max
+            .as_deref()
+            .map(parse_duration_ms)
+            .transpose()?,
         image: request.image,
         target_image: request.target_image,
         max: request.max,

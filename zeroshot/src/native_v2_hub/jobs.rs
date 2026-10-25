@@ -90,6 +90,7 @@ pub(crate) fn new_job(spec: &HubJobSpec, now_ms: u64) -> Result<Job, HubError> {
         output: None,
         archive: None,
         graph_hash: None,
+        pool_wait: None,
     })
 }
 

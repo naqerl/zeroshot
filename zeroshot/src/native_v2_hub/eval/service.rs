@@ -598,6 +598,7 @@ impl HubService {
             output: None,
             archive: None,
             graph_hash: None,
+            pool_wait: None,
         })
     }
 

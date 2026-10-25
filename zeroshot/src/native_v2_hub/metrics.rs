@@ -256,6 +256,9 @@ impl Metrics {
                 ("archived", report.archived.len()),
                 ("deleted", report.deleted.len()),
                 ("reaped", report.reaped.len()),
+                ("shortage", report.shortages.len()),
+                ("blocked", report.blocked.len()),
+                ("wait_timeout", report.expired.len()),
                 ("error", report.errors.len()),
             ] {
                 *counters.pool_events.entry(event).or_default() += count as u64;
@@ -314,6 +317,7 @@ impl Metrics {
         render_jobs(&mut out, state, now_ms);
         render_members(&mut out, state, self);
         render_pools(&mut out, state);
+        render_capacity(&mut out, state, now_ms);
         render_job_histograms(&mut out, state);
         render_tokens(&mut out, state, &self.label_keys);
         let Ok(counters) = self.counters.lock() else {
@@ -446,6 +450,70 @@ fn render_pools(out: &mut Exposition, state: &HubState) {
             &[("pool", pool), ("phase", phase)],
             *count as f64,
         );
+    }
+}
+
+/// Pool capacity: refusals per type and location, why a pool holds back, and which server
+/// each pool member runs on.
+#[allow(clippy::cast_precision_loss)]
+fn render_capacity(out: &mut Exposition, state: &HubState, now_ms: u64) {
+    out.family(
+        "zeroshot_hub_pool_capacity_unavailable_total",
+        "counter",
+        "Server creations the provider refused for lack of capacity, or the catalog showed \
+         unavailable, by pool, server type and location.",
+    );
+    for pool in &state.pools {
+        for (server_type, locations) in &pool.unavailable {
+            for (location, count) in locations {
+                out.sample(
+                    "zeroshot_hub_pool_capacity_unavailable_total",
+                    &[
+                        ("pool", &pool.name),
+                        ("server_type", server_type),
+                        ("location", location),
+                    ],
+                    *count as f64,
+                );
+            }
+        }
+    }
+    out.family(
+        "zeroshot_hub_pool_holding",
+        "gauge",
+        "1 while a pool starts no servers, by reason: blocked, capacity or boot_failures.",
+    );
+    for pool in &state.pools {
+        let paused = pool.paused_until_ms.is_some_and(|until| now_ms < until);
+        for (reason, holding) in [
+            ("blocked", pool.blocked.is_some()),
+            ("capacity", pool.shortage.is_some()),
+            ("boot_failures", paused),
+        ] {
+            out.sample(
+                "zeroshot_hub_pool_holding",
+                &[("pool", &pool.name), ("reason", reason)],
+                if holding { 1.0 } else { 0.0 },
+            );
+        }
+    }
+    out.family(
+        "zeroshot_hub_member_machine_info",
+        "gauge",
+        "The server type and location of each pool member.",
+    );
+    for member in &state.members {
+        if let Some(machine) = &member.machine {
+            out.sample(
+                "zeroshot_hub_member_machine_info",
+                &[
+                    ("member", &member.name),
+                    ("server_type", &machine.server_type),
+                    ("location", &machine.location),
+                ],
+                1.0,
+            );
+        }
     }
 }
 
