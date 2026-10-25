@@ -11,7 +11,7 @@ use openengine_cluster_protocol::{RunWatchParams, SubscriptionCloseReason};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use zeroshot_engine::native_v2_cli::local::LocalCliBackend;
-use zeroshot_engine::native_v2_cli::mcp::{McpFailure, McpHost, WatchStream, serve as serve_session};
+use zeroshot_engine::native_v2_cli::mcp::{McpFailure, McpHost, WatchStream};
 use zeroshot_engine::native_v2_cli::oecp::NamedTargetCliBackend;
 use zeroshot_engine::native_v2_cli::{
     CliRunWatchEventNotification, CliSubscription, CliSubscriptionItem, NativeV2CliBackend,
@@ -23,17 +23,6 @@ use crate::native_v2_target::{
     FileTargetRegistry, NativeV2TargetConnector, TargetConnectorError, TargetHttpControlAuthority,
     TargetOecpWebSocketDialer, default_target_registry_path,
 };
-
-pub(super) async fn serve_stdio() -> Result<(), super::ProcessError> {
-    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    let stdout = tokio::io::stdout();
-    // The watch pump is not Send. A LocalSet runs it beside this stdio loop.
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(serve_session(ProductionHost, stdin, stdout))
-        .await
-        .map_err(super::ProcessError::from)
-}
 
 pub(super) async fn serve_http(listen: SocketAddr) -> Result<(), super::ProcessError> {
     zeroshot_engine::native_v2_cli::mcp::serve_http(ProductionHost, listen)
@@ -58,7 +47,7 @@ impl McpHost for ProductionHost {
             from_cursor: command.after.clone(),
         };
         let (sender, receiver) = mpsc::channel(64);
-        // Backend watch futures are not Send. `serve` polls this task on its LocalSet.
+        // Backend watch futures are not Send. The HTTP worker polls this task on its LocalSet.
         let task = if command.run.target.is_none() {
             let backend =
                 LocalCliBackend::production().map_err(|error| McpFailure::from_cli(&error))?;

@@ -9,7 +9,7 @@ use openengine_cluster_protocol::{
 
 use super::{
     AcpArgs, AttachArgs, Cli, CliCommand, ConnectionCommand, ConnectionScopeArg, McpCommand,
-    McpTransport, PlanCommand, PlanSelectorArgs, PlanSubmitArgs, RunArgs, RunCheckpointsArgs,
+    PlanCommand, PlanSelectorArgs, PlanSubmitArgs, RunArgs, RunCheckpointsArgs,
     RunResumeArgs, RunLogsArgs, RunReportArgs, RunSelectorArgs, RunWatchArgs, TargetCommand,
     TemplateCommand, TemplateName, UtilityCommand,
 };
@@ -93,13 +93,7 @@ impl CliCommand {
 impl McpCommand {
     fn into_command(self) -> Result<NativeV2CliCommand, NativeV2CliError> {
         match self {
-            Self::Serve { transport, listen } => Ok(NativeV2CliCommand::McpServe {
-                transport: match transport {
-                    McpTransport::Http => crate::native_v2_cli::McpTransport::Http,
-                    McpTransport::Stdio => crate::native_v2_cli::McpTransport::Stdio,
-                },
-                listen,
-            }),
+            Self::Serve { listen } => Ok(NativeV2CliCommand::McpServe { listen }),
         }
     }
 }

@@ -2,11 +2,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use super::super::{CliTestBackend, CliTestCall, NeverDetach, RunWatchCommand};
-use super::{serve, serve_http_listener, McpFailure, McpHost, WatchStream};
+use super::{serve_http_listener, McpFailure, McpHost, WatchStream};
 use crate::native_v2_cli::{NativeV2CliCommand, execute_native_v2_cli};
 
 struct ToolHost {
@@ -65,18 +64,18 @@ impl McpHost for ScriptHost {
     }
 }
 
+/// Drives the real HTTP transport on an ephemeral port. The host is `!Send`, so the
+/// server owns its own thread and current-thread runtime.
 struct Session {
-    input: tokio::io::DuplexStream,
-    output: BufReader<tokio::io::DuplexStream>,
+    client: reqwest::Client,
+    url: String,
+    frames: std::collections::VecDeque<Value>,
 }
 
 impl Session {
     fn spawn(host: impl McpHost + 'static) -> Self {
-        let (client_input, server_input) = tokio::io::duplex(1 << 20);
-        let (server_output, client_output) = tokio::io::duplex(1 << 20);
-        // The CLI executor future is not Send, so the server runs on its own
-        // current-thread runtime.
-        let _thread = std::thread::Builder::new()
+        let (address_sender, address_receiver) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
             .name("mcp-test-server".to_owned())
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -84,14 +83,20 @@ impl Session {
                     .build()
                     .expect("mcp test runtime");
                 runtime.block_on(async move {
-                    let reader = BufReader::new(server_input);
-                    let _ = serve(host, reader, server_output).await;
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                        .await
+                        .expect("bind MCP test listener");
+                    let address = listener.local_addr().expect("MCP test address");
+                    address_sender.send(address).expect("report MCP test address");
+                    let _ = serve_http_listener(host, listener).await;
                 });
             })
-            .expect("spawn mcp test server");
+            .expect("spawn MCP test server");
+        let address = address_receiver.recv().expect("MCP test address");
         Self {
-            input: client_input,
-            output: BufReader::new(client_output),
+            client: reqwest::Client::new(),
+            url: format!("http://{address}/mcp"),
+            frames: std::collections::VecDeque::new(),
         }
     }
 
@@ -106,31 +111,49 @@ impl Session {
         self.read().await
     }
 
+    /// Posts one message. Server-sent events are queued for `read`.
     async fn send(&mut self, message: &Value) {
-        let mut bytes = serde_json::to_vec(message).expect("request json");
-        bytes.push(b'\n');
-        self.input.write_all(&bytes).await.expect("write request");
+        let response = self
+            .client
+            .post(&self.url)
+            .json(message)
+            .send()
+            .await
+            .expect("post MCP message");
+        if response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .starts_with("text/event-stream")
+        {
+            let body = tokio::time::timeout(Duration::from_secs(5), response.text())
+                .await
+                .expect("timed out reading the MCP event stream")
+                .expect("MCP event stream body");
+            for line in body.lines() {
+                let Some(data) = line.strip_prefix("data: ") else {
+                    continue;
+                };
+                self.frames.push_back(
+                    serde_json::from_str(data).expect("event stream data is JSON"),
+                );
+            }
+            return;
+        }
+        if response.status() == reqwest::StatusCode::ACCEPTED {
+            return;
+        }
+        let value: Value = response.json().await.expect("MCP response JSON");
+        self.frames.push_back(value);
     }
 
     async fn read(&mut self) -> Value {
-        let line = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut self.output))
-            .await
-            .expect("timed out waiting for MCP output")
-            .expect("read MCP output");
-        serde_json::from_str(&line).expect("MCP output is JSON")
+        if self.frames.is_empty() {
+            panic!("no MCP frame was produced");
+        }
+        self.frames.pop_front().expect("queued MCP frame")
     }
-}
-
-async fn read_frame(output: &mut BufReader<tokio::io::DuplexStream>) -> std::io::Result<String> {
-    let mut line = String::new();
-    let read = output.read_line(&mut line).await?;
-    if read == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "closed",
-        ));
-    }
-    Ok(line)
 }
 
 async fn initialize(session: &mut Session) {

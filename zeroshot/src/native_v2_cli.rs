@@ -98,12 +98,6 @@ mod tests;
 #[cfg(test)]
 pub(in crate::native_v2_cli) use tests::support::{Call as CliTestCall, FakeBackend as CliTestBackend};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum McpTransport {
-    Http,
-    Stdio,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetAdd {
     pub name: String,
@@ -330,9 +324,8 @@ pub enum NativeV2CliCommand {
     Acp {
         profile: RunProfileName,
     },
-    /// The process entrypoint owns the MCP transport loop.
+    /// The process entrypoint owns the HTTP listen loop.
     McpServe {
-        transport: McpTransport,
         listen: SocketAddr,
     },
     Update,

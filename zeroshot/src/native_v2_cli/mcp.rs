@@ -1,4 +1,4 @@
-//! MCP server over Streamable HTTP or stdio.
+//! MCP server over Streamable HTTP.
 //!
 //! Tools build the same command values as the CLI. The process entrypoint runs those values
 //! through the existing executors. Run events are the durable stream `watch` already reads.
@@ -22,4 +22,3 @@ mod tests;
 
 pub use host::{McpFailure, McpHost, WatchStream};
 pub use http::{serve_http, serve_http_listener};
-pub use serve::serve;
