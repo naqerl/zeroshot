@@ -215,3 +215,60 @@ fn declared_runtime_inputs_enforce_unique_bounded_connection_authority() {
             .contains_key(&ConnectionKey::new("provider").unwrap())
     );
 }
+
+#[test]
+fn caller_model_limits_reject_null_float_and_units_and_skip_other_bindings() {
+    // Null behaves exactly like an omitted field, so an explicit JSON null stays caller-friendly.
+    let nulls: NodeRuntimeBinding = serde_json::from_value(serde_json::json!({
+        "kind": "agent",
+        "model": "worker-model",
+        "contextWindow": null,
+        "maxTokens": null
+    }))
+    .unwrap();
+    assert_eq!(nulls.context_window(), None);
+    assert_eq!(nulls.max_tokens(), None);
+
+    // Fractions are rejected by the typed visitor rather than truncated or rounded.
+    for field in ["contextWindow", "maxTokens"] {
+        let mut wire = serde_json::json!({"kind": "agent", "model": "worker-model"});
+        wire[field] = serde_json::json!(1.5);
+        let error = serde_json::from_value::<NodeRuntimeBinding>(wire).unwrap_err();
+        assert!(error.to_string().contains(field), "{field}: {error}");
+    }
+
+    // Both inclusive boundaries are accepted and round-trip through serialization.
+    for (context_window, max_tokens) in [
+        (MIN_MODEL_CONTEXT_WINDOW, MIN_MODEL_MAX_TOKENS),
+        (MAX_MODEL_CONTEXT_WINDOW, MAX_MODEL_MAX_TOKENS),
+    ] {
+        let binding = NodeRuntimeBinding::Agent {
+            lane: None,
+            model: crate::ModelId::new("worker-model").unwrap(),
+            effort: None,
+            context_window: Some(context_window),
+            max_tokens: Some(max_tokens),
+            session_scope: SessionScope::Execution,
+            connections: DeclaredConnections::empty(),
+        };
+        binding.validate_model_limits().unwrap();
+        let round_trip: NodeRuntimeBinding =
+            serde_json::from_str(&serde_json::to_string(&binding).unwrap()).unwrap();
+        assert_eq!(round_trip, binding);
+    }
+
+    // Non-agent bindings have no limits to validate.
+    for binding in [
+        NodeRuntimeBinding::GitDelivery {
+            pull_request_feedback: PullRequestFeedback::Consider,
+            connections: DeclaredConnections::empty(),
+        },
+        NodeRuntimeBinding::CommentDelivery {
+            connections: DeclaredConnections::empty(),
+        },
+    ] {
+        binding.validate_model_limits().unwrap();
+        assert_eq!(binding.context_window(), None);
+        assert_eq!(binding.max_tokens(), None);
+    }
+}

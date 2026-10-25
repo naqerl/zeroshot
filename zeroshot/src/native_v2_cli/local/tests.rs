@@ -1114,3 +1114,32 @@ async fn wave11_cli_contract_local_deduplication_and_zero_deadline_cleanup_are_e
     assert_local_start_deduplicates_before_controller_launch().await;
     assert_zero_deadline_cleanup_and_recovery_claim_edges().await;
 }
+
+#[test]
+fn local_review_tokens_are_bounded_and_lease_paths_stay_private() {
+    assert!(checked_review_token(String::new()).is_err());
+    assert!(checked_review_token("token\0suffix".to_owned()).is_err());
+    assert!(checked_review_token("t".repeat(4097)).is_err());
+    assert_eq!(
+        checked_review_token("t".repeat(4096)).assert_value(),
+        "t".repeat(4096)
+    );
+
+    let root = TestDirectory::new("local-review-token");
+    let state = root.child("state");
+    let workspace = root.child("workspace");
+    std::fs::create_dir(&workspace).assert_value();
+    let lease = local_workspace_lease_path(&state, &workspace).assert_value();
+    assert!(lease.starts_with(state.join("workspaces")));
+    assert_eq!(
+        local_workspace_lease_path(&state, &workspace).assert_value(),
+        lease,
+        "one workspace must always map to the same lease path"
+    );
+
+    let run_id = RunId::new("0199f33f-3b44-7d21-9000-0000000000ff");
+    let storage = create_local_run_storage(&state, &run_id).assert_value();
+    assert_eq!(storage, state.join("runs").join(run_id.as_str()));
+    assert!(storage.is_dir());
+    assert!(create_local_run_storage(&state, &RunId::new("invalid-local-run")).is_err());
+}
