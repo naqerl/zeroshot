@@ -466,3 +466,161 @@ async fn wave8_cli_contract_validate_only_preflight_materializes_without_backend
         );
     }
 }
+
+#[test]
+fn github_tokens_reject_empty_oversized_and_control_bearing_values() {
+    assert_eq!(
+        validate_github_token("ghp_token".to_owned()).assert_value(),
+        "ghp_token"
+    );
+    for rejected in [
+        String::new(),
+        "x".repeat(4_097),
+        "ghp_bad\0token".to_owned(),
+    ] {
+        assert!(matches!(
+            validate_github_token(rejected),
+            Err(NativeV2CliError::GitHubToken)
+        ));
+    }
+}
+
+#[test]
+fn run_environment_inputs_distinguish_empty_missing_and_malformed_files() {
+    assert!(matches!(read_run_environment(&None), Ok(None)));
+    assert!(matches!(
+        read_run_environment(&Some(crate::native_v2_cli::RunEnvironmentInput::Empty)),
+        Ok(Some(environment)) if environment == Default::default()
+    ));
+
+    let directory = tempfile::tempdir().assert_value();
+    let missing = directory.path().join("missing.json");
+    assert!(matches!(
+        read_run_environment(&Some(crate::native_v2_cli::RunEnvironmentInput::File(
+            missing
+        ))),
+        Err(NativeV2CliError::Read {
+            kind: "run environment",
+            ..
+        })
+    ));
+    let malformed = directory.path().join("malformed.json");
+    std::fs::write(&malformed, b"{not json").assert_value();
+    assert!(matches!(
+        read_run_environment(&Some(crate::native_v2_cli::RunEnvironmentInput::File(
+            malformed
+        ))),
+        Err(NativeV2CliError::Json {
+            kind: "run environment",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn connection_selection_keeps_present_utf8_fields_and_rejects_non_utf8_values() {
+    let selected = select_connection_requirements(
+        BTreeMap::from([(
+            ConnectionKey::new("provider").assert_value(),
+            [
+                EnvironmentVariableName::new("ABSENT").assert_value(),
+                EnvironmentVariableName::new("OPENAI_API_KEY").assert_value(),
+            ]
+            .into_iter()
+            .collect(),
+        )]),
+        |name| (name == "OPENAI_API_KEY").then(|| OsString::from("secret")),
+    )
+    .assert_value();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(
+        selected
+            .values()
+            .next()
+            .assert_value()
+            .as_map()
+            .get(&EnvironmentVariableName::new("OPENAI_API_KEY").assert_value()),
+        Some(&"secret".to_owned())
+    );
+
+    let error = select_connection_requirements(
+        BTreeMap::from([(
+            ConnectionKey::new("provider").assert_value(),
+            [EnvironmentVariableName::new("OPENAI_API_KEY").assert_value()]
+                .into_iter()
+                .collect(),
+        )]),
+        |_| {
+            use std::os::unix::ffi::OsStringExt as _;
+            Some(OsString::from_vec(vec![b'n', 0xff]))
+        },
+    )
+    .expect_err("non-UTF-8 environment values must not be submitted");
+    assert!(
+        matches!(error, NativeV2CliError::Environment(name) if name.as_str() == "OPENAI_API_KEY")
+    );
+}
+
+fn intent_command(selection: RunSelection) -> RunCommand {
+    RunCommand {
+        environment: None,
+        target: None,
+        cwd: None,
+        source_connection: None,
+        title: RunTitle::new("Intent validation").assert_value(),
+        input: "input.json".into(),
+        selection,
+        repository: None,
+        branch: None,
+        revision: None,
+        detach: false,
+        validate_only: false,
+        submission_key: None,
+    }
+}
+
+fn resolved_profile(profile: GraphProfile) -> ResolvedRunProfile {
+    let mut graph = BuiltinGraphTemplate::SingleWorker
+        .materialize(TemplateDelivery::None)
+        .assert_value();
+    graph.profile = profile;
+    let runtime = uniform(UniformHarness::Codex, UniformProvider::OpenAi)
+        .materialize(&graph, PullRequestFeedback::Consider, None)
+        .assert_value();
+    ResolvedRunProfile {
+        graph,
+        runtime,
+        remote_selector: None,
+    }
+}
+
+#[test]
+fn prepare_intent_rejects_non_full_profiles_and_mismatched_initial_input() {
+    let command = intent_command(RunSelection::Profile(None));
+    let profile = resolved_profile(GraphProfile::SingleWorker);
+    let error = prepare_intent(&command, profile, serde_json::json!({"task":"x"}), None)
+        .expect_err("non-full graph profile must be rejected");
+    assert!(
+        matches!(error, NativeV2CliError::Usage(message) if message.contains("openengine.graph.full/v1"))
+    );
+
+    let profile = resolved_profile(GraphProfile::Full);
+    let error = prepare_intent(&command, profile, serde_json::json!("not an object"), None)
+        .expect_err("initial input must match the authored schema");
+    assert!(matches!(error, NativeV2CliError::InitialInput(_)));
+}
+
+#[test]
+fn prepare_intent_preserves_an_explicit_submission_key() {
+    let mut command = intent_command(RunSelection::Profile(None));
+    command.submission_key = Some(IdempotencyKey::new("cli-retry-key").assert_value());
+    let intent = prepare_intent(
+        &command,
+        resolved_profile(GraphProfile::Full),
+        serde_json::json!({"task":"x"}),
+        Some(Default::default()),
+    )
+    .assert_value();
+    assert_eq!(intent.submission_key, command.submission_key.assert_value());
+    assert_eq!(intent.initial_input, serde_json::json!({"task":"x"}));
+}

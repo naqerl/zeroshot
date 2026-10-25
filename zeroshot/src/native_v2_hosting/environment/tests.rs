@@ -324,3 +324,107 @@ async fn root_setup_and_startup_have_separate_caches_and_share_installed_tools()
     );
     fixture.cleanup().await;
 }
+
+#[tokio::test]
+async fn unprivileged_setup_hooks_install_tools_and_fail_closed_on_startup_identity() {
+    let root = TestDirectory::new("unprivileged-environment-hooks");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).assert_value();
+    let runtime = root.child("runtime");
+    std::fs::create_dir(&runtime).assert_value();
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o711)).assert_value();
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    let pool =
+        HostedProcessPool::new(uid, gid, uid.checked_add(10_000).assert_value()).assert_value();
+    let identity = pool
+        .identity(HostedProcessScope::Environment)
+        .assert_value();
+    let home =
+        prepare_environment(root.path(), &runtime, identity, HookPhase::Setup).assert_value();
+    assert_eq!(home, runtime.join("setup-home"));
+    prepare_tools(root.path(), None).assert_value();
+    assert_eq!(tools_directory(root.path()), root.path().join("tools"));
+    assert_eq!(
+        search_path(root.path(), "/usr/bin:/bin"),
+        format!("{}:/usr/bin:/bin", root.path().join("tools/bin").display())
+    );
+
+    let workspace = root.child("workspace");
+    std::fs::create_dir(&workspace).assert_value();
+    let runtime_plan = serde_json::from_value(
+        serde_json::json!({"harness":"codex","provider":"openai","size":"medium","nodes":{}}),
+    )
+    .assert_value();
+    let log = Arc::new(CapturedProgress::default());
+    let mut preparation = CapsulePreparation::quiet(&runtime_plan).assert_value();
+    preparation.progress = log.clone();
+    let values = BTreeMap::from([
+        ("PATH".to_owned(), search_path(root.path(), "/usr/bin:/bin")),
+        ("HOME".to_owned(), home.to_string_lossy().into_owned()),
+        (
+            "ZEROSHOT_TOOLS".to_owned(),
+            tools_directory(root.path()).to_string_lossy().into_owned(),
+        ),
+        (
+            "PRIVATE_TOKEN".to_owned(),
+            "test-secret-credential".to_owned(),
+        ),
+    ]);
+    let processes = EnvironmentProcesses::default();
+    let redactions = ["test-secret-credential".to_owned()];
+    let request = |phase, script| HookRequest {
+        phase,
+        script,
+        directory: &workspace,
+        identity,
+        environment: &values,
+        preparation: &preparation,
+        redactions: &redactions,
+    };
+    processes
+        .run(request(
+            HookPhase::Setup,
+            Some(
+                "printf '#!/bin/sh\\necho installed\\n' > \"$ZEROSHOT_TOOLS/bin/example\"; \
+                 chmod +x \"$ZEROSHOT_TOOLS/bin/example\"; example > installed",
+            ),
+        ))
+        .await
+        .assert_value();
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("installed")).assert_value(),
+        "installed\n"
+    );
+    processes
+        .run(request(HookPhase::Setup, Some("   ")))
+        .await
+        .assert_value();
+    processes
+        .run(request(HookPhase::Setup, None))
+        .await
+        .assert_value();
+
+    assert_eq!(
+        processes
+            .run(request(
+                HookPhase::Setup,
+                Some("echo \"$PRIVATE_TOKEN\" >&2; exit 23"),
+            ))
+            .await,
+        Err(CapsuleAllocationUnavailable::EnvironmentSetup)
+    );
+    let logs = log.0.lock().assert_value().join("\n");
+    assert!(logs.contains("[REDACTED]"));
+    assert!(!logs.contains("test-secret-credential"));
+    processes.finish_output().await.assert_value();
+
+    let startup_home =
+        prepare_environment(root.path(), &runtime, identity, HookPhase::Startup).assert_value();
+    assert_eq!(startup_home, runtime.join("environment"));
+    assert_eq!(
+        processes
+            .run(request(HookPhase::Startup, Some("true")))
+            .await,
+        Err(CapsuleAllocationUnavailable::EnvironmentStartup)
+    );
+}

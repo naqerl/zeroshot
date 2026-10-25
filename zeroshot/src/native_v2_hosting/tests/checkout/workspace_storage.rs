@@ -102,7 +102,7 @@ async fn external_restore_failure_never_releases_an_allocated_capsule() {
 }
 
 const COMMENT_URL: &str = "https://github.com/acme/project/pull/17";
-const COMMENT_GH: &str = r#"#!/usr/bin/python3
+const COMMENT_GH: &str = r#"#!/usr/local/bin/python3
 import json, os, pathlib, sys
 assert os.environ['GH_TOKEN'] == 'checkout-secret'
 assert sys.argv[1] == 'api'
