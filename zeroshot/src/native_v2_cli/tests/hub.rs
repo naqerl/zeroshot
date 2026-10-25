@@ -2,8 +2,8 @@ use std::ffi::OsString;
 
 use crate::native_v2_cli::hub::{
     HubApiOptions, HubCommand, HubEvalCaseSource, HubEvalCommand, HubJudgeMode, HubContextCommand,
-    HubDaemonRun, HubInstall, HubManager, HubMemberState, HubRequest, HubStrategy, HubTokenSource,
-    HubUninstall,
+    HubDaemonRun, HubInstall, HubManager, HubMemberState, HubPoolCommand, HubPoolTag, HubRequest,
+    HubStrategy, HubTokenSource, HubUninstall,
 };
 use crate::native_v2_cli::{NativeV2CliCommand, NativeV2CliError, parse_native_v2_args};
 
@@ -792,5 +792,202 @@ fn eval_names_cases_and_variants_are_validated() {
     assert!(
         message(&["hub", "eval", "run", "--suite", "s", "--variant", "a=model"])
             .contains("KEY=VALUE")
+    );
+}
+
+#[test]
+fn pool_add_takes_ordered_type_and_location_lists() {
+    let command = parse(&[
+        "hub",
+        "pool",
+        "add",
+        "burst",
+        "--type",
+        "cpx31,cx43",
+        "--type",
+        "cx53",
+        "--location",
+        "fsn1,nbg1",
+        "--multi-arch",
+        "--wait-max",
+        "30m",
+        "--image",
+        "docker-ce",
+        "--target-image",
+        "img:1",
+        "--max",
+        "3",
+        "--tag",
+        "hetzner",
+        "--ssh-key",
+        "/k",
+        "--ssh-from",
+        "198.51.100.7/32",
+    ])
+    .expect("pool add parses");
+    let HubCommand::Pool(HubPoolCommand::Add(add)) = command else {
+        panic!("expected pool add");
+    };
+    assert_eq!(add.server_types, ["cpx31", "cx43", "cx53"]);
+    assert_eq!(add.locations, ["fsn1", "nbg1"]);
+    assert!(add.multi_arch);
+    assert_eq!(add.wait_max.as_deref(), Some("30m"));
+    let missing = parse(&[
+        "hub",
+        "pool",
+        "add",
+        "burst",
+        "--image",
+        "docker-ce",
+        "--target-image",
+        "img:1",
+        "--max",
+        "3",
+        "--tag",
+        "hetzner",
+        "--ssh-key",
+        "/k",
+        "--ssh-from",
+        "198.51.100.7/32",
+    ]);
+    assert!(missing.is_err(), "--type is required: no default type");
+    assert_eq!(
+        parse(&["hub", "pool", "types"]).expect("types"),
+        HubCommand::Pool(HubPoolCommand::Types)
+    );
+}
+
+#[test]
+fn pool_tag_profiles_parse_and_reject_size_tags() {
+    let command = parse(&[
+        "hub",
+        "pool",
+        "tag",
+        "set",
+        "burst",
+        "gpu-heavy",
+        "--type",
+        "cpx41,cx43",
+        "--location",
+        "hel1",
+        "--location",
+        "fsn1",
+        "--min-vcpu",
+        "8",
+        "--min-ram",
+        "16G",
+        "--slots",
+        "2",
+        "--priority",
+        "3",
+    ])
+    .expect("tag set parses");
+    assert_eq!(
+        command,
+        HubCommand::Pool(HubPoolCommand::TagSet(Box::new(HubPoolTag {
+            pool: "burst".to_owned(),
+            tag: "gpu-heavy".to_owned(),
+            server_types: vec!["cpx41".to_owned(), "cx43".to_owned()],
+            locations: vec!["hel1".to_owned(), "fsn1".to_owned()],
+            min_cores: Some(8),
+            min_memory_gb: Some(16),
+            slots: Some(2),
+            priority: 3,
+        })))
+    );
+    for size in ["16", "16g", "16GB"] {
+        let HubCommand::Pool(HubPoolCommand::TagSet(tag)) = parse(&[
+            "hub",
+            "pool",
+            "tag",
+            "set",
+            "burst",
+            "big",
+            "--min-ram",
+            size,
+        ])
+        .expect("memory parses") else {
+            panic!("expected tag set");
+        };
+        assert_eq!(tag.min_memory_gb, Some(16), "{size}");
+    }
+    for bad in [
+        &[
+            "hub",
+            "pool",
+            "tag",
+            "set",
+            "burst",
+            "big",
+            "--min-ram",
+            "lots",
+        ][..],
+        &[
+            "hub",
+            "pool",
+            "tag",
+            "set",
+            "burst",
+            "big",
+            "--min-ram",
+            "0",
+        ],
+        &["hub", "pool", "tag", "set", "burst", "min-vcpu=4"],
+        &["hub", "pool", "tag", "set", "burst", "big", "--slots", "0"],
+    ] {
+        assert!(parse(bad).is_err(), "{bad:?}");
+    }
+    assert_eq!(
+        parse(&["hub", "pool", "tag", "ls", "burst"]).expect("list"),
+        HubCommand::Pool(HubPoolCommand::TagList {
+            name: "burst".to_owned()
+        })
+    );
+    assert_eq!(
+        parse(&["hub", "pool", "tag", "rm", "burst", "big"]).expect("remove"),
+        HubCommand::Pool(HubPoolCommand::TagRemove {
+            name: "burst".to_owned(),
+            tag: "big".to_owned()
+        })
+    );
+}
+
+#[test]
+fn submit_size_flags_become_size_tags() {
+    let HubCommand::Submit(submit) = parse(&[
+        "hub",
+        "submit",
+        "--tag",
+        "hetzner",
+        "--server-type",
+        "cx43",
+        "--min-vcpu",
+        "8",
+        "--min-ram",
+        "16GB",
+        "--title",
+        "t",
+        "--input",
+        "in.json",
+    ])
+    .expect("submit parses") else {
+        panic!("expected submit");
+    };
+    assert_eq!(
+        submit.job.tags,
+        ["hetzner", "min-ram-gb=16", "min-vcpu=8", "server-type=cx43"]
+    );
+    assert!(
+        parse(&[
+            "hub",
+            "submit",
+            "--min-vcpu",
+            "0",
+            "--title",
+            "t",
+            "--input",
+            "i"
+        ])
+        .is_err()
     );
 }
