@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::model::{Job, MemberState, Schedule};
+use super::pool::Provider;
 
 /// `POST /v1/hub/members`.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -15,6 +16,55 @@ pub(crate) struct AddMember {
     pub slots: u32,
     #[serde(default)]
     pub priority: i32,
+}
+
+/// `POST /v1/hub/pools`. Paths are absolute paths on the hub host.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct AddPool {
+    pub name: String,
+    pub provider: Provider,
+    /// Server types, best first.
+    pub server_types: Vec<String>,
+    /// Locations, in order; empty means every location offering one of the types.
+    #[serde(default)]
+    pub locations: Vec<String>,
+    #[serde(default)]
+    pub multi_arch: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_max_ms: Option<u64>,
+    pub image: String,
+    pub target_image: String,
+    pub max: u32,
+    pub slots: u32,
+    pub idle_ms: u64,
+    pub ttl_ms: u64,
+    pub tags: Vec<String>,
+    pub ssh_key: std::path::PathBuf,
+    pub ssh_from: Vec<String>,
+    /// The servers' btrfs data folder; default: a file on the local disk.
+    #[serde(default)]
+    pub data: super::data::DataSettings,
+}
+
+/// `PUT /v1/hub/pools/{name}/tags/{tag}`: the machines a pool creates for jobs with a tag.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct SetTagProfile {
+    /// Server types, best first; empty means the pool's types that meet the minimum.
+    #[serde(default)]
+    pub server_types: Vec<String>,
+    /// Locations in order; empty means the pool's.
+    #[serde(default)]
+    pub locations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_cores: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_memory_gb: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slots: Option<u32>,
+    #[serde(default)]
+    pub priority: u32,
 }
 
 /// `PATCH /v1/hub/members/{name}`.

@@ -99,6 +99,20 @@ impl FileTargetRegistry {
         }
         Ok(result)
     }
+
+    /// Register a direct target, as `zeroshot target add NAME --url URL --direct` does.
+    pub fn add_direct(&self, name: &str, url: &str) -> Result<(), TargetConnectorError> {
+        self.insert(prepare_target(TargetAdd {
+            name: name.to_owned(),
+            url: url.to_owned(),
+            direct: true,
+        })?)
+    }
+
+    /// Forget a target. Returns whether it was registered.
+    pub fn remove(&self, name: &str) -> Result<bool, TargetConnectorError> {
+        self.with_state(true, |state| Ok(state.targets.remove(name).is_some()))
+    }
 }
 
 impl TargetRegistry for FileTargetRegistry {

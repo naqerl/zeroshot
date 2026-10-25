@@ -19,10 +19,13 @@ use super::driver::{HubDriver, route};
 use super::error::HubError;
 use super::metrics::Metrics;
 use super::model::{
-    HubState, Job, JobError, JobErrorKind, JobState, LOCAL_MEMBER, Member, MemberState, Schedule,
-    ScheduleState,
+    HubState, Job, JobError, JobErrorKind, JobState, LOCAL_MEMBER, Member, MemberState,
+    PlacementSpec, Requirements, Schedule, ScheduleState,
 };
-use super::placement::{Fit, Placement, describe, fit, matching_members, place, rejections};
+use super::placement::{Fit, Placement, Rejection, describe, fit, matching_members, place, rejections};
+use super::lease::{PoolReport, PoolRuntime};
+use super::pool;
+use super::profile;
 use super::schedule::{self, Dispatched, TickReport};
 use super::stats;
 use super::store::HubStore;
@@ -51,6 +54,8 @@ pub(crate) struct HubService {
     unconfirmed_limit: u32,
     /// Eval work in progress, so the worker never runs one piece twice at once.
     eval_claims: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// Provider and tunnel effects of pools; `None` without a provider token.
+    pools: Option<PoolRuntime>,
 }
 
 pub(crate) fn member_document(member: &Member) -> Value {
@@ -89,6 +94,7 @@ impl HubService {
             metrics: Metrics::default(),
             unconfirmed_limit: schedule::DEFAULT_UNCONFIRMED_LIMIT,
             eval_claims: std::sync::Mutex::default(),
+            pools: None,
         })
     }
 
@@ -104,6 +110,25 @@ impl HubService {
     pub(crate) fn with_unconfirmed_limit(mut self, limit: Option<u32>) -> Self {
         self.unconfirmed_limit = limit.unwrap_or(self.unconfirmed_limit);
         self
+    }
+
+    /// Create, tunnel to and delete pool servers with this runtime.
+    #[must_use]
+    pub(crate) fn with_pools(mut self, runtime: PoolRuntime) -> Self {
+        self.pools = Some(runtime);
+        self
+    }
+
+    pub(super) fn pool_runtime(&self) -> Option<&PoolRuntime> {
+        self.pools.as_ref()
+    }
+
+    pub(super) fn registry(&self) -> &FileTargetRegistry {
+        &self.registry
+    }
+
+    pub(super) async fn placement_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.placement.lock().await
     }
 
     pub(crate) fn metrics(&self) -> &Metrics {
@@ -263,7 +288,7 @@ impl HubService {
             let probed = state
                 .members
                 .iter()
-                .filter(|member| query.tags.iter().all(|tag| member.tags.contains(tag)))
+                .filter(|member| query.tags.iter().all(|tag| member.has_tag(tag)))
                 .filter(|member| member.state != MemberState::Disabled)
                 .collect::<Vec<_>>();
             let loads = schedule::probe(&probed, &state.jobs, self.driver()).await;
@@ -276,7 +301,7 @@ impl HubService {
         let targets = state
             .members
             .iter()
-            .filter(|member| query.tags.iter().all(|tag| member.tags.contains(tag)))
+            .filter(|member| query.tags.iter().all(|tag| member.has_tag(tag)))
             .map(|member| {
                 let mut view = member.view();
                 let (kind, origin) = self.member_kind(&member.name);
@@ -388,7 +413,9 @@ impl HubService {
                 Ok(state.clone())
             })
             .await?;
-        if let Some(rejected) = rejections(&state.members, &job.placement, &job.requirements) {
+        job.requirements.machine =
+            profile::machine_for(&state.pools, &job.placement, &job.requirements);
+        if let Some(rejected) = unplaceable(&state, &job.placement, &job.requirements) {
             self.metrics.record_rejection(Some(&rejected));
             return Err(HubError::no_eligible(describe(&job.placement), rejected));
         }
@@ -396,7 +423,18 @@ impl HubService {
         let loads = schedule::probe(&matching, &state.jobs, self.driver()).await;
         self.metrics.record_loads(&loads);
         let now = now_ms();
-        match place(&state.members, &job.placement, &job.requirements, &loads) {
+        let placement = match place(&state.members, &job.placement, &job.requirements, &loads) {
+            // A pool that serves the job starts a server for it once it is queued.
+            Placement::NoEligible { .. }
+                if pool::serving(&state.pools, &job.placement, &job.requirements).is_some() =>
+            {
+                Placement::Busy {
+                    matching: Vec::new(),
+                }
+            }
+            placement => placement,
+        };
+        match placement {
             Placement::Place(member) => {
                 job.state = JobState::Running;
                 job.target = Some(member.clone());
@@ -487,7 +525,9 @@ impl HubService {
             if let Some(existing) = idempotent(state, &job) {
                 return Ok(job_document(&existing, now));
             }
-            if let Some(rejected) = rejections(&state.members, &job.placement, &job.requirements) {
+            job.requirements.machine =
+                profile::machine_for(&state.pools, &job.placement, &job.requirements);
+            if let Some(rejected) = unplaceable(state, &job.placement, &job.requirements) {
                 self.metrics.record_rejection(Some(&rejected));
                 return Err(HubError::no_eligible(describe(&job.placement), rejected));
             }
@@ -525,8 +565,7 @@ impl HubService {
                 return Ok(schedule_document(&existing));
             }
             let template = &schedule.template;
-            if let Some(rejected) =
-                rejections(&state.members, &template.placement, &template.requirements)
+            if let Some(rejected) = unplaceable(state, &template.placement, &template.requirements)
             {
                 self.metrics.record_rejection(Some(&rejected));
                 return Err(HubError::no_eligible(
@@ -778,7 +817,19 @@ impl HubService {
     /// discovery, probes, and submissions run between phases.
     pub(crate) async fn pass(&self) -> Result<(TickReport, Value), HubError> {
         let started = std::time::Instant::now();
-        let result = self.pass_phases().await;
+        let result = match self.pass_phases().await {
+            Ok((report, mut view)) => match self.pool_pass().await {
+                Ok(pools) => {
+                    self.metrics.record_pool_pass(&pools);
+                    if pools != PoolReport::default() {
+                        view["pools"] = pools.view();
+                    }
+                    Ok((report, view))
+                }
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
         self.metrics
             .record_pass(started.elapsed().as_secs_f64(), result.is_err());
         result
@@ -889,6 +940,18 @@ fn idempotent(state: &HubState, job: &Job) -> Option<Job> {
         .iter()
         .find(|existing| existing.submission_key.as_ref() == Some(key))
         .cloned()
+}
+
+/// Why no member can ever take a job, or `None` when a member or a pool can.
+fn unplaceable(
+    state: &HubState,
+    spec: &PlacementSpec,
+    requirements: &Requirements,
+) -> Option<Vec<Rejection>> {
+    if pool::serving(&state.pools, spec, requirements).is_some() {
+        return None;
+    }
+    rejections(&state.members, spec, requirements)
 }
 
 pub(crate) fn create_private_directory(path: &Path) -> Result<(), HubError> {

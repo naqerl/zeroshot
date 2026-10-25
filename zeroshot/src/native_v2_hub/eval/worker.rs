@@ -445,6 +445,8 @@ impl HubService {
                     error: None,
                     schedule_id: None,
                     output: None,
+                    archive: None,
+                    graph_hash: None,
                     submission_key: None,
                     not_before_ms: None,
                     expires_at_ms: None,

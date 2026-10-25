@@ -596,6 +596,9 @@ impl HubService {
             error: None,
             schedule_id: None,
             output: None,
+            archive: None,
+            graph_hash: None,
+            pool_wait: None,
         })
     }
 

@@ -308,6 +308,7 @@ impl NativeV2CliBackend for LocalCliBackend {
             .map_err(local_error)?
             .ok_or_else(|| local_message("run does not exist"))?;
         let token_usage = stored.snapshot.token_usage.clone();
+        let graph_hash = crate::active_memory::runtime::authored_graph_hash(&stored.admitted).ok();
         let ledger: Arc<dyn RunLedger> = Arc::new(ledger);
         let service =
             crate::native_v2_observability::history::RunHistoryService::for_ledger(ledger);
@@ -315,10 +316,10 @@ impl NativeV2CliBackend for LocalCliBackend {
             .definition(&run_id)
             .await
             .map_err(|error| local_message(error.message))?;
-        Ok(crate::native_v2_observability::history::build_run_report(
-            &definition,
-            token_usage,
-        ))
+        let mut report =
+            crate::native_v2_observability::history::build_run_report(&definition, token_usage);
+        report.run.authored_graph_hash = graph_hash;
+        Ok(report)
     }
 
     async fn run_checkpoints(

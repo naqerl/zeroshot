@@ -29,6 +29,10 @@ pub struct RunReportHeader {
     pub phase: RunPhase,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<RunReportSource>,
+    /// SHA-256 of the admitted authored graph, the key lessons are learned under. Present when
+    /// the backend can read the admitted run (local runs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authored_graph_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -82,6 +86,7 @@ pub fn build_run_report(definition: &RunDefinition, token_usage: Option<TokenUsa
             title: definition.title.clone(),
             phase: definition.phase.clone(),
             source: definition.source.as_ref().map(report_source),
+            authored_graph_hash: None,
         },
         nodes: definition.nodes.clone(),
         totals: RunReportTotals {

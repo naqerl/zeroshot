@@ -75,6 +75,78 @@ pub enum HubCommand {
     Uninstall(HubUninstall),
     /// Evaluation suites, cases, runs, and reports.
     Eval(HubEvalCommand),
+    /// On-demand cloud server pools.
+    Pool(HubPoolCommand),
+}
+
+/// `hub pool`: on-demand cloud server pools whose servers become hub members.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HubPoolCommand {
+    Add(Box<HubPoolAdd>),
+    List,
+    Remove {
+        name: String,
+    },
+    /// List the provider's server types with prices.
+    Types,
+    /// Clear a blocked, capacity-waiting or boot-paused pool so it starts servers again.
+    Resume {
+        name: String,
+    },
+    /// Set the machines a pool creates for jobs with a tag.
+    TagSet(Box<HubPoolTag>),
+    /// List a pool's tag profiles.
+    TagList {
+        name: String,
+    },
+    /// Remove a tag profile; jobs with the tag fall back to the pool's types.
+    TagRemove {
+        name: String,
+        tag: String,
+    },
+}
+
+/// `hub pool tag set`: the machines a pool creates for jobs carrying `tag`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HubPoolTag {
+    pub pool: String,
+    pub tag: String,
+    /// Server types, best first; empty means the pool's types that meet the minimum.
+    pub server_types: Vec<String>,
+    /// Locations in order; empty means the pool's locations.
+    pub locations: Vec<String>,
+    pub min_cores: Option<u32>,
+    pub min_memory_gb: Option<u32>,
+    pub slots: Option<u32>,
+    pub priority: u32,
+}
+
+/// `hub pool add`. Durations stay text until the client parses them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HubPoolAdd {
+    pub name: String,
+    pub provider: String,
+    /// Server types, best first.
+    pub server_types: Vec<String>,
+    /// Locations in order; empty means every location offering one of the types.
+    pub locations: Vec<String>,
+    pub multi_arch: bool,
+    pub wait_max: Option<String>,
+    pub image: String,
+    pub target_image: String,
+    pub max: u32,
+    pub slots: u32,
+    pub idle: String,
+    pub ttl: String,
+    pub tags: Vec<String>,
+    pub ssh_key: PathBuf,
+    pub ssh_from: Vec<String>,
+    /// Filesystem of the servers' data folder; only `btrfs`.
+    pub data_fs: String,
+    /// Size of the btrfs data file on the local disk, in GB; `None` sizes it to the free disk.
+    pub data_size_gb: Option<u32>,
+    /// Keep the data on an attached Volume of this many GB instead of the local disk.
+    pub data_volume_gb: Option<u32>,
 }
 
 /// `hub daemon run` options.
@@ -98,6 +170,8 @@ pub struct HubApiOptions {
     /// Submissions a target may leave unconfirmed before the job fails; `None` uses the
     /// daemon's default.
     pub unconfirmed_limit: Option<u32>,
+    /// Hetzner Cloud API token file for pool servers; `None` reads `HCLOUD_TOKEN`.
+    pub hetzner_token_file: Option<PathBuf>,
 }
 
 /// `hub context`: named hub endpoints, docker-context style.

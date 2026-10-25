@@ -14,6 +14,8 @@ use std::sync::Mutex;
 use super::eval::SampleState;
 use super::model::{HubState, Job, JobState, MemberState, ScheduleState};
 use super::placement::{Load, Rejection};
+use super::pool;
+use super::profile::{self, Spec, SpecSource};
 use super::usage::{TOKEN_KINDS, Tokens};
 
 /// Distinct values kept per bounded label before the rest collapse into `_other`.
@@ -178,6 +180,7 @@ struct Counters {
     requests: BTreeMap<(String, String, u16), u64>,
     latency: BTreeMap<(String, String), Histogram>,
     loads: BTreeMap<String, Load>,
+    pool_events: BTreeMap<&'static str, u64>,
 }
 
 /// In-memory counters of one daemon, plus the job label keys exported with token counters.
@@ -246,6 +249,25 @@ impl Metrics {
         });
     }
 
+    /// Count what one pool pass did.
+    pub(crate) fn record_pool_pass(&self, report: &super::lease::PoolReport) {
+        self.with(|counters| {
+            for (event, count) in [
+                ("started", report.started.len()),
+                ("teardown", report.teardowns.len()),
+                ("archived", report.archived.len()),
+                ("deleted", report.deleted.len()),
+                ("reaped", report.reaped.len()),
+                ("shortage", report.shortages.len()),
+                ("blocked", report.blocked.len()),
+                ("wait_timeout", report.expired.len()),
+                ("error", report.errors.len()),
+            ] {
+                *counters.pool_events.entry(event).or_default() += count as u64;
+            }
+        });
+    }
+
     pub(crate) fn record_loads(&self, loads: &BTreeMap<String, Load>) {
         self.with(|counters| {
             for (member, load) in loads {
@@ -296,6 +318,8 @@ impl Metrics {
         );
         render_jobs(&mut out, state, now_ms);
         render_members(&mut out, state, self);
+        render_pools(&mut out, state);
+        render_capacity(&mut out, state, now_ms);
         render_job_histograms(&mut out, state);
         render_tokens(&mut out, state, &self.label_keys);
         let Ok(counters) = self.counters.lock() else {
@@ -354,6 +378,18 @@ impl Metrics {
             );
         }
         out.family(
+            "zeroshot_hub_pool_events_total",
+            "counter",
+            "Pool lease events (started, teardown, archived, deleted, reaped, error).",
+        );
+        for (event, count) in &counters.pool_events {
+            out.sample(
+                "zeroshot_hub_pool_events_total",
+                &[("event", event)],
+                *count as f64,
+            );
+        }
+        out.family(
             "zeroshot_hub_api_requests_total",
             "counter",
             "Hub API requests by route template, method, and status code.",
@@ -388,6 +424,146 @@ impl Metrics {
         self.with(|counters| counters.loads.get(member).cloned())
             .flatten()
     }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn render_pools(out: &mut Exposition, state: &HubState) {
+    out.family(
+        "zeroshot_hub_pool_leases",
+        "gauge",
+        "Pool servers by pool and lease phase; every one is billed.",
+    );
+    let mut counts = BTreeMap::<(String, String), u64>::new();
+    for pool in &state.pools {
+        counts
+            .entry((pool.name.clone(), "active".to_owned()))
+            .or_default();
+    }
+    for lease in &state.leases {
+        let phase = serde_json::to_value(lease.phase)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        *counts.entry((lease.pool.clone(), phase)).or_default() += 1;
+    }
+    for ((pool, phase), count) in &counts {
+        out.sample(
+            "zeroshot_hub_pool_leases",
+            &[("pool", pool), ("phase", phase)],
+            *count as f64,
+        );
+    }
+}
+
+/// Pool capacity: refusals per type and location, why a pool holds back, and which server
+/// each pool member runs on.
+#[allow(clippy::cast_precision_loss)]
+fn render_capacity(out: &mut Exposition, state: &HubState, now_ms: u64) {
+    out.family(
+        "zeroshot_hub_pool_capacity_unavailable_total",
+        "counter",
+        "Server creations the provider refused for lack of capacity, or the catalog showed \
+         unavailable, by pool, server type and location.",
+    );
+    for pool in &state.pools {
+        for (server_type, locations) in &pool.unavailable {
+            for (location, count) in locations {
+                out.sample(
+                    "zeroshot_hub_pool_capacity_unavailable_total",
+                    &[
+                        ("pool", &pool.name),
+                        ("server_type", server_type),
+                        ("location", location),
+                    ],
+                    *count as f64,
+                );
+            }
+        }
+    }
+    out.family(
+        "zeroshot_hub_pool_holding",
+        "gauge",
+        "1 while a pool starts no servers, by reason: blocked, capacity or boot_failures.",
+    );
+    for pool in &state.pools {
+        let paused = pool.paused_until_ms.is_some_and(|until| now_ms < until);
+        for (reason, holding) in [
+            ("blocked", pool.blocked.is_some()),
+            ("capacity", !pool.shortages.is_empty()),
+            ("boot_failures", paused),
+        ] {
+            out.sample(
+                "zeroshot_hub_pool_holding",
+                &[("pool", &pool.name), ("reason", reason)],
+                if holding { 1.0 } else { 0.0 },
+            );
+        }
+    }
+    out.family(
+        "zeroshot_hub_member_machine_info",
+        "gauge",
+        "The server type and location of each pool member.",
+    );
+    for member in &state.members {
+        if let Some(machine) = &member.machine {
+            let (source, profile) = spec_labels(member.spec.as_ref());
+            out.sample(
+                "zeroshot_hub_member_machine_info",
+                &[
+                    ("member", &member.name),
+                    ("server_type", &machine.server_type),
+                    ("location", &machine.location),
+                    ("source", source),
+                    ("profile", &profile),
+                ],
+                1.0,
+            );
+        }
+    }
+    render_queued(out, state);
+}
+
+/// Queued jobs a pool serves, by the source of their machine spec and the tag profile chosen.
+#[allow(clippy::cast_precision_loss)]
+fn render_queued(out: &mut Exposition, state: &HubState) {
+    out.family(
+        "zeroshot_hub_pool_queued_jobs",
+        "gauge",
+        "Queued jobs a pool serves, by machine source (pool, tag or job) and tag profile.",
+    );
+    let mut counts = BTreeMap::<(String, &'static str, String), u64>::new();
+    for job in state
+        .jobs
+        .iter()
+        .filter(|job| job.state == JobState::Queued)
+    {
+        if let Some(pool) = pool::serving(&state.pools, &job.placement, &job.requirements) {
+            let spec = profile::resolve_spec(pool, &job.placement.tags);
+            let (source, profile) = spec_labels(Some(&spec));
+            *counts
+                .entry((pool.name.clone(), source, profile))
+                .or_default() += 1;
+        }
+    }
+    for ((pool, source, profile), count) in &counts {
+        out.sample(
+            "zeroshot_hub_pool_queued_jobs",
+            &[("pool", pool), ("source", source), ("profile", profile)],
+            *count as f64,
+        );
+    }
+}
+
+fn spec_labels(spec: Option<&Spec>) -> (&'static str, String) {
+    let Some(spec) = spec else {
+        return ("pool", String::new());
+    };
+    let source = match spec.source {
+        SpecSource::Job => "job",
+        SpecSource::Tag => "tag",
+        SpecSource::Pool => "pool",
+    };
+    (source, spec.tag.clone().unwrap_or_default())
 }
 
 const JOB_STATES: [&str; 7] = [

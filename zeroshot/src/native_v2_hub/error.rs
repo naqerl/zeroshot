@@ -70,6 +70,9 @@ pub(crate) enum HubError {
     /// whether it acted is unknown.
     #[error("{0}")]
     Unanswered(String),
+    /// A cloud provider call failed or its outcome is not confirmed.
+    #[error("cloud provider: {0}")]
+    Provider(String),
 }
 
 impl HubError {
@@ -92,7 +95,10 @@ impl HubError {
             Self::NoEligibleTarget { .. } => 422,
             Self::NoCapacity(_) | Self::WaitTimeout(_) => 503,
             Self::Unauthorized { .. } => 401,
-            Self::Target { .. } | Self::Unreachable { .. } | Self::Unanswered(_) => 502,
+            Self::Target { .. }
+            | Self::Unreachable { .. }
+            | Self::Unanswered(_)
+            | Self::Provider(_) => 502,
             Self::Storage(_) | Self::Remote { .. } => 500,
         }
     }
@@ -115,6 +121,7 @@ impl HubError {
             Self::Remote { .. } => ("target", "hub.remote"),
             Self::Target { .. } => ("target", "hub.target"),
             Self::Unanswered(_) => ("target", "hub.target_unanswered"),
+            Self::Provider(_) => ("target", "hub.provider"),
         }
     }
 

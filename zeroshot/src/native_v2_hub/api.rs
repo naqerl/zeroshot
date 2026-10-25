@@ -14,7 +14,7 @@ use axum::extract::{MatchedPath, Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -26,8 +26,8 @@ use super::error::HubError;
 use super::eval::{AddCase, AddSuite, CaseQuery, CreateRun, ReportRequest, RunQuery};
 use super::service::HubService;
 use super::wire::{
-    AddMember, CreateSchedule, EnqueueJob, JobQuery, MemberQuery, StatsRequest, StreamFrame,
-    StreamRequest, SubmitJob, UpdateMember,
+    AddMember, AddPool, CreateSchedule, EnqueueJob, JobQuery, MemberQuery, StatsRequest,
+    SetTagProfile, StreamFrame, StreamRequest, SubmitJob, UpdateMember,
 };
 
 /// Response header carrying the CLI exit code of an error.
@@ -63,6 +63,15 @@ pub(crate) fn router_with_mcp(state: Arc<ApiState>, mcp: Option<Router>) -> Rout
         .route(
             "/v1/hub/members/{name}",
             patch(update_member).delete(remove_member),
+        )
+        .route("/v1/hub/pools", get(list_pools).post(add_pool))
+        .route("/v1/hub/pools/types", get(pool_types))
+        .route("/v1/hub/pools/{name}", delete(remove_pool))
+        .route("/v1/hub/pools/{name}/resume", post(resume_pool))
+        .route("/v1/hub/pools/{name}/tags", get(list_tag_profiles))
+        .route(
+            "/v1/hub/pools/{name}/tags/{tag}",
+            put(set_tag_profile).delete(remove_tag_profile),
         )
         .route("/v1/hub/jobs", post(submit))
         .route("/v1/hub/jobs/query", post(ps))
@@ -250,6 +259,54 @@ async fn update_member(
 
 async fn remove_member(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Response {
     reply(state.service.remove(&name).await)
+}
+
+async fn add_pool(State(state): State<Arc<ApiState>>, bytes: Bytes) -> Response {
+    let result = async { state.service.add_pool(body::<AddPool>(&bytes)?).await }.await;
+    reply(result)
+}
+
+async fn list_pools(State(state): State<Arc<ApiState>>) -> Response {
+    reply(Ok(state.service.list_pools().await))
+}
+
+async fn remove_pool(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Response {
+    reply(state.service.remove_pool(&name).await)
+}
+
+async fn pool_types(State(state): State<Arc<ApiState>>) -> Response {
+    reply(state.service.pool_types().await)
+}
+
+async fn list_tag_profiles(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+) -> Response {
+    reply(state.service.list_tag_profiles(&name).await)
+}
+
+async fn set_tag_profile(
+    State(state): State<Arc<ApiState>>,
+    Path((name, tag)): Path<(String, String)>,
+    bytes: Bytes,
+) -> Response {
+    let result = async {
+        let request = body::<SetTagProfile>(&bytes)?;
+        state.service.set_tag_profile((&name, &tag), request).await
+    }
+    .await;
+    reply(result)
+}
+
+async fn remove_tag_profile(
+    State(state): State<Arc<ApiState>>,
+    Path((name, tag)): Path<(String, String)>,
+) -> Response {
+    reply(state.service.remove_tag_profile(&name, &tag).await)
+}
+
+async fn resume_pool(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Response {
+    reply(state.service.resume_pool(&name).await)
 }
 
 async fn submit(State(state): State<Arc<ApiState>>, bytes: Bytes) -> Response {

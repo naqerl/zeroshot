@@ -19,24 +19,34 @@ use zeroshot_engine::native_v2_cli::hub::{HubCommand, HubRequest};
 use crate::native_v2_target::{FileTargetRegistry, default_target_registry_path};
 
 mod api;
+mod archive;
+mod capacity;
 mod client;
 mod clock;
 mod context;
 mod cron;
 mod daemon;
+mod data;
 mod driver;
 mod error;
 mod eval;
+mod health;
+mod hetzner;
 mod install;
 mod jobs;
+mod lease;
 mod metrics;
 mod model;
 mod paths;
 mod placement;
+mod pool;
+mod profile;
+mod provision;
 mod schedule;
 mod service;
 mod stats;
 mod store;
+mod tunnel;
 mod usage;
 mod wire;
 
@@ -64,11 +74,15 @@ pub(crate) async fn execute_hub(
         HubCommand::Daemon(options) => {
             let open = |store| {
                 let driver = driver::ProcessDriver::production(registry_path.clone())?;
-                service::HubService::open(
+                let service = service::HubService::open(
                     store,
                     Arc::new(driver),
                     FileTargetRegistry::new(registry_path.clone()),
-                )
+                )?;
+                Ok(match lease::production_runtime(&options.api)? {
+                    Some(runtime) => service.with_pools(runtime),
+                    None => service,
+                })
             };
             daemon::run(store, open, &options, output).await.map(|()| 0)
         }
