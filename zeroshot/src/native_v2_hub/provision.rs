@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use super::data;
 use super::error::HubError;
 use super::pool::{Lease, Pool, Resource};
 
@@ -166,10 +167,10 @@ pub(crate) trait Provisioner: Send + Sync {
 }
 
 /// The cloud-init document of a lease's server. It schedules the backstop shutdown first, so a
-/// server whose hub vanished still stops at the end of its TTL plus grace, installs Docker when
-/// the image lacks it, and runs the pinned target image bound to the server's loopback, with
-/// its public origin set to the hub's end of the tunnel. It carries the hub's public key only:
-/// no provider token, API token or credential.
+/// server whose hub vanished still stops at the end of its TTL plus grace, then runs the boot
+/// script of [`data::boot_script`]: Docker, a btrfs data folder, and the pinned target image
+/// bound to the server's loopback with its public origin set to the hub's end of the tunnel.
+/// It carries the hub's public key only: no provider token, API token or credential.
 pub(crate) fn user_data(pool: &Pool, lease: &Lease, public_key: &str) -> Result<String, HubError> {
     let backstop_minutes = lease
         .hard_deadline_ms()
@@ -182,23 +183,39 @@ pub(crate) fn user_data(pool: &Pool, lease: &Lease, public_key: &str) -> Result<
             "the pool's SSH public key must be one line".to_owned(),
         ));
     }
-    let image = quoted(&pool.target_image)?;
     let origin = format!("http://127.0.0.1:{}", lease.local_port);
-    let document = format!(
+    let script = data::boot_script(&data::Boot {
+        data: &pool.data,
+        target_image: &pool.target_image,
+        public_origin: &origin,
+        data_folder: DATA_FOLDER,
+        target_port: TARGET_PORT,
+    })?;
+    let mut document = format!(
         "#cloud-config\n\
          ssh_pwauth: false\n\
          disable_root: false\n\
          ssh_authorized_keys:\n  - \"{key}\"\n\
-         runcmd:\n\
-         \x20 - [shutdown, -h, \"+{backstop_minutes}\"]\n\
-         \x20 - [sh, -c, \"command -v docker >/dev/null 2>&1 || (curl -fsSL https://get.docker.com | sh)\"]\n\
-         \x20 - [mkdir, -p, \"{DATA_FOLDER}\"]\n\
-         \x20 - [docker, run, --detach, --restart, unless-stopped, --name, zeroshot-target, \
-         --publish, \"127.0.0.1:{TARGET_PORT}:{TARGET_PORT}\", --volume, \
-         \"{DATA_FOLDER}:/var/lib/zeroshot\", {image}, target, serve, --listen, \
-         \"0.0.0.0:{TARGET_PORT}\", --public-origin, \"{origin}\", --storage, \
-         /var/lib/zeroshot/native-v2]\n"
+         write_files:\n\
+         \x20 - path: {path}\n\
+         \x20   owner: root:root\n\
+         \x20   permissions: '0700'\n\
+         \x20   content: |\n",
+        path = data::BOOT_SCRIPT,
     );
+    for line in script.lines() {
+        if !line.is_empty() {
+            document.push_str("      ");
+            document.push_str(line);
+        }
+        document.push('\n');
+    }
+    document.push_str(&format!(
+        "runcmd:\n\
+         \x20 - [shutdown, -h, \"+{backstop_minutes}\"]\n\
+         \x20 - [{path}]\n",
+        path = data::BOOT_SCRIPT,
+    ));
     if document.len() > USER_DATA_LIMIT {
         return Err(HubError::Usage(format!(
             "cloud-init user data is {} bytes; the provider accepts at most {USER_DATA_LIMIT}",
@@ -216,17 +233,4 @@ pub(crate) fn pinned(image: &str) -> bool {
     let name = image.rsplit('/').next().unwrap_or(image);
     name.split_once(':')
         .is_some_and(|(_, tag)| !tag.is_empty() && tag != "latest")
-}
-
-fn quoted(value: &str) -> Result<String, HubError> {
-    if value.is_empty()
-        || !value
-            .chars()
-            .all(|character| character.is_ascii_graphic() && !matches!(character, '"' | '\\'))
-    {
-        return Err(HubError::Usage(format!(
-            "image reference {value:?} has characters cloud-init cannot carry"
-        )));
-    }
-    Ok(format!("\"{value}\""))
 }

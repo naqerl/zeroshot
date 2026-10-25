@@ -506,7 +506,8 @@ async fn a_queued_job_creates_a_server_that_joins_as_a_member_and_runs_it() {
     assert!(request.labels.contains_key(LABEL_EXPIRES));
     assert!(request.user_data.contains(IMAGE));
     assert!(request.user_data.contains("127.0.0.1:8080:8080"));
-    assert!(request.user_data.contains("/mnt/zs:/var/lib/zeroshot"));
+    assert!(request.user_data.contains("DATA='/mnt/zs'"));
+    assert!(request.user_data.contains("\"$DATA:/var/lib/zeroshot\""));
     assert!(request.user_data.contains("[shutdown, -h, \"+"));
 
     rig.pass().await;
@@ -1076,7 +1077,7 @@ fn user_data_pins_the_image_and_carries_no_secrets() {
         document.contains(&format!("[shutdown, -h, \"+{backstop}\"]")),
         "{document}"
     );
-    assert!(document.contains("\"http://127.0.0.1:40123\""));
+    assert!(document.contains("ORIGIN='http://127.0.0.1:40123'"));
     assert!(!document.to_lowercase().contains("token"));
     assert!(document.len() <= provision::USER_DATA_LIMIT);
     assert!(provision::user_data(&pool, &lease, "two\nlines").is_err());
