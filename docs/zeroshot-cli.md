@@ -1304,6 +1304,15 @@ Options:
       --tag <TAG>
           Require this member tag. Repeat for several; all must match
 
+      --server-type <TYPE>
+          Pool jobs: run on this server type (one the pool or a tag profile lists); overrides tag profiles. Same as --tag server-type=TYPE
+
+      --min-vcpu <N>
+          Pool jobs: run on a server with at least N vCPUs; overrides tag profiles. Same as --tag min-vcpu=N
+
+      --min-ram <SIZE>
+          Pool jobs: run on a server with at least this much memory in GB, such as 16 or 16G; overrides tag profiles. Same as --tag min-ram-gb=N
+
       --strategy <STRATEGY>
           Choice among free matching members
 
@@ -1502,6 +1511,15 @@ Options:
 
       --tag <TAG>
           Require this member tag. Repeat for several; all must match
+
+      --server-type <TYPE>
+          Pool jobs: run on this server type (one the pool or a tag profile lists); overrides tag profiles. Same as --tag server-type=TYPE
+
+      --min-vcpu <N>
+          Pool jobs: run on a server with at least N vCPUs; overrides tag profiles. Same as --tag min-vcpu=N
+
+      --min-ram <SIZE>
+          Pool jobs: run on a server with at least this much memory in GB, such as 16 or 16G; overrides tag profiles. Same as --tag min-ram-gb=N
 
       --strategy <STRATEGY>
           Choice among free matching members
@@ -2447,6 +2465,15 @@ Options:
       --tag <TAG>
           Require this member tag. Repeat for several; all must match
 
+      --server-type <TYPE>
+          Pool jobs: run on this server type (one the pool or a tag profile lists); overrides tag profiles. Same as --tag server-type=TYPE
+
+      --min-vcpu <N>
+          Pool jobs: run on a server with at least N vCPUs; overrides tag profiles. Same as --tag min-vcpu=N
+
+      --min-ram <SIZE>
+          Pool jobs: run on a server with at least this much memory in GB, such as 16 or 16G; overrides tag profiles. Same as --tag min-ram-gb=N
+
       --strategy <STRATEGY>
           Choice among free matching members
 
@@ -2774,6 +2801,9 @@ Commands:
   add     Add a pool. The daemon needs a provider token (--hetzner-token-file or HCLOUD_TOKEN)
   list    List pools and their servers as JSON [alias: ls]
   remove  Remove a pool that has no servers left [alias: rm]
+  types   List the provider's current server types as JSON: vCPUs, memory, disk, architecture, gross price per hour by location, and the locations that can create each one now
+  resume  Let a pool start servers again after it stopped on an account limit or a rejected request, and retry a capacity shortage or a failed-boot pause now
+  tag     Prefer machines per job tag: set, list or remove a pool's tag profiles
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -2789,7 +2819,7 @@ Options:
 ```text
 Add a pool. The daemon needs a provider token (--hetzner-token-file or HCLOUD_TOKEN)
 
-Usage: zeroshot hub pool add [OPTIONS] --type <TYPE> --location <LOCATION> --image <IMAGE> --target-image <IMAGE> --max <N> --ssh-key <FILE> --ssh-from <CIDR> <NAME>
+Usage: zeroshot hub pool add [OPTIONS] --type <TYPE,...> --image <IMAGE> --target-image <IMAGE> --max <N> --ssh-key <FILE> --ssh-from <CIDR> <NAME>
 
 Arguments:
   <NAME>
@@ -2804,11 +2834,17 @@ Options:
 
           [default: hetzner]
 
-      --type <TYPE>
-          Server type, such as cx33
+      --type <TYPE,...>
+          Server types to create, best first, comma-separated. A job gets the first type that fits its size request (`hub submit --server-type/--min-vcpu/--min-ram`) or its tag profile (`hub pool tag set`). Each must be a current type from `hub pool types`; ARM types need --multi-arch
 
-      --location <LOCATION>
-          Location, such as fsn1
+      --location <LOCATION,...>
+          Locations to try, in order, for each type, comma-separated. When a location has no capacity the next one is tried, then the next type. Default: every location offering one of the types
+
+      --multi-arch
+          The target image runs on arm64 as well as amd64, so ARM server types are allowed
+
+      --wait-max <DURATION>
+          Expire a queued job this pool serves once it has waited this long for a server, such as 30m; its error kind is pool_wait_timeout. Default: wait until the job's own expiry
 
       --image <IMAGE>
           Server image: a snapshot id or a system image such as docker-ce
@@ -2883,6 +2919,162 @@ Options:
           Print help
 ```
 
+##### `zeroshot hub pool types`
+
+```text
+List the provider's current server types as JSON: vCPUs, memory, disk, architecture, gross price per hour by location, and the locations that can create each one now.
+
+Asks the hub daemon, which reads the provider's catalog with its token.
+
+Usage: zeroshot hub pool types [OPTIONS]
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+##### `zeroshot hub pool resume`
+
+```text
+Let a pool start servers again after it stopped on an account limit or a rejected request, and retry a capacity shortage or a failed-boot pause now
+
+Usage: zeroshot hub pool resume [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>
+          Pool name
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help
+```
+
+##### `zeroshot hub pool tag`
+
+```text
+Prefer machines per job tag: set, list or remove a pool's tag profiles.
+
+A job's machine comes from, in order: its own --server-type/--min-vcpu/--min-ram, the profile of one of its tags, then the pool's --type list. Among several profiled tags the highest --priority wins, then the larger minimum vCPU, then memory; profiles that would tie are rejected. A job runs on any live pool server at least as large as its profile asks before a new one is created.
+
+Usage: zeroshot hub pool tag [OPTIONS] <COMMAND>
+
+Commands:
+  set     Set (or replace) the machines the pool creates for jobs with TAG
+  list    List the pool's tag profiles as JSON [alias: ls]
+  remove  Remove a tag profile; jobs with the tag fall back to the pool's types [alias: rm]
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+###### `zeroshot hub pool tag set`
+
+```text
+Set (or replace) the machines the pool creates for jobs with TAG
+
+Usage: zeroshot hub pool tag set [OPTIONS] <POOL> <TAG>
+
+Arguments:
+  <POOL>
+          Pool name
+
+  <TAG>
+          Job tag the profile applies to; pool servers join with it
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+      --type <TYPE,...>
+          Server types to create for the tag, best first, comma-separated; each a current type from `hub pool types`. Default: the pool's types that meet --min-vcpu/--min-ram
+
+      --location <LOCATION,...>
+          Locations to try, in order, for each type, comma-separated. Default: the pool's
+
+      --min-vcpu <N>
+          Least vCPUs a server for the tag needs; existing servers this large are reused. Default: the smallest of the profile's types
+
+      --min-ram <SIZE>
+          Least memory a server for the tag needs, in GB, such as 16 or 16G. Default: the smallest of the profile's types
+
+      --slots <N>
+          Concurrent runs per server created for the tag. Default: the pool's --slots
+
+      --priority <N>
+          Wins over lower priorities when a job carries several profiled tags
+
+          [default: 0]
+
+  -h, --help
+          Print help
+```
+
+###### `zeroshot hub pool tag list`
+
+```text
+List the pool's tag profiles as JSON
+
+Usage: zeroshot hub pool tag list [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>
+          Pool name
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help
+```
+
+###### `zeroshot hub pool tag remove`
+
+```text
+Remove a tag profile; jobs with the tag fall back to the pool's types
+
+Usage: zeroshot hub pool tag remove [OPTIONS] <POOL> <TAG>
+
+Arguments:
+  <POOL>
+          Pool name
+
+  <TAG>
+          Job tag
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help
+```
+
+###### `zeroshot hub pool tag help`
+
+```text
+Print this message or the help of the given subcommand(s)
+
+Usage: zeroshot hub pool tag help [COMMAND]
+
+Commands:
+  set     Set (or replace) the machines the pool creates for jobs with TAG
+  list    List the pool's tag profiles as JSON
+  remove  Remove a tag profile; jobs with the tag fall back to the pool's types
+  help    Print this message or the help of the given subcommand(s)
+```
+
 ##### `zeroshot hub pool help`
 
 ```text
@@ -2894,6 +3086,9 @@ Commands:
   add     Add a pool. The daemon needs a provider token (--hetzner-token-file or HCLOUD_TOKEN)
   list    List pools and their servers as JSON
   remove  Remove a pool that has no servers left
+  types   List the provider's current server types as JSON: vCPUs, memory, disk, architecture, gross price per hour by location, and the locations that can create each one now
+  resume  Let a pool start servers again after it stopped on an account limit or a rejected request, and retry a capacity shortage or a failed-boot pause now
+  tag     Prefer machines per job tag: set, list or remove a pool's tag profiles
   help    Print this message or the help of the given subcommand(s)
 ```
 
