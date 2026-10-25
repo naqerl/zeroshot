@@ -64,6 +64,130 @@ impl McpHost for ScriptHost {
     }
 }
 
+/// Serves a scripted durable watch. Events in `replay` are available while subscribing;
+/// `live` events arrive after `live_delay` so they exercise the live path.
+struct EventHost {
+    replay: Vec<Value>,
+    live: Vec<Value>,
+    live_delay: Duration,
+}
+
+impl EventHost {
+    fn new(events: Vec<Value>) -> Self {
+        Self {
+            replay: events,
+            live: Vec::new(),
+            live_delay: Duration::ZERO,
+        }
+    }
+
+    fn streaming(replay: Vec<Value>, live: Vec<Value>, live_delay: Duration) -> Self {
+        Self {
+            replay,
+            live,
+            live_delay,
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl McpHost for EventHost {
+    async fn execute(&self, _command: NativeV2CliCommand) -> Result<String, McpFailure> {
+        Err(McpFailure::invalid("event host has no command executor"))
+    }
+
+    async fn open_watch(&self, command: &RunWatchCommand) -> Result<WatchStream, McpFailure> {
+        let after = command
+            .after
+            .as_ref()
+            .and_then(|cursor| sequence_from_cursor(cursor.as_str()))
+            .unwrap_or(0);
+        let replay = self
+            .replay
+            .iter()
+            .filter(|event| sequence(event).is_some_and(|cursor| cursor > after))
+            .cloned()
+            .collect::<Vec<_>>();
+        let live = self
+            .live
+            .iter()
+            .filter(|event| sequence(event).is_some_and(|cursor| cursor > after))
+            .cloned()
+            .collect::<Vec<_>>();
+        let delay = self.live_delay;
+        let (sender, receiver) = mpsc::channel(32);
+        let task = tokio::spawn(async move {
+            for event in replay {
+                if sender.send(Ok(event)).await.is_err() {
+                    return;
+                }
+            }
+            if !live.is_empty() {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                for event in live {
+                    if sender.send(Ok(event)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(WatchStream::new(receiver, task))
+    }
+}
+
+fn sequence_from_cursor(cursor: &str) -> Option<u64> {
+    cursor.strip_prefix("v2:")?.parse().ok()
+}
+
+fn sequence(event: &Value) -> Option<u64> {
+    sequence_from_cursor(event.get("cursor")?.as_str()?)
+}
+
+fn source() -> Value {
+    json!({"repository": "acme/repo", "branch": "main", "revision": "abc123"})
+}
+
+fn watch_event(run_id: &str, cursor: &str, status: Value) -> Value {
+    json!({
+        "subscriptionId": "v2-watch-455",
+        "runId": run_id,
+        "title": "Repair checkout",
+        "size": "medium",
+        "source": source(),
+        "cursor": cursor,
+        "status": status
+    })
+}
+
+fn running_status(node: &str) -> Value {
+    json!({
+        "phase": "running",
+        "activeExecutions": [{"execution": "exec-1", "node": node}],
+        "metadata": {"tokenUsage": {"inputTokens": 10, "outputTokens": 2, "complete": true}}
+    })
+}
+
+fn finished_status() -> Value {
+    json!({
+        "phase": "finished",
+        "terminalResult": {
+            "status": "failed",
+            "reason": "worker_failed",
+            "context": {
+                "primary": {"message": "primary failure"},
+                "recorded": [
+                    {"message": "first error", "cursor": "v2:1"},
+                    {"message": "last error", "cursor": "v2:3"}
+                ],
+                "incomplete": false
+            }
+        },
+        "metadata": {"tokenUsage": {"inputTokens": 20, "outputTokens": 3, "complete": true}}
+    })
+}
+
 /// Drives the real HTTP transport on an ephemeral port. The host is `!Send`, so the
 /// server owns its own thread and current-thread runtime.
 struct Session {
@@ -174,6 +298,10 @@ impl Session {
             panic!("no MCP frame was produced");
         }
         self.frames.pop_front().expect("queued MCP frame")
+    }
+
+    fn drain_frames(&mut self) -> Vec<Value> {
+        self.frames.drain(..).collect()
     }
 }
 
@@ -401,13 +529,31 @@ async fn events_list_describes_poll_and_push_only() {
     assert_eq!(
         event["payloadSchema"]["required"],
         json!([
-            "subscriptionId",
-            "runId",
-            "title",
-            "size",
-            "cursor",
-            "status"
+            "eventId",
+            "name",
+            "timestamp",
+            "data",
+            "summary",
+            "replayed",
+            "_meta"
         ])
+    );
+    assert!(
+        event["payloadSchema"]["properties"]["data"]
+            .get("properties")
+            .is_some()
+    );
+    for filter in ["phases", "nodes", "terminalOnly", "verbose"] {
+        assert!(
+            event["inputSchema"]["properties"].get(filter).is_some(),
+            "{filter} is documented"
+        );
+    }
+    assert!(
+        event["inputSchema"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("maxAgeMs")
     );
     let next = session
         .request(3, "events/list", json!({"cursor": "1"}))
@@ -513,6 +659,225 @@ async fn events_stream_pushes_a_notification() {
         }
     }
     assert!(saw_event);
+}
+
+#[tokio::test]
+async fn events_trim_run_constants_and_collapse_terminal_errors() {
+    let mut session = Session::spawn(EventHost::new(vec![
+        watch_event("run-public", "v2:1", running_status("worker")),
+        watch_event("run-public", "v2:2", finished_status()),
+    ]));
+    initialize(&mut session).await;
+    session
+        .send(&json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "events/stream",
+            "params": {
+                "name": "run.event",
+                "arguments": {"runId": "run-public"}
+            }
+        }))
+        .await;
+    let frames = session.drain_frames();
+    let active = frames
+        .iter()
+        .find(|frame| frame["method"] == "notifications/events/active")
+        .expect("active notification");
+    assert_eq!(
+        active["params"]["run"],
+        json!({
+            "runId": "run-public",
+            "title": "Repair checkout",
+            "size": "medium",
+            "source": source()
+        })
+    );
+    let events = frames
+        .iter()
+        .filter(|frame| frame["method"] == "notifications/events/event")
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 2);
+
+    let running = &events[0]["params"];
+    assert_eq!(running["data"]["cursor"], json!("v2:1"));
+    assert!(running["data"].get("title").is_none());
+    assert!(running["data"].get("size").is_none());
+    assert!(running["data"].get("source").is_none());
+    assert!(running["data"].get("subscriptionId").is_none());
+    assert!(running["data"]["status"].get("metadata").is_none());
+    assert_eq!(
+        running["summary"],
+        json!({"phase": "running", "node": "worker", "terminal": false, "reason": null})
+    );
+
+    let finished = &events[1]["params"];
+    assert_eq!(finished["data"]["cursor"], json!("v2:2"));
+    assert!(finished["data"].get("title").is_none());
+    assert!(finished["data"].get("size").is_none());
+    assert!(finished["data"].get("source").is_none());
+    assert!(finished["data"].get("subscriptionId").is_none());
+    assert!(finished["data"]["status"].get("metadata").is_some());
+    assert_eq!(
+        finished["data"]["status"]["terminalResult"]["context"]["recorded"],
+        json!({"reason": "worker_failed", "lastError": "last error", "errorCount": 2})
+    );
+    assert_eq!(
+        finished["summary"],
+        json!({
+            "phase": "finished",
+            "node": null,
+            "terminal": true,
+            "reason": "worker_failed"
+        })
+    );
+}
+
+#[tokio::test]
+async fn events_verbose_keeps_the_recorded_failure_array() {
+    let mut session = Session::spawn(EventHost::new(vec![watch_event(
+        "run-public",
+        "v2:2",
+        finished_status(),
+    )]));
+    initialize(&mut session).await;
+    let collapsed = session
+        .request(
+            2,
+            "events/poll",
+            json!({
+                "name": "run.event",
+                "arguments": {"runId": "run-public"},
+                "cursor": "v2:1"
+            }),
+        )
+        .await;
+    assert_eq!(
+        collapsed["result"]["events"][0]["data"]["status"]["terminalResult"]["context"]["recorded"],
+        json!({"reason": "worker_failed", "lastError": "last error", "errorCount": 2})
+    );
+
+    let verbose = session
+        .request(
+            3,
+            "events/poll",
+            json!({
+                "name": "run.event",
+                "arguments": {"runId": "run-public", "verbose": true},
+                "cursor": "v2:1"
+            }),
+        )
+        .await;
+    let recorded =
+        verbose["result"]["events"][0]["data"]["status"]["terminalResult"]["context"]["recorded"]
+            .as_array()
+            .expect("verbose keeps the recorded array");
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(recorded[1]["message"], json!("last error"));
+}
+
+#[tokio::test]
+async fn events_terminal_only_skips_nonterminal_events_and_advances_the_cursor() {
+    let mut session = Session::spawn(EventHost::new(vec![
+        watch_event("run-public", "v2:2", running_status("worker")),
+        watch_event("run-public", "v2:3", finished_status()),
+    ]));
+    initialize(&mut session).await;
+    let response = session
+        .request(
+            2,
+            "events/poll",
+            json!({
+                "name": "run.event",
+                "arguments": {"runId": "run-public", "terminalOnly": true},
+                "cursor": "v2:1"
+            }),
+        )
+        .await;
+    assert_eq!(response["result"]["events"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        response["result"]["events"][0]["eventId"],
+        json!("run-public:v2:3")
+    );
+    assert_eq!(response["result"]["cursor"], json!("v2:3"));
+    assert_eq!(response["result"]["truncated"], json!(false));
+    assert_eq!(response["result"]["events"][0]["replayed"], json!(false));
+    assert_eq!(
+        response["result"]["events"][0]["summary"]["terminal"],
+        json!(true)
+    );
+}
+
+#[tokio::test]
+async fn events_phase_filter_drops_events_without_truncation() {
+    let mut session = Session::spawn(EventHost::new(vec![
+        watch_event("run-public", "v2:2", running_status("worker")),
+        watch_event("run-public", "v2:3", json!({"phase": "admitted"})),
+        watch_event("run-public", "v2:4", finished_status()),
+    ]));
+    initialize(&mut session).await;
+    let response = session
+        .request(
+            2,
+            "events/poll",
+            json!({
+                "name": "run.event",
+                "arguments": {"runId": "run-public", "phases": ["running"]},
+                "cursor": "v2:1"
+            }),
+        )
+        .await;
+    assert_eq!(response["result"]["events"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        response["result"]["events"][0]["data"]["cursor"],
+        json!("v2:2")
+    );
+    assert_eq!(response["result"]["cursor"], json!("v2:4"));
+    assert_eq!(response["result"]["truncated"], json!(false));
+
+    let invalid = session
+        .request(
+            3,
+            "events/poll",
+            json!({
+                "name": "run.event",
+                "arguments": {"runId": "run-public", "phases": ["unknown"]},
+                "cursor": "v2:1"
+            }),
+        )
+        .await;
+    assert_eq!(invalid["error"]["code"], json!(-32602));
+}
+
+#[tokio::test]
+async fn events_mark_replayed_and_live_events() {
+    let mut session = Session::spawn(EventHost::streaming(
+        vec![watch_event("run-public", "v2:1", running_status("worker"))],
+        vec![watch_event("run-public", "v2:2", running_status("worker"))],
+        Duration::from_millis(500),
+    ));
+    initialize(&mut session).await;
+    session
+        .send(&json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "events/stream",
+            "params": {
+                "name": "run.event",
+                "arguments": {"runId": "run-public"}
+            }
+        }))
+        .await;
+    let frames = session.drain_frames();
+    let events = frames
+        .iter()
+        .filter(|frame| frame["method"] == "notifications/events/event")
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["params"]["data"]["cursor"], json!("v2:1"));
+    assert_eq!(events[0]["params"]["replayed"], json!(true));
+    assert_eq!(events[1]["params"]["data"]["cursor"], json!("v2:2"));
+    assert_eq!(events[1]["params"]["replayed"], json!(false));
 }
 
 #[test]

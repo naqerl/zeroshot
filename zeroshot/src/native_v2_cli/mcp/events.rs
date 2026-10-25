@@ -8,7 +8,9 @@ use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncWrite;
 use tokio::sync::Mutex;
 
-use super::args::{object_schema, optional_string, reject_unknown, string_prop};
+use super::args::{
+    bool_prop, object_schema, optional_string, reject_unknown, string_array_prop, string_prop,
+};
 use super::host::{parse_cli, McpFailure, McpHost, WatchStream};
 use super::super::{NativeV2CliCommand, RunWatchCommand};
 
@@ -21,10 +23,14 @@ const DEFAULT_MAX_EVENTS: usize = 50;
 const MAX_EVENTS_LIMIT: u64 = 1000;
 const NEXT_POLL_MS: u64 = 1000;
 const DRAIN_LIMIT: usize = 10_000;
+const PHASES: &[&str] = &["admitted", "running", "stopping", "finished"];
 
 pub(super) struct Prepared {
     stream: WatchStream,
     cursor: Option<String>,
+    run: Option<Value>,
+    replayed: Vec<Value>,
+    filters: Filters,
 }
 
 pub(super) enum EventError {
@@ -41,6 +47,46 @@ struct PollRequest {
     arguments: Value,
     cursor: Option<String>,
     max_events: usize,
+    filters: Filters,
+}
+
+#[derive(Clone, Default)]
+struct Filters {
+    phases: Option<Vec<String>>,
+    nodes: Option<Vec<String>>,
+    terminal_only: bool,
+    verbose: bool,
+}
+
+impl Filters {
+    fn accepts(&self, data: &Value, terminal: bool) -> bool {
+        if self.terminal_only && !terminal {
+            return false;
+        }
+        if let Some(phases) = &self.phases {
+            let phase = data.pointer("/status/phase").and_then(Value::as_str);
+            if !phase.is_some_and(|phase| phases.iter().any(|allowed| allowed == phase)) {
+                return false;
+            }
+        }
+        if let Some(nodes) = &self.nodes {
+            let matched = data
+                .pointer("/status/activeExecutions")
+                .and_then(Value::as_array)
+                .is_some_and(|executions| {
+                    executions.iter().any(|execution| {
+                        execution
+                            .get("node")
+                            .and_then(Value::as_str)
+                            .is_some_and(|node| nodes.iter().any(|allowed| allowed == node))
+                    })
+                });
+            if !matched {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 struct Batch {
@@ -74,7 +120,9 @@ pub(super) fn list(params: &Value) -> Result<Value, EventError> {
             "name": EVENT_NAME,
             "description": "A durable run event from the same stream `zeroshot watch` reads. \
                 Subscribe with runId and an optional target. Delivery is poll or push. \
-                Signed webhooks (events/subscribe) are unsupported.",
+                Signed webhooks (events/subscribe) are unsupported. maxAgeMs is accepted at \
+                the subscription level but not applied because durable watch records carry no \
+                occurrence time; the event timestamp is delivery time.",
             "delivery": ["poll", "push"],
             "inputSchema": input_schema(),
             "payloadSchema": payload_schema(),
@@ -106,13 +154,20 @@ pub(super) async fn prepare(host: &impl McpHost, params: &Value) -> Result<Prepa
     let request = parse_subscription(params, false)?;
     let command = watch_command(&request.arguments, request.cursor.as_deref())?;
     let mut stream = host.open_watch(&command).await.map_err(classify)?;
-    let cursor = if request.cursor.is_none() {
+    let (cursor, run, replayed) = if request.cursor.is_none() {
         let drained = drain(&mut stream).await?;
-        last_cursor(&drained)?
+        let run = drained.first().and_then(run_constants);
+        (None, run, drained)
     } else {
-        request.cursor
+        (request.cursor, None, Vec::new())
     };
-    Ok(Prepared { stream, cursor })
+    Ok(Prepared {
+        stream,
+        cursor,
+        run,
+        replayed,
+        filters: request.filters,
+    })
 }
 
 pub(super) async fn drive<W>(
@@ -127,11 +182,36 @@ where
     let Prepared {
         mut stream,
         mut cursor,
+        mut run,
+        replayed,
+        filters,
     } = prepared;
     if cancelled.load(Ordering::Relaxed) {
         return Ok(());
     }
-    write_active(&writer, &id, &cursor, false).await?;
+    write_active(
+        &writer,
+        &id,
+        &ActiveView {
+            cursor: &cursor,
+            run: run.as_ref(),
+            truncated: false,
+        },
+    )
+    .await?;
+    let mut delivery = Delivery {
+        cursor: &mut cursor,
+        run: &mut run,
+        filters: &filters,
+        replayed: true,
+    };
+    for event in replayed {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        emit_event(&writer, &id, &mut delivery, &event).await?;
+    }
+    delivery.replayed = false;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
@@ -156,12 +236,12 @@ where
                         return Ok(());
                     }
                     Some(Ok(event)) => {
-                        emit_event(&writer, &id, &mut cursor, &event).await?;
+                        emit_event(&writer, &id, &mut delivery, &event).await?;
                     }
                 }
             }
             _ = heartbeat.tick() => {
-                write_heartbeat(&writer, &id, &cursor).await?;
+                write_heartbeat(&writer, &id, delivery.cursor).await?;
             }
         }
     }
@@ -248,11 +328,93 @@ fn parse_subscription(params: &Value, capped: bool) -> Result<PollRequest, Event
             )));
         }
     };
+    let filters = parse_filters(
+        arguments
+            .as_object()
+            .expect("arguments was validated as an object"),
+    )?;
     Ok(PollRequest {
         arguments,
         cursor,
         max_events,
+        filters,
     })
+}
+
+fn parse_filters(arguments: &Map<String, Value>) -> Result<Filters, EventError> {
+    reject_unknown(
+        arguments,
+        &[
+            "runId",
+            "target",
+            "phases",
+            "nodes",
+            "terminalOnly",
+            "verbose",
+        ],
+    )
+    .map_err(EventError::Invalid)?;
+    let phases = match arguments.get("phases") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(values)) => {
+            let mut phases = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(phase) = value.as_str() else {
+                    return Err(EventError::Invalid(McpFailure::invalid(
+                        "phases must be an array of strings",
+                    )));
+                };
+                if !PHASES.contains(&phase) {
+                    return Err(EventError::Invalid(McpFailure::invalid(format!(
+                        "unknown phase {phase}"
+                    ))));
+                }
+                phases.push(phase.to_owned());
+            }
+            Some(phases)
+        }
+        Some(_) => {
+            return Err(EventError::Invalid(McpFailure::invalid(
+                "phases must be an array of strings",
+            )));
+        }
+    };
+    let nodes = match arguments.get("nodes") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(values)) => {
+            let mut nodes = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(node) = value.as_str() else {
+                    return Err(EventError::Invalid(McpFailure::invalid(
+                        "nodes must be an array of strings",
+                    )));
+                };
+                nodes.push(node.to_owned());
+            }
+            Some(nodes)
+        }
+        Some(_) => {
+            return Err(EventError::Invalid(McpFailure::invalid(
+                "nodes must be an array of strings",
+            )));
+        }
+    };
+    Ok(Filters {
+        phases,
+        nodes,
+        terminal_only: optional_bool(arguments, "terminalOnly")?,
+        verbose: optional_bool(arguments, "verbose")?,
+    })
+}
+
+fn optional_bool(arguments: &Map<String, Value>, key: &str) -> Result<bool, EventError> {
+    match arguments.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(EventError::Invalid(McpFailure::invalid(format!(
+            "{key} must be a boolean"
+        )))),
+    }
 }
 
 fn max_events(map: &Map<String, Value>) -> Result<usize, EventError> {
@@ -274,7 +436,7 @@ async fn collect(host: &impl McpHost, request: &PollRequest) -> Result<Batch, Ev
     let command = watch_command(&request.arguments, request.cursor.as_deref())?;
     let mut stream = host.open_watch(&command).await.map_err(classify)?;
     if let Some(cursor) = request.cursor.as_deref() {
-        return collect_after(&mut stream, cursor, request.max_events).await;
+        return collect_after(&mut stream, cursor, request).await;
     }
     let drained = drain(&mut stream).await?;
     Ok(Batch {
@@ -307,14 +469,14 @@ async fn drain(stream: &mut WatchStream) -> Result<Vec<Value>, EventError> {
 async fn collect_after(
     stream: &mut WatchStream,
     requested: &str,
-    max_events: usize,
+    request: &PollRequest,
 ) -> Result<Batch, EventError> {
     let mut events = Vec::new();
     let mut cursor = requested.to_owned();
     let mut truncated = false;
     let mut waiting = true;
     loop {
-        if events.len() == max_events {
+        if events.len() == request.max_events {
             let extra = next_event(stream, IDLE_WAIT).await?;
             return Ok(Batch {
                 events,
@@ -336,7 +498,11 @@ async fn collect_after(
             truncated = true;
         }
         cursor = event_cursor;
-        events.push(occurrence(&event, false).map_err(classify)?);
+        if let Some(occurrence) =
+            occurrence(&event, false, &request.filters, false).map_err(classify)?
+        {
+            events.push(occurrence);
+        }
     }
     Ok(Batch {
         events,
@@ -367,7 +533,18 @@ fn watch_command(arguments: &Value, cursor: Option<&str>) -> Result<RunWatchComm
             "arguments must be an object",
         )));
     };
-    reject_unknown(map, &["runId", "target"]).map_err(EventError::Invalid)?;
+    reject_unknown(
+        map,
+        &[
+            "runId",
+            "target",
+            "phases",
+            "nodes",
+            "terminalOnly",
+            "verbose",
+        ],
+    )
+    .map_err(EventError::Invalid)?;
     let mut argv = vec!["watch".to_owned()];
     if let Some(run_id) = optional_string(map, "runId").map_err(EventError::Invalid)? {
         argv.push(run_id);
@@ -399,19 +576,123 @@ fn watch_cursor(event: &Value) -> Result<String, McpFailure> {
         })
 }
 
-fn occurrence(event: &Value, include_cursor: bool) -> Result<Value, McpFailure> {
+fn run_constants(event: &Value) -> Option<Value> {
+    let run_id = event.get("runId")?.as_str()?;
+    let mut run = Map::new();
+    run.insert("runId".to_owned(), json!(run_id));
+    for key in ["title", "size", "source"] {
+        run.insert(
+            key.to_owned(),
+            event.get(key).cloned().unwrap_or(Value::Null),
+        );
+    }
+    Some(Value::Object(run))
+}
+
+fn event_data(event: &Value, verbose: bool) -> Value {
+    let mut data = event.clone();
+    if let Some(map) = data.as_object_mut() {
+        for key in ["title", "size", "source", "subscriptionId"] {
+            map.remove(key);
+        }
+    }
+    let phase = data
+        .pointer("/status/phase")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if phase.as_deref() != Some("finished") {
+        if let Some(status) = data.get_mut("status").and_then(Value::as_object_mut) {
+            status.remove("metadata");
+        }
+    } else {
+        collapse_terminal(&mut data, verbose);
+    }
+    data
+}
+
+fn collapse_terminal(data: &mut Value, verbose: bool) {
+    if verbose {
+        return;
+    }
+    let Some(terminal) = data.pointer_mut("/status/terminalResult") else {
+        return;
+    };
+    let reason = terminal.get("reason").cloned().unwrap_or(Value::Null);
+    let Some(context) = terminal.get_mut("context").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let Some(recorded) = context.get("recorded").and_then(Value::as_array) else {
+        return;
+    };
+    let error_count = recorded.len();
+    let last_error = recorded
+        .last()
+        .and_then(|entry| entry.get("message"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    context.insert(
+        "recorded".to_owned(),
+        json!({
+            "reason": reason,
+            "lastError": last_error,
+            "errorCount": error_count,
+        }),
+    );
+}
+
+fn summary(data: &Value) -> Value {
+    let phase = data
+        .pointer("/status/phase")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let terminal = phase.as_str() == Some("finished");
+    let node = data
+        .pointer("/status/activeExecutions")
+        .and_then(Value::as_array)
+        .and_then(|executions| executions.first())
+        .and_then(|execution| execution.get("node"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let reason = if terminal {
+        data.pointer("/status/terminalResult/reason")
+            .cloned()
+            .unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    json!({
+        "phase": phase,
+        "node": node,
+        "terminal": terminal,
+        "reason": reason,
+    })
+}
+
+fn occurrence(
+    event: &Value,
+    include_cursor: bool,
+    filters: &Filters,
+    replayed: bool,
+) -> Result<Option<Value>, McpFailure> {
     let cursor = watch_cursor(event)?;
     let run_id = event.get("runId").and_then(Value::as_str).unwrap_or("run");
+    let data = event_data(event, filters.verbose);
+    let terminal = data.pointer("/status/phase").and_then(Value::as_str) == Some("finished");
+    if !filters.accepts(&data, terminal) {
+        return Ok(None);
+    }
     let mut value = json!({
         "eventId": format!("{run_id}:{cursor}"),
         "name": EVENT_NAME,
         "timestamp": now_rfc3339(),
-        "data": event.clone(),
+        "data": data,
+        "summary": summary(&data),
+        "replayed": replayed,
     });
     if include_cursor {
         value["cursor"] = json!(cursor);
     }
-    Ok(value)
+    Ok(Some(value))
 }
 
 fn skipped(previous: &str, next: &str) -> bool {
@@ -449,7 +730,7 @@ fn meta(id: &Value) -> Value {
 }
 
 fn input_schema() -> Value {
-    object_schema(
+    let mut schema = object_schema(
         &["runId"],
         vec![
             ("runId", string_prop("Public run ID.")),
@@ -457,31 +738,110 @@ fn input_schema() -> Value {
                 "target",
                 string_prop("Named target. Omit for the local controller."),
             ),
+            (
+                "phases",
+                string_array_prop(
+                    "Only emit events whose status phase is one of admitted, running, stopping, \
+                     or finished.",
+                ),
+            ),
+            (
+                "nodes",
+                string_array_prop(
+                    "Only emit events with an active execution at one of these graph nodes.",
+                ),
+            ),
+            (
+                "terminalOnly",
+                bool_prop("Only emit terminal (finished) events."),
+            ),
+            (
+                "verbose",
+                bool_prop("Keep the full recorded failure array on terminal events."),
+            ),
         ],
-    )
+    );
+    schema["description"] = json!(
+        "Subscription arguments. maxAgeMs is accepted but not applied because durable watch \
+         records carry no occurrence time; the event timestamp is delivery time."
+    );
+    schema
 }
 
 fn payload_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["subscriptionId", "runId", "title", "size", "cursor", "status"],
+        "required": ["eventId", "name", "timestamp", "data", "summary", "replayed", "_meta"],
         "properties": {
-            "subscriptionId": {"type": "string"},
-            "runId": {"type": "string"},
-            "title": {"type": "string"},
-            "source": {"type": "object"},
-            "size": {"type": "string"},
-            "cursor": {"type": "string"},
-            "status": {"type": "object"}
+            "eventId": {"type": "string"},
+            "name": {"type": "string", "const": EVENT_NAME},
+            "timestamp": {"type": "string", "format": "date-time"},
+            "cursor": {
+                "type": "string",
+                "description": "Stream notification cursor; poll results return the next cursor separately."
+            },
+            "replayed": {"type": "boolean"},
+            "data": {
+                "type": "object",
+                "description": "Trimmed watch record. Run constants are sent once on notifications/events/active.",
+                "additionalProperties": false,
+                "required": ["runId", "cursor", "status"],
+                "properties": {
+                    "runId": {"type": "string"},
+                    "cursor": {"type": "string"},
+                    "status": {
+                        "type": "object",
+                        "description": "Public run status. status.metadata is present only when phase is finished.",
+                        "additionalProperties": true,
+                        "properties": {
+                            "phase": {
+                                "type": "string",
+                                "enum": PHASES
+                            },
+                            "activeExecutions": {"type": "array"},
+                            "terminalResult": {
+                                "type": "object",
+                                "description": "On failed terminal events context.recorded is {reason,lastError,errorCount} unless verbose is true."
+                            },
+                            "metadata": {"type": "object"}
+                        }
+                    }
+                }
+            },
+            "summary": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["phase", "node", "terminal", "reason"],
+                "properties": {
+                    "phase": {"type": ["string", "null"]},
+                    "node": {"type": ["string", "null"]},
+                    "terminal": {"type": "boolean"},
+                    "reason": {"type": ["string", "null"]}
+                }
+            },
+            "_meta": {"type": "object"}
         }
     })
+}
+
+struct Delivery<'a> {
+    cursor: &'a mut Option<String>,
+    run: &'a mut Option<Value>,
+    filters: &'a Filters,
+    replayed: bool,
+}
+
+struct ActiveView<'a> {
+    cursor: &'a Option<String>,
+    run: Option<&'a Value>,
+    truncated: bool,
 }
 
 async fn emit_event<W>(
     writer: &Mutex<W>,
     id: &Value,
-    cursor: &mut Option<String>,
+    delivery: &mut Delivery<'_>,
     event: &Value,
 ) -> std::io::Result<()>
 where
@@ -491,17 +851,32 @@ where
         Ok(cursor) => cursor,
         Err(failure) => return write_failure(writer, id, &failure).await,
     };
-    if let Some(previous) = cursor.clone() {
-        if skipped(&previous, &event_cursor) {
-            *cursor = Some(event_cursor.clone());
-            write_active(writer, id, cursor, true).await?;
-        }
-    }
-    *cursor = Some(event_cursor);
-    let mut params = match occurrence(event, true) {
-        Ok(params) => params,
+    let discovered = if delivery.run.is_none() {
+        *delivery.run = run_constants(event);
+        delivery.run.is_some()
+    } else {
+        false
+    };
+    let gap = delivery
+        .cursor
+        .as_deref()
+        .is_some_and(|previous| skipped(previous, &event_cursor));
+    let occurrence = match occurrence(event, true, delivery.filters, delivery.replayed) {
+        Ok(occurrence) => occurrence,
         Err(failure) => return write_failure(writer, id, &failure).await,
     };
+    *delivery.cursor = Some(event_cursor);
+    let active = ActiveView {
+        cursor: &*delivery.cursor,
+        run: delivery.run.as_ref(),
+        truncated: gap,
+    };
+    let Some(mut params) = occurrence else {
+        return write_active(writer, id, &active).await;
+    };
+    if gap || discovered {
+        write_active(writer, id, &active).await?;
+    }
     params["_meta"] = meta(id);
     write_notification(writer, "notifications/events/event", params).await
 }
@@ -509,8 +884,7 @@ where
 async fn write_active<W>(
     writer: &Mutex<W>,
     id: &Value,
-    cursor: &Option<String>,
-    truncated: bool,
+    active: &ActiveView<'_>,
 ) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -519,8 +893,9 @@ where
         writer,
         "notifications/events/active",
         json!({
-            "cursor": cursor_value(cursor),
-            "truncated": truncated,
+            "cursor": cursor_value(active.cursor),
+            "run": active.run.cloned().unwrap_or(Value::Null),
+            "truncated": active.truncated,
             "_meta": meta(id),
         }),
     )
