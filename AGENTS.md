@@ -760,8 +760,8 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   loss terminalizes active work as `runtime_lost` and poisons the session. The local UI requires both
   per-run leases before treating an in-process ACP owner without a controller socket as live.
   Ordinary runs retain run-scoped session keys.
-- `zeroshot mcp serve` is a local MCP server with Streamable HTTP on `POST /mcp` by default and
-  newline-delimited stdio behind `--transport stdio`. Each tool builds the same command value as the
+- `zeroshot mcp serve` is a local MCP server with Streamable HTTP on `POST /mcp`.
+  Each tool builds the same command value as the
   CLI and runs it through the existing public or hub executor. Tool parameters for graph, initial
   input, exact or uniform runtime, and environment definitions are inline JSON values materialized
   into private temporary files for the command's lifetime. The `io.modelcontextprotocol/events` extension exposes one
@@ -905,7 +905,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   enqueues real runs.
   `zeroshot hub install` and `zeroshot hub uninstall` change system services and need explicit
   user intent; prefer `--dry-run` first.
-  `zeroshot mcp serve` is a local HTTP/stdio server and does not itself start a run. Its read-only tools
+  `zeroshot mcp serve` is a local HTTP server and does not itself start a run. Its read-only tools
   are `status`, `logs`, `watch`, `list`, `report`, `hub_list`, `hub_ps`, `hub_stats`, `hub_logs`,
   and `hub_daemon_status`. `watch`, `logs`, and `hub_logs` follow until the stream ends; live run
   events use the events extension. `run`, `resume`, `hub_submit`, and `hub_enqueue` submit work.

@@ -1,16 +1,12 @@
 # Serve Zeroshot over MCP
 
-`zeroshot mcp serve` is a Model Context Protocol server. By default it serves Streamable HTTP on
-`POST /mcp`; `--transport stdio` selects newline-delimited JSON-RPC on stdin and stdout. Each tool
-runs the same command the CLI would, in this process. Run events come from the durable stream
-`zeroshot watch` already reads.
+`zeroshot mcp serve` is a Model Context Protocol server. It serves Streamable HTTP on `POST /mcp`.
+Each tool runs the same command the CLI would, in this process. Run events come from the durable
+stream `zeroshot watch` already reads.
 
 ```bash
-# Streamable HTTP on http://127.0.0.1:3000/mcp (the default)
+# Streamable HTTP on http://127.0.0.1:3000/mcp
 zeroshot mcp serve --listen 127.0.0.1:3000
-
-# Newline-delimited stdio fallback
-zeroshot mcp serve --transport stdio
 ```
 
 An HTTP client connects to `http://127.0.0.1:3000/mcp` with JSON-RPC request bodies. The optional
@@ -20,17 +16,8 @@ share the `default` session. Notifications return `202 Accepted` without a JSON-
 the final response. Earlier event polls and ordinary requests return JSON. The HTTP transport
 prints its listening URL to stderr.
 
-A stdio client starts it as:
-
-```json
-{
-  "command": "zeroshot",
-  "args": ["mcp", "serve", "--transport", "stdio"]
-}
-```
-
-Stdio writes no banner and exits when the client closes stdin. An HTTP server stops on Ctrl-C or
-SIGTERM.
+An HTTP client that only knows command-launched servers can be pointed at the URL instead; the
+server stops on Ctrl-C or SIGTERM.
 
 ## Handshake
 

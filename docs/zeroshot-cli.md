@@ -1054,12 +1054,12 @@ Commands:
 ```text
 Serve Zeroshot tools and run events as an MCP server.
 
-The Streamable HTTP transport listens on POST /mcp by default. Use --transport stdio for the original newline-delimited stdio transport. Tools call the same commands as this CLI. Run events use the `io.modelcontextprotocol/events` extension and the durable stream `watch` already reads. Signed webhooks are unsupported.
+The Streamable HTTP transport listens on POST /mcp. Tools call the same commands as this CLI. Run events use the `io.modelcontextprotocol/events` extension and the durable stream `watch` already reads. Signed webhooks are unsupported.
 
 Usage: zeroshot mcp <COMMAND>
 
 Commands:
-  serve  Serve JSON-RPC MCP until the selected transport stops
+  serve  Serve JSON-RPC MCP over Streamable HTTP on POST /mcp until stopped
   help   Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1070,24 +1070,15 @@ Options:
 #### `zeroshot mcp serve`
 
 ```text
-Serve JSON-RPC MCP until the selected transport stops.
+Serve JSON-RPC MCP over Streamable HTTP on POST /mcp until stopped.
 
-HTTP is the default and serves Streamable HTTP at POST /mcp. Stdio reads one JSON-RPC message per line from stdin until the client closes it. Each tool returns that command's JSON. A failing command is a tool error carrying the command's diagnostic code and message.
+Each tool returns that command's JSON. A failing command is a tool error carrying the command's diagnostic code and message.
 
 Usage: zeroshot mcp serve [OPTIONS]
 
 Options:
-      --transport <TRANSPORT>
-          Transport to serve
-
-          Possible values:
-          - http:  Streamable HTTP with one POST /mcp endpoint
-          - stdio: Newline-delimited JSON-RPC on stdin and stdout
-
-          [default: http]
-
       --listen <LISTEN>
-          Address for the HTTP transport. Ignored by stdio
+          Address to listen on
 
           [default: 127.0.0.1:3000]
 
@@ -1103,7 +1094,7 @@ Print this message or the help of the given subcommand(s)
 Usage: zeroshot mcp help [COMMAND]
 
 Commands:
-  serve  Serve JSON-RPC MCP until the selected transport stops
+  serve  Serve JSON-RPC MCP over Streamable HTTP on POST /mcp until stopped
   help   Print this message or the help of the given subcommand(s)
 ```
 

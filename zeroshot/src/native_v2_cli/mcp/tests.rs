@@ -87,7 +87,9 @@ impl Session {
                         .await
                         .expect("bind MCP test listener");
                     let address = listener.local_addr().expect("MCP test address");
-                    address_sender.send(address).expect("report MCP test address");
+                    address_sender
+                        .send(address)
+                        .expect("report MCP test address");
                     let _ = serve_http_listener(host, listener).await;
                 });
             })
@@ -135,9 +137,8 @@ impl Session {
                 let Some(data) = line.strip_prefix("data: ") else {
                     continue;
                 };
-                self.frames.push_back(
-                    serde_json::from_str(data).expect("event stream data is JSON"),
-                );
+                self.frames
+                    .push_back(serde_json::from_str(data).expect("event stream data is JSON"));
             }
             return;
         }
