@@ -227,6 +227,9 @@ pub(crate) struct Lease {
     pub server_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub firewall_id: Option<u64>,
+    /// The Volume of a `--data-volume` pool's lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipv4: Option<String>,
     /// Provider action being awaited (create or delete).
@@ -268,6 +271,7 @@ impl Lease {
             expires_at_ms: now.saturating_add(pool.ttl_ms),
             server_id: None,
             firewall_id: None,
+            volume_id: None,
             ipv4: None,
             action_id: None,
             reason: None,
@@ -503,6 +507,9 @@ pub(crate) struct Resource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ResourceKind {
     Server,
+    /// A Hetzner Volume holding a lease's btrfs data folder; deleted after its server, which
+    /// detaches it.
+    Volume,
     PrimaryIp,
     Firewall,
 }

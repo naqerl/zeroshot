@@ -3,7 +3,10 @@
 use serde_json::json;
 
 use super::super::data::{self, DataFs, DataMode, DataSettings};
-use super::super::pool::Lease;
+use super::super::pool::{
+    LABEL_HUB, LABEL_LEASE, LABEL_LOCATION, LABEL_SERVER_TYPE, Lease, ResourceKind,
+};
+use super::super::clock::now_ms;
 use super::super::provision;
 use super::super::model::HubState;
 use super::super::store::migrate;
@@ -253,4 +256,84 @@ fn the_rendered_boot_script_is_valid_posix_shell() {
             String::from_utf8_lossy(&checked.stderr)
         );
     }
+}
+
+/// A `--data-volume 200` pool on the fake cloud.
+async fn volume_rig() -> super::pool::Rig {
+    let rig = rig();
+    let mut request = add_request(rig.directory.path(), 1);
+    request.data.volume_gb = Some(200);
+    rig.service.add_pool(request).await.expect("add pool");
+    rig
+}
+
+#[tokio::test]
+async fn a_volume_pool_creates_attaches_and_deletes_a_volume_after_its_server() {
+    let rig = volume_rig().await;
+    let lease = rig.running_job_on_server_of_added_pool().await;
+    let request = rig.cloud.with(|cloud| cloud.created[0].clone());
+    assert_eq!(request.volume_gb, Some(200));
+    assert!(request.user_data.contains("DATA_MODE='volume'"));
+    let volume = lease.volume_id.expect("volume held");
+    assert!(rig.cloud.holds(ResourceKind::Volume, volume));
+    assert_eq!(
+        serde_json::to_value(&lease).expect("lease")["volumeId"],
+        json!(volume)
+    );
+
+    rig.driver.finish_all();
+    rig.pass().await;
+    rig.set(|state| {
+        for member in &mut state.members {
+            member.idle_since_ms = Some(1);
+        }
+    })
+    .await;
+    for _ in 0..3 {
+        rig.pass().await;
+    }
+    assert!(rig.state().await.leases.is_empty());
+    assert_eq!(
+        rig.cloud.with(|cloud| cloud.destroyed.clone()),
+        [
+            (ResourceKind::Server, lease.server_id.expect("server")),
+            (ResourceKind::Volume, volume),
+            (ResourceKind::Firewall, lease.firewall_id.expect("firewall")),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_lease_adopts_and_the_reaper_deletes_labelled_volumes() {
+    let rig = volume_rig().await;
+    let state = rig.state().await;
+    let hub_id = state.hub_id.clone().expect("hub id");
+    let held = Lease::new(&state.pools[0], "hj_one", 40000, now_ms());
+    rig.set(|state| state.leases.push(held)).await;
+    let hub = hub_id.as_str();
+    let labels = [
+        (LABEL_HUB, hub),
+        (LABEL_LEASE, "one"),
+        (LABEL_SERVER_TYPE, "cpx31"),
+        (LABEL_LOCATION, "fsn1"),
+    ];
+    let server = rig.cloud.plant(ResourceKind::Server, &labels);
+    let volume = rig.cloud.plant(ResourceKind::Volume, &labels);
+    let firewall = rig.cloud.plant(ResourceKind::Firewall, &labels);
+    let orphan = rig.cloud.plant(
+        ResourceKind::Volume,
+        &[(LABEL_HUB, hub), (LABEL_LEASE, "gone")],
+    );
+    rig.pass().await;
+    let lease = rig.lease().await;
+    assert_eq!(
+        (lease.server_id, lease.volume_id, lease.firewall_id),
+        (Some(server), Some(volume), Some(firewall))
+    );
+    assert!(rig.cloud.with(|cloud| cloud.created.is_empty()));
+    assert_eq!(
+        rig.cloud.with(|cloud| cloud.destroyed.clone()),
+        [(ResourceKind::Volume, orphan)]
+    );
+    assert!(rig.cloud.holds(ResourceKind::Volume, volume));
 }

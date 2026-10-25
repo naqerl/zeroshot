@@ -29,6 +29,8 @@ pub(crate) struct ServerRequest {
     pub labels: BTreeMap<String, String>,
     /// Source CIDRs admitted on SSH; every other inbound port is closed.
     pub ssh_from: Vec<String>,
+    /// Size of an unformatted Volume to create and attach for the btrfs data folder, in GB.
+    pub volume_gb: Option<u32>,
 }
 
 /// A created server; `action_id` is its creation action.
@@ -36,6 +38,7 @@ pub(crate) struct ServerRequest {
 pub(crate) struct Created {
     pub server_id: u64,
     pub firewall_id: Option<u64>,
+    pub volume_id: Option<u64>,
     pub action_id: Option<u64>,
 }
 
@@ -145,7 +148,8 @@ impl Catalog {
 
 #[async_trait]
 pub(crate) trait Provisioner: Send + Sync {
-    /// Create a firewall admitting only SSH from `ssh_from`, then the server behind it. A
+    /// Create a firewall admitting only SSH from `ssh_from`, the unformatted Volume of
+    /// `volume_gb` when asked, then the server behind the firewall with the Volume attached. A
     /// failure leaves nothing behind that the provider confirmed; anything it could not remove
     /// carries the lease's labels for the caller's cleanup and the reaper.
     async fn create(&self, request: &ServerRequest) -> Result<Created, Failure>;
@@ -162,7 +166,7 @@ pub(crate) trait Provisioner: Send + Sync {
     async fn destroy(&self, resource: &Resource) -> Result<Option<u64>, HubError>;
     /// One check of a provider action.
     async fn action(&self, action_id: u64) -> Result<Progress, HubError>;
-    /// Servers, primary IPs and firewalls matching a label selector.
+    /// Servers, Volumes, primary IPs and firewalls matching a label selector.
     async fn list_by_label(&self, selector: &str) -> Result<Vec<Resource>, HubError>;
 }
 

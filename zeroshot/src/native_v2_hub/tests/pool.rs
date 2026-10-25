@@ -135,7 +135,11 @@ impl Provisioner for FakeCloud {
             }
             cloud.created.push(request.clone());
             let mut ids = Vec::new();
-            for kind in [ResourceKind::Firewall, ResourceKind::Server] {
+            let volume = request.volume_gb.map(|_| ResourceKind::Volume);
+            for kind in [ResourceKind::Firewall, ResourceKind::Server]
+                .into_iter()
+                .chain(volume)
+            {
                 cloud.next_id += 1;
                 ids.push(cloud.next_id);
                 cloud.resources.insert(
@@ -151,6 +155,7 @@ impl Provisioner for FakeCloud {
             Ok(Created {
                 server_id: ids[1],
                 firewall_id: Some(ids[0]),
+                volume_id: ids.get(2).copied(),
                 action_id: Some(ids[1] + 1000),
             })
         })
@@ -409,6 +414,11 @@ impl Rig {
     /// Enqueue `hj_one`, bring its server up and place the job there.
     pub(super) async fn running_job_on_server(&self) -> Lease {
         self.add_pool(1).await;
+        self.running_job_on_server_of_added_pool().await
+    }
+
+    /// As [`Self::running_job_on_server`], with the pool already added.
+    pub(super) async fn running_job_on_server_of_added_pool(&self) -> Lease {
         self.enqueue("hj_one").await;
         for _ in 0..4 {
             self.pass().await;

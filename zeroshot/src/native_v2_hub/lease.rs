@@ -366,10 +366,14 @@ impl HubService {
             .find(|resource| resource.kind == ResourceKind::Server)
         {
             lease.server_id = Some(server.id);
-            lease.firewall_id = existing
-                .iter()
-                .find(|resource| resource.kind == ResourceKind::Firewall)
-                .map(|resource| resource.id);
+            let held = |kind| {
+                existing
+                    .iter()
+                    .find(|resource| resource.kind == kind)
+                    .map(|resource| resource.id)
+            };
+            lease.firewall_id = held(ResourceKind::Firewall);
+            lease.volume_id = held(ResourceKind::Volume);
             lease.machine = adopted_machine(pool, server);
             lease.advance(LeasePhase::Booting);
             return Ok(Creation::Created(false));
@@ -394,11 +398,13 @@ impl HubService {
                 user_data: provision::user_data(pool, lease, &public_key)?,
                 labels,
                 ssh_from: pool.ssh_from.clone(),
+                volume_gb: pool.data.volume_gb,
             };
             match runtime.provisioner.create(&request).await {
                 Ok(created) => {
                     lease.server_id = Some(created.server_id);
                     lease.firewall_id = created.firewall_id;
+                    lease.volume_id = created.volume_id;
                     lease.action_id = created.action_id;
                     lease.machine = Some(machine(server_type, location));
                     lease.advance(LeasePhase::Booting);
@@ -460,7 +466,7 @@ impl HubService {
     }
 
     /// Delete whatever refused create attempts of a lease left behind, servers first, keeping
-    /// the server and firewall the lease holds. What fails here stays labelled for the reaper.
+    /// the server, Volume and firewall the lease holds. What fails here stays labelled for the reaper.
     async fn sweep(&self, runtime: &PoolRuntime, lease: &Lease, report: &mut PoolReport) {
         let Some(hub_id) = self.snapshot().await.hub_id else {
             return;
@@ -482,6 +488,7 @@ impl HubService {
             let held = match resource.kind {
                 ResourceKind::Server => lease.server_id,
                 ResourceKind::Firewall => lease.firewall_id,
+                ResourceKind::Volume => lease.volume_id,
                 ResourceKind::PrimaryIp => None,
             };
             held != Some(resource.id)
@@ -637,7 +644,7 @@ impl HubService {
         };
         let state = self.snapshot().await;
         let mut orphans = pool::orphans(&resources, &state, now_ms());
-        // Servers first: a firewall is deletable only once its server is gone.
+        // Servers first: a Volume or firewall is deletable only once its server is gone.
         orphans.sort_by_key(|resource| resource.kind);
         for resource in orphans {
             match runtime.provisioner.destroy(resource).await {
@@ -685,7 +692,8 @@ async fn boot(runtime: &PoolRuntime, lease: &mut Lease) -> Result<(), HubError> 
     Ok(())
 }
 
-/// Delete the server, await its action, then delete its firewall. Returns whether every
+/// Delete the server, await its action, then delete its Volume, which the deletion detached,
+/// and its firewall. Returns whether every
 /// resource of the lease is confirmed gone.
 async fn delete(runtime: &PoolRuntime, lease: &mut Lease) -> Result<bool, HubError> {
     if let Some(action_id) = lease.action_id {
@@ -715,6 +723,11 @@ async fn delete(runtime: &PoolRuntime, lease: &mut Lease) -> Result<bool, HubErr
             }
             None => lease.server_id = None,
         }
+    }
+    if let Some(volume_id) = lease.volume_id {
+        let resource = resource(ResourceKind::Volume, volume_id, lease);
+        runtime.provisioner.destroy(&resource).await?;
+        lease.volume_id = None;
     }
     if let Some(firewall_id) = lease.firewall_id {
         let resource = resource(ResourceKind::Firewall, firewall_id, lease);

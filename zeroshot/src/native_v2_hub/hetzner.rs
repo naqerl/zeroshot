@@ -352,9 +352,51 @@ fn locations(datacenters: &[Value], names: &BTreeMap<u64, String>) -> Vec<Locati
     found
 }
 
+impl Hetzner {
+    /// An unformatted Volume beside the server, carrying the lease's labels: the boot script
+    /// formats it btrfs.
+    async fn create_volume(&self, request: &ServerRequest, size: u32) -> Result<u64, Failure> {
+        self.call(
+            Method::POST,
+            "/volumes",
+            Some(&json!({
+                "name": request.name,
+                "size": size,
+                "location": request.location,
+                "labels": request.labels,
+                "automount": false,
+            })),
+        )
+        .await?
+        .and_then(|document| document.pointer("/volume/id").and_then(Value::as_u64))
+        .ok_or_else(|| Failure::new(Refusal::Transient, "Hetzner created no volume"))
+    }
+
+    /// Delete what a failed create made, the Volume before the firewall. Anything still
+    /// attached to a server that was created after all is refused here; it carries the lease's
+    /// labels, so the lease's cleanup or the reaper removes it.
+    async fn undo(&self, mut failure: Failure, volume: Option<u64>, firewall: u64) -> Failure {
+        let made = volume
+            .map(|id| ("volume", "volumes", id))
+            .into_iter()
+            .chain([("firewall", "firewalls", firewall)]);
+        for (kind, collection, id) in made {
+            if let Err(left) = self
+                .call(Method::DELETE, &format!("/{collection}/{id}"), None)
+                .await
+            {
+                failure.message =
+                    format!("{}; {kind} {id} left for cleanup: {left}", failure.message);
+            }
+        }
+        failure
+    }
+}
+
 const fn collection(kind: ResourceKind) -> &'static str {
     match kind {
         ResourceKind::Server => "servers",
+        ResourceKind::Volume => "volumes",
         ResourceKind::PrimaryIp => "primary_ips",
         ResourceKind::Firewall => "firewalls",
     }
@@ -436,6 +478,13 @@ impl Provisioner for Hetzner {
             .await?
             .and_then(|document| document.pointer("/firewall/id").and_then(Value::as_u64))
             .ok_or_else(|| Failure::new(Refusal::Transient, "Hetzner created no firewall"))?;
+        let volume = match request.volume_gb {
+            Some(size) => match self.create_volume(request, size).await {
+                Ok(volume) => Some(volume),
+                Err(failure) => return Err(self.undo(failure, None, firewall).await),
+            },
+            None => None,
+        };
         let created = self
             .call(
                 Method::POST,
@@ -448,6 +497,8 @@ impl Provisioner for Hetzner {
                     "user_data": request.user_data,
                     "labels": request.labels,
                     "firewalls": [{ "firewall": firewall }],
+                    "volumes": volume.into_iter().collect::<Vec<_>>(),
+                    "automount": false,
                     "start_after_create": true,
                     "public_net": { "enable_ipv4": true, "enable_ipv6": true },
                 })),
@@ -457,22 +508,10 @@ impl Provisioner for Hetzner {
         let document = match created {
             Ok(Some(document)) => document,
             outcome => {
-                let mut failure = outcome.err().unwrap_or_else(|| {
+                let failure = outcome.err().unwrap_or_else(|| {
                     Failure::new(Refusal::Invalid, "Hetzner POST /servers is 404")
                 });
-                // A firewall still attached to a server that was created after all is refused
-                // here; it carries the lease's labels, so the lease's cleanup or the reaper
-                // removes it.
-                if let Err(left) = self
-                    .call(Method::DELETE, &format!("/firewalls/{firewall}"), None)
-                    .await
-                {
-                    failure.message = format!(
-                        "{}; firewall {firewall} left for cleanup: {left}",
-                        failure.message
-                    );
-                }
-                return Err(failure);
+                return Err(self.undo(failure, volume, firewall).await);
             }
         };
         let server_id = document
@@ -482,6 +521,7 @@ impl Provisioner for Hetzner {
         Ok(Created {
             server_id,
             firewall_id: Some(firewall),
+            volume_id: volume,
             action_id: document.pointer("/action/id").and_then(Value::as_u64),
         })
     }
@@ -553,6 +593,7 @@ impl Provisioner for Hetzner {
         let mut found = Vec::new();
         for kind in [
             ResourceKind::Server,
+            ResourceKind::Volume,
             ResourceKind::PrimaryIp,
             ResourceKind::Firewall,
         ] {
