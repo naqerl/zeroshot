@@ -317,37 +317,30 @@ fn server_type(item: &Value) -> Option<(u64, ServerType)> {
     ))
 }
 
-/// Locations from datacenters: a location offers, and has room for, the union of its
-/// datacenters' server types.
-fn locations(datacenters: &[Value], names: &BTreeMap<u64, String>) -> Vec<Location> {
+/// Locations from priced server types: a location offers, and has room for, every type whose
+/// `prices` name it. Hetzner retired per-datacenter capacity with `GET /v1/datacenters`, so
+/// `available == supported` is the honest answer: creation is the authoritative check, and a
+/// create refused for capacity is already [`Refusal::Capacity`], which makes the pool retry the
+/// next location and then the next type. Do not re-add the datacenter call.
+fn locations(types: &[ServerType]) -> Vec<Location> {
     let mut found: Vec<Location> = Vec::new();
-    for datacenter in datacenters {
-        let Some(name) = datacenter.pointer("/location/name").and_then(Value::as_str) else {
-            continue;
-        };
-        let types = |key: &str| {
-            datacenter
-                .pointer(&format!("/server_types/{key}"))
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|id| names.get(&id.as_u64()?).cloned())
-                .collect::<BTreeSet<_>>()
-        };
-        let index = found
-            .iter()
-            .position(|location| location.name == name)
-            .unwrap_or_else(|| {
-                found.push(Location {
-                    name: name.to_owned(),
-                    supported: BTreeSet::new(),
-                    available: BTreeSet::new(),
+    for server_type in types {
+        for name in server_type.hourly.keys() {
+            let index = found
+                .iter()
+                .position(|location| location.name == *name)
+                .unwrap_or_else(|| {
+                    found.push(Location {
+                        name: name.clone(),
+                        supported: BTreeSet::new(),
+                        available: BTreeSet::new(),
+                    });
+                    found.len() - 1
                 });
-                found.len() - 1
-            });
-        let location = &mut found[index];
-        location.supported.extend(types("supported"));
-        location.available.extend(types("available"));
+            let location = &mut found[index];
+            location.supported.insert(server_type.name.clone());
+            location.available.insert(server_type.name.clone());
+        }
     }
     found
 }
@@ -527,18 +520,15 @@ impl Provisioner for Hetzner {
     }
 
     async fn catalog(&self) -> Result<Catalog, HubError> {
-        let mut names = BTreeMap::new();
         let mut types = Vec::new();
         for item in self.pages("server_types", "").await? {
-            if let Some((id, server_type)) = server_type(&item) {
-                names.insert(id, server_type.name.clone());
+            if let Some((_id, server_type)) = server_type(&item) {
                 types.push(server_type);
             }
         }
-        let datacenters = self.pages("datacenters", "").await?;
         Ok(Catalog {
+            locations: locations(&types),
             types,
-            locations: locations(&datacenters, &names),
         })
     }
 

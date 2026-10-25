@@ -530,7 +530,7 @@ fn create_failures_are_classified_by_code_status_and_message() {
 }
 
 #[tokio::test]
-async fn the_catalog_joins_types_prices_and_datacenters_by_location() {
+async fn the_catalog_derives_locations_from_priced_server_types() {
     let (hetzner, mock) = serve().await;
     let price = |location: &str, gross: &str| json!({"location": location, "price_hourly": {"net": "0", "gross": gross}});
     mock.on(
@@ -557,21 +557,6 @@ async fn the_catalog_joins_types_prices_and_datacenters_by_location() {
             ]}),
         ),
     );
-    mock.on(
-        "GET /v1/datacenters",
-        answer(
-            200,
-            json!({"datacenters": [
-                {"location": {"name": "fsn1"},
-                 "server_types": {"supported": [1, 2, 3], "available": [1]}},
-                {"location": {"name": "fsn1"},
-                 "server_types": {"supported": [1], "available": [2, 99]}},
-                {"location": {"name": "nbg1"},
-                 "server_types": {"supported": [1], "available": []}},
-                {"name": "no location"}
-            ]}),
-        ),
-    );
     let catalog = hetzner.catalog().await.expect("catalog");
     let names = catalog
         .types
@@ -595,19 +580,39 @@ async fn the_catalog_joins_types_prices_and_datacenters_by_location() {
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>(),
-        ["cax21", "cx11", "cx23"]
+        ["cx23"]
     );
     assert_eq!(
         fsn1.available
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>(),
-        ["cax21", "cx23"]
+        ["cx23"]
     );
-    assert!(catalog.location("nbg1").expect("nbg1").available.is_empty());
+    let nbg1 = catalog.location("nbg1").expect("nbg1");
+    assert_eq!(
+        nbg1.supported
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["cx23"]
+    );
+    assert_eq!(
+        nbg1.available
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["cx23"]
+    );
     assert_eq!(catalog.locations.len(), 2);
-    assert!(mock.seen()[1].uri.contains("page=2"));
-    assert!(hetzner.catalog().await.is_err(), "404 collection");
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[1].uri.contains("page=2"));
+    assert!(
+        seen.iter()
+            .all(|call| call.uri.starts_with("/v1/server_types?")),
+        "the catalog must not request datacenters: {seen:?}"
+    );
 }
 
 #[test]
