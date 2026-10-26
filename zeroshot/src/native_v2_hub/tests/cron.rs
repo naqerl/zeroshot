@@ -23,7 +23,6 @@ fn schedule(id: &str, next_fire_ms: u64) -> Schedule {
         timezone: "UTC".to_owned(),
         template,
         repin_from: None,
-        expires_after_ms: Some(60_000),
         submission_key: None,
         created_at_ms: 0,
         next_fire_ms: Some(next_fire_ms),
@@ -113,7 +112,6 @@ fn fire_due_queues_one_job_per_due_schedule_and_advances() {
     assert!(queued.job_id.starts_with("hj_"));
     assert_eq!(queued.priority, 3);
     assert_eq!(queued.submitted_at_ms, now);
-    assert_eq!(queued.expires_at_ms, Some(now + 60_000));
     let due = &state.schedules[0];
     assert_eq!(due.fired, 1);
     assert_eq!(due.last_job_id.as_deref(), Some(queued.job_id.as_str()));
@@ -225,6 +223,5 @@ fn schedule_views_name_times_in_utc_and_the_schedule_zone() {
     assert_eq!(view["lastFiredAt"], "2026-10-25T07:45:00Z");
     assert_eq!(view["lastJobId"], "hj_last");
     assert_eq!(view["fired"], 4);
-    assert_eq!(view["expiresAfterMs"], 60_000);
     assert!(view["removedAt"].is_null());
 }

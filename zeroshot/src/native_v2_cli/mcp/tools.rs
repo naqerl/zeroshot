@@ -239,7 +239,6 @@ const HUB_SUBMIT_KEYS: &[&str] = &[
     "label",
     "wait",
     "queue",
-    "expires",
     "title",
     "input",
     "taskFrom",
@@ -274,7 +273,6 @@ const HUB_ENQUEUE_KEYS: &[&str] = &[
     "cron",
     "cronTz",
     "priority",
-    "expires",
     "title",
     "input",
     "taskFrom",
@@ -821,7 +819,6 @@ fn hub_submit_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFailure> 
     push_placement(&mut argv, map)?;
     push_wait(&mut argv, map)?;
     push_flag(&mut argv, map, "queue", "--queue")?;
-    push_opt(&mut argv, map, "expires", "--expires")?;
     push_run_flags(
         &mut argv,
         map,
@@ -840,7 +837,6 @@ fn hub_enqueue_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFailure>
     push_opt(&mut argv, map, "cron", "--cron")?;
     push_opt(&mut argv, map, "cronTz", "--cron-tz")?;
     push_i64(&mut argv, map, "priority", "--priority")?;
-    push_opt(&mut argv, map, "expires", "--expires")?;
     push_run_flags(
         &mut argv,
         map,
@@ -1226,10 +1222,6 @@ fn hub_submit_schema() -> Value {
         "queue",
         bool_prop("Queue the job when every matching member is busy."),
     ));
-    properties.push((
-        "expires",
-        string_prop("Expire the job after a duration or at an RFC 3339 time."),
-    ));
     properties.extend(
         run_properties()
             .into_iter()
@@ -1253,10 +1245,6 @@ fn hub_enqueue_schema() -> Value {
         (
             "priority",
             integer_prop("Higher priority jobs are placed first."),
-        ),
-        (
-            "expires",
-            string_prop("Expire the job after a duration or at an RFC 3339 time."),
         ),
     ]);
     properties.extend(

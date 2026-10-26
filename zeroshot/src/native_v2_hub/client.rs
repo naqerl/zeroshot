@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use zeroshot_engine::native_v2_cli::hub::{HubCommand, HubEnqueue, HubPs, HubStats, HubSubmit};
 
 use super::api::EXIT_CODE_HEADER;
-use super::clock::{now_ms, parse_duration_ms, parse_expiry_ms, parse_future_ms, parse_past_ms};
+use super::clock::{now_ms, parse_duration_ms, parse_future_ms, parse_past_ms};
 use super::context::Resolved;
 use super::cron;
 use super::error::HubError;
@@ -419,12 +419,7 @@ async fn submit(
     output: &mut impl Write,
 ) -> Result<i32, HubError> {
     let started = now_ms();
-    let mut job = jobs::new_job(&request.job, started)?;
-    job.expires_at_ms = request
-        .expires
-        .as_deref()
-        .map(|expires| parse_expiry_ms(expires, started))
-        .transpose()?;
+    let job = jobs::new_job(&request.job, started)?;
     let files = job_files(&job)?;
     let deadline = match &request.wait {
         None => None,
@@ -491,11 +486,6 @@ async fn enqueue(client: &HubClient, request: HubEnqueue) -> Result<Value, HubEr
         .as_deref()
         .map(|at| parse_future_ms(at, now))
         .transpose()?;
-    job.expires_at_ms = request
-        .expires
-        .as_deref()
-        .map(|expires| parse_expiry_ms(expires, now))
-        .transpose()?;
     let files = job_files(&job)?;
     client
         .post(&["v1", "hub", "queue"], &EnqueueJob { job, files })
@@ -509,17 +499,6 @@ pub(crate) fn schedule(request: HubEnqueue) -> Result<(Schedule, Vec<JobFile>), 
     let parsed = cron::parse(&expression)?;
     let (timezone, zone) = cron::timezone(request.cron_timezone.as_deref())?;
     let next_fire_ms = cron::next_fire(&parsed, &zone, now)?;
-    let expires_after_ms = request
-        .expires
-        .as_deref()
-        .map(|expires| {
-            parse_duration_ms(expires).map_err(|_| {
-                HubError::Usage(format!(
-                    "--expires {expires:?} with --cron must be a DURATION such as 2h"
-                ))
-            })
-        })
-        .transpose()?;
     let mut template = jobs::new_job(&request.job, now)?;
     template.priority = request.priority;
     let repin_from = (request.job.repository.is_none() && request.job.revision.is_none())
@@ -537,7 +516,6 @@ pub(crate) fn schedule(request: HubEnqueue) -> Result<(Schedule, Vec<JobFile>), 
             submission_key: template.submission_key.take(),
             template,
             repin_from,
-            expires_after_ms,
             created_at_ms: now,
             next_fire_ms: Some(next_fire_ms),
             last_fired_ms: None,

@@ -76,7 +76,6 @@ pub(crate) fn new_job(spec: &HubJobSpec, now_ms: u64) -> Result<Job, HubError> {
         submission_key: spec.submission_key.clone(),
         submitted_at_ms: now_ms,
         not_before_ms: None,
-        expires_at_ms: None,
         attempts: 0,
         unconfirmed_submissions: 0,
         target: None,

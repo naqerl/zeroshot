@@ -213,7 +213,6 @@ fn state_with_history(now: u64) -> HubState {
         timezone: "UTC".to_owned(),
         template: job("hs_1", now),
         repin_from: None,
-        expires_after_ms: None,
         submission_key: None,
         created_at_ms: now,
         next_fire_ms: None,

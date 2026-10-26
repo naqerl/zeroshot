@@ -767,10 +767,11 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   Each tool builds the same command value as the CLI and runs it through the existing public or hub
   executor. Tool parameters for graph, initial input, exact or uniform runtime, and environment
   definitions are inline JSON values materialized into private temporary files for the command's
-  lifetime. The `io.modelcontextprotocol/events` extension exposes one `run.event` type whose
-  payload is the durable notification `watch` already emits; `events/poll` and `events/stream` both
-  open that `run_watch` subscription. Signed webhooks are unsupported. The endpoint does not itself
-  start a run.
+  lifetime. The `io.modelcontextprotocol/events` extension exposes `run.event`, whose payload is
+  the durable notification `watch` already emits, and `run.warning`, which reports each completed
+  hour of an active run. Both use the same five-field envelope and move `summary` and `replayed`
+  into `data`; `events/poll` and `events/stream` open the same `run_watch` subscription. Signed
+  webhooks are unsupported. The endpoint does not itself start a run.
 
 ## CLI and target contracts
 
@@ -842,11 +843,11 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   without a run ID, `errorKind` `submission_unconfirmed`) on its member with no attempt counted,
   so every pass resubmits it there with the same key, counted in `unconfirmed_submissions` apart
   from `attempts`, until `--unconfirmed-limit` (default 30) fails it as `unconfirmed_limit`; and
-  `Rejected`, the only other kind that fails the job. `hub submit --expires` records a deadline on
-  an immediate job; queued jobs expire without submission, and placed jobs are stopped through the
-  same `force-stop` invocation before settling as `expired` with `run_expired`. The opt-in
-  `hub daemon run --max-stall` persists each running job's watch cursor and cursor-change time,
-  resets both when the cursor advances, and force-stops a run whose cursor stayed unchanged for
+  `Rejected`, the only other kind that fails the job. Hub jobs have no expiry: a job ends only when
+  its run ends, it is force-stopped, or it is reaped with its member. Lifetimes are observable
+  events rather than deadlines, and active runs are reported hourly through `run.warning`. The
+  opt-in `hub daemon run --max-stall` persists each running job's watch cursor and cursor-change
+  time, resets both when the cursor advances, and force-stops a run whose cursor stayed unchanged for
   the configured duration, failing it with reason and error kind `stalled`. Its heartbeat reports
   the duration as `maxStallMs` (`null` when disabled). `hub dequeue` also removes placing jobs
   (`dequeued_while_placing`); a run the target accepts under their key is noted, never adopted. Jobs placing when a daemon stops stay on their member as unconfirmed. Hub-side job problems

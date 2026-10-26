@@ -1282,9 +1282,6 @@ Options:
       --queue
           Queue the job when every matching member is busy instead of failing
 
-      --expires <DURATION|RFC3339>
-          Expire the job if it has not finished after DURATION or at an RFC 3339 time. A queued job is not submitted; a placed run is force-stopped when its deadline passes. A time in the past or a zero duration is refused
-
       --title <TITLE>
           Human-readable title recorded with the run
 
@@ -1496,9 +1493,6 @@ Options:
           Higher priority jobs are placed first
 
           [default: 0]
-
-      --expires <DURATION|TIME>
-          Expire the job if it has not finished after DURATION or at an RFC 3339 time. A queued job is not submitted; a placed run is force-stopped. With --cron, each fired job expires DURATION after its fire time. A time in the past or a zero duration is refused
 
       --title <TITLE>
           Human-readable title recorded with the run
@@ -1895,7 +1889,7 @@ Options:
 ```text
 Serve the hub API and dispatch in the foreground until SIGTERM or Ctrl-C; the entrypoint of installed services.
 
-Each pass fires due cron schedules, refreshes capabilities and running jobs, expires stale jobs, and places due ones; target calls run outside the state lock, so API reads never wait for a slow target. Passes with activity are written as NDJSON. Only one daemon may own a hub folder at a time.
+Each pass fires due cron schedules, refreshes capabilities and running jobs, and places due ones; target calls run outside the state lock, so API reads never wait for a slow target. Passes with activity are written as NDJSON. Only one daemon may own a hub folder at a time.
 
 Usage: zeroshot hub daemon run [OPTIONS]
 

@@ -584,7 +584,6 @@ impl HubService {
             submission_key: None,
             submitted_at_ms: now_ms(),
             not_before_ms: None,
-            expires_at_ms: None,
             attempts: 0,
             unconfirmed_submissions: 0,
             target: None,
