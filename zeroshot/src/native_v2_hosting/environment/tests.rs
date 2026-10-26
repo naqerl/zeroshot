@@ -428,3 +428,66 @@ async fn unprivileged_setup_hooks_install_tools_and_fail_closed_on_startup_ident
         Err(CapsuleAllocationUnavailable::EnvironmentStartup)
     );
 }
+
+#[tokio::test]
+async fn setup_hooks_run_for_an_unprivileged_supervisor_and_redact_output() {
+    let root = TestDirectory::new("runtime-hooks-unprivileged");
+    let workspace = root.child("workspace");
+    std::fs::create_dir(&workspace).assert_value();
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    let pool = HostedProcessPool::new(uid, gid, uid.saturating_add(10)).assert_value();
+    let identity = pool
+        .identity(HostedProcessScope::Environment)
+        .assert_value();
+    let runtime = serde_json::from_value(
+        serde_json::json!({"harness":"codex","provider":"openai","size":"medium","nodes":{}}),
+    )
+    .assert_value();
+    let log = Arc::new(CapturedProgress::default());
+    let mut preparation = CapsulePreparation::quiet(&runtime).assert_value();
+    preparation.progress = log.clone();
+    let values = BTreeMap::from([
+        ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+        ("HOME".to_owned(), root.path().to_string_lossy().into_owned()),
+    ]);
+    let processes = EnvironmentProcesses::default();
+    let redactions = ["test-secret-credential".to_owned()];
+    let request = |script: &'static str| HookRequest {
+        phase: HookPhase::Setup,
+        script: Some(script),
+        directory: &workspace,
+        identity,
+        environment: &values,
+        preparation: &preparation,
+        redactions: &redactions,
+    };
+    processes
+        .run(request(
+            "printf 'setup-visible\\n'; printf 'setup-secret test-secret-credential\\n' >&2; printf done > setup-done",
+        ))
+        .await
+        .assert_value();
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("setup-done")).assert_value(),
+        "done"
+    );
+    processes
+        .run(request("printf 'second-visible\\n'"))
+        .await
+        .assert_value();
+    assert_eq!(
+        processes
+            .run(request("printf 'failed-secret test-secret-credential\\n' >&2; exit 7"))
+            .await,
+        Err(CapsuleAllocationUnavailable::EnvironmentSetup)
+    );
+    processes.finish_output().await.assert_value();
+    let lines = log.0.lock().assert_value().clone();
+    let joined = lines.join("\n");
+    assert!(joined.contains("setup-visible"), "{joined}");
+    assert!(joined.contains("second-visible"), "{joined}");
+    assert!(joined.contains("Environment setup started"), "{joined}");
+    assert!(!joined.contains("test-secret-credential"), "{joined}");
+    assert!(joined.contains("[REDACTED]"), "{joined}");
+}
