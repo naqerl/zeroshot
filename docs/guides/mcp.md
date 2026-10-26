@@ -128,7 +128,8 @@ the durable watch notification: `subscriptionId`, `runId`, `title`, optional `so
 `cursor`, and `status`.
 
 A `jobId` that already has a run behaves exactly like that `runId`. A queued, scheduled, or
-placing job can be followed before its run exists. The stream opens immediately and sends
+placing job can be followed before its run exists, so one subscription can follow a job from the
+queue to its terminal result. The stream opens immediately and sends
 `notifications/events/active` with `run: null` and the current hub `job` (including `state`,
 `error`, and `errorKind`). It keeps sending heartbeats, reads the hub job record every
 `nextPollMs` (1000 ms), and starts delivering ordinary `run.event` notifications as soon as the
@@ -139,9 +140,10 @@ answers the request with `resultType: complete`. Discovery-phase notifications u
 includes the current `job` document so a poller can observe queue state without opening a stream.
 
 `events/list` reports `delivery` as `poll` and `push`, and `resultType` `complete`. Signed
-webhooks are not offered. `events/subscribe` with `runId` or `jobId` opens the same long-lived
-stream as `events/stream`; without either selector it, and `events/unsubscribe`, returns
-JSON-RPC `Unsupported` (`-32026`) with `data.feature` `deliveryMode` and `data.value` `webhook`.
+webhooks are not offered. `events/subscribe` with a `runId` or `jobId` argument opens the same
+long-lived stream as `events/stream`; `events/subscribe` without an `arguments` object, and
+`events/unsubscribe`, returns JSON-RPC `Unsupported` (`-32026`) with `data.feature`
+`deliveryMode` and `data.value` `webhook`.
 
 `events/poll` returns occurrences after an opaque cursor:
 

@@ -556,9 +556,14 @@ where
         Action::Stream(prepared) => {
             let (sender, receiver) = mpsc::unbounded_channel();
             let writer = Arc::new(Mutex::new(LineWriter::new(sender)));
-            session
-                .borrow_mut()
-                .spawn_stream(prepared, id, &writer, host);
+            session.borrow_mut().spawn_stream(
+                serve::StreamRequest {
+                    prepared,
+                    id,
+                    writer,
+                },
+                host,
+            );
             WorkerReply::Stream(receiver)
         }
     }

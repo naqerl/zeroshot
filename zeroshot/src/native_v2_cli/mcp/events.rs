@@ -26,6 +26,8 @@ const MAX_EVENTS_LIMIT: u64 = 1000;
 const NEXT_POLL_MS: u64 = 1000;
 const DRAIN_LIMIT: usize = 10_000;
 const PHASES: &[&str] = &["admitted", "running", "stopping", "finished"];
+/// The hub's built-in local member is the default local backend, not a named target.
+const LOCAL_HUB_MEMBER: &str = "local";
 
 pub(super) struct Prepared {
     source: Source,
@@ -153,10 +155,10 @@ pub(super) fn list(params: &Value) -> Result<Value, EventError> {
         "events": [{
             "name": EVENT_NAME,
             "description": "A durable run event from the same stream `zeroshot watch` reads. \
-                Subscribe with runId and an optional target. Delivery is poll or push. \
-                Signed webhooks (events/subscribe) are unsupported. maxAgeMs is accepted at \
-                the subscription level but not applied because durable watch records carry no \
-                occurrence time; the event timestamp is delivery time.",
+                Subscribe with exactly one of runId or jobId and an optional target. Delivery is \
+                poll or push. Signed webhooks (events/subscribe) are unsupported. maxAgeMs is \
+                accepted at the subscription level but not applied because durable watch records \
+                carry no occurrence time; the event timestamp is delivery time.",
             "delivery": ["poll", "push"],
             "inputSchema": input_schema(),
             "payloadSchema": payload_schema(),
@@ -269,11 +271,32 @@ async fn prepare_watch(
     })
 }
 
-pub(super) async fn drive<W, H>(
-    prepared: Prepared,
+pub(super) struct StreamOutput<W> {
     id: Value,
     writer: Arc<Mutex<W>>,
     cancelled: Arc<AtomicBool>,
+}
+
+impl<W> StreamOutput<W> {
+    pub(super) fn new(id: Value, writer: Arc<Mutex<W>>, cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            id,
+            writer,
+            cancelled,
+        }
+    }
+}
+
+struct WatchState {
+    stream: WatchStream,
+    cursor: Option<String>,
+    run: Option<Value>,
+    replayed: Vec<Value>,
+}
+
+pub(super) async fn drive<W, H>(
+    prepared: Prepared,
+    output: StreamOutput<W>,
     host: Rc<H>,
 ) -> std::io::Result<()>
 where
@@ -288,30 +311,37 @@ where
             run,
             replayed,
         } => {
-            drive_watch(
-                stream, cursor, run, replayed, &filters, id, writer, cancelled,
-            )
-            .await
+            let state = WatchState {
+                stream,
+                cursor,
+                run,
+                replayed,
+            };
+            drive_watch(state, &filters, output).await
         }
-        Source::Discovery(discovery) => {
-            drive_discovery(host, discovery, filters, id, writer, cancelled).await
-        }
+        Source::Discovery(discovery) => drive_discovery(host, discovery, filters, output).await,
     }
 }
 
 async fn drive_watch<W>(
-    mut stream: WatchStream,
-    mut cursor: Option<String>,
-    mut run: Option<Value>,
-    replayed: Vec<Value>,
+    state: WatchState,
     filters: &Filters,
-    id: Value,
-    writer: Arc<Mutex<W>>,
-    cancelled: Arc<AtomicBool>,
+    output: StreamOutput<W>,
 ) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin + Send,
 {
+    let WatchState {
+        mut stream,
+        mut cursor,
+        mut run,
+        replayed,
+    } = state;
+    let StreamOutput {
+        id,
+        writer,
+        cancelled,
+    } = output;
     if cancelled.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -378,14 +408,17 @@ async fn drive_discovery<W, H>(
     host: Rc<H>,
     discovery: Discovery,
     filters: Filters,
-    id: Value,
-    writer: Arc<Mutex<W>>,
-    cancelled: Arc<AtomicBool>,
+    output: StreamOutput<W>,
 ) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin + Send,
     H: McpHost + 'static,
 {
+    let StreamOutput {
+        id,
+        writer,
+        cancelled,
+    } = output;
     let Discovery {
         job_id,
         mut target,
@@ -409,7 +442,16 @@ where
     .await?;
     if job.terminal {
         let terminal_cursor = next_discovery_cursor(&mut sequence);
-        write_discovery_terminal(&writer, &id, &job_id, &job, &terminal_cursor).await?;
+        write_discovery_terminal(
+            &writer,
+            &id,
+            DiscoveryTerminal {
+                job_id: &job_id,
+                job: &job,
+                cursor: &terminal_cursor,
+            },
+        )
+        .await?;
         write_result(&writer, &id).await?;
         return Ok(());
     }
@@ -456,26 +498,25 @@ where
                             return Ok(());
                         }
                     };
-                    return drive_watch(
+                    let state = WatchState {
                         stream,
-                        None,
-                        None,
-                        Vec::new(),
-                        &filters,
-                        id,
-                        writer,
-                        cancelled,
-                    )
-                    .await;
+                        cursor: None,
+                        run: None,
+                        replayed: Vec::new(),
+                    };
+                    return drive_watch(state, &filters, StreamOutput::new(id, writer, cancelled))
+                        .await;
                 }
                 if snapshot.terminal {
                     let terminal_cursor = next_discovery_cursor(&mut sequence);
                     write_discovery_terminal(
                         &writer,
                         &id,
-                        &job_id,
-                        &snapshot,
-                        &terminal_cursor,
+                        DiscoveryTerminal {
+                            job_id: &job_id,
+                            job: &snapshot,
+                            cursor: &terminal_cursor,
+                        },
                     )
                     .await?;
                     write_result(&writer, &id).await?;
@@ -538,16 +579,25 @@ fn next_discovery_cursor(sequence: &mut u64) -> String {
     format!("v2:{sequence}")
 }
 
+struct DiscoveryTerminal<'a> {
+    job_id: &'a str,
+    job: &'a JobSnapshot,
+    cursor: &'a str,
+}
+
 async fn write_discovery_terminal<W>(
     writer: &Mutex<W>,
     id: &Value,
-    job_id: &str,
-    job: &JobSnapshot,
-    cursor: &str,
+    terminal: DiscoveryTerminal<'_>,
 ) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
+    let DiscoveryTerminal {
+        job_id,
+        job,
+        cursor,
+    } = terminal;
     write_notification(
         writer,
         "notifications/events/event",
@@ -908,6 +958,7 @@ async fn job_status(host: &impl McpHost, job_id: &str) -> Result<JobSnapshot, Ev
         target: view
             .get("target")
             .and_then(Value::as_str)
+            .filter(|target| *target != LOCAL_HUB_MEMBER)
             .map(str::to_owned),
         terminal: run_id.is_none() && job_is_terminal(&view),
         error: view.get("error").cloned().unwrap_or(Value::Null),
@@ -1226,7 +1277,15 @@ fn payload_schema() -> Value {
                 "description": "Stream notification cursor; poll results return the next cursor separately."
             },
             "replayed": {"type": "boolean"},
-            "data": {"oneOf": [run_data, job_data]},
+            "data": {"oneOf": [run_data, job_data.clone()]},
+            "job": job_data,
+            "state": {
+                "type": "string",
+                "description": "Terminal job state when the job never ran.",
+                "enum": ["queued", "scheduled", "running", "succeeded", "failed", "dequeued", "expired"]
+            },
+            "error": {"type": ["string", "null"]},
+            "errorKind": {"type": ["string", "null"]},
             "summary": {
                 "type": "object",
                 "additionalProperties": false,

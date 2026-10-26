@@ -32,7 +32,13 @@ pub(super) enum Action {
         message: &'static str,
         data: Option<Value>,
     },
-    Stream(Prepared),
+    Stream(Box<Prepared>),
+}
+
+pub(super) struct StreamRequest<W> {
+    pub(super) prepared: Box<Prepared>,
+    pub(super) id: Value,
+    pub(super) writer: Arc<Mutex<W>>,
 }
 
 /// Per-session MCP state held by the HTTP transport worker.
@@ -64,17 +70,12 @@ impl SessionState {
         handle_notification(message, &mut self.cancellations);
     }
 
-    pub(super) fn spawn_stream<H, W>(
-        &mut self,
-        prepared: Prepared,
-        id: Value,
-        writer: &Arc<Mutex<W>>,
-        host: &Rc<H>,
-    ) where
+    pub(super) fn spawn_stream<H, W>(&mut self, request: StreamRequest<W>, host: &Rc<H>)
+    where
         H: McpHost + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        spawn_stream(prepared, id, writer, host, &mut self.cancellations);
+        spawn_stream(request, host, &mut self.cancellations);
     }
 
     pub(super) fn shutdown(&mut self) {
@@ -102,24 +103,22 @@ where
 }
 
 fn spawn_stream<H, W>(
-    prepared: Prepared,
-    id: Value,
-    writer: &Arc<Mutex<W>>,
+    request: StreamRequest<W>,
     host: &Rc<H>,
     cancellations: &mut HashMap<String, StreamCancel>,
 ) where
     H: McpHost + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let StreamRequest {
+        prepared,
+        id,
+        writer,
+    } = request;
     let flag = Arc::new(AtomicBool::new(false));
     let host = Rc::clone(host);
-    let task = tokio::task::spawn_local(events::drive(
-        prepared,
-        id.clone(),
-        Arc::clone(writer),
-        Arc::clone(&flag),
-        host,
-    ));
+    let output = events::StreamOutput::new(id.clone(), writer, Arc::clone(&flag));
+    let task = tokio::task::spawn_local(events::drive(*prepared, output, host));
     let cancel = StreamCancel {
         flag,
         handle: task.abort_handle(),
@@ -188,12 +187,12 @@ where
             Err(error) => event_failure(error),
         },
         "events/stream" => match events::prepare(host, &params).await {
-            Ok(prepared) => Action::Stream(prepared),
+            Ok(prepared) => Action::Stream(Box::new(prepared)),
             Err(error) => event_failure(error),
         },
         "events/subscribe" if events::requests_subscription(&params) => {
             match events::prepare(host, &params).await {
-                Ok(prepared) => Action::Stream(prepared),
+                Ok(prepared) => Action::Stream(Box::new(prepared)),
                 Err(error) => event_failure(error),
             }
         }

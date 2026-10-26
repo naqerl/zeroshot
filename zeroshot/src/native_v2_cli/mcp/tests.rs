@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -145,6 +146,7 @@ struct JobHost {
     statuses: Vec<Value>,
     reads: AtomicUsize,
     events: Vec<Value>,
+    watched_targets: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 impl JobHost {
@@ -154,7 +156,12 @@ impl JobHost {
             statuses,
             reads: AtomicUsize::new(0),
             events,
+            watched_targets: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn watched_targets(&self) -> Arc<Mutex<Vec<Option<String>>>> {
+        Arc::clone(&self.watched_targets)
     }
 }
 
@@ -180,6 +187,10 @@ impl McpHost for JobHost {
     }
 
     async fn open_watch(&self, command: &RunWatchCommand) -> Result<WatchStream, McpFailure> {
+        self.watched_targets
+            .lock()
+            .expect("watched targets")
+            .push(command.run.target.clone());
         let run_id = command.run.run_id.as_str();
         let (sender, receiver) = mpsc::channel(32);
         for event in self.events.clone() {
@@ -853,6 +864,43 @@ async fn events_job_with_a_run_delivers_that_runs_events() {
 }
 
 #[tokio::test]
+async fn events_local_job_opens_the_local_watch() {
+    let host = JobHost::new(
+        vec![json!({
+            "jobId": "hj_local",
+            "state": "running",
+            "target": "local",
+            "runId": "run-local"
+        })],
+        vec![watch_event("ignored", "v2:1", running_status("worker"))],
+    );
+    let watched_targets = host.watched_targets();
+    let mut session = Session::spawn(host);
+    initialize(&mut session).await;
+    session
+        .send(&json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "events/stream",
+            "params": {
+                "name": "run.event",
+                "arguments": {"jobId": "hj_local"}
+            }
+        }))
+        .await;
+    let frames = session.drain_frames();
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame["method"] == "notifications/events/event")
+    );
+    assert_eq!(
+        watched_targets.lock().expect("watched targets").as_slice(),
+        [None]
+    );
+}
+
+#[tokio::test]
 async fn events_follow_a_queued_job_until_its_run_appears() {
     let mut session = Session::spawn(JobHost::new(
         vec![
@@ -899,6 +947,10 @@ async fn events_follow_a_queued_job_until_its_run_appears() {
         .find(|frame| frame["method"] == "notifications/events/event")
         .expect("run events after the job was placed");
     assert_eq!(event["params"]["data"]["runId"], json!("run-public"));
+    assert_eq!(
+        frames.last().unwrap()["result"]["resultType"],
+        json!("complete")
+    );
 }
 
 #[tokio::test]
