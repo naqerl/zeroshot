@@ -19,7 +19,7 @@ use super::data::{DataFs, DataSettings};
 use super::cron;
 use super::error::HubError;
 use super::jobs;
-use super::model::{Job, Schedule, ScheduleState};
+use super::model::{Job, PlacementSpec, Schedule, ScheduleState};
 use super::pool::Provider;
 use super::service::FILE_FLAGS;
 use super::wire::{
@@ -455,6 +455,14 @@ async fn submit(
             Err(error) => return Err(error),
         }
     };
+    // A job the hub parked for a pool is already accepted: waiting reads it back instead of
+    // submitting it again.
+    let document = match deadline {
+        Some(deadline) if !placed(&document) => {
+            wait_for_placement(client, &document, deadline, &body.job.placement).await?
+        }
+        _ => document,
+    };
     write_json(output, &document)?;
     let running = document
         .pointer("/job/runId")
@@ -471,6 +479,48 @@ async fn submit(
     client
         .stream(&job_id, &StreamRequest::Watch { after: None })
         .await
+}
+
+/// Whether the hub has placed the job on a member.
+fn placed(document: &Value) -> bool {
+    document
+        .pointer("/job/runId")
+        .and_then(Value::as_str)
+        .is_some()
+        || document.pointer("/job/state").and_then(Value::as_str) == Some("running")
+}
+
+/// `--wait` for a job the hub parked: read it back until it is placed, or fail once the
+/// deadline passes or the job ends without ever being placed.
+async fn wait_for_placement(
+    client: &HubClient,
+    document: &Value,
+    deadline: u64,
+    placement: &PlacementSpec,
+) -> Result<Value, HubError> {
+    let job_id = document
+        .pointer("/job/jobId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    loop {
+        if now_ms() >= deadline {
+            return Err(HubError::WaitTimeout(super::placement::describe(placement)));
+        }
+        let remaining = Duration::from_millis(deadline.saturating_sub(now_ms()));
+        tokio::time::sleep(remaining.min(WAIT_POLL)).await;
+        let observed = client.get(&["v1", "hub", "jobs", &job_id]).await?;
+        if placed(&observed) {
+            return Ok(observed);
+        }
+        let ended = observed
+            .pointer("/job/state")
+            .and_then(Value::as_str)
+            .is_some_and(|state| matches!(state, "succeeded" | "failed" | "dequeued" | "expired"));
+        if ended {
+            return Err(HubError::WaitTimeout(super::placement::describe(placement)));
+        }
+    }
 }
 
 async fn enqueue(client: &HubClient, request: HubEnqueue) -> Result<Value, HubError> {

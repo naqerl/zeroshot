@@ -868,7 +868,9 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 - Hub pools (`native_v2_hub/pool.rs` model and scaling, `lease.rs` per-pass lease steps,
   `provision.rs` `Provisioner` trait plus cloud-init, `hetzner.rs` reqwest client, `tunnel.rs`
   `ssh -N -L`, `archive.rs`) create Hetzner servers for queued jobs only a pool matches. An empty
-  pool is eligible, so such jobs queue rather than exit 4. A lease steps one phase per pass:
+  pool is eligible, so such jobs queue rather than exit 4, and `hub submit` parks a job a pool
+  serves instead of failing as no-capacity; `--wait` follows that parked job until placement. A
+  lease steps one phase per pass:
   Creating, Booting, Connecting, Active, Draining, Deleting, Done. A server is deleted only after
   each of its runs is terminal, has its postmortem, and is archived to `hub/archive/JOB_ID/`. The
   reaper (start, then every 5 min) deletes resources labelled `zeroshot/hub=ID` that state does not

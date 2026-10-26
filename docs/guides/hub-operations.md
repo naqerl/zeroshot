@@ -98,6 +98,15 @@ sum by (model) (increase(zeroshot_hub_tokens_total{kind="output"}[1d]))
 sum by (reason) (rate(zeroshot_hub_placement_rejections_total[15m]))
 ```
 
+## Submitting a job
+
+`zeroshot hub submit` places a run on a free member immediately when one can take it. When no free
+member can but a pool serves the job's placement, submit parks the job exactly as `hub enqueue`
+accepts it: the job is persisted as queued and returned without an error, because the pool
+provisions a machine for it. `hub.no_capacity` (exit 3) is reserved for a placement that neither a
+free member nor a pool can serve now. Pass `--wait` (optionally `--wait=DURATION`) to block until
+the hub actually places the job; without it, submit returns as soon as the job is placed or parked.
+
 ## Unconfirmed submissions
 
 When a target does not confirm a submission (the `zeroshot run` timed out, returned no receipt, or

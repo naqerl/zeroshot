@@ -27,7 +27,7 @@ use super::super::provision::{
 use super::super::service::HubService;
 use super::super::store::{HubStore, migrate};
 use super::super::tunnel::{TunnelSpec, Tunnels, ssh_arguments};
-use super::super::wire::AddPool;
+use super::super::wire::{AddMember, AddPool};
 use super::{FakeDriver, job, spec};
 use crate::native_v2_target::{FileTargetRegistry, TargetRegistry};
 
@@ -496,16 +496,13 @@ async fn a_pool_with_no_servers_makes_tagged_jobs_queue_instead_of_failing() {
     assert_eq!(error.exit_code(), EXIT_NO_ELIGIBLE_TARGET);
 
     rig.add_pool(1).await;
-    let error = rig
+    let parked = rig
         .service
         .submit(tagged("hj_early"), false, Vec::new())
         .await
-        .expect_err("nothing free yet");
-    assert_eq!(error.exit_code(), EXIT_NO_CAPACITY, "{error:?}");
-    rig.service
-        .submit(tagged("hj_early"), true, Vec::new())
-        .await
-        .expect("queued for the pool");
+        .expect("the pool will provision a server for it");
+    assert_eq!(parked["job"]["state"], json!("queued"), "{parked}");
+    assert!(parked["job"]["target"].is_null(), "{parked}");
     assert_eq!(
         job_named(&rig.state().await, "hj_early").state,
         JobState::Queued
@@ -514,6 +511,87 @@ async fn a_pool_with_no_servers_makes_tagged_jobs_queue_instead_of_failing() {
     let mut pinned = job("hj_pinned", 1);
     pinned.placement = spec(Some("elsewhere"), &[TAG], Strategy::FirstFree);
     assert!(rig.service.enqueue(pinned, Vec::new()).await.is_err());
+}
+
+#[tokio::test]
+async fn submit_refuses_with_no_capacity_only_when_no_pool_serves_the_tags() {
+    let rig = rig();
+    rig.service
+        .add(AddMember {
+            name: "local".to_owned(),
+            tags: vec!["solo".to_owned()],
+            slots: 1,
+            priority: 0,
+        })
+        .await
+        .expect("add local");
+    let mut first = job("hj_first", 1);
+    first.placement = spec(None, &["solo"], Strategy::FirstFree);
+    rig.service
+        .submit(first, false, Vec::new())
+        .await
+        .expect("placed on the free member");
+
+    // The only member matching `solo` is busy, and no pool carries that tag.
+    let mut second = job("hj_second", 2);
+    second.placement = spec(None, &["solo"], Strategy::FirstFree);
+    let error = rig
+        .service
+        .submit(second, false, Vec::new())
+        .await
+        .expect_err("no member and no pool can serve it now");
+    assert!(matches!(error, HubError::NoCapacity(_)), "{error:?}");
+    assert_eq!(error.diagnostic()["code"], json!("hub.no_capacity"));
+    assert_eq!(error.exit_code(), EXIT_NO_CAPACITY);
+}
+
+#[tokio::test]
+async fn submit_still_runs_a_job_immediately_on_a_free_member() {
+    let rig = rig();
+    rig.add_pool(1).await;
+    rig.service
+        .add(AddMember {
+            name: "local".to_owned(),
+            tags: vec![TAG.to_owned()],
+            slots: 1,
+            priority: 0,
+        })
+        .await
+        .expect("add local");
+
+    let placed = rig
+        .service
+        .submit(tagged("hj_now"), false, Vec::new())
+        .await
+        .expect("placed immediately");
+    assert_eq!(placed["job"]["state"], json!("running"), "{placed}");
+    assert_eq!(placed["job"]["target"], json!("local"), "{placed}");
+    assert!(placed["job"]["runId"].is_string(), "{placed}");
+}
+
+#[tokio::test]
+async fn a_job_submit_parked_for_a_pool_is_placed_once_its_server_joins() {
+    let rig = rig();
+    rig.add_pool(1).await;
+    rig.service
+        .submit(tagged("hj_parked"), false, Vec::new())
+        .await
+        .expect("parked for the pool");
+    assert_eq!(
+        job_named(&rig.state().await, "hj_parked").state,
+        JobState::Queued
+    );
+
+    for _ in 0..4 {
+        rig.pass().await;
+    }
+    let lease = rig.lease().await;
+    assert_eq!(lease.phase, LeasePhase::Active, "{lease:?}");
+    let state = rig.state().await;
+    let job = job_named(&state, "hj_parked");
+    assert_eq!(job.state, JobState::Running);
+    assert_eq!(job.target.as_deref(), Some(lease.name.as_str()));
+    assert!(job.run_id.is_some());
 }
 
 #[tokio::test]
