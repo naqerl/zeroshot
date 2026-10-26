@@ -1,11 +1,10 @@
-use std::future::Future;
-use std::pin::Pin;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
@@ -86,14 +85,6 @@ impl EventHost {
             live_delay: Duration::ZERO,
         }
     }
-
-    fn streaming(replay: Vec<Value>, live: Vec<Value>, live_delay: Duration) -> Self {
-        Self {
-            replay,
-            live,
-            live_delay,
-        }
-    }
 }
 
 #[async_trait(?Send)]
@@ -143,49 +134,127 @@ impl McpHost for EventHost {
     }
 }
 
-/// A hub host whose job status advances through `statuses` on each read and whose
-/// placed run exposes the scripted watch events.
-struct JobHost {
-    statuses: Vec<Value>,
-    reads: AtomicUsize,
+/// A hub host that serves one running job, one member, and the job's run watch.
+struct HubFeedHost {
+    jobs: Vec<Value>,
+    members: Vec<Value>,
     events: Vec<Value>,
+}
+
+#[async_trait(?Send)]
+impl McpHost for HubFeedHost {
+    async fn execute(&self, command: NativeV2CliCommand) -> Result<String, McpFailure> {
+        match command {
+            NativeV2CliCommand::Hub(HubRequest {
+                command: HubCommand::Ps(_),
+                ..
+            }) => Ok(json!({"schema": "zeroshot.hub.jobs/v1", "jobs": self.jobs}).to_string()),
+            NativeV2CliCommand::Hub(HubRequest {
+                command: HubCommand::List { .. },
+                ..
+            }) => Ok(
+                json!({"schema": "zeroshot.hub.targets/v1", "targets": self.members}).to_string(),
+            ),
+            _ => Err(McpFailure::invalid(
+                "hub feed host only lists jobs and members",
+            )),
+        }
+    }
+
+    async fn open_watch(&self, command: &RunWatchCommand) -> Result<WatchStream, McpFailure> {
+        let run_id = command.run.run_id.as_str();
+        let (sender, receiver) = mpsc::channel(32);
+        for event in self.events.clone() {
+            let mut event = event;
+            event["runId"] = json!(run_id);
+            sender
+                .try_send(Ok(event))
+                .expect("scripted run event fits the buffer");
+        }
+        drop(sender);
+        let task = tokio::spawn(async {});
+        Ok(WatchStream::new(receiver, task))
+    }
+}
+
+fn hub_feed_host() -> HubFeedHost {
+    HubFeedHost {
+        jobs: vec![json!({
+            "jobId": "hj_feed",
+            "state": "running",
+            "title": "Repair checkout",
+            "target": "local",
+            "runId": "run-public",
+            "submittedAt": "2026-01-01T00:00:00Z",
+            "dispatchedAt": "2026-01-01T00:00:01Z"
+        })],
+        members: vec![json!({
+            "name": "local",
+            "state": "active",
+            "addedAt": "2026-01-01T00:00:00Z"
+        })],
+        events: vec![watch_event("run-public", "v2:1", running_status("worker"))],
+    }
+}
+
+/// A hub host whose job snapshot advances through `jobs` on each `hub ps` read and
+/// whose runs replay scripted watch records after an optional delay.
+struct HubLifecycleHost {
+    jobs: Vec<Vec<Value>>,
+    reads: AtomicUsize,
+    members: Vec<Value>,
+    run_events: HashMap<String, Vec<Value>>,
+    watch_delay: Duration,
     watched_targets: Arc<Mutex<Vec<Option<String>>>>,
 }
 
-impl JobHost {
-    fn new(statuses: Vec<Value>, events: Vec<Value>) -> Self {
-        assert!(!statuses.is_empty(), "a job host needs at least one status");
+impl HubLifecycleHost {
+    fn new(
+        jobs: Vec<Vec<Value>>,
+        members: Vec<Value>,
+        run_events: HashMap<String, Vec<Value>>,
+    ) -> Self {
+        assert!(!jobs.is_empty(), "a lifecycle host needs one job snapshot");
         Self {
-            statuses,
+            jobs,
             reads: AtomicUsize::new(0),
-            events,
+            members,
+            run_events,
+            watch_delay: Duration::ZERO,
             watched_targets: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    fn watched_targets(&self) -> Arc<Mutex<Vec<Option<String>>>> {
-        Arc::clone(&self.watched_targets)
+    fn with_watch_delay(mut self, delay: Duration) -> Self {
+        self.watch_delay = delay;
+        self
     }
 }
 
 #[async_trait(?Send)]
-impl McpHost for JobHost {
+impl McpHost for HubLifecycleHost {
     async fn execute(&self, command: NativeV2CliCommand) -> Result<String, McpFailure> {
         match command {
             NativeV2CliCommand::Hub(HubRequest {
-                command: HubCommand::Status { job },
+                command: HubCommand::Ps(_),
                 ..
             }) => {
                 let read = self.reads.fetch_add(1, Ordering::SeqCst);
-                let index = read.min(self.statuses.len() - 1);
-                Ok(json!({
-                    "schema": "zeroshot.hub.job/v1",
-                    "job": self.statuses[index],
-                    "requestedJob": job,
-                })
-                .to_string())
+                let index = read.min(self.jobs.len() - 1);
+                Ok(
+                    json!({ "schema": "zeroshot.hub.jobs/v1", "jobs": self.jobs[index] })
+                        .to_string(),
+                )
             }
-            _ => Err(McpFailure::invalid("job host only answers hub status")),
+            NativeV2CliCommand::Hub(HubRequest {
+                command: HubCommand::List { .. },
+                ..
+            }) => Ok(
+                json!({"schema": "zeroshot.hub.targets/v1", "targets": self.members}).to_string(),
+            ),
+            _ => Err(McpFailure::invalid(
+                "lifecycle host only lists jobs and members",
+            )),
         }
     }
 
@@ -194,27 +263,54 @@ impl McpHost for JobHost {
             .lock()
             .expect("watched targets")
             .push(command.run.target.clone());
-        let run_id = command.run.run_id.as_str();
+        let run_id = command.run.run_id.as_str().to_owned();
+        let events = self.run_events.get(&run_id).cloned().unwrap_or_default();
+        let delay = self.watch_delay;
         let (sender, receiver) = mpsc::channel(32);
-        for event in self.events.clone() {
-            let mut event = event;
-            event["runId"] = json!(run_id);
-            sender
-                .try_send(Ok(event))
-                .expect("scripted job run event fits the buffer");
-        }
-        drop(sender);
-        let task = tokio::spawn(async {});
+        let task = tokio::spawn(async move {
+            if !events.is_empty() && !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            for mut event in events {
+                event["runId"] = json!(run_id);
+                if sender.send(Ok(event)).await.is_err() {
+                    return;
+                }
+            }
+        });
         Ok(WatchStream::new(receiver, task))
     }
 }
 
+fn hub_lifecycle_job(job_id: &str, state: &str, run_id: Option<&str>) -> Value {
+    let mut job = json!({
+        "jobId": job_id,
+        "title": "Lifecycle job",
+        "state": state,
+        "target": "builder",
+        "project": "acme/repo",
+        "submittedAt": "2026-01-01T00:00:00Z",
+    });
+    if let Some(run_id) = run_id {
+        job["runId"] = json!(run_id);
+        job["dispatchedAt"] = json!("2026-01-01T00:00:01Z");
+    }
+    job
+}
+
+fn hub_member(name: &str) -> Value {
+    json!({"name": name, "state": "active", "addedAt": "2026-01-01T00:00:00Z"})
+}
+
 fn sequence_from_cursor(cursor: &str) -> Option<u64> {
-    cursor.strip_prefix("v2:")?.parse().ok()
+    cursor.rsplit_once(':')?.1.parse().ok()
 }
 
 fn sequence(event: &Value) -> Option<u64> {
-    sequence_from_cursor(event.get("cursor")?.as_str()?)
+    let cursor = event
+        .get("cursor")
+        .or_else(|| event.pointer("/data/cursor"))?;
+    sequence_from_cursor(cursor.as_str()?)
 }
 
 fn source() -> Value {
@@ -323,6 +419,25 @@ impl Session {
         self.post(message, None).await
     }
 
+    /// Starts a stream without waiting for its body, so a long-lived subscription can be
+    /// inspected and then dropped.
+    async fn start_stream(&mut self, message: &Value) -> reqwest::Response {
+        let mut request = self.client.post(&self.url).json(message);
+        if let Some(session) = &self.session {
+            request = request.header("mcp-session-id", session);
+        }
+        let response = request.send().await.expect("start MCP stream");
+        if let Some(session) = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+        {
+            self.session = Some(session);
+        }
+        response
+    }
+
     async fn post(&mut self, message: &Value, session: Option<String>) -> Option<String> {
         let mut request = self.client.post(&self.url).json(message);
         if let Some(session) = session {
@@ -371,10 +486,66 @@ impl Session {
         }
         self.frames.pop_front().expect("queued MCP frame")
     }
+}
 
-    fn drain_frames(&mut self) -> Vec<Value> {
-        self.frames.drain(..).collect()
+/// Drains server-sent event frames until `done` accepts what has been read or the deadline
+/// passes. A hub stream is intentionally long-lived, so a closed reader is the only local stop.
+async fn collect_stream(
+    response: reqwest::Response,
+    deadline: Duration,
+    mut done: impl FnMut(&[Value]) -> bool,
+) -> Vec<Value> {
+    let mut body = response.bytes_stream();
+    let mut pending = String::new();
+    let mut frames = Vec::new();
+    let end = tokio::time::Instant::now() + deadline;
+    while !done(&frames) {
+        let chunk = match tokio::time::timeout_at(end, body.next()).await {
+            Ok(Some(Ok(chunk))) => chunk,
+            _ => break,
+        };
+        pending.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(index) = pending.find("\n\n") {
+            let block: String = pending.drain(..index + 2).collect();
+            for line in block.lines() {
+                let Some(data) = line.strip_prefix("data: ") else {
+                    continue;
+                };
+                frames.push(serde_json::from_str(data).expect("stream data is JSON"));
+            }
+        }
     }
+    frames
+}
+
+fn stream_notifications(frames: &[Value]) -> Vec<&Value> {
+    frames
+        .iter()
+        .filter(|frame| {
+            frame
+                .get("method")
+                .and_then(Value::as_str)
+                .is_some_and(|method| method.starts_with("notifications/events/"))
+        })
+        .collect()
+}
+
+fn hub_event_states(frames: &[Value], job_id: &str) -> Vec<String> {
+    stream_notifications(frames)
+        .into_iter()
+        .filter(|frame| frame["params"]["name"] == json!("hub.job"))
+        .filter(|frame| frame["params"]["data"]["jobId"] == json!(job_id))
+        .filter_map(|frame| frame["params"]["data"]["state"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn has_complete_frame(frames: &[Value]) -> bool {
+    frames.iter().any(|frame| {
+        frame
+            .get("result")
+            .and_then(|result| result.get("resultType"))
+            == Some(&json!("complete"))
+    })
 }
 
 async fn initialize(session: &mut Session) {
@@ -666,70 +837,46 @@ async fn failing_status_is_a_tool_error_with_the_cli_code() {
 }
 
 #[tokio::test]
-async fn events_list_describes_run_events_and_warnings() {
+async fn events_list_describes_poll_and_push_only() {
     let mut session = Session::spawn(ScriptHost);
     initialize(&mut session).await;
     let listed = session.request(2, "events/list", json!({})).await;
     assert_eq!(listed["result"]["resultType"], json!("complete"));
-    let events = listed["result"]["events"].as_array().expect("events");
-    assert_eq!(events.len(), 2);
-    let event = &events[0];
-    assert_eq!(event["name"], json!("run.event"));
+    let event = &listed["result"]["events"][0];
+    assert_eq!(event["name"], json!("hub.job"));
     assert_eq!(event["delivery"], json!(["poll", "push"]));
     assert!(
         event["description"]
             .as_str()
             .unwrap_or_default()
-            .contains("unsupported")
+            .contains("hub job")
     );
-    let warning = &events[1];
-    assert_eq!(warning["name"], json!("run.warning"));
-    assert_eq!(warning["delivery"], json!(["push"]));
-    assert!(
-        warning["description"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("each completed hour")
-    );
-    assert_eq!(warning["inputSchema"], event["inputSchema"]);
-    assert_eq!(warning["payloadSchema"], event["payloadSchema"]);
-    assert_eq!(
-        event["inputSchema"]["oneOf"],
-        json!([{"required": ["runId"]}, {"required": ["jobId"]}])
-    );
-    assert!(event["inputSchema"]["properties"].get("runId").is_some());
-    assert!(event["inputSchema"]["properties"].get("jobId").is_some());
-    assert!(event["inputSchema"]["properties"].get("target").is_some());
+    assert!(event["inputSchema"].get("oneOf").is_none());
+    for property in ["runId", "jobId", "target"] {
+        assert!(
+            event["inputSchema"]["properties"].get(property).is_some(),
+            "{property} is documented"
+        );
+    }
     assert_eq!(
         event["payloadSchema"]["required"],
         json!(["eventId", "name", "timestamp", "data", "_meta"])
     );
-    assert_eq!(event["payloadSchema"]["additionalProperties"], json!(false));
-    let shapes = event["payloadSchema"]["properties"]["data"]["oneOf"]
-        .as_array()
-        .expect("run, job, and warning data shapes");
-    assert_eq!(shapes.len(), 3);
-    assert_eq!(
-        shapes[0]["required"],
-        json!(["runId", "cursor", "status", "summary", "replayed"])
+    assert!(
+        event["payloadSchema"]["properties"]["data"].is_object(),
+        "payload documents data"
     );
     assert!(
-        shapes[1]["properties"].get("jobId").is_some(),
-        "job data documents jobId"
+        event["payloadSchema"]["properties"].get("cursor").is_none(),
+        "the hub cursor stays inside data"
     );
-    assert_eq!(
-        shapes[2]["required"],
-        json!([
-            "runId",
-            "hours",
-            "startedAt",
-            "phase",
-            "message",
-            "summary",
-            "replayed"
-        ])
+    assert!(
+        event["payloadSchema"]["properties"]
+            .get("truncated")
+            .is_none(),
+        "truncation is reported by the poll and active views, not the event envelope"
     );
-    for filter in ["phases", "nodes", "terminalOnly", "verbose"] {
+    for filter in ["kinds", "phases", "nodes", "terminalOnly", "verbose"] {
         assert!(
             event["inputSchema"]["properties"].get(filter).is_some(),
             "{filter} is documented"
@@ -746,232 +893,136 @@ async fn events_list_describes_run_events_and_warnings() {
         .await;
     assert_eq!(next["result"]["events"], json!([]));
     let subscribe = session
-        .request(4, "events/subscribe", json!({"name": "run.event"}))
+        .start_stream(&json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "events/subscribe",
+            "params": {}
+        }))
         .await;
-    assert_eq!(subscribe["error"]["code"], json!(-32026));
-    assert_eq!(subscribe["error"]["data"]["feature"], json!("deliveryMode"));
-    assert_eq!(subscribe["error"]["data"]["value"], json!("webhook"));
+    assert_eq!(subscribe.status(), reqwest::StatusCode::OK);
+    drop(subscribe);
 }
 
 #[tokio::test]
-async fn events_subscribe_accepts_run_warning() {
-    let mut session = Session::spawn(EventHost::new(vec![watch_event(
-        "run-public",
-        "v2:1",
-        finished_status(),
-    )]));
+async fn hub_events_multiplex_a_whole_hub_on_one_cursor() {
+    let mut session = Session::spawn(hub_feed_host());
     initialize(&mut session).await;
-    session
-        .send(&json!({
-            "jsonrpc": "2.0",
-            "id": 7,
-            "method": "events/subscribe",
-            "params": {
-                "name": "run.warning",
-                "arguments": {"runId": "run-public"}
-            }
-        }))
-        .await;
-    let frames = session.drain_frames();
-    let active = frames
-        .iter()
-        .find(|frame| frame["method"] == "notifications/events/active")
-        .expect("the warning subscription is active");
-    assert_eq!(
-        active["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
-        json!(7)
-    );
-    assert!(
-        frames.iter().all(|frame| {
-            !(frame["method"] == "notifications/events/event"
-                && frame["params"]["name"] == json!("run.warning"))
-        }),
-        "a terminal replay never writes a warning"
-    );
-    assert!(
-        frames
+    let first = session.request(2, "events/poll", json!({})).await;
+    assert_eq!(first["result"]["resultType"], json!("complete"));
+    let mut cursor = first["result"]["cursor"].clone();
+    let mut events = first["result"]["events"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for id in 3..20 {
+        if ["hub.job", "hub.run", "hub.pool"]
             .iter()
-            .any(|frame| frame["id"] == json!(7) && frame.get("result").is_some()),
-        "the warning subscription completes at the terminal phase"
-    );
-}
-
-type WarningDrive = Pin<Box<dyn Future<Output = std::io::Result<()>>>>;
-
-struct WarningSession {
-    sender: mpsc::Sender<Result<Value, McpFailure>>,
-    drive: WarningDrive,
-    output: Arc<tokio::sync::Mutex<Vec<u8>>>,
-}
-
-fn warning_session(run_id: &str, elapsed_ms: u64) -> WarningSession {
-    let (sender, receiver) = mpsc::channel(8);
-    let stream = WatchStream::new(receiver, tokio::spawn(async {}));
-    let prepared = super::events::warning_test_prepared(stream, run_id, Some("job-1"), elapsed_ms);
-    let output = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    let stream_output = super::events::StreamOutput::new(
-        json!(7),
-        Arc::clone(&output),
-        Arc::new(AtomicBool::new(false)),
-    );
-    let drive = Box::pin(super::events::drive(
-        prepared,
-        stream_output,
-        Rc::new(ScriptHost),
-    ));
-    WarningSession {
-        sender,
-        drive,
-        output,
-    }
-}
-
-impl WarningSession {
-    async fn advance(&mut self, duration: Duration) {
-        tokio::select! {
-            _ = tokio::time::sleep(duration) => {}
-            result = &mut self.drive => panic!("warning subscription ended early: {result:?}"),
+            .all(|name| events.iter().any(|event| event["name"] == json!(name)))
+        {
+            break;
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let response = session
+            .request(
+                id,
+                "events/poll",
+                json!({
+                    "name": "hub.event",
+                    "arguments": {},
+                    "cursor": cursor
+                }),
+            )
+            .await;
+        if let Some(batch) = response["result"]["events"].as_array() {
+            events.extend(batch.iter().cloned());
+        }
+        cursor = response["result"]["cursor"].clone();
     }
-
-    async fn finish(&mut self, event: Value) {
-        self.sender
-            .send(Ok(event))
-            .await
-            .expect("warning watch receives the terminal event");
-        (&mut self.drive)
-            .await
-            .expect("warning subscription completes");
+    for name in ["hub.job", "hub.run", "hub.pool"] {
+        assert!(
+            events.iter().any(|event| event["name"] == json!(name)),
+            "{name} arrives on the hub stream: {events:?}"
+        );
     }
-
-    async fn frames(&self) -> Vec<Value> {
-        let output = self.output.lock().await.clone();
-        String::from_utf8(output)
-            .expect("warning output is UTF-8")
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("warning output is JSON"))
-            .collect()
+    let mut sequences = Vec::new();
+    for event in &events {
+        let event_id = event["eventId"].as_str().expect("hub event id");
+        let sequence = event_id
+            .strip_prefix("hub:")
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("hub cursor shape");
+        sequences.push(sequence);
+        let envelope = event.as_object().expect("hub event object");
+        assert_eq!(
+            envelope.len(),
+            5,
+            "hub occurrences keep the flattened lifetimes envelope"
+        );
+        for key in ["eventId", "name", "timestamp", "data", "_meta"] {
+            assert!(envelope.contains_key(key), "{key} is in the envelope");
+        }
+        assert_eq!(event["data"]["cursor"], json!(event_id));
     }
+    assert!(sequences.windows(2).all(|pair| pair[0] <= pair[1]));
+    let run = events
+        .iter()
+        .find(|event| event["name"] == json!("hub.run"))
+        .expect("run event");
+    assert_eq!(run["data"]["runId"], json!("run-public"));
+    assert_eq!(run["data"]["runCursor"], json!("v2:1"));
+    assert_eq!(run["data"]["summary"]["phase"], json!("running"));
+    assert_eq!(run["data"]["replayed"], json!(true));
 
-    async fn warnings(&self) -> Vec<Value> {
-        self.frames()
-            .await
-            .into_iter()
-            .filter(|frame| {
-                frame["method"] == json!("notifications/events/event")
-                    && frame["params"]["name"] == json!("run.warning")
-            })
-            .map(|frame| frame["params"].clone())
-            .collect()
-    }
-}
-
-fn assert_warning_envelope(warning: &Value) {
-    let mut keys = warning
-        .as_object()
-        .expect("warning notification is an object")
-        .keys()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    keys.sort_unstable();
-    assert_eq!(keys, vec!["_meta", "data", "eventId", "name", "timestamp"]);
-    assert_eq!(
-        warning["_meta"]["io.modelcontextprotocol/subscriptionId"],
-        json!(7)
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn warning_crossing_one_hour_emits_exactly_one_notification() {
-    const HOUR_MS: u64 = 3_600_000;
-    let mut session = warning_session("run-public", HOUR_MS - 500);
-    session.advance(Duration::from_millis(700)).await;
-
-    let warnings = session.warnings().await;
-    assert_eq!(warnings.len(), 1);
-    let warning = &warnings[0];
-    assert_warning_envelope(warning);
-    assert_eq!(warning["name"], json!("run.warning"));
-    assert_eq!(warning["eventId"], json!("run-public:warning:1"));
-    let data = &warning["data"];
-    assert_eq!(data["runId"], json!("run-public"));
-    assert_eq!(data["jobId"], json!("job-1"));
-    assert_eq!(data["hours"], json!(1));
-    assert_eq!(data["phase"], json!("running"));
-    assert_eq!(data["message"], json!("run has been active for 1 hour"));
-    assert_eq!(data["replayed"], json!(false));
-    assert!(
-        data["startedAt"]
-            .as_str()
-            .is_some_and(|started| started.contains('T')),
-        "startedAt is an RFC 3339 timestamp: {data}"
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn warning_crossing_two_and_three_hours_emits_each_hour_once() {
-    const HOUR_MS: u64 = 3_600_000;
-    let mut session = warning_session("run-public", HOUR_MS - 500);
-    session.advance(Duration::from_millis(700)).await;
-    session.advance(Duration::from_millis(HOUR_MS + 500)).await;
-
-    let warnings = session.warnings().await;
-    assert_eq!(warnings.len(), 2);
-    assert_eq!(
-        warnings
-            .iter()
-            .map(|warning| warning["data"]["hours"].clone())
-            .collect::<Vec<_>>(),
-        vec![json!(1), json!(2)],
-        "crossing the second hour adds the 2h warning, not another 1h warning"
-    );
-    assert_eq!(
-        warnings[1]["data"]["message"],
-        json!("run has been active for 2 hours")
-    );
-
-    session.advance(Duration::from_millis(HOUR_MS + 500)).await;
-    let warnings = session.warnings().await;
-    assert_eq!(
-        warnings
-            .iter()
-            .map(|warning| warning["data"]["hours"].clone())
-            .collect::<Vec<_>>(),
-        vec![json!(1), json!(2), json!(3)]
-    );
-    assert_eq!(warnings[2]["eventId"], json!("run-public:warning:3"));
-}
-
-#[tokio::test(start_paused = true)]
-async fn warning_subscription_after_seventy_five_minutes_does_not_replay_first_hour() {
-    let mut session = warning_session("run-public", 75 * 60 * 1000);
-    session.advance(Duration::from_secs(30)).await;
-    assert!(
-        session.warnings().await.is_empty(),
-        "the completed first hour is never replayed"
-    );
-
-    session.advance(Duration::from_secs(46 * 60)).await;
-    let warnings = session.warnings().await;
-    assert_eq!(warnings.len(), 1);
-    assert_eq!(warnings[0]["data"]["hours"], json!(2));
-    assert_eq!(
-        warnings[0]["data"]["message"],
-        json!("run has been active for 2 hours")
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn finished_run_emits_no_further_warnings() {
-    const HOUR_MS: u64 = 3_600_000;
-    let mut session = warning_session("run-public", HOUR_MS - 500);
-    session
-        .finish(watch_event("run-public", "v2:1", finished_status()))
+    let after = session
+        .request(
+            20,
+            "events/poll",
+            json!({
+                "name": "hub.event",
+                "arguments": {},
+                "cursor": cursor
+            }),
+        )
         .await;
+    assert_eq!(after["result"]["events"], json!([]));
+    assert_eq!(after["result"]["cursor"], cursor);
+}
+
+#[tokio::test]
+async fn hub_events_filter_run_and_pool_kinds_on_replay() {
+    let mut session = Session::spawn(hub_feed_host());
+    initialize(&mut session).await;
+    let response = session
+        .request(
+            2,
+            "events/poll",
+            json!({"name": "hub.event", "arguments": {}}),
+        )
+        .await;
+    let cursor = response["result"]["cursor"].clone();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let runs = session
+        .request(
+            3,
+            "events/poll",
+            json!({
+                "name": "hub.run",
+                "arguments": {"runId": "run-public", "phases": ["running"]},
+                "cursor": "hub:0"
+            }),
+        )
+        .await;
+    let runs = runs["result"]["events"]
+        .as_array()
+        .expect("filtered events");
+    assert!(!runs.is_empty());
+    assert!(runs.iter().all(|event| event["name"] == json!("hub.run")));
     assert!(
-        session.warnings().await.is_empty(),
-        "a run that finishes before the hour boundary never warns"
+        runs.iter()
+            .all(|event| event["data"]["summary"]["phase"] == json!("running"))
     );
+    assert_ne!(cursor, json!(null));
 }
 
 #[tokio::test]
@@ -1003,15 +1054,10 @@ async fn events_poll_advances_the_cursor() {
         json!("v2:2")
     );
     assert!(response["result"]["events"][0].get("cursor").is_none());
-    assert_eq!(
-        response["result"]["events"][0]["_meta"],
-        json!({}),
-        "polled occurrences keep the envelope's object _meta"
-    );
 }
 
 #[tokio::test]
-async fn events_poll_reports_a_skipped_window() {
+async fn events_poll_does_not_report_sparse_cursor_gaps() {
     let mut session = Session::spawn(ScriptHost);
     initialize(&mut session).await;
     let response = session
@@ -1025,8 +1071,9 @@ async fn events_poll_reports_a_skipped_window() {
             }),
         )
         .await;
-    assert_eq!(response["result"]["truncated"], json!(true));
+    assert_eq!(response["result"]["truncated"], json!(false));
     assert_eq!(response["result"]["cursor"], json!("v2:5"));
+    assert_eq!(response["result"]["hasMore"], json!(false));
     assert_eq!(
         response["result"]["events"][0]["data"]["cursor"],
         json!("v2:5")
@@ -1034,248 +1081,688 @@ async fn events_poll_reports_a_skipped_window() {
 }
 
 #[tokio::test]
-async fn events_stream_pushes_a_notification() {
-    let mut session = Session::spawn(ScriptHost);
+async fn events_stream_pushes_a_hub_run_notification() {
+    let mut session = Session::spawn(hub_feed_host());
     initialize(&mut session).await;
-    session
-        .send(&json!({
+    let response = session
+        .start_stream(&json!({
             "jsonrpc": "2.0",
             "id": 7,
             "method": "events/stream",
-            "params": {
-                "name": "run.event",
-                "arguments": {"runId": "run-public"},
-                "cursor": "v2:1"
-            }
+            "params": {"name": "hub.run", "arguments": {}}
         }))
         .await;
-    let mut saw_event = false;
-    for _ in 0..8 {
-        let message = session.read().await;
-        if message["method"] == "notifications/events/active" {
-            assert_eq!(
-                message["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
-                json!(7)
-            );
-        }
-        if message["method"] == "notifications/events/event" {
-            assert!(message["params"].get("cursor").is_none());
-            assert_eq!(message["params"]["data"]["cursor"], json!("v2:2"));
-            assert_eq!(message["params"]["name"], json!("run.event"));
-            assert_eq!(
-                message["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
-                json!(7)
-            );
-            saw_event = true;
-            break;
-        }
-    }
-    assert!(saw_event);
+    let frames = collect_stream(response, Duration::from_secs(2), |frames| {
+        stream_notifications(frames)
+            .iter()
+            .any(|frame| frame["params"]["name"] == json!("hub.run"))
+    })
+    .await;
+    let event = stream_notifications(&frames)
+        .into_iter()
+        .find(|frame| frame["params"]["name"] == json!("hub.run"))
+        .expect("a hub.run event");
+    assert_eq!(event["params"]["data"]["runId"], json!("run-public"));
+    assert_eq!(event["params"]["data"]["replayed"], json!(false));
+    assert_eq!(
+        event["params"]["data"]["summary"]["phase"],
+        json!("running")
+    );
+    assert!(
+        event["params"]["eventId"]
+            .as_str()
+            .is_some_and(|event_id| event_id.starts_with("hub:"))
+    );
+    assert_eq!(
+        event["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        json!(7)
+    );
+    assert!(!has_complete_frame(&frames));
 }
 
 #[tokio::test]
-async fn events_job_with_a_run_delivers_that_runs_events() {
-    let mut session = Session::spawn(JobHost::new(
-        vec![json!({
-            "jobId": "hj_placed",
-            "state": "running",
-            "target": "builder",
-            "runId": "run-public"
-        })],
-        vec![watch_event("ignored", "v2:1", running_status("worker"))],
-    ));
+async fn events_job_selector_filters_the_hub_stream() {
+    let mut session = Session::spawn(hub_feed_host());
     initialize(&mut session).await;
-    session
-        .send(&json!({
+    let response = session
+        .start_stream(&json!({
             "jsonrpc": "2.0",
             "id": 8,
             "method": "events/stream",
-            "params": {
-                "name": "run.event",
-                "arguments": {"jobId": "hj_placed"}
-            }
+            "params": {"name": "hub.event", "arguments": {"jobId": "hj_feed"}}
         }))
         .await;
-    let frames = session.drain_frames();
-    let event = frames
-        .iter()
-        .find(|frame| frame["method"] == "notifications/events/event")
-        .expect("the placed job's run event");
-    assert_eq!(event["params"]["eventId"], json!("run-public:v2:1"));
-    assert_eq!(event["params"]["data"]["runId"], json!("run-public"));
-    assert_eq!(
-        event["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
-        json!(8)
-    );
-    assert_eq!(
-        frames.last().unwrap()["result"]["resultType"],
-        json!("complete")
-    );
+    let frames = collect_stream(response, Duration::from_secs(2), |frames| {
+        let names = stream_notifications(frames)
+            .into_iter()
+            .filter_map(|frame| frame["params"]["name"].as_str())
+            .collect::<Vec<_>>();
+        names.contains(&"hub.job") && names.contains(&"hub.run")
+    })
+    .await;
+    assert!(stream_notifications(&frames).iter().all(|frame| {
+        frame["params"]
+            .get("data")
+            .and_then(|data| data.get("jobId"))
+            .is_none_or(|job_id| *job_id == json!("hj_feed"))
+    }));
+    assert!(!has_complete_frame(&frames));
 }
 
 #[tokio::test]
-async fn events_local_job_opens_the_local_watch() {
-    let host = JobHost::new(
-        vec![json!({
-            "jobId": "hj_local",
-            "state": "running",
-            "target": "local",
-            "runId": "run-local"
-        })],
-        vec![watch_event("ignored", "v2:1", running_status("worker"))],
+async fn events_poll_marks_replayed_and_live_hub_events() {
+    let host = HubLifecycleHost::new(
+        vec![vec![hub_lifecycle_job(
+            "hj_replayed",
+            "running",
+            Some("run-replayed"),
+        )]],
+        vec![hub_member("builder")],
+        HashMap::new(),
     );
-    let watched_targets = host.watched_targets();
     let mut session = Session::spawn(host);
     initialize(&mut session).await;
-    session
-        .send(&json!({
+    let mut replayed = Value::Null;
+    for _ in 0..40 {
+        replayed = session
+            .request(
+                2,
+                "events/poll",
+                json!({"arguments": {}, "cursor": "hub:0", "maxEvents": 100}),
+            )
+            .await;
+        if replayed["result"]["events"]
+            .as_array()
+            .is_some_and(|events| !events.is_empty())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let events = replayed["result"]["events"]
+        .as_array()
+        .expect("hub poll events");
+    assert!(!events.is_empty());
+    assert!(
+        events
+            .iter()
+            .all(|event| event["data"]["replayed"] == json!(true))
+    );
+
+    let response = session
+        .start_stream(&json!({
             "jsonrpc": "2.0",
-            "id": 11,
+            "id": 3,
             "method": "events/stream",
-            "params": {
-                "name": "run.event",
-                "arguments": {"jobId": "hj_local"}
-            }
+            "params": {"arguments": {}}
         }))
         .await;
-    let frames = session.drain_frames();
-    assert!(
-        frames
+    let frames = collect_stream(response, Duration::from_secs(2), |frames| {
+        stream_notifications(frames)
             .iter()
-            .any(|frame| frame["method"] == "notifications/events/event")
-    );
-    assert_eq!(
-        watched_targets.lock().expect("watched targets").as_slice(),
-        [None]
+            .any(|frame| frame["params"]["data"]["replayed"] == json!(true))
+    })
+    .await;
+    let event = stream_notifications(&frames)
+        .into_iter()
+        .find(|frame| frame["params"]["data"]["replayed"] == json!(true))
+        .expect("a replayed hub event");
+    assert!(
+        event["params"]["eventId"]
+            .as_str()
+            .is_some_and(|event_id| event_id.starts_with("hub:"))
     );
 }
 
 #[tokio::test]
-async fn events_follow_a_queued_job_until_its_run_appears() {
-    let mut session = Session::spawn(JobHost::new(
+async fn hub_subscription_opens_before_any_job_and_follows_its_lifecycle() {
+    let host = HubLifecycleHost::new(
         vec![
-            json!({"jobId": "hj_queued", "state": "queued", "runId": null}),
-            json!({
-                "jobId": "hj_queued",
-                "state": "running",
-                "target": "builder",
-                "runId": "run-public"
-            }),
+            Vec::new(),
+            Vec::new(),
+            vec![hub_lifecycle_job("hj_life", "running", Some("run-life"))],
+            vec![hub_lifecycle_job("hj_life", "succeeded", Some("run-life"))],
+            vec![hub_lifecycle_job("hj_life", "succeeded", Some("run-life"))],
         ],
-        vec![watch_event("ignored", "v2:1", running_status("worker"))],
-    ));
+        vec![hub_member("builder")],
+        HashMap::new(),
+    );
+    let mut session = Session::spawn(host);
     initialize(&mut session).await;
-    session
-        .send(&json!({
+    let response = session
+        .start_stream(&json!({
             "jsonrpc": "2.0",
             "id": 9,
             "method": "events/stream",
-            "params": {
-                "name": "run.event",
-                "arguments": {"jobId": "hj_queued"}
-            }
+            "params": {"arguments": {}}
         }))
         .await;
-    let frames = session.drain_frames();
-    let queued = frames
-        .iter()
-        .find(|frame| {
-            frame["method"] == "notifications/events/active"
-                && frame["params"]["state"] == json!("queued")
-        })
-        .expect("active notification for the queued job");
-    assert_eq!(queued["params"]["run"], Value::Null);
-    assert_eq!(queued["params"]["job"]["jobId"], json!("hj_queued"));
-    assert_eq!(queued["params"]["job"]["state"], json!("queued"));
+    let frames = collect_stream(response, Duration::from_secs(4), |frames| {
+        let states = hub_event_states(frames, "hj_life");
+        ["submitted", "running", "succeeded"]
+            .iter()
+            .all(|state| states.iter().any(|seen| seen == state))
+    })
+    .await;
+    let states = hub_event_states(&frames, "hj_life");
     assert!(
-        queued["params"]["eventId"]
-            .as_str()
-            .is_some_and(|event_id| event_id.starts_with("hj_queued:"))
+        states.iter().any(|state| state == "submitted"),
+        "{states:?}"
     );
-    let event = frames
+    assert!(states.iter().any(|state| state == "running"), "{states:?}");
+    assert!(
+        states.iter().any(|state| state == "succeeded"),
+        "{states:?}"
+    );
+    assert!(!has_complete_frame(&frames));
+    let job_events = stream_notifications(&frames)
+        .into_iter()
+        .filter(|frame| frame["params"]["name"] == json!("hub.job"))
+        .collect::<Vec<_>>();
+    assert!(
+        job_events
+            .iter()
+            .all(|frame| frame["params"]["data"]["replayed"] == json!(false))
+    );
+    assert!(
+        job_events
+            .iter()
+            .all(|frame| frame["params"]["data"]["at"].is_string())
+    );
+    let mut sequences = job_events
         .iter()
-        .find(|frame| frame["method"] == "notifications/events/event")
-        .expect("run events after the job was placed");
-    assert_eq!(event["params"]["data"]["runId"], json!("run-public"));
-    assert_eq!(
-        frames.last().unwrap()["result"]["resultType"],
-        json!("complete")
-    );
+        .filter_map(|frame| frame["params"]["eventId"].as_str())
+        .map(|event_id| sequence_from_cursor(event_id).expect("hub sequence"))
+        .collect::<Vec<_>>();
+    let sorted = {
+        let mut sorted = sequences.clone();
+        sorted.sort_unstable();
+        sorted
+    };
+    assert_eq!(sequences, sorted);
+    sequences.dedup();
+    assert_eq!(sequences.len(), job_events.len());
 }
 
 #[tokio::test]
-async fn events_end_a_job_that_fails_before_it_runs() {
-    let mut session = Session::spawn(JobHost::new(
-        vec![json!({
-            "jobId": "hj_rejected",
-            "state": "failed",
-            "runId": null,
-            "error": "the target refused the submission",
-            "errorKind": "submission_rejected"
-        })],
-        Vec::new(),
-    ));
+async fn hub_stream_survives_a_terminal_run_and_carries_the_next_job() {
+    let mut run_events = HashMap::new();
+    run_events.insert(
+        "run-one".to_owned(),
+        vec![watch_event("run-one", "v2:2", finished_status())],
+    );
+    run_events.insert(
+        "run-two".to_owned(),
+        vec![watch_event("run-two", "v2:1", running_status("worker"))],
+    );
+    let host = HubLifecycleHost::new(
+        vec![
+            vec![hub_lifecycle_job("hj_one", "running", Some("run-one"))],
+            vec![hub_lifecycle_job("hj_one", "running", Some("run-one"))],
+            vec![hub_lifecycle_job("hj_one", "succeeded", Some("run-one"))],
+            vec![
+                hub_lifecycle_job("hj_one", "succeeded", Some("run-one")),
+                hub_lifecycle_job("hj_two", "running", Some("run-two")),
+            ],
+            vec![
+                hub_lifecycle_job("hj_one", "succeeded", Some("run-one")),
+                hub_lifecycle_job("hj_two", "running", Some("run-two")),
+            ],
+        ],
+        vec![hub_member("builder")],
+        run_events,
+    )
+    .with_watch_delay(Duration::from_millis(300));
+    let mut session = Session::spawn(host);
     initialize(&mut session).await;
-    session
-        .send(&json!({
+    let response = session
+        .start_stream(&json!({
             "jsonrpc": "2.0",
             "id": 10,
             "method": "events/stream",
-            "params": {
-                "name": "run.event",
-                "arguments": {"jobId": "hj_rejected"}
-            }
+            "params": {"arguments": {}}
         }))
         .await;
-    let frames = session.drain_frames();
-    let terminal = frames
-        .iter()
-        .find(|frame| {
-            frame["method"] == "notifications/events/event"
-                && frame["params"]["data"]["state"] == json!("failed")
-        })
-        .expect("terminal job notification");
-    assert_eq!(
-        terminal["params"]["data"]["error"],
-        json!("the target refused the submission")
-    );
-    assert_eq!(
-        terminal["params"]["data"]["errorKind"],
-        json!("submission_rejected")
+    let frames = collect_stream(response, Duration::from_secs(4), |frames| {
+        let terminal = stream_notifications(frames).iter().any(|frame| {
+            frame["params"]["name"] == json!("hub.run")
+                && frame["params"]["data"]["summary"]["terminal"] == json!(true)
+        });
+        let second = hub_event_states(frames, "hj_two")
+            .iter()
+            .any(|state| state == "running");
+        terminal && second
+    })
+    .await;
+    assert!(
+        stream_notifications(&frames).iter().any(|frame| {
+            frame["params"]["name"] == json!("hub.run")
+                && frame["params"]["data"]["summary"]["terminal"] == json!(true)
+        }),
+        "{frames:#?}"
     );
     assert!(
-        terminal["params"]["eventId"]
-            .as_str()
-            .is_some_and(|event_id| event_id.starts_with("hj_rejected:"))
+        hub_event_states(&frames, "hj_two")
+            .iter()
+            .any(|state| state == "running"),
+        "{frames:#?}"
     );
-    assert_eq!(
-        frames.last().unwrap()["result"]["resultType"],
-        json!("complete")
+    assert!(!has_complete_frame(&frames));
+}
+
+#[tokio::test]
+async fn hub_poll_resumes_from_a_cursor_captured_before_a_terminal_event() {
+    let mut run_events = HashMap::new();
+    run_events.insert(
+        "run-one".to_owned(),
+        vec![watch_event("run-one", "v2:2", finished_status())],
+    );
+    run_events.insert(
+        "run-two".to_owned(),
+        vec![watch_event("run-two", "v2:1", running_status("worker"))],
+    );
+    let host = HubLifecycleHost::new(
+        vec![
+            vec![hub_lifecycle_job("hj_one", "running", Some("run-one"))],
+            vec![hub_lifecycle_job("hj_one", "running", Some("run-one"))],
+            vec![
+                hub_lifecycle_job("hj_one", "succeeded", Some("run-one")),
+                hub_lifecycle_job("hj_two", "running", Some("run-two")),
+            ],
+            vec![
+                hub_lifecycle_job("hj_one", "succeeded", Some("run-one")),
+                hub_lifecycle_job("hj_two", "running", Some("run-two")),
+            ],
+        ],
+        vec![hub_member("builder")],
+        run_events,
+    )
+    .with_watch_delay(Duration::from_millis(400));
+    let mut session = Session::spawn(host);
+    initialize(&mut session).await;
+    let mut first = Value::Null;
+    for _ in 0..40 {
+        first = session
+            .request(
+                2,
+                "events/poll",
+                json!({"arguments": {}, "cursor": "hub:0", "maxEvents": 100}),
+            )
+            .await;
+        if first["result"]["events"]
+            .as_array()
+            .is_some_and(|events| !events.is_empty())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let cursor = first["result"]["cursor"]
+        .as_str()
+        .expect("first hub cursor")
+        .to_owned();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let later = session
+        .request(
+            3,
+            "events/poll",
+            json!({"arguments": {}, "cursor": cursor, "maxEvents": 100}),
+        )
+        .await;
+    assert_eq!(later["result"]["truncated"], json!(false), "{later}");
+    let events = later["result"]["events"]
+        .as_array()
+        .expect("resumed events");
+    assert!(!events.is_empty(), "{later}");
+    assert!(events.iter().all(|event| {
+        sequence_from_cursor(event["eventId"].as_str().unwrap_or_default()).unwrap_or_default()
+            > sequence_from_cursor(&cursor).unwrap_or_default()
+    }));
+    assert!(
+        events.iter().any(|event| {
+            event["name"] == json!("hub.run") && event["data"]["summary"]["terminal"] == json!(true)
+        }),
+        "{later}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["name"] == json!("hub.job")
+                && event["data"]["jobId"] == json!("hj_two")
+                && event["data"]["state"] == json!("running")
+        }),
+        "{later}"
     );
 }
 
 #[tokio::test]
-async fn event_subscriptions_require_exactly_one_selector() {
-    let mut session = Session::spawn(ScriptHost);
+async fn hub_pool_reports_provisioning_then_active() {
+    let host = HubLifecycleHost::new(
+        vec![Vec::new(), Vec::new()],
+        vec![hub_member("builder")],
+        HashMap::new(),
+    );
+    let mut session = Session::spawn(host);
     initialize(&mut session).await;
-    for (id, arguments) in [
-        (2, json!({"runId": "run-public", "jobId": "hj_1"})),
-        (3, json!({})),
-    ] {
+    let mut phases = Vec::new();
+    for _ in 0..40 {
         let response = session
             .request(
-                id,
-                "events/stream",
-                json!({"name": "run.event", "arguments": arguments}),
+                2,
+                "events/poll",
+                json!({"arguments": {}, "cursor": "hub:0", "maxEvents": 100}),
             )
             .await;
-        assert_eq!(response["error"]["code"], json!(-32602), "{response}");
-        assert_eq!(
-            response["error"]["data"]["code"],
-            json!("request.invalid"),
-            "{response}"
-        );
+        if let Some(events) = response["result"]["events"].as_array() {
+            for event in events {
+                if event["name"] == json!("hub.pool") {
+                    phases.push(
+                        event["data"]["phase"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                    );
+                    assert_eq!(event["data"]["pool"], json!("builder"));
+                    assert_eq!(event["data"]["leaseId"], json!("builder"));
+                    assert_eq!(event["data"]["machine"], json!("builder"));
+                    assert!(event["data"]["at"].is_string());
+                }
+            }
+        }
+        if phases.iter().any(|phase| phase == "provisioning")
+            && phases.iter().any(|phase| phase == "active")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    assert!(
+        phases.iter().any(|phase| phase == "provisioning"),
+        "{phases:?}"
+    );
+    assert!(phases.iter().any(|phase| phase == "active"), "{phases:?}");
+}
+
+#[tokio::test]
+async fn hub_run_selector_narrows_the_stream_without_ending_it() {
+    let mut run_events = HashMap::new();
+    run_events.insert(
+        "run-a".to_owned(),
+        vec![watch_event("run-a", "v2:1", running_status("worker"))],
+    );
+    run_events.insert(
+        "run-b".to_owned(),
+        vec![watch_event("run-b", "v2:1", running_status("worker"))],
+    );
+    let host = HubLifecycleHost::new(
+        vec![vec![
+            hub_lifecycle_job("hj_a", "running", Some("run-a")),
+            hub_lifecycle_job("hj_b", "running", Some("run-b")),
+        ]],
+        vec![hub_member("builder")],
+        run_events,
+    );
+    let mut session = Session::spawn(host);
+    initialize(&mut session).await;
+    let response = session
+        .start_stream(&json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "events/stream",
+            "params": {"arguments": {"runId": "run-a"}}
+        }))
+        .await;
+    let frames = collect_stream(response, Duration::from_millis(1500), |_| false).await;
+    let notifications = stream_notifications(&frames);
+    assert!(
+        notifications.iter().any(|frame| {
+            frame["params"]["name"] == json!("hub.run")
+                && frame["params"]["data"]["runId"] == json!("run-a")
+        }),
+        "{frames:#?}"
+    );
+    assert!(
+        notifications
+            .iter()
+            .all(|frame| frame["params"]["data"]["runId"] != json!("run-b")),
+        "{frames:#?}"
+    );
+    assert!(!has_complete_frame(&frames));
+}
+
+#[tokio::test]
+async fn hub_stream_sends_heartbeats_while_idle() {
+    let host = HubLifecycleHost::new(vec![Vec::new()], Vec::new(), HashMap::new());
+    let mut session = Session::spawn(host);
+    initialize(&mut session).await;
+    let response = session
+        .start_stream(&json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "events/stream",
+            "params": {"arguments": {}}
+        }))
+        .await;
+    let frames = collect_stream(response, Duration::from_secs(2), |frames| {
+        stream_notifications(frames)
+            .iter()
+            .any(|frame| frame["method"] == json!("notifications/events/heartbeat"))
+    })
+    .await;
+    let heartbeat = stream_notifications(&frames)
+        .into_iter()
+        .find(|frame| frame["method"] == json!("notifications/events/heartbeat"))
+        .expect("an idle heartbeat");
+    assert!(
+        heartbeat["params"]["cursor"]
+            .as_str()
+            .is_some_and(|cursor| cursor.starts_with("hub:"))
+    );
+    assert!(!has_complete_frame(&frames));
+}
+
+#[tokio::test]
+async fn hub_poll_clipping_is_has_more_without_reporting_truncation() {
+    let host = HubLifecycleHost::new(
+        vec![vec![hub_lifecycle_job(
+            "hj_clip",
+            "running",
+            Some("run-clip"),
+        )]],
+        vec![hub_member("builder")],
+        HashMap::new(),
+    );
+    let mut session = Session::spawn(host);
+    initialize(&mut session).await;
+    for _ in 0..40 {
+        let response = session
+            .request(
+                2,
+                "events/poll",
+                json!({"arguments": {}, "cursor": "hub:0", "maxEvents": 100}),
+            )
+            .await;
+        if response["result"]["events"]
+            .as_array()
+            .is_some_and(|events| events.len() > 1)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let clipped = session
+        .request(
+            3,
+            "events/poll",
+            json!({"arguments": {}, "cursor": "hub:0", "maxEvents": 1}),
+        )
+        .await;
+    assert_eq!(clipped["result"]["hasMore"], json!(true), "{clipped}");
+    assert_eq!(
+        clipped["result"]["truncated"],
+        json!(false),
+        "a resumable maxEvents clip is hasMore, not permanent loss: {clipped}"
+    );
+    let cursor = clipped["result"]["cursor"]
+        .as_str()
+        .expect("clipped cursor")
+        .to_owned();
+    let first = clipped["result"]["events"][0].clone();
+    let resumed = session
+        .request(
+            4,
+            "events/poll",
+            json!({"arguments": {}, "cursor": cursor, "maxEvents": 1}),
+        )
+        .await;
+    let second = resumed["result"]["events"][0].clone();
+    assert!(
+        sequence(&second).unwrap() > sequence(&first).unwrap(),
+        "{resumed}"
+    );
+    assert_eq!(
+        second["data"]["cursor"], second["eventId"],
+        "the resumed batch starts at the next unread hub event: {resumed}"
+    );
+}
+
+#[tokio::test]
+async fn hub_replay_reports_the_exact_evicted_range_and_starts_at_the_front() {
+    let jobs = (0..2050)
+        .map(|index| hub_lifecycle_job(&format!("hj_{index}"), "running", None))
+        .collect::<Vec<_>>();
+    let host = HubLifecycleHost::new(vec![jobs], Vec::new(), HashMap::new());
+    let mut session = Session::spawn(host);
+    initialize(&mut session).await;
+    let mut first = Value::Null;
+    for _ in 0..80 {
+        let response = session
+            .request(
+                2,
+                "events/poll",
+                json!({"arguments": {}, "cursor": "hub:0", "maxEvents": 50}),
+            )
+            .await;
+        if response["result"]["truncated"].is_object()
+            && response["result"]["events"]
+                .as_array()
+                .is_some_and(|events| events.len() == 50)
+        {
+            first = response;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(first["result"]["truncated"].is_object(), "{first}");
+    let first_event = first["result"]["events"][0].clone();
+    let front = sequence(&first_event).expect("front sequence");
+    assert!(front > 1, "{first}");
+    assert_eq!(
+        first["result"]["truncated"],
+        json!({"from": "hub:1", "to": format!("hub:{}", front - 1)}),
+        "{first}"
+    );
+    let response = session
+        .start_stream(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "events/stream",
+            "params": {"arguments": {}, "cursor": "hub:0"}
+        }))
+        .await;
+    let frames = collect_stream(response, Duration::from_secs(2), |frames| {
+        stream_notifications(frames)
+            .iter()
+            .any(|frame| frame["method"] == json!("notifications/events/event"))
+    })
+    .await;
+    let active = stream_notifications(&frames)
+        .into_iter()
+        .find(|frame| frame["method"] == json!("notifications/events/active"))
+        .expect("active frame");
+    assert_eq!(
+        active["params"]["truncated"],
+        json!({"from": "hub:1", "to": format!("hub:{}", front - 1)}),
+        "{active}"
+    );
+    let streamed = stream_notifications(&frames)
+        .into_iter()
+        .find(|frame| frame["method"] == json!("notifications/events/event"))
+        .expect("replayed event");
+    assert_eq!(
+        sequence_from_cursor(streamed["params"]["eventId"].as_str().unwrap_or_default()),
+        Some(front),
+        "stream replay starts at the retained log front"
+    );
+}
+
+#[tokio::test]
+async fn event_subscriptions_reject_two_selectors_and_accept_the_whole_hub() {
+    let mut session = Session::spawn(ScriptHost);
+    initialize(&mut session).await;
+    let response = session
+        .request(
+            2,
+            "events/stream",
+            json!({
+                "name": "run.event",
+                "arguments": {"runId": "run-public", "jobId": "hj_1"}
+            }),
+        )
+        .await;
+    assert_eq!(response["error"]["code"], json!(-32602), "{response}");
+    assert_eq!(
+        response["error"]["data"]["code"],
+        json!("request.invalid"),
+        "{response}"
+    );
+
+    let response = session
+        .start_stream(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "events/stream",
+            "params": {"name": "hub.job", "arguments": {}}
+        }))
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .starts_with("text/event-stream")
+    );
+    drop(response);
+}
+
+#[tokio::test]
+async fn events_unsubscribe_stops_a_stream_by_request_id() {
+    let host = HubLifecycleHost::new(vec![Vec::new()], Vec::new(), HashMap::new());
+    let mut session = Session::spawn(host);
+    initialize(&mut session).await;
+    let response = session
+        .start_stream(&json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "events/subscribe",
+            "params": {}
+        }))
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let stopped = session
+        .request(7, "events/unsubscribe", json!({"requestId": 6}))
+        .await;
+    assert_eq!(stopped["result"]["unsubscribed"], json!(true), "{stopped}");
+    let body = tokio::time::timeout(Duration::from_secs(2), response.text())
+        .await
+        .expect("unsubscribe closes the stream")
+        .expect("stream body");
+    assert!(!body.contains("\"resultType\":\"complete\""), "{body}");
+    let missing = session
+        .request(8, "events/unsubscribe", json!({"requestId": 6}))
+        .await;
+    assert_eq!(missing["result"]["unsubscribed"], json!(false), "{missing}");
 }
 
 #[tokio::test]
@@ -1285,38 +1772,23 @@ async fn events_trim_run_constants_and_collapse_terminal_errors() {
         watch_event("run-public", "v2:2", finished_status()),
     ]));
     initialize(&mut session).await;
-    session
-        .send(&json!({
-            "jsonrpc": "2.0",
-            "id": 7,
-            "method": "events/stream",
-            "params": {
+    let response = session
+        .request(
+            2,
+            "events/poll",
+            json!({
                 "name": "run.event",
-                "arguments": {"runId": "run-public"}
-            }
-        }))
+                "arguments": {"runId": "run-public"},
+                "cursor": "v2:0"
+            }),
+        )
         .await;
-    let frames = session.drain_frames();
-    let active = frames
-        .iter()
-        .find(|frame| frame["method"] == "notifications/events/active")
-        .expect("active notification");
-    assert_eq!(
-        active["params"]["run"],
-        json!({
-            "runId": "run-public",
-            "title": "Repair checkout",
-            "size": "medium",
-            "source": source()
-        })
-    );
-    let events = frames
-        .iter()
-        .filter(|frame| frame["method"] == "notifications/events/event")
-        .collect::<Vec<_>>();
+    let events = response["result"]["events"]
+        .as_array()
+        .expect("poll events");
     assert_eq!(events.len(), 2);
 
-    let running = &events[0]["params"];
+    let running = &events[0];
     assert_eq!(running["data"]["cursor"], json!("v2:1"));
     assert!(running["data"].get("title").is_none());
     assert!(running["data"].get("size").is_none());
@@ -1328,7 +1800,7 @@ async fn events_trim_run_constants_and_collapse_terminal_errors() {
         json!({"phase": "running", "node": "worker", "terminal": false, "reason": null})
     );
 
-    let finished = &events[1]["params"];
+    let finished = &events[1];
     assert_eq!(finished["data"]["cursor"], json!("v2:2"));
     assert!(finished["data"].get("title").is_none());
     assert!(finished["data"].get("size").is_none());
@@ -1522,37 +1994,6 @@ async fn events_phase_filter_drops_events_without_truncation() {
     assert_eq!(invalid["error"]["code"], json!(-32602));
 }
 
-#[tokio::test]
-async fn events_mark_replayed_and_live_events() {
-    let mut session = Session::spawn(EventHost::streaming(
-        vec![watch_event("run-public", "v2:1", running_status("worker"))],
-        vec![watch_event("run-public", "v2:2", running_status("worker"))],
-        Duration::from_millis(500),
-    ));
-    initialize(&mut session).await;
-    session
-        .send(&json!({
-            "jsonrpc": "2.0",
-            "id": 7,
-            "method": "events/stream",
-            "params": {
-                "name": "run.event",
-                "arguments": {"runId": "run-public"}
-            }
-        }))
-        .await;
-    let frames = session.drain_frames();
-    let events = frames
-        .iter()
-        .filter(|frame| frame["method"] == "notifications/events/event")
-        .collect::<Vec<_>>();
-    assert_eq!(events.len(), 2);
-    assert_eq!(events[0]["params"]["data"]["cursor"], json!("v2:1"));
-    assert_eq!(events[0]["params"]["data"]["replayed"], json!(true));
-    assert_eq!(events[1]["params"]["data"]["cursor"], json!("v2:2"));
-    assert_eq!(events[1]["params"]["data"]["replayed"], json!(false));
-}
-
 #[test]
 fn inline_tool_data_is_materialized_for_the_command() {
     let original = json!({
@@ -1680,7 +2121,7 @@ async fn http_transport_streams_events_as_server_sent_events() {
         .await
         .expect("bind MCP HTTP test listener");
     let address = listener.local_addr().expect("MCP HTTP test address");
-    let server = tokio::spawn(serve_http_listener(ScriptHost, listener));
+    let server = tokio::spawn(serve_http_listener(hub_feed_host(), listener));
     let url = format!("http://{address}/mcp");
     let client = reqwest::Client::new();
     let response = client
@@ -1713,11 +2154,7 @@ async fn http_transport_streams_events_as_server_sent_events() {
             "jsonrpc": "2.0",
             "id": 7,
             "method": "events/stream",
-            "params": {
-                "name": "run.event",
-                "arguments": {"runId": "run-public"},
-                "cursor": "v2:1"
-            }
+            "params": {"name": "hub.run", "arguments": {}}
         }))
         .send()
         .await
@@ -1731,12 +2168,22 @@ async fn http_transport_streams_events_as_server_sent_events() {
             .unwrap_or_default()
             .starts_with("text/event-stream")
     );
-    let body = tokio::time::timeout(Duration::from_secs(5), response.text())
-        .await
-        .expect("events/stream ends")
-        .expect("events/stream body");
-    assert!(body.contains("notifications/events/active"));
-    assert!(body.contains("notifications/events/event"));
-    assert!(body.contains("\"resultType\":\"complete\""));
+    let frames = collect_stream(response, Duration::from_secs(2), |frames| {
+        stream_notifications(frames)
+            .iter()
+            .any(|frame| frame["params"]["name"] == json!("hub.run"))
+    })
+    .await;
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame["method"] == "notifications/events/active")
+    );
+    assert!(
+        stream_notifications(&frames)
+            .iter()
+            .any(|frame| frame["method"] == "notifications/events/event")
+    );
+    assert!(!has_complete_frame(&frames));
     server.abort();
 }
