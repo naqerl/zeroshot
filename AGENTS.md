@@ -870,7 +870,10 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   `/.well-known/zeroshot-native-v2`. Cron schedules use `croner` with an explicit IANA zone (`jiff`
   bundled tzdb). Member capacity is hub-declared `slots`; load is the observed nonterminal runs.
   Dispatch submission keys are `hub-JOB_ID-ATTEMPT`. Exit code 3 means no capacity or an expired
-  wait, and 4 means that no active member matches or supports the job.
+  wait, and 4 means that no active member matches or supports the job. Every pass probes every
+  member, including when no job is due; a running job is failed as `target_lost` when its member
+  disappears or remains unreachable for three consecutive probes, and removing a member with a
+  placed job is refused with the job IDs.
 - Hub pools (`native_v2_hub/pool.rs` model and scaling, `lease.rs` per-pass lease steps,
   `provision.rs` `Provisioner` trait plus cloud-init, `hetzner.rs` reqwest client, `tunnel.rs`
   `ssh -N -L`, `archive.rs`) create Hetzner servers for queued jobs only a pool matches. An empty

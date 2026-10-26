@@ -16,7 +16,10 @@ use super::model::{
 };
 use super::usage::{JobUsage, Tokens, reported};
 use super::placement::{Load, Placement, describe, place};
-use super::schedule::{active_runs, apply_status, due_jobs, expire, expire_unconfirmed, tick};
+use super::schedule::{
+    UNREACHABLE_REAP_THRESHOLD, active_runs, apply_status, due_jobs, expire, expire_unconfirmed,
+    tick,
+};
 use super::stats::{Dimension, ModelPrice, StatsQuery, aggregate, percentiles};
 
 #[path = "tests/api.rs"]
@@ -92,6 +95,7 @@ pub(super) fn job(id: &str, submitted_at_ms: u64) -> Job {
         dispatched_at_ms: None,
         last_cursor: None,
         last_cursor_at_ms: None,
+        target_last_ok_at_ms: None,
         finished_at_ms: None,
         failure_reason: None,
         token_usage: None,
@@ -290,6 +294,7 @@ async fn placed_jobs_past_their_deadline_stop_the_run_and_settle_expired() {
     running.expires_at_ms = Some(50);
     service
         .mutate(|state| {
+            state.members.push(member("box", &[], 1, 0));
             state.jobs.push(running);
             Ok(())
         })
@@ -330,6 +335,7 @@ async fn a_deadline_run_whose_stop_fails_stays_running_until_a_later_stop_succee
     running.expires_at_ms = Some(1);
     service
         .mutate(|state| {
+            state.members.push(member("box", &[], 1, 0));
             state.jobs.push(running);
             Ok(())
         })
@@ -408,6 +414,7 @@ async fn a_stalled_run_is_stopped_and_failed_with_its_cursor_and_still_time() {
     running.last_cursor_at_ms = Some(0);
     service
         .mutate(|state| {
+            state.members.push(member("box", &[], 1, 0));
             state.jobs.push(running);
             Ok(())
         })
@@ -457,6 +464,7 @@ async fn a_stalled_run_whose_stop_fails_stays_running_until_a_later_stop_succeed
     running.last_cursor_at_ms = Some(0);
     service
         .mutate(|state| {
+            state.members.push(member("box", &[], 1, 0));
             state.jobs.push(running);
             Ok(())
         })
@@ -514,6 +522,7 @@ async fn an_advancing_cursor_resets_the_stall_clock_and_without_max_stall_nothin
         .insert("run-cursor".to_owned(), "new-cursor".to_owned());
     service
         .mutate(|state| {
+            state.members.push(member("box", &[], 1, 0));
             state.jobs.push(running);
             Ok(())
         })
@@ -544,6 +553,163 @@ async fn an_advancing_cursor_resets_the_stall_clock_and_without_max_stall_nothin
     assert!(report.stalled.is_empty());
     assert_eq!(disabled.snapshot().await.jobs[0].state, JobState::Running);
     assert!(driver.stops.lock().expect("fake lock").is_empty());
+}
+
+#[tokio::test]
+async fn a_placed_job_whose_member_disappears_is_reaped_with_target_lost() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let driver = std::sync::Arc::new(FakeDriver::default());
+    let service = super::service::HubService::open(
+        super::store::HubStore::new(directory.path().join("hub")),
+        driver,
+        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
+    )
+    .expect("service");
+    let mut running = job("hj_lost", 0);
+    running.state = JobState::Running;
+    running.target = Some("box".to_owned());
+    running.run_id = Some("run-lost".to_owned());
+    service
+        .mutate(|state| {
+            state.members.push(member("box", &[], 1, 0));
+            state.jobs.push(running);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+    let (report, _) = service.pass().await.expect("healthy pass");
+    assert!(report.target_lost.is_empty());
+    let observed = service.snapshot().await;
+    assert!(
+        observed
+            .member("box")
+            .expect("member")
+            .last_probe_ok_at_ms
+            .is_some()
+    );
+    assert!(observed.jobs[0].target_last_ok_at_ms.is_some());
+
+    service
+        .mutate(|state| {
+            state.members.clear();
+            Ok(())
+        })
+        .await
+        .expect("remove member");
+    let (report, view) = service.pass().await.expect("lost pass");
+    assert_eq!(report.target_lost.len(), 1);
+    assert_eq!(view["targetLost"], json!(report.target_lost));
+    let settled = service.snapshot().await.jobs.remove(0);
+    assert_eq!(settled.state, JobState::Failed);
+    assert_eq!(settled.failure_reason.as_deref(), Some("target_lost"));
+    let error = settled.error.expect("target-lost error");
+    assert_eq!(error.kind, JobErrorKind::TargetLost);
+    assert!(error.message.contains("box"), "{}", error.message);
+    assert!(
+        error.message.contains("no longer a hub member"),
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("last successful probe"),
+        "{}",
+        error.message
+    );
+}
+
+#[tokio::test]
+async fn a_member_unreachable_once_keeps_its_job_until_the_reap_threshold() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let driver = std::sync::Arc::new(FakeDriver {
+        unreachable: vec!["box".to_owned()],
+        ..FakeDriver::default()
+    });
+    let service = super::service::HubService::open(
+        super::store::HubStore::new(directory.path().join("hub")),
+        driver,
+        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
+    )
+    .expect("service");
+    let mut running = job("hj_flapping", 0);
+    running.state = JobState::Running;
+    running.target = Some("box".to_owned());
+    running.run_id = Some("run-flapping".to_owned());
+    let mut boxed = member("box", &[], 1, 0);
+    boxed.last_probe_ok_at_ms = Some(1);
+    service
+        .mutate(|state| {
+            state.members.push(boxed);
+            state.jobs.push(running);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+    for _ in 0..UNREACHABLE_REAP_THRESHOLD - 1 {
+        let (report, _) = service.pass().await.expect("flapping pass");
+        assert!(report.target_lost.is_empty());
+        assert_eq!(service.snapshot().await.jobs[0].state, JobState::Running);
+    }
+    let (report, _) = service.pass().await.expect("threshold pass");
+    assert_eq!(report.target_lost.len(), 1);
+    let settled = service.snapshot().await.jobs.remove(0);
+    assert_eq!(settled.state, JobState::Failed);
+    let error = settled.error.expect("target-lost error");
+    assert_eq!(error.kind, JobErrorKind::TargetLost);
+    assert!(
+        error
+            .message
+            .contains(&format!("{UNREACHABLE_REAP_THRESHOLD} consecutive probes")),
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("last successful probe"),
+        "{}",
+        error.message
+    );
+}
+
+#[tokio::test]
+async fn a_reachable_drain_member_keeps_its_placed_job_running() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let driver = std::sync::Arc::new(FakeDriver::default());
+    let service = super::service::HubService::open(
+        super::store::HubStore::new(directory.path().join("hub")),
+        driver,
+        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
+    )
+    .expect("service");
+    let mut running = job("hj_draining", 0);
+    running.state = JobState::Running;
+    running.target = Some("box".to_owned());
+    running.run_id = Some("run-draining".to_owned());
+    let mut boxed = member("box", &[], 1, 0);
+    boxed.state = MemberState::Drain;
+    service
+        .mutate(|state| {
+            state.members.push(boxed);
+            state.jobs.push(running);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+    for _ in 0..UNREACHABLE_REAP_THRESHOLD + 2 {
+        let (report, _) = service.pass().await.expect("draining pass");
+        assert!(report.target_lost.is_empty());
+    }
+    let observed = service.snapshot().await;
+    assert_eq!(observed.jobs[0].state, JobState::Running);
+    assert_eq!(
+        observed.member("box").expect("member").unreachable_probes,
+        0
+    );
+    assert!(
+        observed
+            .member("box")
+            .expect("member")
+            .last_probe_ok_at_ms
+            .is_some()
+    );
 }
 
 #[test]

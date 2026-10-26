@@ -140,6 +140,19 @@ does not lose the stall clock. The daemon heartbeat (`daemon.json` and the `star
 reports the configured duration in milliseconds as `maxStallMs`; it is `null` when disabled.
 `zeroshot hub install` passes `--max-stall` through to the installed service.
 
+## Lost members and removing a member
+
+The dispatcher probes every member on every pass, not only when a queued job needs placement.
+A running job is failed with `failureReason` `target_lost` and `errorKind` `target_lost` when its
+member is no longer in the hub, or when that member fails three consecutive load probes (one per
+`--interval`). A single failed probe, or a member that flaps below that threshold, leaves the job
+running. The error message names the member and the last successful probe. A member that is merely
+in the `drain` state still answers probes, so its jobs keep running.
+
+`zeroshot hub remove MEMBER` refuses while any job is placed on that member and names the job IDs.
+Stop placed jobs with `zeroshot hub force-stop JOB`, or dequeue jobs that are still placing, before
+removing the member. This keeps removal from orphaning a running job.
+
 ## Evals
 
 `zeroshot hub eval` reruns captured tasks under other topologies, models, or runtime settings,

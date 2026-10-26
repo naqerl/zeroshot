@@ -1210,7 +1210,9 @@ Options:
 #### `zeroshot hub remove`
 
 ```text
-Remove a member from the hub. Its target registration is unchanged
+Remove a member from the hub. Its target registration is unchanged.
+
+Refuses while a job is placed on the member, naming the job IDs; stop or dequeue those jobs first. A job whose member disappears or stays unreachable is failed as target_lost.
 
 Usage: zeroshot hub remove [OPTIONS] <NAME>
 
@@ -1223,7 +1225,7 @@ Options:
           Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
 
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 #### `zeroshot hub list`

@@ -268,6 +268,39 @@ async fn members_are_added_updated_listed_and_removed_through_the_api() {
 }
 
 #[tokio::test]
+async fn removing_a_member_with_a_placed_job_is_refused_and_names_the_job() {
+    let hub = hub_with(FakeDriver::default(), None).await;
+    let client = &hub.client;
+    run(client, add("local", 1)).await.expect("add local");
+    let placed = run(
+        client,
+        submit(spec(hub.directory.path(), "placed", None), false, None),
+    )
+    .await
+    .expect("submit");
+    let job_id = placed["job"]["jobId"].as_str().expect("job id").to_owned();
+    assert_eq!(placed["job"]["state"], json!("running"));
+    assert_eq!(placed["job"]["target"], json!("local"));
+
+    let refused = expect_code(
+        client,
+        HubCommand::Remove {
+            name: "local".to_owned(),
+        },
+        "hub.conflict",
+    )
+    .await;
+    assert!(refused.to_string().contains(&job_id), "{refused}");
+    assert!(refused.to_string().contains("placed jobs"), "{refused}");
+    let state = hub.service.snapshot().await;
+    assert_eq!(state.jobs[0].state, super::super::model::JobState::Running);
+    assert!(
+        state.member("local").is_some(),
+        "the member was not removed"
+    );
+}
+
+#[tokio::test]
 async fn unreachable_members_probe_as_unreachable() {
     let driver = FakeDriver {
         unreachable: vec!["box".to_owned()],
