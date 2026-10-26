@@ -38,7 +38,7 @@ pub(crate) struct InstallEnv {
 
 /// `hub daemon run` arguments the service starts with: the interval plus the API options
 /// given to `hub install` (--listen, --token-file, --metrics-listen, --metrics-label,
-/// --unconfirmed-limit).
+/// --unconfirmed-limit, --max-stall).
 pub(crate) fn daemon_arguments(interval: &str, api: &HubApiOptions) -> Vec<String> {
     let mut arguments = ["hub", "daemon", "run", "--interval", interval]
         .map(str::to_owned)
@@ -57,6 +57,9 @@ pub(crate) fn daemon_arguments(interval: &str, api: &HubApiOptions) -> Vec<Strin
     }
     if let Some(limit) = api.unconfirmed_limit {
         arguments.extend(["--unconfirmed-limit".to_owned(), limit.to_string()]);
+    }
+    if let Some(max_stall) = &api.max_stall {
+        arguments.extend(["--max-stall".to_owned(), max_stall.clone()]);
     }
     arguments
 }

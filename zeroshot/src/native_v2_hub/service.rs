@@ -10,12 +10,13 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use futures_util::future::join_all;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use super::clock::{self, now_ms};
 use super::cron;
-use super::driver::{HubDriver, route};
+use super::driver::{HubDriver, force_stop_arguments, route};
 use super::error::HubError;
 use super::metrics::Metrics;
 use super::model::{
@@ -49,6 +50,9 @@ pub(crate) struct HubService {
     metrics: Metrics,
     /// Unconfirmed submissions a job may have before it fails.
     unconfirmed_limit: u32,
+    /// Optional `hub daemon run --max-stall`; a running job whose cursor stays unchanged for this
+    /// long is stopped and failed.
+    max_stall_ms: Option<u64>,
     /// Eval work in progress, so the worker never runs one piece twice at once.
     eval_claims: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
@@ -88,6 +92,7 @@ impl HubService {
             placement: Mutex::new(()),
             metrics: Metrics::default(),
             unconfirmed_limit: schedule::DEFAULT_UNCONFIRMED_LIMIT,
+            max_stall_ms: None,
             eval_claims: std::sync::Mutex::default(),
         })
     }
@@ -103,6 +108,13 @@ impl HubService {
     #[must_use]
     pub(crate) fn with_unconfirmed_limit(mut self, limit: Option<u32>) -> Self {
         self.unconfirmed_limit = limit.unwrap_or(self.unconfirmed_limit);
+        self
+    }
+
+    /// Stop running jobs whose watch cursor does not advance for this long (`None` disables it).
+    #[must_use]
+    pub(crate) fn with_max_stall(mut self, max_stall_ms: Option<u64>) -> Self {
+        self.max_stall_ms = max_stall_ms;
         self
     }
 
@@ -428,6 +440,32 @@ impl HubService {
                 Err(HubError::NoCapacity(describe(&job.placement)))
             }
         }
+    }
+
+    /// Stop the runs of selected jobs through the same target operation as `hub force-stop`.
+    /// Returns failed stops by job ID; jobs without a confirmed run are not stopped.
+    async fn stop_runs<'a>(
+        &self,
+        runs: impl Iterator<Item = (&'a String, Option<&'a str>, Option<&'a str>)>,
+    ) -> BTreeMap<String, String> {
+        let stops = runs.filter_map(|(job_id, target, run_id)| {
+            let run_id = run_id?;
+            Some(async move {
+                let stopped = match target {
+                    Some(target) => self.driver().stop(target, run_id).await,
+                    None => Err(HubError::Target {
+                        message: format!("run {run_id} has no member to stop it on"),
+                        diagnostic: None,
+                    }),
+                };
+                (job_id.clone(), stopped)
+            })
+        });
+        join_all(stops)
+            .await
+            .into_iter()
+            .filter_map(|(job_id, result)| result.err().map(|error| (job_id, error.to_string())))
+            .collect()
     }
 
     /// Submit a job already marked as placing on `member`, outside the state lock, and record
@@ -766,7 +804,7 @@ impl HubService {
             StreamRequest::Attach { execution } => {
                 vec!["attach".to_owned(), run_id.clone(), execution]
             }
-            StreamRequest::ForceStop => vec!["force-stop".to_owned(), run_id.clone()],
+            StreamRequest::ForceStop => return Ok(force_stop_arguments(target, run_id)),
         };
         arguments.extend(route(target));
         Ok(arguments)
@@ -792,24 +830,75 @@ impl HubService {
             .await?;
         let results = schedule::poll(polls, self.driver()).await;
         let now = now_ms();
-        let (finished, expired, placing, members) = self
+        let (finished, expiring, members) = self
             .mutate(|state| {
                 let finished = schedule::apply_polls(state, results, now);
-                let expired = schedule::expire(&mut state.jobs, now);
-                Ok((
-                    finished,
-                    expired,
-                    schedule::placing(state),
-                    state.members.clone(),
+                let expiring = schedule::expiring_runs(&state.jobs, now);
+                Ok((finished, expiring, state.members.clone()))
+            })
+            .await?;
+        let stopped = self
+            .stop_runs(
+                expiring
+                    .iter()
+                    .map(|run| (&run.job_id, run.target.as_deref(), run.run_id.as_deref())),
+            )
+            .await;
+        let mut expired = self
+            .mutate(|state| {
+                Ok(schedule::settle_expiring(
+                    &mut state.jobs,
+                    now,
+                    &expiring,
+                    &stopped,
                 ))
             })
             .await?;
+        expired.extend(
+            self.mutate(|state| {
+                Ok(if stopped.is_empty() {
+                    schedule::expire(&mut state.jobs, now)
+                } else {
+                    schedule::expire_unconfirmed(&mut state.jobs, now)
+                })
+            })
+            .await?,
+        );
         let mut report = TickReport {
             fired,
             finished,
             expired,
             ..TickReport::default()
         };
+        if let Some(max_stall_ms) = self.max_stall_ms {
+            let now = now_ms();
+            let stalled = self
+                .mutate(|state| Ok(schedule::stalled_runs(&state.jobs, now, max_stall_ms)))
+                .await?;
+            let stopped = self
+                .stop_runs(stalled.iter().map(|run| {
+                    (
+                        &run.job_id,
+                        Some(run.target.as_str()),
+                        Some(run.run_id.as_str()),
+                    )
+                }))
+                .await;
+            report.stalled = self
+                .mutate(|state| {
+                    Ok(schedule::settle_stalled(
+                        &mut state.jobs,
+                        schedule::StallSettlement {
+                            now_ms: now,
+                            max_stall_ms,
+                            stalled: &stalled,
+                            stop_errors: &stopped,
+                        },
+                    ))
+                })
+                .await?;
+        }
+        let placing = schedule::placing(&self.snapshot().await);
         for (job_id, member) in placing {
             let (job, dispatched) = self.dispatch(&job_id, &member, now).await?;
             schedule::record_dispatch(&mut report, &job, &dispatched);

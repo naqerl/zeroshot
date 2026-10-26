@@ -63,6 +63,18 @@ pub(crate) fn parse_future_ms(text: &str, now_ms: u64) -> Result<u64, HubError> 
     Ok(now_ms.saturating_add(duration))
 }
 
+/// Parse an `--expires` value, which must name a time after `now_ms`. A duration is measured
+/// from now, so a zero or malformed duration is invalid just like an instant in the past.
+pub(crate) fn parse_expiry_ms(text: &str, now_ms: u64) -> Result<u64, HubError> {
+    let at = parse_future_ms(text, now_ms)?;
+    if at <= now_ms {
+        return Err(HubError::Usage(format!(
+            "invalid --expires {text:?}: the deadline must be in the future"
+        )));
+    }
+    Ok(at)
+}
+
 /// RFC 3339 time, or DURATION before `now_ms`.
 pub(crate) fn parse_past_ms(text: &str, now_ms: u64) -> Result<u64, HubError> {
     if let Some(instant) = parse_rfc3339_ms(text) {

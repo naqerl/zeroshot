@@ -1280,6 +1280,9 @@ Options:
       --queue
           Queue the job when every matching member is busy instead of failing
 
+      --expires <DURATION|RFC3339>
+          Expire the job if it has not finished after DURATION or at an RFC 3339 time. A queued job is not submitted; a placed run is force-stopped when its deadline passes. A time in the past or a zero duration is refused
+
       --title <TITLE>
           Human-readable title recorded with the run
 
@@ -1493,7 +1496,7 @@ Options:
           [default: 0]
 
       --expires <DURATION|TIME>
-          Expire the job if it is still queued after DURATION or at an RFC 3339 time. With --cron, each fired job expires DURATION after its fire time
+          Expire the job if it has not finished after DURATION or at an RFC 3339 time. A queued job is not submitted; a placed run is force-stopped. With --cron, each fired job expires DURATION after its fire time. A time in the past or a zero duration is refused
 
       --title <TITLE>
           Human-readable title recorded with the run
@@ -1918,6 +1921,9 @@ Options:
       --unconfirmed-limit <N>
           Fail a job after this many submissions its target did not confirm (timeouts, lost receipts) [default: 30]. Each is retried on the same member with the same key
 
+      --max-stall <DURATION>
+          Stop a running job whose watch cursor does not advance for DURATION, such as 30m. The run is force-stopped and the job fails with error kind stalled. Disabled by default
+
   -h, --help
           Print help (see a summary with '-h')
 ```
@@ -2117,6 +2123,9 @@ Options:
 
       --unconfirmed-limit <N>
           Fail a job after this many submissions its target did not confirm (timeouts, lost receipts) [default: 30]. Each is retried on the same member with the same key
+
+      --max-stall <DURATION>
+          Stop a running job whose watch cursor does not advance for DURATION, such as 30m. The run is force-stopped and the job fails with error kind stalled. Disabled by default
 
       --dry-run
           Print the generated service definition and steps without applying them
