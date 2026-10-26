@@ -37,6 +37,12 @@ The type names above are only an example. There is no default type.
 - `--ssh-from` is the hub's public address. The server firewall allows SSH from it and nothing
   else.
 
+The pool's `.pub` key is also registered with the provider and attached to the server by its
+provider key ID. Cloud-init alone is not enough: a key written only to `ssh_authorized_keys` leaves
+the login account's password expired, so PAM refuses the key session with "Password change required
+but no TTY available". The boot configuration also marks the password as non-expiring so the key
+session works.
+
 - `--data-fs` is the data folder's filesystem. Only `btrfs` (the default) is supported; see
   [The btrfs data folder](#the-btrfs-data-folder).
 - `--data-size GB` sizes the btrfs data file on the server's local disk. Without it the file takes

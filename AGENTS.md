@@ -874,8 +874,11 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   reaper (start, then every 5 min) deletes resources labelled `zeroshot/hub=ID` that state does not
   own or that are past `zeroshot/expires`. Failed boots pause the pool (5 min doubling to 1 h). The
   API token comes from `--hetzner-token-file` or `HCLOUD_TOKEN` and is never stored. Labels carry
-  IDs, server type and location only, and user data carries the hub's public key and the boot
-  script, never a secret. `data.rs` owns the btrfs data folder: pool `--data-fs btrfs` (only),
+  IDs, server type and location only. The hub registers the pool's public key with the provider,
+  reuses an existing key by public key or MD5 fingerprint, attaches it to the server by key ID,
+  and also writes it plus a non-expiring login in user data; key-registration failures remain
+  distinct from server create/delete errors. No secret enters either. `data.rs` owns the btrfs
+  data folder: pool `--data-fs btrfs` (only),
   `--data-size` or `--data-volume` (a labelled Hetzner Volume deleted after its server), and the
   idempotent, strict boot script (file or Volume, mkfs.btrfs, fstab, snapshot and reflink
   probe, then the target). `health.rs` is the SSH check run in Connecting before registration;

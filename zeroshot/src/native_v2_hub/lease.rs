@@ -397,6 +397,7 @@ impl HubService {
                 location: location.to_owned(),
                 image: pool.image.clone(),
                 user_data: provision::user_data(pool, lease, &public_key)?,
+                public_key: public_key.clone(),
                 labels,
                 ssh_from: pool.ssh_from.clone(),
                 volume_gb: pool.data.volume_gb,
@@ -414,6 +415,9 @@ impl HubService {
                     return Ok(Creation::Created(refused));
                 }
                 Err(failure) => {
+                    if failure.key_registration {
+                        return Err(HubError::KeyRegistration(failure.message));
+                    }
                     refused = true;
                     match failure.refusal {
                         Refusal::Capacity => {

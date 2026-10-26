@@ -26,6 +26,8 @@ pub(crate) struct ServerRequest {
     pub location: String,
     pub image: String,
     pub user_data: String,
+    /// The pool's SSH public key, registered with the provider so its servers admit the hub.
+    pub public_key: String,
     pub labels: BTreeMap<String, String>,
     /// Source CIDRs admitted on SSH; every other inbound port is closed.
     pub ssh_from: Vec<String>,
@@ -74,6 +76,8 @@ pub(crate) enum Refusal {
 pub(crate) struct Failure {
     pub refusal: Refusal,
     pub message: String,
+    /// The failure happened while registering the pool's SSH key, before any server existed.
+    pub key_registration: bool,
 }
 
 impl Failure {
@@ -81,7 +85,13 @@ impl Failure {
         Self {
             refusal,
             message: message.into(),
+            key_registration: false,
         }
+    }
+
+    pub(crate) fn during_key_registration(mut self) -> Self {
+        self.key_registration = true;
+        self
     }
 }
 
@@ -200,6 +210,7 @@ pub(crate) fn user_data(pool: &Pool, lease: &Lease, public_key: &str) -> Result<
          ssh_pwauth: false\n\
          disable_root: false\n\
          ssh_authorized_keys:\n  - \"{key}\"\n\
+         chpasswd: {{ expire: false }}\n\
          write_files:\n\
          \x20 - path: {path}\n\
          \x20   owner: root:root\n\
@@ -216,6 +227,7 @@ pub(crate) fn user_data(pool: &Pool, lease: &Lease, public_key: &str) -> Result<
     }
     document.push_str(&format!(
         "runcmd:\n\
+         \x20 - [sh, -c, \"chage -M 99999 -E -1 -I -1 -d $(date +%F) root >/dev/null 2>&1 || true\"]\n\
          \x20 - [shutdown, -h, \"+{backstop_minutes}\"]\n\
          \x20 - [{path}]\n",
         path = data::BOOT_SCRIPT,

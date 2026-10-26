@@ -279,6 +279,205 @@ pub(crate) fn classify(status: u16, code: &str, message: &str) -> Refusal {
     }
 }
 
+fn normalize_ssh_key(public_key: &str) -> String {
+    let mut parts = public_key.split_whitespace();
+    match (parts.next(), parts.next()) {
+        (Some(kind), Some(body)) => format!("{kind} {body}"),
+        _ => String::new(),
+    }
+}
+
+fn normalize_fingerprint(fingerprint: &str) -> String {
+    let fingerprint = fingerprint.trim();
+    let fingerprint = fingerprint
+        .strip_prefix("MD5:")
+        .or_else(|| fingerprint.strip_prefix("md5:"))
+        .unwrap_or(fingerprint);
+    fingerprint
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
+fn matching_ssh_key(keys: &[Value], normalized: &str, fingerprint: Option<&str>) -> Option<u64> {
+    keys.iter()
+        .find(|key| {
+            key.get("public_key")
+                .and_then(Value::as_str)
+                .is_some_and(|candidate| normalize_ssh_key(candidate) == normalized)
+                || fingerprint.is_some_and(|fingerprint| {
+                    key.get("fingerprint")
+                        .and_then(Value::as_str)
+                        .is_some_and(|candidate| normalize_fingerprint(candidate) == fingerprint)
+                })
+        })
+        .and_then(|key| key.get("id").and_then(Value::as_u64))
+}
+
+fn ssh_key_name(fingerprint: Option<&str>) -> String {
+    let suffix = fingerprint.map_or("pool", |fingerprint| {
+        &fingerprint[..fingerprint.len().min(12)]
+    });
+    format!("zeroshot-hub-{suffix}")
+}
+
+/// The OpenSSH MD5 fingerprint of a public key: MD5 of its decoded key body, lowercase hex.
+fn ssh_key_fingerprint(public_key: &str) -> Option<String> {
+    let body = public_key.split_whitespace().nth(1)?;
+    let bytes = decode_base64(body)?;
+    Some(md5_hex(&bytes))
+}
+
+fn decode_base64(text: &str) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = 0_u32;
+    let mut bits = 0_u32;
+    for byte in text.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push(u8::try_from((buffer >> bits) & 0xff).ok()?);
+            buffer &= (1_u32 << bits) - 1;
+        }
+    }
+    Some(output)
+}
+
+fn md5_hex(bytes: &[u8]) -> String {
+    let digest = md5(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[allow(clippy::too_many_lines)]
+fn md5(bytes: &[u8]) -> [u8; 16] {
+    const SHIFTS: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    const CONSTANTS: [u32; 64] = [
+        0xd76a_a478,
+        0xe8c7_b756,
+        0x2420_70db,
+        0xc1bd_ceee,
+        0xf57c_0faf,
+        0x4787_c62a,
+        0xa830_4613,
+        0xfd46_9501,
+        0x6980_98d8,
+        0x8b44_f7af,
+        0xffff_5bb1,
+        0x895c_d7be,
+        0x6b90_1122,
+        0xfd98_7193,
+        0xa679_438e,
+        0x49b4_0821,
+        0xf61e_2562,
+        0xc040_b340,
+        0x265e_5a51,
+        0xe9b6_c7aa,
+        0xd62f_105d,
+        0x0244_1453,
+        0xd8a1_e681,
+        0xe7d3_fbc8,
+        0x21e1_cde6,
+        0xc337_07d6,
+        0xf4d5_0d87,
+        0x455a_14ed,
+        0xa9e3_e905,
+        0xfcef_a3f8,
+        0x676f_02d9,
+        0x8d2a_4c8a,
+        0xfffa_3942,
+        0x8771_f681,
+        0x6d9d_6122,
+        0xfde5_380c,
+        0xa4be_ea44,
+        0x4bde_cfa9,
+        0xf6bb_4b60,
+        0xbebf_bc70,
+        0x289b_7ec6,
+        0xeaa1_27fa,
+        0xd4ef_3085,
+        0x0488_1d05,
+        0xd9d4_d039,
+        0xe6db_99e5,
+        0x1fa2_7cf8,
+        0xc4ac_5665,
+        0xf429_2244,
+        0x432a_ff97,
+        0xab94_23a7,
+        0xfc93_a039,
+        0x655b_59c3,
+        0x8f0c_cc92,
+        0xffef_f47d,
+        0x8584_5dd1,
+        0x6fa8_7e4f,
+        0xfe2c_e6e0,
+        0xa301_4314,
+        0x4e08_11a1,
+        0xf753_7e82,
+        0xbd3a_f235,
+        0x2ad7_d2bb,
+        0xeb86_d391,
+    ];
+    let mut state = [0x6745_2301_u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+    let bit_length = (bytes.len() as u64).wrapping_mul(8);
+    let mut padded = bytes.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_length.to_le_bytes());
+    for chunk in padded.chunks_exact(64) {
+        let mut words = [0_u32; 16];
+        for (word, bytes) in words.iter_mut().zip(chunk.chunks_exact(4)) {
+            *word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        }
+        let [mut a, mut b, mut c, mut d] = state;
+        for index in 0..64 {
+            let (function, word) = match index {
+                0..=15 => ((b & c) | (!b & d), index),
+                16..=31 => ((d & b) | (!d & c), (5 * index + 1) % 16),
+                32..=47 => (b ^ c ^ d, (3 * index + 5) % 16),
+                _ => (c ^ (b | !d), (7 * index) % 16),
+            };
+            let previous = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(
+                a.wrapping_add(function)
+                    .wrapping_add(CONSTANTS[index])
+                    .wrapping_add(words[word])
+                    .rotate_left(SHIFTS[index]),
+            );
+            a = previous;
+        }
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+    }
+    let mut digest = [0_u8; 16];
+    for (bytes, word) in digest.chunks_exact_mut(4).zip(state) {
+        bytes.copy_from_slice(&word.to_le_bytes());
+    }
+    digest
+}
+
 fn server_type(item: &Value) -> Option<(u64, ServerType)> {
     let number = |key: &str| item.get(key).and_then(Value::as_u64);
     let hourly = item
@@ -346,6 +545,87 @@ fn locations(types: &[ServerType]) -> Vec<Location> {
 }
 
 impl Hetzner {
+    /// The provider ID of the pool's SSH public key, registering it if it is new. A key already
+    /// registered under another name is reused by its public key or MD5 fingerprint, including
+    /// after a `409 uniqueness_error`.
+    async fn ssh_key_id(&self, public_key: &str) -> Result<u64, Failure> {
+        let normalized = normalize_ssh_key(public_key);
+        if normalized.is_empty() {
+            return Err(Failure::new(
+                Refusal::Invalid,
+                "the pool's SSH public key is not a key type and key body",
+            )
+            .during_key_registration());
+        }
+        let fingerprint = ssh_key_fingerprint(public_key);
+        let keys = self.ssh_keys().await?;
+        if let Some(id) = matching_ssh_key(&keys, &normalized, fingerprint.as_deref()) {
+            return Ok(id);
+        }
+        let body = json!({
+            "name": ssh_key_name(fingerprint.as_deref()),
+            "public_key": public_key.trim(),
+        });
+        match self.call(Method::POST, "/ssh_keys", Some(&body)).await {
+            Ok(Some(document)) => document
+                .pointer("/ssh_key/id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    Failure::new(Refusal::Transient, "Hetzner registered no SSH key ID")
+                        .during_key_registration()
+                }),
+            Ok(None) => Err(
+                Failure::new(Refusal::Invalid, "Hetzner POST /ssh_keys is 404")
+                    .during_key_registration(),
+            ),
+            Err(failure) if failure.message.contains("HTTP 409 uniqueness_error") => {
+                let keys = self.ssh_keys().await?;
+                matching_ssh_key(&keys, &normalized, fingerprint.as_deref()).ok_or_else(|| {
+                    Failure::new(
+                        failure.refusal,
+                        format!(
+                            "{}; the key is not in the re-listed provider keys",
+                            failure.message
+                        ),
+                    )
+                    .during_key_registration()
+                })
+            }
+            Err(failure) => Err(failure.during_key_registration()),
+        }
+    }
+
+    async fn ssh_keys(&self) -> Result<Vec<Value>, Failure> {
+        let mut found = Vec::new();
+        let mut page = 1_u64;
+        loop {
+            let path = format!("/ssh_keys?page={page}&per_page={PAGE_SIZE}");
+            let document = self
+                .call(Method::GET, &path, None)
+                .await
+                .map_err(Failure::during_key_registration)?
+                .ok_or_else(|| {
+                    Failure::new(Refusal::Invalid, "Hetzner GET /ssh_keys is 404")
+                        .during_key_registration()
+                })?;
+            found.extend(
+                document
+                    .get("ssh_keys")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            );
+            match document
+                .pointer("/meta/pagination/next_page")
+                .and_then(Value::as_u64)
+            {
+                Some(next) if next > page => page = next,
+                _ => return Ok(found),
+            }
+        }
+    }
+
     /// An unformatted Volume beside the server, carrying the lease's labels: the boot script
     /// formats it btrfs.
     async fn create_volume(&self, request: &ServerRequest, size: u32) -> Result<u64, Failure> {
@@ -452,6 +732,7 @@ fn action_progress(document: &Value) -> Progress {
 #[async_trait]
 impl Provisioner for Hetzner {
     async fn create(&self, request: &ServerRequest) -> Result<Created, Failure> {
+        let ssh_key = self.ssh_key_id(&request.public_key).await?;
         let firewall = self
             .call(
                 Method::POST,
@@ -488,6 +769,7 @@ impl Provisioner for Hetzner {
                     "location": request.location,
                     "image": request.image,
                     "user_data": request.user_data,
+                    "ssh_keys": [ssh_key],
                     "labels": request.labels,
                     "firewalls": [{ "firewall": firewall }],
                     "volumes": volume.into_iter().collect::<Vec<_>>(),

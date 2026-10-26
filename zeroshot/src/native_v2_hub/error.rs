@@ -73,6 +73,9 @@ pub(crate) enum HubError {
     /// A cloud provider call failed or its outcome is not confirmed.
     #[error("cloud provider: {0}")]
     Provider(String),
+    /// The provider refused or failed to register the pool's SSH key.
+    #[error("provider key registration: {0}")]
+    KeyRegistration(String),
 }
 
 impl HubError {
@@ -98,7 +101,8 @@ impl HubError {
             Self::Target { .. }
             | Self::Unreachable { .. }
             | Self::Unanswered(_)
-            | Self::Provider(_) => 502,
+            | Self::Provider(_)
+            | Self::KeyRegistration(_) => 502,
             Self::Storage(_) | Self::Remote { .. } => 500,
         }
     }
@@ -122,6 +126,7 @@ impl HubError {
             Self::Target { .. } => ("target", "hub.target"),
             Self::Unanswered(_) => ("target", "hub.target_unanswered"),
             Self::Provider(_) => ("target", "hub.provider"),
+            Self::KeyRegistration(_) => ("target", "hub.key_registration"),
         }
     }
 

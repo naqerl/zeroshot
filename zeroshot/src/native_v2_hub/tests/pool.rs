@@ -51,6 +51,8 @@ pub(super) struct Cloud {
     pub(super) ready: Option<Progress>,
     /// Refuse every create with this.
     pub(super) refuse_all: Option<Refusal>,
+    /// Refuse the SSH key before any server is created.
+    pub(super) refuse_key_registration: bool,
     /// Refuse creates of a server type in a location.
     pub(super) refuse: BTreeMap<(String, String), Refusal>,
     /// A refused create leaves its labelled firewall behind, as a half-done create can.
@@ -111,6 +113,12 @@ impl Provisioner for FakeCloud {
         self.with(|cloud| {
             let place = (request.server_type.clone(), request.location.clone());
             cloud.attempts.push(place.clone());
+            if cloud.refuse_key_registration {
+                return Err(
+                    Failure::new(Refusal::Invalid, "provider refused the pool key")
+                        .during_key_registration(),
+                );
+            }
             if let Some(refusal) = cloud
                 .refuse_all
                 .or_else(|| cloud.refuse.get(&place).copied())
@@ -838,6 +846,26 @@ async fn an_unconfirmed_create_is_adopted_instead_of_duplicated() {
     assert_eq!(lease.server_id, Some(existing));
     assert_eq!(lease.phase, LeasePhase::Booting);
     assert!(rig.cloud.with(|cloud| cloud.created.is_empty()));
+}
+
+#[tokio::test]
+async fn provider_key_registration_failures_are_their_own_error() {
+    let cloud = FakeCloud::default();
+    cloud.with(|cloud| cloud.refuse_key_registration = true);
+    let rig = rig_with(cloud);
+    rig.add_pool(1).await;
+    rig.enqueue("hj_one").await;
+    let view = rig.pass().await;
+    assert!(
+        first_error(&view).contains("provider key registration: provider refused the pool key"),
+        "{view}"
+    );
+    let lease = rig.lease().await;
+    assert_eq!(lease.phase, LeasePhase::Creating);
+    assert!(
+        rig.cloud.with(|cloud| cloud.created.is_empty()),
+        "no server was created"
+    );
 }
 
 #[tokio::test]

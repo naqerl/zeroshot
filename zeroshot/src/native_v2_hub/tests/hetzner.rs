@@ -9,11 +9,15 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
+use super::super::data;
 use super::super::hetzner::{Hetzner, Token, classify};
-use super::super::pool::{Resource, ResourceKind};
-use super::super::provision::{Architecture, Progress, Provisioner, Refusal, ServerRequest};
+use super::super::pool::{Lease, Resource, ResourceKind};
+use super::super::provision::{self, Architecture, Progress, Provisioner, Refusal, ServerRequest};
+use super::pool::pool_fixture;
 
 const SECRET: &str = "test-token-not-real";
+const PUBLIC_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl hub@zeroshot\n";
+const FINGERPRINT: &str = "65:96:2d:fc:e8:d5:a9:11:64:0c:0f:ea:00:6e:5b:bd";
 
 /// A scripted answer: status, JSON body (`None` sends plain text) and extra headers.
 #[derive(Clone)]
@@ -116,9 +120,28 @@ fn request() -> ServerRequest {
         location: "fsn1".to_owned(),
         image: "docker-ce".to_owned(),
         user_data: "#cloud-config\n".to_owned(),
+        public_key: PUBLIC_KEY.to_owned(),
         labels: BTreeMap::from([("zeroshot/hub".to_owned(), "h1".to_owned())]),
         ssh_from: vec!["198.51.100.7/32".to_owned()],
         volume_gb: None,
+    }
+}
+
+fn registered_key(id: u64) -> Answer {
+    answer(
+        200,
+        json!({"ssh_keys": [{
+            "id": id,
+            "name": "zeroshot-hub",
+            "fingerprint": FINGERPRINT,
+            "public_key": PUBLIC_KEY.trim(),
+        }]}),
+    )
+}
+
+fn register_key(mock: &Mock, count: usize) {
+    for _ in 0..count {
+        mock.on("GET /v1/ssh_keys", registered_key(7));
     }
 }
 
@@ -134,6 +157,7 @@ fn resource(kind: ResourceKind, id: u64) -> Resource {
 #[tokio::test]
 async fn create_puts_an_ssh_only_firewall_in_front_of_the_labelled_server() {
     let (hetzner, mock) = serve().await;
+    register_key(&mock, 1);
     mock.on(
         "POST /v1/firewalls",
         answer(201, json!({"firewall": {"id": 11}})),
@@ -151,21 +175,22 @@ async fn create_puts_an_ssh_only_firewall_in_front_of_the_labelled_server() {
         (22, Some(11), Some(33))
     );
     let seen = mock.seen();
-    assert_eq!(seen.len(), 2);
+    assert_eq!(seen.len(), 3);
     assert!(
         seen.iter()
             .all(|call| call.authorization == format!("Bearer {SECRET}"))
     );
-    let rule = &seen[0].body["rules"][0];
+    let rule = &seen[1].body["rules"][0];
     assert_eq!(rule["port"], json!("22"));
     assert_eq!(rule["direction"], json!("in"));
     assert_eq!(rule["source_ips"], json!(["198.51.100.7/32"]));
-    assert_eq!(seen[0].body["rules"].as_array().map(Vec::len), Some(1));
-    let server = &seen[1].body;
+    assert_eq!(seen[1].body["rules"].as_array().map(Vec::len), Some(1));
+    let server = &seen[2].body;
     assert_eq!(server["name"], json!("zs-one"));
     assert_eq!(server["server_type"], json!("cpx31"));
     assert_eq!(server["firewalls"], json!([{"firewall": 11}]));
     assert_eq!(server["volumes"], json!([]));
+    assert_eq!(server["ssh_keys"], json!([7]));
     assert_eq!(server["labels"]["zeroshot/hub"], json!("h1"));
     for call in &seen {
         assert!(!call.body.to_string().contains(SECRET));
@@ -174,8 +199,154 @@ async fn create_puts_an_ssh_only_firewall_in_front_of_the_labelled_server() {
 }
 
 #[tokio::test]
+async fn an_unregistered_key_is_created_and_its_id_is_used_for_the_server() {
+    let (hetzner, mock) = serve().await;
+    mock.on("GET /v1/ssh_keys", answer(200, json!({"ssh_keys": []})));
+    mock.on(
+        "POST /v1/ssh_keys",
+        answer(201, json!({"ssh_key": {"id": 8}})),
+    );
+    mock.on(
+        "POST /v1/firewalls",
+        answer(201, json!({"firewall": {"id": 11}})),
+    );
+    mock.on(
+        "POST /v1/servers",
+        answer(201, json!({"server": {"id": 22}})),
+    );
+    hetzner.create(&request()).await.expect("created");
+    let seen = mock.seen();
+    assert_eq!(seen[1].method, "POST");
+    assert_eq!(seen[1].uri, "/v1/ssh_keys");
+    assert_eq!(seen[1].body["public_key"], json!(PUBLIC_KEY.trim()));
+    assert_eq!(seen[1].body["name"], json!("zeroshot-hub-65962dfce8d5"));
+    assert_eq!(seen[3].body["ssh_keys"], json!([8]));
+}
+
+#[tokio::test]
+async fn a_uniqueness_conflict_re_lists_and_reuses_the_existing_key() {
+    let (hetzner, mock) = serve().await;
+    mock.on("GET /v1/ssh_keys", answer(200, json!({"ssh_keys": []})));
+    mock.on(
+        "POST /v1/ssh_keys",
+        answer(
+            409,
+            json!({"error": {"code": "uniqueness_error", "message": "already exists"}}),
+        ),
+    );
+    mock.on("GET /v1/ssh_keys", registered_key(9));
+    mock.on(
+        "POST /v1/firewalls",
+        answer(201, json!({"firewall": {"id": 11}})),
+    );
+    mock.on(
+        "POST /v1/servers",
+        answer(201, json!({"server": {"id": 22}})),
+    );
+    hetzner.create(&request()).await.expect("created");
+    let seen = mock.seen();
+    assert_eq!(
+        seen.iter()
+            .filter(|call| call.uri.starts_with("/v1/ssh_keys"))
+            .count(),
+        3
+    );
+    assert_eq!(seen.last().expect("server").body["ssh_keys"], json!([9]));
+}
+
+#[tokio::test]
+async fn an_already_registered_key_is_not_created_again() {
+    let (hetzner, mock) = serve().await;
+    register_key(&mock, 1);
+    mock.on(
+        "POST /v1/firewalls",
+        answer(201, json!({"firewall": {"id": 11}})),
+    );
+    mock.on(
+        "POST /v1/servers",
+        answer(201, json!({"server": {"id": 22}})),
+    );
+    hetzner.create(&request()).await.expect("created");
+    assert!(
+        mock.seen()
+            .iter()
+            .all(|call| call.method != "POST" || call.uri != "/v1/ssh_keys"),
+        "the provider's existing key must be reused"
+    );
+}
+
+#[tokio::test]
+async fn an_unlistable_key_is_a_key_registration_failure() {
+    let (hetzner, mock) = serve().await;
+    mock.on(
+        "GET /v1/ssh_keys",
+        answer(
+            500,
+            json!({"error": {"code": "server_error", "message": "boom"}}),
+        ),
+    );
+    let failure = hetzner.create(&request()).await.expect_err("list failed");
+    assert!(
+        failure.key_registration,
+        "listing the pool key is a key operation, not a server create"
+    );
+}
+
+#[tokio::test]
+async fn a_key_is_matched_by_its_md5_fingerprint() {
+    let (hetzner, mock) = serve().await;
+    mock.on(
+        "GET /v1/ssh_keys",
+        answer(
+            200,
+            json!({"ssh_keys": [{
+                "id": 10,
+                "name": "registered-elsewhere",
+                "fingerprint": FINGERPRINT.replace(':', "").to_uppercase(),
+                "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOther",
+            }]}),
+        ),
+    );
+    mock.on(
+        "POST /v1/firewalls",
+        answer(201, json!({"firewall": {"id": 11}})),
+    );
+    mock.on(
+        "POST /v1/servers",
+        answer(201, json!({"server": {"id": 22}})),
+    );
+    hetzner.create(&request()).await.expect("created");
+    let seen = mock.seen();
+    assert!(
+        seen.iter()
+            .all(|call| call.method != "POST" || call.uri != "/v1/ssh_keys"),
+        "the fingerprint match must avoid registering a duplicate"
+    );
+    assert_eq!(seen.last().expect("server").body["ssh_keys"], json!([10]));
+}
+
+#[test]
+fn user_data_disables_password_expiry_before_the_boot_script() {
+    let pool = pool_fixture();
+    let lease = Lease::new(&pool, "hj_one", 40123, 0);
+    let document = provision::user_data(&pool, &lease, PUBLIC_KEY).expect("user data");
+    assert!(
+        document.contains("chpasswd: { expire: false }\n"),
+        "{document}"
+    );
+    let chage = document
+        .find("chage -M 99999 -E -1 -I -1 -d $(date +%F) root")
+        .expect("chage");
+    let boot = document
+        .rfind(&format!("  - [{}]", data::BOOT_SCRIPT))
+        .expect("boot script runcmd");
+    assert!(chage < boot, "chage must be the first runcmd");
+}
+
+#[tokio::test]
 async fn a_refused_server_create_removes_its_firewall_and_reports_the_error() {
     let (hetzner, mock) = serve().await;
+    register_key(&mock, 5);
     mock.on(
         "POST /v1/firewalls",
         answer(201, json!({"firewall": {"id": 11}})),
@@ -203,7 +374,7 @@ async fn a_refused_server_create_removes_its_firewall_and_reports_the_error() {
         "{message}"
     );
     assert!(!message.contains(SECRET));
-    assert_eq!(mock.seen()[2].method, "DELETE");
+    assert_eq!(mock.seen().last().expect("call").method, "DELETE");
 
     mock.on(
         "POST /v1/firewalls",
@@ -638,6 +809,7 @@ fn empty(status: u16) -> Answer {
 #[tokio::test]
 async fn a_data_volume_is_created_unformatted_attached_and_undone_on_failure() {
     let (hetzner, mock) = serve().await;
+    register_key(&mock, 5);
     let with_volume = ServerRequest {
         volume_gb: Some(200),
         ..request()
@@ -660,8 +832,8 @@ async fn a_data_volume_is_created_unformatted_attached_and_undone_on_failure() {
         (22, Some(44), Some(11))
     );
     let seen = mock.seen();
-    let volume = &seen[1].body;
-    assert_eq!(seen[1].uri, "/v1/volumes");
+    let volume = &seen[2].body;
+    assert_eq!(seen[2].uri, "/v1/volumes");
     assert_eq!(volume["size"], json!(200));
     assert_eq!(volume["location"], json!("fsn1"));
     assert_eq!(volume["name"], json!("zs-one"));
@@ -671,8 +843,8 @@ async fn a_data_volume_is_created_unformatted_attached_and_undone_on_failure() {
         volume.get("format").is_none(),
         "the boot script formats it btrfs"
     );
-    assert_eq!(seen[2].body["volumes"], json!([44]));
-    assert_eq!(seen[2].body["automount"], json!(false));
+    assert_eq!(seen[3].body["volumes"], json!([44]));
+    assert_eq!(seen[3].body["automount"], json!(false));
 
     // A refused server deletes the Volume, then the firewall.
     mock.on(
