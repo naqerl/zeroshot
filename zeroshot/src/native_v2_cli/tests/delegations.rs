@@ -89,7 +89,7 @@ fn delegation_listing_and_owner_scope_parse_exactly() {
     assert_eq!(
         parse_native_v2_args(args(&["delegation", "list"])).assert_value(),
         NativeV2CliCommand::Delegation(DelegationCommand {
-            target: "cloud".to_owned(),
+            target: "platform".to_owned(),
             action: DelegationAction::List {
                 owner: DelegationOwner::User,
                 organization_id: None,
@@ -128,7 +128,7 @@ fn delegation_selectors_and_key_subcommands_parse_exactly() {
     assert_eq!(
         parse_native_v2_args(args(&["delegation", "show", id])).assert_value(),
         NativeV2CliCommand::Delegation(DelegationCommand {
-            target: "cloud".to_owned(),
+            target: "platform".to_owned(),
             action: DelegationAction::Show { id: id.to_owned() },
         })
     );
@@ -143,7 +143,7 @@ fn delegation_selectors_and_key_subcommands_parse_exactly() {
     assert_eq!(
         parse_native_v2_args(args(&["delegation", "key", "list", id])).assert_value(),
         NativeV2CliCommand::Delegation(DelegationCommand {
-            target: "cloud".to_owned(),
+            target: "platform".to_owned(),
             action: DelegationAction::KeyList { id: id.to_owned() },
         })
     );
@@ -175,7 +175,7 @@ fn delegation_selectors_and_key_subcommands_parse_exactly() {
     assert_eq!(
         parse_native_v2_args(args(&["delegation", "key", "create", id])).assert_value(),
         NativeV2CliCommand::Delegation(DelegationCommand {
-            target: "cloud".to_owned(),
+            target: "platform".to_owned(),
             action: DelegationAction::KeyCreate {
                 id: id.to_owned(),
                 request: DelegationKeyCreateRequest {
@@ -188,7 +188,7 @@ fn delegation_selectors_and_key_subcommands_parse_exactly() {
     assert_eq!(
         parse_native_v2_args(args(&["delegation", "key", "revoke", id, key_id])).assert_value(),
         NativeV2CliCommand::Delegation(DelegationCommand {
-            target: "cloud".to_owned(),
+            target: "platform".to_owned(),
             action: DelegationAction::KeyRevoke {
                 id: id.to_owned(),
                 key_id: key_id.to_owned(),

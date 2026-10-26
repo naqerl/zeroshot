@@ -77,6 +77,48 @@ impl Drop for TemporaryDirectory {
     }
 }
 
+/// Absolute path to the Python 3 interpreter used by Unix executable fixtures.
+///
+/// Fixture scripts keep the portable `#!/usr/bin/env python3` shebang so the repository does not
+/// depend on one host layout, while `python3_script` binds execution to the interpreter that is
+/// actually installed on the machine running the test.
+#[cfg(unix)]
+#[must_use]
+pub fn python3_interpreter() -> PathBuf {
+    let mut candidates = vec![
+        PathBuf::from("/usr/local/bin/python3"),
+        PathBuf::from("/usr/bin/python3"),
+        PathBuf::from("/bin/python3"),
+    ];
+    if let Some(search_path) = std::env::var_os("PATH") {
+        candidates
+            .extend(std::env::split_paths(&search_path).map(|directory| directory.join("python3")));
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| {
+            candidate
+                .metadata()
+                .is_ok_and(|metadata| metadata.is_file())
+        })
+        .expect("a Python 3 interpreter is required by executable fixtures")
+}
+
+/// Rewrites a portable Python fixture shebang to the interpreter installed on this host.
+#[cfg(unix)]
+#[must_use]
+pub fn python3_script(source: &str) -> String {
+    const PORTABLE: &str = "#!/usr/bin/env python3";
+    match source.strip_prefix(PORTABLE) {
+        Some(rest) => format!(
+            "#!{}\n{}",
+            python3_interpreter().display(),
+            rest.strip_prefix('\n').unwrap_or(rest)
+        ),
+        None => source.to_owned(),
+    }
+}
+
 /// Writes a Unix executable and waits out writable descriptors inherited by concurrent forks.
 ///
 /// The lock handoff closes the `fork`/`CLOEXEC` window that can otherwise make an immediate spawn

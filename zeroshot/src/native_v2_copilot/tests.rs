@@ -27,11 +27,13 @@ mod hosted;
 const INSTRUCTIONS: &str = "Return answer 42 using the required schema.";
 
 fn script() -> String {
-    std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/native_v2_copilot/tests/runtime.py"
-    ))
-    .unwrap()
+    openengine_cluster_testkit::fixture::python3_script(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/native_v2_copilot/tests/runtime.py"
+        ))
+        .unwrap(),
+    )
 }
 
 fn binding(names: impl Iterator<Item = String>) -> NodeRuntimeBinding {

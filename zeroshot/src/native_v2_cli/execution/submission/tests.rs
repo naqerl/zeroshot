@@ -543,22 +543,25 @@ fn connection_selection_keeps_present_utf8_fields_and_rejects_non_utf8_values() 
         Some(&"secret".to_owned())
     );
 
-    let error = select_connection_requirements(
-        BTreeMap::from([(
-            ConnectionKey::new("provider").assert_value(),
-            [EnvironmentVariableName::new("OPENAI_API_KEY").assert_value()]
-                .into_iter()
-                .collect(),
-        )]),
-        |_| {
-            use std::os::unix::ffi::OsStringExt as _;
-            Some(OsString::from_vec(vec![b'n', 0xff]))
-        },
-    )
-    .expect_err("non-UTF-8 environment values must not be submitted");
-    assert!(
-        matches!(error, NativeV2CliError::Environment(name) if name.as_str() == "OPENAI_API_KEY")
-    );
+    #[cfg(unix)]
+    {
+        let error = select_connection_requirements(
+            BTreeMap::from([(
+                ConnectionKey::new("provider").assert_value(),
+                [EnvironmentVariableName::new("OPENAI_API_KEY").assert_value()]
+                    .into_iter()
+                    .collect(),
+            )]),
+            |_| {
+                use std::os::unix::ffi::OsStringExt as _;
+                Some(OsString::from_vec(vec![b'n', 0xff]))
+            },
+        )
+        .expect_err("non-UTF-8 environment values must not be submitted");
+        assert!(
+            matches!(error, NativeV2CliError::Environment(name) if name.as_str() == "OPENAI_API_KEY")
+        );
+    }
 }
 
 fn intent_command(selection: RunSelection) -> RunCommand {
