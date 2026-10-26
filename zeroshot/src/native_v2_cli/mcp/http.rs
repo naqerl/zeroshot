@@ -462,7 +462,7 @@ where
             return;
         }
     };
-    let reply = process_request(host.as_ref(), &resolved.state, &job.message).await;
+    let reply = process_request(host, &resolved.state, &job.message).await;
     let _ = job.reply.send(JobReply {
         session: resolved.id,
         reply,
@@ -470,7 +470,7 @@ where
 }
 
 async fn process_request<H>(
-    host: &H,
+    host: &Rc<H>,
     session: &Rc<RefCell<SessionState>>,
     message: &Value,
 ) -> WorkerReply
@@ -516,7 +516,7 @@ where
 }
 
 async fn process_message<H>(
-    host: &H,
+    host: &Rc<H>,
     session: &Rc<RefCell<SessionState>>,
     message: &Value,
 ) -> WorkerReply
@@ -541,7 +541,7 @@ where
         session.borrow_mut().reset_for_initialize();
     }
     let initialized = session.borrow().initialized();
-    match serve::dispatch(host, message, initialized).await {
+    match serve::dispatch(host.as_ref(), message, initialized).await {
         Action::Reply(result) => {
             if method == Some("initialize") {
                 session.borrow_mut().mark_initialized();
@@ -556,7 +556,14 @@ where
         Action::Stream(prepared) => {
             let (sender, receiver) = mpsc::unbounded_channel();
             let writer = Arc::new(Mutex::new(LineWriter::new(sender)));
-            session.borrow_mut().spawn_stream(prepared, id, &writer);
+            session.borrow_mut().spawn_stream(
+                serve::StreamRequest {
+                    prepared,
+                    id,
+                    writer,
+                },
+                host,
+            );
             WorkerReply::Stream(receiver)
         }
     }

@@ -1,3 +1,4 @@
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -12,6 +13,7 @@ use super::args::{
     bool_prop, object_schema, optional_string, reject_unknown, string_array_prop, string_prop,
 };
 use super::host::{parse_cli, McpFailure, McpHost, WatchStream};
+use super::super::hub::{HubCommand, HubRequest};
 use super::super::{NativeV2CliCommand, RunWatchCommand};
 
 pub(super) const EXTENSION_ID: &str = "io.modelcontextprotocol/events";
@@ -24,13 +26,28 @@ const MAX_EVENTS_LIMIT: u64 = 1000;
 const NEXT_POLL_MS: u64 = 1000;
 const DRAIN_LIMIT: usize = 10_000;
 const PHASES: &[&str] = &["admitted", "running", "stopping", "finished"];
+/// The hub's built-in local member is the default local backend, not a named target.
+const LOCAL_HUB_MEMBER: &str = "local";
 
 pub(super) struct Prepared {
-    stream: WatchStream,
-    cursor: Option<String>,
-    run: Option<Value>,
-    replayed: Vec<Value>,
+    source: Source,
     filters: Filters,
+}
+
+enum Source {
+    Watch {
+        stream: WatchStream,
+        cursor: Option<String>,
+        run: Option<Value>,
+        replayed: Vec<Value>,
+    },
+    Discovery(Discovery),
+}
+
+struct Discovery {
+    job_id: String,
+    target: Option<String>,
+    job: JobSnapshot,
 }
 
 pub(super) enum EventError {
@@ -44,10 +61,27 @@ pub(super) enum EventError {
 }
 
 struct PollRequest {
-    arguments: Value,
+    selector: Selector,
+    target: Option<String>,
     cursor: Option<String>,
     max_events: usize,
     filters: Filters,
+}
+
+#[derive(Clone)]
+enum Selector {
+    Run(String),
+    Job(String),
+}
+
+struct JobSnapshot {
+    view: Value,
+    run_id: Option<String>,
+    target: Option<String>,
+    state: String,
+    terminal: bool,
+    error: Value,
+    error_kind: Value,
 }
 
 #[derive(Clone, Default)]
@@ -121,15 +155,21 @@ pub(super) fn list(params: &Value) -> Result<Value, EventError> {
         "events": [{
             "name": EVENT_NAME,
             "description": "A durable run event from the same stream `zeroshot watch` reads. \
-                Subscribe with runId and an optional target. Delivery is poll or push. \
-                Signed webhooks (events/subscribe) are unsupported. maxAgeMs is accepted at \
-                the subscription level but not applied because durable watch records carry no \
-                occurrence time; the event timestamp is delivery time.",
+                Subscribe with exactly one of runId or jobId and an optional target. Delivery is \
+                poll or push. Signed webhooks (events/subscribe) are unsupported. maxAgeMs is \
+                accepted at the subscription level but not applied because durable watch records \
+                carry no occurrence time; the event timestamp is delivery time.",
             "delivery": ["poll", "push"],
             "inputSchema": input_schema(),
             "payloadSchema": payload_schema(),
         }]
     }))
+}
+
+pub(super) fn requests_subscription(params: &Value) -> bool {
+    params
+        .get("arguments")
+        .is_some_and(|arguments| !arguments.is_null())
 }
 
 pub(super) fn unsupported_webhook() -> EventError {
@@ -141,53 +181,167 @@ pub(super) fn unsupported_webhook() -> EventError {
 
 pub(super) async fn poll(host: &impl McpHost, params: &Value) -> Result<Value, EventError> {
     let request = parse_subscription(params, true)?;
-    let batch = collect(host, &request).await?;
-    Ok(json!({
+    let (batch, job) = match request.selector.clone() {
+        Selector::Run(run_id) => {
+            let batch = collect(host, &request, &run_id, request.target.as_deref()).await?;
+            (batch, None)
+        }
+        Selector::Job(job_id) => {
+            let snapshot = job_status(host, &job_id).await?;
+            if let Some(run_id) = snapshot.run_id.clone() {
+                let target = request.target.clone().or_else(|| snapshot.target.clone());
+                let batch = collect(host, &request, &run_id, target.as_deref()).await?;
+                (batch, Some(snapshot.view))
+            } else {
+                (
+                    Batch {
+                        events: Vec::new(),
+                        cursor: None,
+                        truncated: false,
+                        has_more: false,
+                    },
+                    Some(snapshot.view),
+                )
+            }
+        }
+    };
+    let mut result = json!({
         "resultType": "complete",
         "events": batch.events,
         "cursor": cursor_value(&batch.cursor),
         "truncated": batch.truncated,
         "hasMore": batch.has_more,
         "nextPollMs": NEXT_POLL_MS,
-    }))
+    });
+    if let Some(job) = job {
+        result["job"] = job;
+    }
+    Ok(result)
 }
 
 pub(super) async fn prepare(host: &impl McpHost, params: &Value) -> Result<Prepared, EventError> {
     let request = parse_subscription(params, false)?;
-    let command = watch_command(&request.arguments, request.cursor.as_deref())?;
+    match request.selector.clone() {
+        Selector::Run(run_id) => {
+            prepare_watch(host, &request, &run_id, request.target.as_deref()).await
+        }
+        Selector::Job(job_id) => {
+            let snapshot = job_status(host, &job_id).await?;
+            if let Some(run_id) = snapshot.run_id.clone() {
+                let target = request.target.clone().or_else(|| snapshot.target.clone());
+                prepare_watch(host, &request, &run_id, target.as_deref()).await
+            } else {
+                let target = request.target.clone().or_else(|| snapshot.target.clone());
+                Ok(Prepared {
+                    source: Source::Discovery(Discovery {
+                        job_id,
+                        target,
+                        job: snapshot,
+                    }),
+                    filters: request.filters,
+                })
+            }
+        }
+    }
+}
+
+async fn prepare_watch(
+    host: &impl McpHost,
+    request: &PollRequest,
+    run_id: &str,
+    target: Option<&str>,
+) -> Result<Prepared, EventError> {
+    let command = watch_command(run_id, target, request.cursor.as_deref())?;
     let mut stream = host.open_watch(&command).await.map_err(classify)?;
     let (cursor, run, replayed) = if request.cursor.is_none() {
         let drained = drain(&mut stream).await?;
         let run = drained.first().and_then(run_constants);
         (None, run, drained)
     } else {
-        (request.cursor, None, Vec::new())
+        (request.cursor.clone(), None, Vec::new())
     };
     Ok(Prepared {
-        stream,
-        cursor,
-        run,
-        replayed,
-        filters: request.filters,
+        source: Source::Watch {
+            stream,
+            cursor,
+            run,
+            replayed,
+        },
+        filters: request.filters.clone(),
     })
 }
 
-pub(super) async fn drive<W>(
-    prepared: Prepared,
+pub(super) struct StreamOutput<W> {
     id: Value,
     writer: Arc<Mutex<W>>,
     cancelled: Arc<AtomicBool>,
+}
+
+impl<W> StreamOutput<W> {
+    pub(super) fn new(id: Value, writer: Arc<Mutex<W>>, cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            id,
+            writer,
+            cancelled,
+        }
+    }
+}
+
+struct WatchState {
+    stream: WatchStream,
+    cursor: Option<String>,
+    run: Option<Value>,
+    replayed: Vec<Value>,
+}
+
+pub(super) async fn drive<W, H>(
+    prepared: Prepared,
+    output: StreamOutput<W>,
+    host: Rc<H>,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin + Send,
+    H: McpHost + 'static,
+{
+    let Prepared { source, filters } = prepared;
+    match source {
+        Source::Watch {
+            stream,
+            cursor,
+            run,
+            replayed,
+        } => {
+            let state = WatchState {
+                stream,
+                cursor,
+                run,
+                replayed,
+            };
+            drive_watch(state, &filters, output).await
+        }
+        Source::Discovery(discovery) => drive_discovery(host, discovery, filters, output).await,
+    }
+}
+
+async fn drive_watch<W>(
+    state: WatchState,
+    filters: &Filters,
+    output: StreamOutput<W>,
 ) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin + Send,
 {
-    let Prepared {
+    let WatchState {
         mut stream,
         mut cursor,
         mut run,
         replayed,
-        filters,
-    } = prepared;
+    } = state;
+    let StreamOutput {
+        id,
+        writer,
+        cancelled,
+    } = output;
     if cancelled.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -198,13 +352,14 @@ where
             cursor: &cursor,
             run: run.as_ref(),
             truncated: false,
+            job: None,
         },
     )
     .await?;
     let mut delivery = Delivery {
         cursor: &mut cursor,
         run: &mut run,
-        filters: &filters,
+        filters,
         replayed: true,
     };
     for event in replayed {
@@ -247,6 +402,227 @@ where
             }
         }
     }
+}
+
+async fn drive_discovery<W, H>(
+    host: Rc<H>,
+    discovery: Discovery,
+    filters: Filters,
+    output: StreamOutput<W>,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin + Send,
+    H: McpHost + 'static,
+{
+    let StreamOutput {
+        id,
+        writer,
+        cancelled,
+    } = output;
+    let Discovery {
+        job_id,
+        mut target,
+        mut job,
+    } = discovery;
+    let mut sequence = 0_u64;
+    let mut cursor = Some(next_discovery_cursor(&mut sequence));
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    write_active(
+        &writer,
+        &id,
+        &ActiveView {
+            cursor: &cursor,
+            run: None,
+            truncated: false,
+            job: Some(&job.view),
+        },
+    )
+    .await?;
+    if job.terminal {
+        let terminal_cursor = next_discovery_cursor(&mut sequence);
+        write_discovery_terminal(
+            &writer,
+            &id,
+            DiscoveryTerminal {
+                job_id: &job_id,
+                job: &job,
+                cursor: &terminal_cursor,
+            },
+        )
+        .await?;
+        write_result(&writer, &id).await?;
+        return Ok(());
+    }
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.tick().await;
+    let mut poll = tokio::time::interval(Duration::from_millis(NEXT_POLL_MS));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    poll.tick().await;
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        tokio::select! {
+            biased;
+            _ = heartbeat.tick() => {
+                write_heartbeat(&writer, &id, &cursor).await?;
+            }
+            _ = poll.tick() => {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                let snapshot = match job_status(host.as_ref(), &job_id).await {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        return finish_stream_error(&writer, &id, error).await;
+                    }
+                };
+                if target.is_none() {
+                    target = snapshot.target.clone();
+                }
+                if let Some(run_id) = snapshot.run_id.clone() {
+                    let command = match watch_command(&run_id, target.as_deref(), None) {
+                        Ok(command) => command,
+                        Err(error) => {
+                            return finish_stream_error(&writer, &id, error).await;
+                        }
+                    };
+                    let stream = match host.open_watch(&command).await {
+                        Ok(stream) => stream,
+                        Err(failure) => {
+                            write_failure(&writer, &id, &failure).await?;
+                            write_result(&writer, &id).await?;
+                            return Ok(());
+                        }
+                    };
+                    let state = WatchState {
+                        stream,
+                        cursor: None,
+                        run: None,
+                        replayed: Vec::new(),
+                    };
+                    return drive_watch(state, &filters, StreamOutput::new(id, writer, cancelled))
+                        .await;
+                }
+                if snapshot.terminal {
+                    let terminal_cursor = next_discovery_cursor(&mut sequence);
+                    write_discovery_terminal(
+                        &writer,
+                        &id,
+                        DiscoveryTerminal {
+                            job_id: &job_id,
+                            job: &snapshot,
+                            cursor: &terminal_cursor,
+                        },
+                    )
+                    .await?;
+                    write_result(&writer, &id).await?;
+                    return Ok(());
+                }
+                if snapshot.view != job.view {
+                    job = snapshot;
+                    cursor = Some(next_discovery_cursor(&mut sequence));
+                    write_active(
+                        &writer,
+                        &id,
+                        &ActiveView {
+                            cursor: &cursor,
+                            run: None,
+                            truncated: false,
+                            job: Some(&job.view),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
+}
+
+async fn finish_stream_error<W>(
+    writer: &Mutex<W>,
+    id: &Value,
+    error: EventError,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match error {
+        EventError::Invalid(failure) | EventError::Failed(failure) => {
+            write_failure(writer, id, &failure).await?;
+        }
+        other => {
+            let (_, _, data) = rpc_error(other);
+            let failure = McpFailure {
+                code: data
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("event.error")
+                    .to_owned(),
+                message: data
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("event stream failed")
+                    .to_owned(),
+            };
+            write_failure(writer, id, &failure).await?;
+        }
+    }
+    write_result(writer, id).await
+}
+
+fn next_discovery_cursor(sequence: &mut u64) -> String {
+    *sequence = sequence.saturating_add(1);
+    format!("v2:{sequence}")
+}
+
+struct DiscoveryTerminal<'a> {
+    job_id: &'a str,
+    job: &'a JobSnapshot,
+    cursor: &'a str,
+}
+
+async fn write_discovery_terminal<W>(
+    writer: &Mutex<W>,
+    id: &Value,
+    terminal: DiscoveryTerminal<'_>,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let DiscoveryTerminal {
+        job_id,
+        job,
+        cursor,
+    } = terminal;
+    write_notification(
+        writer,
+        "notifications/events/event",
+        json!({
+            "eventId": format!("{job_id}:{cursor}"),
+            "name": EVENT_NAME,
+            "timestamp": now_rfc3339(),
+            "cursor": cursor,
+            "replayed": false,
+            "data": job.view.clone(),
+            "job": job.view.clone(),
+            "jobId": job_id,
+            "state": job.state,
+            "error": job.error,
+            "errorKind": job.error_kind,
+            "summary": {
+                "phase": Value::Null,
+                "node": Value::Null,
+                "terminal": true,
+                "reason": job.error_kind,
+            },
+            "_meta": meta(id),
+        }),
+    )
+    .await
 }
 
 pub(super) fn rpc_error(error: EventError) -> (i64, &'static str, Value) {
@@ -330,13 +706,25 @@ fn parse_subscription(params: &Value, capped: bool) -> Result<PollRequest, Event
             )));
         }
     };
-    let filters = parse_filters(
-        arguments
-            .as_object()
-            .expect("arguments was validated as an object"),
-    )?;
+    let arguments = arguments
+        .as_object()
+        .expect("arguments was validated as an object");
+    let run_id = optional_string(arguments, "runId").map_err(EventError::Invalid)?;
+    let job_id = optional_string(arguments, "jobId").map_err(EventError::Invalid)?;
+    let selector = match (run_id, job_id) {
+        (Some(run_id), None) => Selector::Run(run_id),
+        (None, Some(job_id)) => Selector::Job(job_id),
+        _ => {
+            return Err(EventError::Invalid(McpFailure::invalid(
+                "exactly one of runId or jobId is required",
+            )));
+        }
+    };
+    let target = optional_string(arguments, "target").map_err(EventError::Invalid)?;
+    let filters = parse_filters(arguments)?;
     Ok(PollRequest {
-        arguments,
+        selector,
+        target,
         cursor,
         max_events,
         filters,
@@ -348,6 +736,7 @@ fn parse_filters(arguments: &Map<String, Value>) -> Result<Filters, EventError> 
         arguments,
         &[
             "runId",
+            "jobId",
             "target",
             "phases",
             "nodes",
@@ -434,8 +823,13 @@ fn max_events(map: &Map<String, Value>) -> Result<usize, EventError> {
     Ok(usize::try_from(count).unwrap_or(DEFAULT_MAX_EVENTS))
 }
 
-async fn collect(host: &impl McpHost, request: &PollRequest) -> Result<Batch, EventError> {
-    let command = watch_command(&request.arguments, request.cursor.as_deref())?;
+async fn collect(
+    host: &impl McpHost,
+    request: &PollRequest,
+    run_id: &str,
+    target: Option<&str>,
+) -> Result<Batch, EventError> {
+    let command = watch_command(run_id, target, request.cursor.as_deref())?;
     let mut stream = host.open_watch(&command).await.map_err(classify)?;
     if let Some(cursor) = request.cursor.as_deref() {
         return collect_after(&mut stream, cursor, request).await;
@@ -529,31 +923,74 @@ fn last_cursor(events: &[Value]) -> Result<Option<String>, EventError> {
         .transpose()
 }
 
-fn watch_command(arguments: &Value, cursor: Option<&str>) -> Result<RunWatchCommand, EventError> {
-    let Some(map) = arguments.as_object() else {
-        return Err(EventError::Invalid(McpFailure::invalid(
-            "arguments must be an object",
-        )));
+async fn job_status(host: &impl McpHost, job_id: &str) -> Result<JobSnapshot, EventError> {
+    let output = host
+        .execute(NativeV2CliCommand::Hub(HubRequest {
+            context: None,
+            command: HubCommand::Status {
+                job: job_id.to_owned(),
+            },
+        }))
+        .await
+        .map_err(classify)?;
+    let document: Value = serde_json::from_str(output.trim()).map_err(invalid_hub_response)?;
+    let view = match document.get("job") {
+        Some(view @ Value::Object(_)) => view.clone(),
+        None if document.get("jobId").is_some() => document,
+        _ => {
+            return Err(EventError::Failed(McpFailure {
+                code: "hub.invalid_response".to_owned(),
+                message: "hub job status did not contain a job".to_owned(),
+            }));
+        }
     };
-    reject_unknown(
-        map,
-        &[
-            "runId",
-            "target",
-            "phases",
-            "nodes",
-            "terminalOnly",
-            "verbose",
-        ],
-    )
-    .map_err(EventError::Invalid)?;
-    let mut argv = vec!["watch".to_owned()];
-    if let Some(run_id) = optional_string(map, "runId").map_err(EventError::Invalid)? {
-        argv.push(run_id);
-    }
-    if let Some(target) = optional_string(map, "target").map_err(EventError::Invalid)? {
+    let run_id = view
+        .get("runId")
+        .and_then(Value::as_str)
+        .filter(|run_id| !run_id.is_empty())
+        .map(str::to_owned);
+    let state = view
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Ok(JobSnapshot {
+        target: view
+            .get("target")
+            .and_then(Value::as_str)
+            .filter(|target| *target != LOCAL_HUB_MEMBER)
+            .map(str::to_owned),
+        terminal: run_id.is_none() && job_is_terminal(&view),
+        error: view.get("error").cloned().unwrap_or(Value::Null),
+        error_kind: view.get("errorKind").cloned().unwrap_or(Value::Null),
+        view,
+        run_id,
+        state,
+    })
+}
+
+fn invalid_hub_response(error: serde_json::Error) -> EventError {
+    EventError::Failed(McpFailure {
+        code: "hub.invalid_response".to_owned(),
+        message: format!("hub job status was not JSON: {error}"),
+    })
+}
+
+fn job_is_terminal(view: &Value) -> bool {
+    view.get("state")
+        .and_then(Value::as_str)
+        .is_some_and(|state| matches!(state, "succeeded" | "failed" | "dequeued" | "expired"))
+}
+
+fn watch_command(
+    run_id: &str,
+    target: Option<&str>,
+    cursor: Option<&str>,
+) -> Result<RunWatchCommand, EventError> {
+    let mut argv = vec!["watch".to_owned(), run_id.to_owned()];
+    if let Some(target) = target {
         argv.push("--target".to_owned());
-        argv.push(target);
+        argv.push(target.to_owned());
     }
     if let Some(cursor) = cursor {
         argv.push("--after".to_owned());
@@ -733,9 +1170,15 @@ fn meta(id: &Value) -> Value {
 
 fn input_schema() -> Value {
     let mut schema = object_schema(
-        &["runId"],
+        &[],
         vec![
             ("runId", string_prop("Public run ID.")),
+            (
+                "jobId",
+                string_prop(
+                    "Hub job ID. A job that has a run behaves like that runId; a queued, scheduled, or placing job is followed until it has a run or reaches a terminal state.",
+                ),
+            ),
             (
                 "target",
                 string_prop("Named target. Omit for the local controller."),
@@ -763,20 +1206,70 @@ fn input_schema() -> Value {
             ),
         ],
     );
+    schema["oneOf"] = json!([{"required": ["runId"]}, {"required": ["jobId"]}]);
     schema["description"] = json!(
-        "Subscription arguments. maxAgeMs is accepted but not applied because durable watch \
-         records carry no occurrence time; the event timestamp is delivery time."
+        "Subscription arguments. Provide exactly one of runId or jobId. A jobId may be combined \
+         with target. maxAgeMs is accepted but not applied because durable watch records carry \
+         no occurrence time; the event timestamp is delivery time."
     );
     schema
 }
 
 fn payload_schema() -> Value {
+    let run_data = json!({
+        "type": "object",
+        "description": "Trimmed watch record. Run constants are sent once on notifications/events/active.",
+        "additionalProperties": false,
+        "required": ["runId", "cursor", "status"],
+        "properties": {
+            "runId": {"type": "string"},
+            "cursor": {"type": "string"},
+            "status": {
+                "type": "object",
+                "description": "Public run status. status.metadata is present only when phase is finished.",
+                "additionalProperties": true,
+                "properties": {
+                    "phase": {
+                        "type": "string",
+                        "enum": PHASES
+                    },
+                    "activeExecutions": {"type": "array"},
+                    "terminalResult": {
+                        "type": "object",
+                        "description": "On failed terminal events context.recorded is {reason,lastError,errorCount} unless verbose is true."
+                    },
+                    "metadata": {"type": "object"}
+                }
+            }
+        }
+    });
+    let job_data = json!({
+        "type": "object",
+        "description": "Hub job state while a queued, scheduled, or placing job is followed before it has a run, and on its terminal event if it never runs.",
+        "additionalProperties": true,
+        "required": ["jobId", "state"],
+        "properties": {
+            "jobId": {"type": "string"},
+            "state": {
+                "type": "string",
+                "enum": ["queued", "scheduled", "running", "succeeded", "failed", "dequeued", "expired"]
+            },
+            "runId": {"type": ["string", "null"]},
+            "target": {"type": ["string", "null"]},
+            "error": {"type": ["string", "null"]},
+            "errorKind": {"type": ["string", "null"]}
+        }
+    });
     json!({
         "type": "object",
         "additionalProperties": false,
         "required": ["eventId", "name", "timestamp", "data", "summary", "replayed", "_meta"],
         "properties": {
-            "eventId": {"type": "string"},
+            "eventId": {
+                "type": "string",
+                "description": "Run events use <runId>:<cursor>; discovery-phase notifications use <jobId>:<cursor>."
+            },
+            "jobId": {"type": "string"},
             "name": {"type": "string", "const": EVENT_NAME},
             "timestamp": {"type": "string", "format": "date-time"},
             "cursor": {
@@ -784,33 +1277,15 @@ fn payload_schema() -> Value {
                 "description": "Stream notification cursor; poll results return the next cursor separately."
             },
             "replayed": {"type": "boolean"},
-            "data": {
-                "type": "object",
-                "description": "Trimmed watch record. Run constants are sent once on notifications/events/active.",
-                "additionalProperties": false,
-                "required": ["runId", "cursor", "status"],
-                "properties": {
-                    "runId": {"type": "string"},
-                    "cursor": {"type": "string"},
-                    "status": {
-                        "type": "object",
-                        "description": "Public run status. status.metadata is present only when phase is finished.",
-                        "additionalProperties": true,
-                        "properties": {
-                            "phase": {
-                                "type": "string",
-                                "enum": PHASES
-                            },
-                            "activeExecutions": {"type": "array"},
-                            "terminalResult": {
-                                "type": "object",
-                                "description": "On failed terminal events context.recorded is {reason,lastError,errorCount} unless verbose is true."
-                            },
-                            "metadata": {"type": "object"}
-                        }
-                    }
-                }
+            "data": {"oneOf": [run_data, job_data.clone()]},
+            "job": job_data,
+            "state": {
+                "type": "string",
+                "description": "Terminal job state when the job never ran.",
+                "enum": ["queued", "scheduled", "running", "succeeded", "failed", "dequeued", "expired"]
             },
+            "error": {"type": ["string", "null"]},
+            "errorKind": {"type": ["string", "null"]},
             "summary": {
                 "type": "object",
                 "additionalProperties": false,
@@ -838,6 +1313,7 @@ struct ActiveView<'a> {
     cursor: &'a Option<String>,
     run: Option<&'a Value>,
     truncated: bool,
+    job: Option<&'a Value>,
 }
 
 async fn emit_event<W>(
@@ -872,6 +1348,7 @@ where
         cursor: &*delivery.cursor,
         run: delivery.run.as_ref(),
         truncated: gap,
+        job: None,
     };
     let Some(mut params) = occurrence else {
         return write_active(writer, id, &active).await;
@@ -891,17 +1368,24 @@ async fn write_active<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    write_notification(
-        writer,
-        "notifications/events/active",
-        json!({
-            "cursor": cursor_value(active.cursor),
-            "run": active.run.cloned().unwrap_or(Value::Null),
-            "truncated": active.truncated,
-            "_meta": meta(id),
-        }),
-    )
-    .await
+    let mut params = json!({
+        "cursor": cursor_value(active.cursor),
+        "run": active.run.cloned().unwrap_or(Value::Null),
+        "truncated": active.truncated,
+        "_meta": meta(id),
+    });
+    if let Some(job) = active.job {
+        params["job"] = job.clone();
+        for key in ["state", "error", "errorKind"] {
+            params[key] = job.get(key).cloned().unwrap_or(Value::Null);
+        }
+        if let (Some(job_id), Some(cursor)) =
+            (job.get("jobId").and_then(Value::as_str), active.cursor)
+        {
+            params["eventId"] = json!(format!("{job_id}:{cursor}"));
+        }
+    }
+    write_notification(writer, "notifications/events/active", params).await
 }
 
 async fn write_heartbeat<W>(
