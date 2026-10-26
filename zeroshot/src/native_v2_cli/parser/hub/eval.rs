@@ -137,7 +137,10 @@ pub(in crate::native_v2_cli::parser) enum HubEvalCaseCommand {
     mut_arg("validate_only", |arg| arg.hide(true)),
     mut_arg("detach", |arg| arg.hide(true)),
     mut_arg("title", |arg| arg.required(false).required_unless_present("from_job")),
-    mut_arg("input", |arg| arg.required(false).required_unless_present("from_job"))
+    mut_arg("input", |arg| arg.required(false).required_unless_present("from_job")),
+    mut_arg("task_from", |arg| arg
+        .required(false)
+        .required_unless_present("from_job"))
 )]
 pub(in crate::native_v2_cli::parser) struct HubEvalCaseAddArgs {
     // Declared first: clap hands fields their matches in order, and the run arguments must
@@ -162,11 +165,12 @@ pub(in crate::native_v2_cli::parser) struct HubEvalCaseAddArgs {
 }
 
 /// `zeroshot run` argument IDs that describe a task, so they conflict with --from-job.
-const RUN_ARGUMENT_IDS: [&str; 21] = [
+const RUN_ARGUMENT_IDS: [&str; 22] = [
     "title",
     "graph",
     "template",
     "input",
+    "task_from",
     "runtime_config",
     "uniform_runtime_config",
     "environment",

@@ -1,8 +1,8 @@
 //! The effects of pool leases, one step per lease and pass: create the server, wait for it to
-//! boot, tunnel to it and register it as a member, keep its tunnel alive, and on idle or TTL
-//! drain it, archive every run it held, remove it from the hub and the target registry, close
-//! its tunnel, delete the server and its firewall, and confirm the deletion. The reaper deletes
-//! labelled provider resources that the state does not hold or that outlived their deadline.
+//! boot, tunnel to it and register it as a member, keep its tunnel alive, and on idle drain it,
+//! archive every run it held, remove it from the hub and the target registry, close its tunnel,
+//! delete the server and its firewall, and confirm the deletion. The reaper deletes labelled
+//! provider resources that the state does not hold.
 //!
 //! Every provider failure is retried with backoff; an unconfirmed step never counts as done.
 //! Nothing is deleted while a run on it is unarchived.
@@ -550,7 +550,6 @@ impl HubService {
             slots: profile::slots_for(pool, &lease.spec),
             pool: Some(pool.name.clone()),
             server_id: lease.server_id,
-            expires_at_ms: Some(lease.expires_at_ms),
             idle_since_ms: Some(now),
             capabilities: Some(capabilities),
             capabilities_at_ms: Some(now),
@@ -655,7 +654,7 @@ impl HubService {
             }
         };
         let state = self.snapshot().await;
-        let mut orphans = pool::orphans(&resources, &state, now_ms());
+        let mut orphans = pool::orphans(&resources, &state);
         // Servers first: a Volume or firewall is deletable only once its server is gone.
         orphans.sort_by_key(|resource| resource.kind);
         for resource in orphans {
@@ -882,7 +881,6 @@ impl HubService {
             max: request.max,
             slots: request.slots.max(1),
             idle_ms: request.idle_ms,
-            ttl_ms: request.ttl_ms,
             tags: request.tags,
             ssh_key: request.ssh_key,
             ssh_from: request.ssh_from,
@@ -1008,8 +1006,8 @@ fn validate_pool(request: &AddPool) -> Result<(), HubError> {
     if request.max == 0 {
         return usage("--max must be at least 1".to_owned());
     }
-    if request.ttl_ms == 0 || request.idle_ms == 0 {
-        return usage("--idle and --ttl must be positive".to_owned());
+    if request.idle_ms == 0 {
+        return usage("--idle must be positive".to_owned());
     }
     if !provision::pinned(&request.target_image) {
         return usage(format!(

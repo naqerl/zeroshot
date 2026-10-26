@@ -89,9 +89,6 @@ pub(crate) struct Member {
     /// When a pool member last became idle; `None` while it runs hub jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_since_ms: Option<u64>,
-    /// When a pool member's lease expires and it is torn down.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at_ms: Option<u64>,
     /// Server type, location and size of a pool member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<Machine>,
@@ -119,7 +116,6 @@ impl Member {
             pool: None,
             server_id: None,
             idle_since_ms: None,
-            expires_at_ms: None,
             machine: None,
             spec: None,
             data: None,
@@ -140,7 +136,6 @@ impl Member {
             "pool": self.pool,
             "serverId": self.server_id,
             "idleSince": self.idle_since_ms.map(rfc3339),
-            "expiresAt": self.expires_at_ms.map(rfc3339),
             "machine": self.machine.as_ref().map(Machine::view),
             "spec": self.spec,
             "data": self.data.as_ref().map(DataHealth::view),

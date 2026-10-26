@@ -2767,7 +2767,7 @@ Commands:
 ```text
 Manage on-demand cloud server pools whose servers join the hub as members.
 
-A pool with no live server still counts as eligible, so a matching job queues and the daemon creates a server for it (up to --max). Each server runs the pinned target image behind an SSH tunnel from the hub, is archived before it is deleted, and is torn down after --idle without jobs or at --ttl. Servers are billed while they exist.
+A pool with no live server still counts as eligible, so a matching job queues and the daemon creates a server for it (up to --max). Each server runs the pinned target image behind an SSH tunnel from the hub, is archived before it is deleted, and is torn down only after --idle without jobs. Servers are billed while they exist.
 
 Usage: zeroshot hub pool [OPTIONS] <COMMAND>
 
@@ -2838,11 +2838,6 @@ Options:
           Tear a server down after this long without jobs
 
           [default: 10m]
-
-      --ttl <DURATION>
-          Tear a server down this long after creation, even while busy; it also shuts itself down shortly after as a backstop
-
-          [default: 2h]
 
       --tag <TAG>
           Placement tag servers join with. Repeat for several

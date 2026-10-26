@@ -180,17 +180,12 @@ pub(crate) trait Provisioner: Send + Sync {
     async fn list_by_label(&self, selector: &str) -> Result<Vec<Resource>, HubError>;
 }
 
-/// The cloud-init document of a lease's server. It schedules the backstop shutdown first, so a
-/// server whose hub vanished still stops at the end of its TTL plus grace, then runs the boot
-/// script of [`data::boot_script`]: Docker, a btrfs data folder, and the pinned target image
-/// bound to the server's loopback with its public origin set to the hub's end of the tunnel.
-/// It carries the hub's public key only: no provider token, API token or credential.
+/// The cloud-init document of a lease's server. It runs the boot script of
+/// [`data::boot_script`]: Docker, a btrfs data folder, and the pinned target image bound to the
+/// server's loopback with its public origin set to the hub's end of the tunnel. The hub alone
+/// decides when the server is deleted, so no clock shuts it down. It carries the hub's public
+/// key only: no provider token, API token or credential.
 pub(crate) fn user_data(pool: &Pool, lease: &Lease, public_key: &str) -> Result<String, HubError> {
-    let backstop_minutes = lease
-        .hard_deadline_ms()
-        .saturating_sub(lease.created_at_ms)
-        .div_ceil(60_000)
-        .max(1);
     let key = public_key.trim();
     if key.is_empty() || key.contains(['\n', '\r', '"']) {
         return Err(HubError::Usage(
@@ -228,7 +223,6 @@ pub(crate) fn user_data(pool: &Pool, lease: &Lease, public_key: &str) -> Result<
     document.push_str(&format!(
         "runcmd:\n\
          \x20 - [sh, -c, \"chage -M 99999 -E -1 -I -1 -d $(date +%F) root >/dev/null 2>&1 || true\"]\n\
-         \x20 - [shutdown, -h, \"+{backstop_minutes}\"]\n\
          \x20 - [{path}]\n",
         path = data::BOOT_SCRIPT,
     ));

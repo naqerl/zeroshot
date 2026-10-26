@@ -1,8 +1,9 @@
 # Run jobs on on-demand cloud servers
 
 A hub pool creates a Hetzner Cloud server when a queued job needs one, joins it to the hub as a
-member, and deletes it when it has been idle or has reached its TTL. Every run is archived on the
-hub host before its server is deleted.
+member, and deletes it once it is idle. A running job keeps its server alive however long it
+takes; there is no age limit or deadline. Every run is archived on the hub host before its server
+is deleted.
 
 ## Add a pool
 
@@ -15,7 +16,7 @@ zeroshot hub pool types
 zeroshot hub pool add burst \
   --provider hetzner --type cpx31,cx43 --location fsn1,nbg1 --image docker-ce \
   --target-image ghcr.io/the-open-engine/zeroshot-target:1.2.3 \
-  --max 3 --idle 10m --ttl 2h --tag linux,burst \
+  --max 3 --idle 10m --tag linux,burst \
   --ssh-key ~/.ssh/zeroshot-pool --ssh-from 203.0.113.7/32
 zeroshot hub pool list
 zeroshot hub pool remove burst   # only once the pool has no servers left
@@ -33,6 +34,8 @@ The type names above are only an example. There is no default type.
 - `--target-image` is the zeroshot target container. It must be pinned: a digest or a tag other
   than `latest`.
 - `--max` caps live servers. `--slots` (default 1) is concurrent runs per server.
+- `--idle` (default 10m) is the only automatic teardown trigger: a server with no hub jobs for
+  this long drains and is deleted. A busy server is never torn down by a clock.
 - `--ssh-key` is a private key on the hub host. Only its `.pub` sibling goes to the server.
 - `--ssh-from` is the hub's public address. The server firewall allows SSH from it and nothing
   else.
@@ -143,22 +146,21 @@ job waits until its own expiry.
 2. **Scale up.** Each pass creates servers for queued jobs that no live or starting server can
    take, one per `--slots` jobs of the same machine choice, up to `--max`.
    The server is named `zs-<job>` and labelled `zeroshot/hub`, `zeroshot/lease`,
-   `zeroshot/expires`, `zeroshot/server-type` and `zeroshot/location`, with no secrets.
-3. **Boot.** cloud-init schedules `shutdown -h` shortly after the TTL as a backstop, then runs
-   the boot script: it installs Docker and btrfs-progs if needed, pulls the target image,
-   mounts the btrfs data folder at `/mnt/zs`, and runs the target on `127.0.0.1:8080` with
-   `/mnt/zs` as its state.
+   `zeroshot/server-type` and `zeroshot/location`, with no secrets.
+3. **Boot.** cloud-init runs the boot script: it installs Docker and btrfs-progs if needed, pulls
+   the target image, mounts the btrfs data folder at `/mnt/zs`, and runs the target on
+   `127.0.0.1:8080` with `/mnt/zs` as its state. Nothing on the server shuts it down on a timer.
 4. **Join.** The hub opens `ssh -N -L` to the server and runs the data health check over SSH.
    Then it reads target discovery through the tunnel,
    registers the target, and adds it as a member with the pool's and its profiles' tags. A dropped tunnel is
    reopened. Host keys are trusted on first use into the pool's own `known_hosts`.
-5. **Teardown.** When a server is idle for `--idle` or reaches `--ttl`, the hub drains it. It
+5. **Teardown.** When a server has been idle for `--idle`, the hub drains it. It
    waits until each run is terminal and its postmortem has finished, then archives the run. Next it
    removes the member and the target, closes the tunnel, deletes the server, waits for the delete
    action, and finally deletes the Volume, if any, and the firewall.
 6. **Reaper.** On start and every five minutes, the hub lists resources labelled
    `zeroshot/hub=<hub id>`. It deletes servers, Volumes, primary IPs, and firewalls that state does not
-   know about or that are past `zeroshot/expires`.
+   know about. It never deletes a resource whose lease state still holds.
 
 A server whose boot fails or times out is deleted. Its pool then pauses for 5 minutes, and the
 pause doubles on each further failure up to an hour, so a broken image does not keep creating
@@ -232,5 +234,5 @@ so it does not depend on the data folder's filesystem. Object Storage upload is 
 ## Cost
 
 Each type's hourly price per location is listed in `zeroshot hub pool types`. Hetzner bills by
-the hour, so a server is billed for at least one hour. `--max`, `--idle`, `--ttl`, `--wait-max`,
-and the self-shutdown backstop bound the spend.
+the hour, so a server is billed for at least one hour. `--max`, `--idle`, and `--wait-max` bound
+the spend; a long-running job costs its server's hourly price until that job finishes.

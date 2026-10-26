@@ -157,7 +157,7 @@ pub(super) enum HubCliCommand {
     /// A pool with no live server still counts as eligible, so a matching job queues and the
     /// daemon creates a server for it (up to --max). Each server runs the pinned target image
     /// behind an SSH tunnel from the hub, is archived before it is deleted, and is torn down
-    /// after --idle without jobs or at --ttl. Servers are billed while they exist.
+    /// only after --idle without jobs. Servers are billed while they exist.
     #[command(subcommand)]
     Pool(HubPoolCliCommand),
 }
@@ -338,11 +338,6 @@ pub(super) struct HubPoolAddArgs {
     #[arg(long, value_name = "DURATION", default_value = "10m")]
     idle: String,
 
-    /// Tear a server down this long after creation, even while busy; it also shuts itself down
-    /// shortly after as a backstop.
-    #[arg(long, value_name = "DURATION", default_value = "2h")]
-    ttl: String,
-
     /// Placement tag servers join with. Repeat for several.
     #[arg(long = "tag", visible_alias = "tags", value_name = "TAG",
           action = clap::ArgAction::Append, value_delimiter = ',')]
@@ -390,7 +385,6 @@ impl HubPoolCliCommand {
                     max: args.max,
                     slots: args.slots,
                     idle: args.idle,
-                    ttl: args.ttl,
                     tags: tags(args.tags)?,
                     ssh_key: args.ssh_key,
                     ssh_from: args.ssh_from,
