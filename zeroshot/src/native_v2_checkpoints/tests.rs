@@ -95,6 +95,68 @@ impl Fixture {
     }
 }
 
+#[test]
+fn capture_omits_root_build_output_and_nested_dependency_directories() {
+    let root = tempfile::tempdir().assert_value();
+    let workspace = root.path().join("workspace");
+    let snapshots = root.path().join("snapshots");
+    fs::create_dir_all(workspace.join("target/debug")).assert_value();
+    fs::write(workspace.join("target/debug/junk"), "junk").assert_value();
+    fs::create_dir_all(workspace.join("node_modules/x")).assert_value();
+    fs::write(workspace.join("node_modules/x/index.js"), "dependency").assert_value();
+    fs::create_dir_all(workspace.join("src")).assert_value();
+    fs::write(workspace.join("src/main.rs"), "fn main() {}").assert_value();
+
+    let id = filesystem::capture(&workspace, &snapshots, &()).assert_value();
+    let tree = snapshots.join(id.as_str()).join("workspace");
+    assert_eq!(
+        fs::read_to_string(tree.join("src/main.rs")).assert_value(),
+        "fn main() {}"
+    );
+    assert!(!tree.join("target").exists());
+    assert!(!tree.join("node_modules").exists());
+}
+
+#[test]
+fn capture_matches_any_depth_dependencies_but_only_root_build_directories() {
+    let root = tempfile::tempdir().assert_value();
+    let workspace = root.path().join("workspace");
+    let snapshots = root.path().join("snapshots");
+    fs::create_dir_all(workspace.join("pkg/node_modules/y")).assert_value();
+    fs::write(workspace.join("pkg/node_modules/y/index.js"), "dependency").assert_value();
+    fs::create_dir_all(workspace.join("pkg/build")).assert_value();
+    fs::write(workspace.join("pkg/build/keep.txt"), "kept").assert_value();
+
+    let id = filesystem::capture(&workspace, &snapshots, &()).assert_value();
+    let tree = snapshots.join(id.as_str()).join("workspace");
+    assert!(!tree.join("pkg/node_modules").exists());
+    assert_eq!(
+        fs::read_to_string(tree.join("pkg/build/keep.txt")).assert_value(),
+        "kept"
+    );
+}
+
+#[test]
+fn capture_restore_round_trip_keeps_source_files_without_build_output() {
+    let root = tempfile::tempdir().assert_value();
+    let workspace = root.path().join("workspace");
+    let snapshots = root.path().join("snapshots");
+    fs::create_dir_all(workspace.join("target")).assert_value();
+    fs::write(workspace.join("target/junk"), "junk").assert_value();
+    fs::create_dir_all(workspace.join("src")).assert_value();
+    fs::write(workspace.join("src/main.rs"), "fn main() {}").assert_value();
+
+    let id = filesystem::capture(&workspace, &snapshots, &()).assert_value();
+    fs::write(workspace.join("src/main.rs"), "later edits").assert_value();
+    fs::write(workspace.join("target/later"), "later build").assert_value();
+    filesystem::restore(&snapshots, &id, &workspace).assert_value();
+
+    assert_eq!(
+        fs::read_to_string(workspace.join("src/main.rs")).assert_value(),
+        "fn main() {}"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn capture_removes_readonly_copied_directories_from_disposable_staging() {
