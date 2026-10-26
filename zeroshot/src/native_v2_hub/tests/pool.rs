@@ -596,6 +596,18 @@ async fn scale_up_stops_at_the_pool_maximum() {
 async fn an_idle_server_is_archived_removed_and_deleted() {
     let rig = rig();
     let lease = rig.finished_job_on_server().await;
+    let known_hosts = rig
+        .service
+        .store()
+        .directory()
+        .join("pool")
+        .join("known_hosts");
+    std::fs::create_dir_all(known_hosts.parent().expect("pool folder")).expect("pool folder");
+    std::fs::write(
+        &known_hosts,
+        format!("{} ssh-ed25519 AAAA\nkept ssh-ed25519 BBBB\n", lease.name),
+    )
+    .expect("known hosts");
     rig.set(|state| {
         let member = state.members.iter_mut().find(|m| m.name == lease.name);
         member.expect("member").idle_since_ms = Some(1);
@@ -646,6 +658,9 @@ async fn an_idle_server_is_archived_removed_and_deleted() {
             (ResourceKind::Firewall, lease.firewall_id.expect("firewall")),
         ]
     );
+    let remaining = std::fs::read_to_string(&known_hosts).expect("known hosts");
+    assert!(!remaining.contains(&lease.name), "{remaining}");
+    assert!(remaining.contains("kept"), "{remaining}");
 }
 
 #[tokio::test]
@@ -1161,23 +1176,83 @@ fn lease_ids_are_hostname_labels_and_backoff_is_capped() {
     assert!(lease.due(capped));
 }
 
-#[test]
-fn ssh_tunnels_forward_loopback_only_with_pinned_host_keys() {
-    let spec = TunnelSpec {
-        name: "zs-one".to_owned(),
+fn tunnel_fixture(name: &str) -> TunnelSpec {
+    TunnelSpec {
+        name: name.to_owned(),
         host: "203.0.113.10".to_owned(),
         local_port: 40123,
         key: PathBuf::from("/hub/id_ed25519"),
         known_hosts: PathBuf::from("/hub/pool/known_hosts"),
-    };
+    }
+}
+
+#[test]
+fn ssh_tunnels_forward_loopback_only_with_pinned_host_keys() {
+    let spec = tunnel_fixture("zs-one");
     let arguments = ssh_arguments(&spec);
     assert!(arguments.contains(&"-N".to_owned()), "{arguments:?}");
     assert!(arguments.contains(&"127.0.0.1:40123:127.0.0.1:8080".to_owned()));
     assert!(arguments.contains(&"BatchMode=yes".to_owned()));
+    assert!(arguments.contains(&"HostKeyAlias=zs-one".to_owned()));
     assert!(arguments.contains(&"UserKnownHostsFile=/hub/pool/known_hosts".to_owned()));
+    assert!(arguments.contains(&"StrictHostKeyChecking=accept-new".to_owned()));
+    assert!(arguments.contains(&"HashKnownHosts=no".to_owned()));
     assert_eq!(
         arguments.last().map(String::as_str),
         Some("root@203.0.113.10")
+    );
+}
+
+#[test]
+fn two_leases_on_one_address_get_different_host_key_aliases() {
+    let first = ssh_arguments(&tunnel_fixture("zs-one"));
+    let second = ssh_arguments(&tunnel_fixture("zs-two"));
+    assert!(
+        first.contains(&"HostKeyAlias=zs-one".to_owned()),
+        "{first:?}"
+    );
+    assert!(
+        second.contains(&"HostKeyAlias=zs-two".to_owned()),
+        "{second:?}"
+    );
+    assert!(!second.contains(&"HostKeyAlias=zs-one".to_owned()));
+}
+
+#[test]
+fn forgetting_a_lease_removes_only_its_host_key_entries() {
+    use super::super::tunnel::forget_host_key;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let known_hosts = directory.path().join("known_hosts");
+    std::fs::write(
+        &known_hosts,
+        "zs-one ssh-ed25519 AAAA\n[zs-one]:2222 ssh-rsa BBBB\nzs-two ssh-ed25519 CCCC\n",
+    )
+    .expect("known hosts");
+    forget_host_key(&known_hosts, "zs-one");
+    assert_eq!(
+        std::fs::read_to_string(&known_hosts).expect("known hosts"),
+        "zs-two ssh-ed25519 CCCC\n"
+    );
+    forget_host_key(&directory.path().join("missing"), "zs-one");
+}
+
+#[test]
+fn forgetting_a_lease_removes_hashed_host_key_entries() {
+    use super::super::tunnel::forget_host_key;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let known_hosts = directory.path().join("known_hosts");
+    std::fs::write(
+        &known_hosts,
+        "|1|MDEyMzQ1Njc4OWFiY2RlZmdoaWo=|CITj5XcVfsdmQiv9huLpJQ+QxpA= ssh-ed25519 AAAA\n\
+         |1|QUJDREVGR0hJSjAxMjM0NTY3ODk=|G2iGuMLW4G+Va/JlhWslJVWxnvg= ssh-ed25519 BBBB\n\
+         plain ssh-ed25519 CCCC\n",
+    )
+    .expect("known hosts");
+    forget_host_key(&known_hosts, "zs-hashed");
+    assert_eq!(
+        std::fs::read_to_string(&known_hosts).expect("known hosts"),
+        "|1|QUJDREVGR0hJSjAxMjM0NTY3ODk=|G2iGuMLW4G+Va/JlhWslJVWxnvg= ssh-ed25519 BBBB\n\
+         plain ssh-ed25519 CCCC\n"
     );
 }
 

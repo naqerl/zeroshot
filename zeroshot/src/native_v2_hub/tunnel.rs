@@ -1,12 +1,18 @@
 //! SSH tunnels from the hub to pool servers: `ssh -N -L 127.0.0.1:PORT:127.0.0.1:8080`, so a
 //! pool target is reached through the hub's loopback only and never listens publicly.
 //!
-//! Host keys are trusted on first use (`StrictHostKeyChecking=accept-new`) into the pool's own
-//! `known_hosts`, since a fresh server's key is unknown until it boots. Each server's key is then
-//! pinned for its lifetime; the window is its first connection.
+//! Host keys are pinned per lease, not per address: every connection names its lease through
+//! `HostKeyAlias`, so the pool's `known_hosts` entry belongs to that lease even when the provider
+//! recycles an IPv4 address for a new server. `StrictHostKeyChecking=accept-new` still accepts a
+//! key only while it is unknown, so the first connection of a lease pins its key and any later
+//! change for that lease is refused. Entries are stored unhashed (`HashKnownHosts=no`) so a
+//! torn-down lease can identify and forget its own entry, best effort; hashed entries left by
+//! older runs are recognized and removed too.
 
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use ring::hmac;
 
 use super::error::HubError;
 
@@ -53,6 +59,8 @@ fn ssh_options(spec: &TunnelSpec) -> Vec<String> {
         "BatchMode=yes".to_owned(),
         "IdentitiesOnly=yes".to_owned(),
         "StrictHostKeyChecking=accept-new".to_owned(),
+        "HashKnownHosts=no".to_owned(),
+        format!("HostKeyAlias={}", spec.name),
         format!("UserKnownHostsFile={}", spec.known_hosts.display()),
     ] {
         arguments.push("-o".to_owned());
@@ -60,6 +68,79 @@ fn ssh_options(spec: &TunnelSpec) -> Vec<String> {
     }
     arguments.extend(["-i".to_owned(), spec.key.display().to_string()]);
     arguments
+}
+
+/// Remove the lease's host key entries from `known_hosts`, best effort. OpenSSH records the
+/// `HostKeyAlias` bare for the default port and bracketed with the port otherwise; older runs may
+/// also have hashed (`|1|...`) entries, which are matched with their HMAC. Every other line is
+/// kept. A missing or unreadable file is ignored, and a stale entry cannot block a later lease
+/// because each lease has its own alias.
+pub(crate) fn forget_host_key(known_hosts: &Path, alias: &str) {
+    let Ok(contents) = std::fs::read_to_string(known_hosts) else {
+        return;
+    };
+    let bracketed = format!("[{alias}]:");
+    let mut kept = String::with_capacity(contents.len());
+    let mut removed = false;
+    for line in contents.lines() {
+        let host = line.split_whitespace().next().unwrap_or_default();
+        if host == alias || host.starts_with(&bracketed) || hashed_host_matches(host, alias) {
+            removed = true;
+        } else {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    if removed {
+        let _ = crate::private_file::replace(known_hosts, kept.as_bytes());
+    }
+}
+
+/// Whether an OpenSSH hashed host field (`|1|salt|hash`) belongs to `alias`.
+fn hashed_host_matches(host: &str, alias: &str) -> bool {
+    let mut parts = host.split('|');
+    if parts.next() != Some("") || parts.next() != Some("1") {
+        return false;
+    }
+    let Some(salt) = parts.next().and_then(decode_base64) else {
+        return false;
+    };
+    let Some(expected) = parts.next().and_then(decode_base64) else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    let key = hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, &salt);
+    hmac::verify(&key, alias.as_bytes(), &expected).is_ok()
+}
+
+/// Decode the standard padded or unpadded base64 used by OpenSSH host fields.
+fn decode_base64(text: &str) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = 0_u32;
+    let mut bits = 0_u32;
+    for byte in text.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push(u8::try_from((buffer >> bits) & 0xff).ok()?);
+            buffer &= (1_u32 << bits) - 1;
+        }
+    }
+    Some(output)
 }
 
 /// The `ssh` arguments of a tunnel.

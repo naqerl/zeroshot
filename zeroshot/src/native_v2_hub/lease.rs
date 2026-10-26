@@ -341,6 +341,8 @@ impl HubService {
             }
             LeasePhase::Deleting => {
                 if delete(runtime, &mut lease).await? {
+                    let known_hosts = self.store().directory().join("pool").join("known_hosts");
+                    tunnel::forget_host_key(&known_hosts, &lease.name);
                     return Ok(Step::Done(Box::new(lease)));
                 }
             }
