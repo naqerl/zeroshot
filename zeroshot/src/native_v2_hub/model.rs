@@ -298,6 +298,12 @@ pub(crate) enum JobErrorKind {
     DequeuedWhilePlacing,
     /// Waited longer than its pool's `--wait-max` for a server; the job expired.
     PoolWaitTimeout,
+    /// The job's deadline passed. A placed run is stopped before the job settles; while a stop
+    /// keeps failing the job stays running with this error.
+    RunExpired,
+    /// The run stopped making progress and is stopped by `hub daemon run --max-stall`; while a
+    /// stop keeps failing the job stays running with this error.
+    Stalled,
     /// Recorded as plain text by an earlier hub.
     Unclassified,
 }
@@ -376,6 +382,11 @@ pub(crate) struct Job {
     pub run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatched_at_ms: Option<u64>,
+    /// Last watch cursor observed in the run's status, and when it last advanced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_cursor_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -454,6 +465,8 @@ impl Job {
             "notBefore": time(self.not_before_ms),
             "expiresAt": time(self.expires_at_ms),
             "dispatchedAt": time(self.dispatched_at_ms),
+            "lastCursor": self.last_cursor,
+            "lastCursorAt": time(self.last_cursor_at_ms),
             "finishedAt": time(self.finished_at_ms),
             "failureReason": self.failure_reason,
             "tokenUsage": self.token_usage,

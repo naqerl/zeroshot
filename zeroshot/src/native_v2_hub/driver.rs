@@ -29,6 +29,10 @@ pub(crate) trait HubDriver: Send + Sync {
     async fn submit(&self, request: SubmitRequest<'_>) -> Result<String, HubError>;
     /// `zeroshot status` of one run.
     async fn status(&self, member: &str, run_id: &str) -> Result<Value, HubError>;
+    /// `zeroshot force-stop` of one run, the same operation `zeroshot hub force-stop` uses.
+    async fn stop(&self, _member: &str, _run_id: &str) -> Result<(), HubError> {
+        Ok(())
+    }
     /// Capability kinds advertised by a named target's discovery document.
     async fn capabilities(&self, member: &str) -> Result<Vec<String>, HubError>;
     /// Complete standard output of a read-only run command (`report`, `status`, `watch`,
@@ -184,6 +188,12 @@ impl HubDriver for ProcessDriver {
             .ok_or_else(|| target_error("zeroshot status returned no JSON".to_owned(), None))
     }
 
+    async fn stop(&self, member: &str, run_id: &str) -> Result<(), HubError> {
+        self.call(force_stop_arguments(member, run_id), None)
+            .await?;
+        Ok(())
+    }
+
     async fn capabilities(&self, member: &str) -> Result<Vec<String>, HubError> {
         let record = self
             .registry
@@ -245,6 +255,13 @@ pub(crate) fn route(member: &str) -> Vec<String> {
     } else {
         vec!["--target".to_owned(), member.to_owned()]
     }
+}
+
+/// The exact `zeroshot` invocation used by `hub force-stop` and by deadline/stall enforcement.
+pub(crate) fn force_stop_arguments(member: &str, run_id: &str) -> Vec<String> {
+    let mut arguments = vec!["force-stop".to_owned(), run_id.to_owned()];
+    arguments.extend(route(member));
+    arguments
 }
 
 pub(crate) fn hub_executable() -> Result<PathBuf, HubError> {

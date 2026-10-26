@@ -1267,6 +1267,7 @@ async fn the_daemon_measures_finished_eval_samples() {
             metrics_listen: None,
             metrics_labels: Vec::new(),
             unconfirmed_limit: None,
+            max_stall: None,
         },
     };
     let open = |store| {

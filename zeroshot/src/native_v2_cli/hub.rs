@@ -172,6 +172,8 @@ pub struct HubApiOptions {
     pub unconfirmed_limit: Option<u32>,
     /// Hetzner Cloud API token file for pool servers; `None` reads `HCLOUD_TOKEN`.
     pub hetzner_token_file: Option<PathBuf>,
+    /// Stop a running job whose watch cursor does not advance for this long; `None` disables it.
+    pub max_stall: Option<String>,
 }
 
 /// `hub context`: named hub endpoints, docker-context style.
@@ -300,6 +302,7 @@ pub struct HubSubmit {
     pub detach: bool,
     pub wait: Option<Option<String>>,
     pub queue: bool,
+    pub expires: Option<String>,
 }
 
 /// Deferred placement: once (`at`) or recurring (`cron`).
