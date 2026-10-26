@@ -137,7 +137,6 @@ pub struct HubPoolAdd {
     pub max: u32,
     pub slots: u32,
     pub idle: String,
-    pub ttl: String,
     pub tags: Vec<String>,
     pub ssh_key: PathBuf,
     pub ssh_from: Vec<String>,

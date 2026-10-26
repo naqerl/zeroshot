@@ -728,7 +728,6 @@ pub(crate) fn add_pool(request: HubPoolAdd) -> Result<AddPool, HubError> {
         max: request.max,
         slots: request.slots,
         idle_ms: parse_duration_ms(&request.idle)?,
-        ttl_ms: parse_duration_ms(&request.ttl)?,
         tags: request.tags,
         ssh_key: super::paths::absolute(&request.ssh_key)?,
         ssh_from: request.ssh_from,

@@ -38,7 +38,6 @@ pub(crate) struct AddPool {
     pub max: u32,
     pub slots: u32,
     pub idle_ms: u64,
-    pub ttl_ms: u64,
     pub tags: Vec<String>,
     pub ssh_key: std::path::PathBuf,
     pub ssh_from: Vec<String>,

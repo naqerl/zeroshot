@@ -16,9 +16,8 @@ use super::super::error::{EXIT_NO_CAPACITY, EXIT_NO_ELIGIBLE_TARGET, HubError};
 use super::super::lease::{PoolRuntime, REAP_INTERVAL_MS, production_runtime};
 use super::super::model::{HubState, Job, JobState, MemberState, STATE_VERSION, Strategy};
 use super::super::pool::{
-    self, BACKSTOP_GRACE_MS, BOOT_DEADLINE_MS, FIRST_PAUSE_MS, MAX_PAUSE_MS, LABEL_EXPIRES,
-    LABEL_HUB, LABEL_LEASE, LABEL_LOCATION, LABEL_SERVER_TYPE, Lease, LeasePhase, Pool, Provider,
-    Resource, ResourceKind, TeardownReason,
+    self, BOOT_DEADLINE_MS, FIRST_PAUSE_MS, MAX_PAUSE_MS, LABEL_HUB, LABEL_LEASE, LABEL_LOCATION,
+    LABEL_SERVER_TYPE, Lease, LeasePhase, Pool, Provider, Resource, ResourceKind, TeardownReason,
 };
 use super::super::provision::{
     self, Architecture, Catalog, Created, Failure, Location, Progress, Provisioner, Refusal,
@@ -377,7 +376,6 @@ pub(super) fn add_request(folder: &Path, max: u32) -> AddPool {
         max,
         slots: 1,
         idle_ms: 600_000,
-        ttl_ms: 7_200_000,
         tags: vec![TAG.to_owned()],
         ssh_key: key,
         ssh_from: vec!["198.51.100.7/32".to_owned()],
@@ -615,12 +613,11 @@ async fn a_queued_job_creates_a_server_that_joins_as_a_member_and_runs_it() {
     let hub_id = rig.state().await.hub_id.expect("hub id");
     assert_eq!(request.labels[LABEL_HUB], hub_id);
     assert_eq!(request.labels[LABEL_LEASE], "one");
-    assert!(request.labels.contains_key(LABEL_EXPIRES));
     assert!(request.user_data.contains(IMAGE));
     assert!(request.user_data.contains("127.0.0.1:8080:8080"));
     assert!(request.user_data.contains("DATA='/mnt/zs'"));
     assert!(request.user_data.contains("\"$DATA:/var/lib/zeroshot\""));
-    assert!(request.user_data.contains("[shutdown, -h, \"+"));
+    assert!(!request.user_data.contains("shutdown"));
 
     rig.pass().await;
     assert_eq!(rig.lease().await.phase, LeasePhase::Connecting);
@@ -640,7 +637,6 @@ async fn a_queued_job_creates_a_server_that_joins_as_a_member_and_runs_it() {
     let member = state.member("zs-one").expect("member");
     assert_eq!(member.pool.as_deref(), Some("burst"));
     assert_eq!(member.server_id, lease.server_id);
-    assert_eq!(member.expires_at_ms, Some(lease.expires_at_ms));
     assert_eq!(member.tags, [TAG]);
     let machine = member.machine.as_ref().expect("machine");
     assert_eq!((machine.cores, machine.memory_mb), (4, 8192));
@@ -742,38 +738,63 @@ async fn an_idle_server_is_archived_removed_and_deleted() {
 }
 
 #[tokio::test]
-async fn ttl_drains_a_busy_server_and_deletes_it_only_after_its_run_finishes() {
+async fn a_busy_server_is_never_torn_down_by_age() {
     let rig = rig();
     let lease = rig.running_job_on_server().await;
-    rig.set(|state| state.leases[0].expires_at_ms = 1).await;
+    // Make the lease older than the retired two-hour TTL, and leave a stale idle mark that the
+    // pass must clear because the job is still running.
+    rig.set(|state| {
+        state.leases[0].created_at_ms = 1;
+        let member = state
+            .members
+            .iter_mut()
+            .find(|member| member.name == lease.name)
+            .expect("member");
+        member.idle_since_ms = Some(1);
+    })
+    .await;
 
     let view = rig.pass().await;
-    assert_eq!(view["pools"]["teardowns"][0]["reason"], json!("ttl"));
+    assert_eq!(
+        view["pools"]["teardowns"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0),
+        0
+    );
     let state = rig.state().await;
     assert_eq!(
         state.member(&lease.name).expect("member").state,
-        MemberState::Drain
+        MemberState::Active
     );
-    assert_eq!(state.leases[0].phase, LeasePhase::Draining);
-    rig.pass().await;
-    assert_eq!(rig.lease().await.phase, LeasePhase::Draining);
+    assert_eq!(
+        state.member(&lease.name).expect("member").idle_since_ms,
+        None
+    );
+    assert_eq!(state.leases[0].phase, LeasePhase::Active);
+    assert_eq!(job_named(&state, "hj_one").state, JobState::Running);
     assert!(rig.cloud.with(|cloud| cloud.destroyed.is_empty()));
 
-    rig.driver.finish_all();
-    rig.pass().await;
-    assert!(job_named(&rig.state().await, "hj_one").archive.is_some());
-    assert_eq!(rig.lease().await.phase, LeasePhase::Deleting);
-    rig.pass().await;
-    rig.pass().await;
-    assert!(rig.state().await.leases.is_empty());
-    assert_eq!(rig.cloud.servers(), 0);
+    let far_future = now_ms().saturating_add(365 * 24 * 60 * 60 * 1000);
+    assert!(
+        pool::teardown_due(&state, far_future).is_empty(),
+        "a running job keeps its server alive however far the clock advances"
+    );
 }
 
 #[tokio::test]
 async fn a_failed_archive_keeps_the_server_until_a_later_pass_archives_it() {
     let rig = rig();
     let lease = rig.finished_job_on_server().await;
-    rig.set(|state| state.leases[0].expires_at_ms = 1).await;
+    rig.set(|state| {
+        let member = state
+            .members
+            .iter_mut()
+            .find(|member| member.name == lease.name)
+            .expect("member");
+        member.idle_since_ms = Some(1);
+    })
+    .await;
     rig.driver.capture_fails.store(true, Ordering::SeqCst);
 
     let view = rig.pass().await;
@@ -816,7 +837,7 @@ async fn an_unfinished_run_is_never_archived() {
 }
 
 #[tokio::test]
-async fn the_reaper_deletes_orphans_and_expired_resources_but_keeps_live_leases() {
+async fn the_reaper_deletes_orphans_but_keeps_live_leases() {
     let rig = rig();
     rig.add_pool(1).await;
     let state = rig.state().await;
@@ -828,15 +849,10 @@ async fn the_reaper_deletes_orphans_and_expired_resources_but_keeps_live_leases(
     };
     let held_id = held.id.clone();
     rig.set(|state| state.leases.push(held)).await;
-    let future = (now_ms() / 1000 + 3600).to_string();
     let hub = hub_id.as_str();
     let orphan = rig.cloud.plant(
         ResourceKind::Server,
-        &[
-            (LABEL_HUB, hub),
-            (LABEL_LEASE, "gone"),
-            (LABEL_EXPIRES, &future),
-        ],
+        &[(LABEL_HUB, hub), (LABEL_LEASE, "gone")],
     );
     let orphan_ip = rig.cloud.plant(
         ResourceKind::PrimaryIp,
@@ -844,19 +860,7 @@ async fn the_reaper_deletes_orphans_and_expired_resources_but_keeps_live_leases(
     );
     let live = rig.cloud.plant(
         ResourceKind::Server,
-        &[
-            (LABEL_HUB, hub),
-            (LABEL_LEASE, &held_id),
-            (LABEL_EXPIRES, &future),
-        ],
-    );
-    let expired = rig.cloud.plant(
-        ResourceKind::Firewall,
-        &[
-            (LABEL_HUB, hub),
-            (LABEL_LEASE, &held_id),
-            (LABEL_EXPIRES, "1"),
-        ],
+        &[(LABEL_HUB, hub), (LABEL_LEASE, &held_id)],
     );
     let foreign = rig.cloud.plant(
         ResourceKind::Server,
@@ -869,10 +873,9 @@ async fn the_reaper_deletes_orphans_and_expired_resources_but_keeps_live_leases(
         [
             (ResourceKind::Server, orphan),
             (ResourceKind::PrimaryIp, orphan_ip),
-            (ResourceKind::Firewall, expired),
         ]
     );
-    assert_eq!(view["pools"]["reaped"].as_array().map(Vec::len), Some(3));
+    assert_eq!(view["pools"]["reaped"].as_array().map(Vec::len), Some(2));
     assert!(rig.cloud.holds(ResourceKind::Server, live));
     assert!(rig.cloud.holds(ResourceKind::Server, foreign));
     assert_eq!(
@@ -889,32 +892,39 @@ async fn the_reaper_deletes_orphans_and_expired_resources_but_keeps_live_leases(
 }
 
 #[test]
-fn orphans_keep_an_expired_lease_whose_runs_are_unarchived() {
+fn orphans_keep_a_held_lease_however_long_it_has_run() {
     let lease = Lease::new(&pool_fixture(), "hj_keep", 1, 0);
     let mut ran = job("hj_keep", 0);
     ran.target = Some(lease.name.clone());
     ran.run_id = Some("run".to_owned());
     ran.state = JobState::Succeeded;
-    let state = HubState {
-        leases: vec![lease.clone()],
-        jobs: vec![ran],
-        ..HubState::default()
-    };
     let resource = Resource {
         kind: ResourceKind::Server,
         id: 7,
         name: lease.name.clone(),
         labels: lease.labels("hub"),
     };
-    let late = lease.hard_deadline_ms() + 1000;
     let resources = std::slice::from_ref(&resource);
-    assert!(pool::orphans(resources, &state, late).is_empty());
+    let state = HubState {
+        leases: vec![lease.clone()],
+        jobs: vec![ran],
+        ..HubState::default()
+    };
+    assert!(pool::orphans(resources, &state).is_empty());
     let archived = HubState {
         jobs: Vec::new(),
-        ..state
+        leases: vec![lease],
+        ..HubState::default()
     };
-    assert_eq!(pool::orphans(resources, &archived, late).len(), 1);
-    assert!(pool::orphans(resources, &archived, 0).is_empty());
+    assert!(
+        pool::orphans(resources, &archived).is_empty(),
+        "the lease owns its resources until it is torn down"
+    );
+    assert_eq!(
+        pool::orphans(resources, &HubState::default()).len(),
+        1,
+        "only a lease the state no longer holds is an orphan"
+    );
 }
 
 #[tokio::test]
@@ -1087,7 +1097,15 @@ async fn a_boot_timeout_and_a_removed_pool_tear_leases_down() {
 async fn deletion_waits_for_the_provider_action() {
     let rig = rig();
     let lease = rig.finished_job_on_server().await;
-    rig.set(|state| state.leases[0].expires_at_ms = 1).await;
+    rig.set(|state| {
+        let member = state
+            .members
+            .iter_mut()
+            .find(|member| member.name == lease.name)
+            .expect("member");
+        member.idle_since_ms = Some(1);
+    })
+    .await;
     rig.cloud.with(|cloud| cloud.pending_deletes = 2);
     rig.pass().await;
     rig.pass().await;
@@ -1213,17 +1231,67 @@ fn version_one_state_migrates_with_empty_pools() {
 }
 
 #[test]
+fn pool_lease_and_member_records_serialize_without_ttl_or_expiry() {
+    let pool = pool_fixture();
+    let pool_json = serde_json::to_value(&pool).expect("pool json");
+    assert!(pool_json.get("ttlMs").is_none(), "{pool_json}");
+    assert!(!pool_json.to_string().contains("ttl"), "{pool_json}");
+
+    let lease = Lease::new(&pool, "hj_one", 40123, 1_000);
+    let lease_json = serde_json::to_value(&lease).expect("lease json");
+    assert!(lease_json.get("expiresAt").is_none(), "{lease_json}");
+    assert!(lease_json.get("expiresAtMs").is_none(), "{lease_json}");
+
+    let mut member = super::member("zs-one", &[TAG], 1, 0);
+    member.pool = Some(pool.name.clone());
+    member.idle_since_ms = Some(1_000);
+    let member_json = serde_json::to_value(&member).expect("member json");
+    assert!(member_json.get("expiresAt").is_none(), "{member_json}");
+    assert!(member_json.get("expiresAtMs").is_none(), "{member_json}");
+    assert!(member.view().get("expiresAt").is_none(), "{member_json}");
+}
+
+#[test]
+fn legacy_pool_ttl_and_expiry_fields_load_and_are_dropped() {
+    let pool = pool_fixture();
+    let lease = Lease::new(&pool, "hj_one", 40123, 1_000);
+    let mut member = super::member("zs-one", &[TAG], 1, 0);
+    member.pool = Some(pool.name.clone());
+    member.idle_since_ms = Some(1_000);
+    let mut document = serde_json::to_value(HubState {
+        version: STATE_VERSION,
+        pools: vec![pool],
+        leases: vec![lease],
+        members: vec![member],
+        ..HubState::default()
+    })
+    .expect("state json");
+    document["pools"][0]["ttlMs"] = json!(7_200_000);
+    document["leases"][0]["expiresAtMs"] = json!(1);
+    document["members"][0]["expiresAtMs"] = json!(1);
+    document["leases"][0]["phase"] = json!("draining");
+    document["leases"][0]["reason"] = json!("ttl");
+
+    let migrated = migrate(document.to_string().as_bytes()).expect("legacy state loads");
+    assert_eq!(migrated.pools.len(), 1);
+    assert_eq!(migrated.leases.len(), 1);
+    assert_eq!(migrated.members.len(), 1);
+    assert!(migrated.leases[0].reason.is_none());
+    let saved = serde_json::to_value(&migrated).expect("state json");
+    assert!(saved["pools"][0].get("ttlMs").is_none(), "{saved}");
+    assert!(saved["leases"][0].get("expiresAtMs").is_none(), "{saved}");
+    assert!(saved["leases"][0].get("reason").is_none(), "{saved}");
+    assert!(saved["members"][0].get("expiresAtMs").is_none(), "{saved}");
+}
+
+#[test]
 fn user_data_pins_the_image_and_carries_no_secrets() {
     let pool = pool_fixture();
     let lease = Lease::new(&pool, "hj_one", 40123, 0);
     let document = provision::user_data(&pool, &lease, "ssh-ed25519 AAAA hub").expect("user data");
     assert!(document.starts_with("#cloud-config"), "{document}");
     assert!(document.contains("ssh-ed25519 AAAA hub"));
-    let backstop = (pool.ttl_ms + BACKSTOP_GRACE_MS) / 60_000;
-    assert!(
-        document.contains(&format!("[shutdown, -h, \"+{backstop}\"]")),
-        "{document}"
-    );
+    assert!(!document.contains("shutdown"), "{document}");
     assert!(document.contains("ORIGIN='http://127.0.0.1:40123'"));
     assert!(!document.to_lowercase().contains("token"));
     assert!(document.len() <= provision::USER_DATA_LIMIT);
@@ -1353,7 +1421,6 @@ pub(super) fn pool_fixture() -> Pool {
         max: 1,
         slots: 1,
         idle_ms: 600_000,
-        ttl_ms: 7_200_000,
         tags: vec![TAG.to_owned()],
         ssh_key: PathBuf::from("/hub/id_ed25519"),
         ssh_from: vec!["198.51.100.7/32".to_owned()],

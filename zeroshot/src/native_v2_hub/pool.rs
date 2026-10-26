@@ -1,6 +1,6 @@
 //! On-demand pool targets: the hub creates a cloud server when queued jobs need a pool, runs
-//! the stock target image on it, registers it as a member, and deletes it once it is idle or its
-//! lease expires, after archiving every run it held.
+//! the stock target image on it, registers it as a member, and deletes it once it is idle,
+//! after archiving every run it held.
 //!
 //! This module owns the pool and lease records and the pure decisions (which jobs a pool serves,
 //! how many servers to start, which leases to tear down, which provider resources are orphans).
@@ -26,11 +26,6 @@ pub(crate) const LABEL_LEASE: &str = "zeroshot/lease";
 pub(crate) const LABEL_SERVER_TYPE: &str = "zeroshot/server-type";
 /// Label naming the location a lease's server was created in.
 pub(crate) const LABEL_LOCATION: &str = "zeroshot/location";
-/// Label holding the Unix second after which the reaper may delete the resource.
-pub(crate) const LABEL_EXPIRES: &str = "zeroshot/expires";
-/// Time after a lease's TTL before the server's backstop shutdown and the reaper's deadline,
-/// leaving room for the orderly drain, archive and delete.
-pub(crate) const BACKSTOP_GRACE_MS: u64 = 15 * 60_000;
 /// How long a new server may take to boot and answer target discovery.
 pub(crate) const BOOT_DEADLINE_MS: u64 = 15 * 60_000;
 /// Longest wait between two provider polls of one lease.
@@ -66,7 +61,6 @@ pub(crate) struct Pool {
     pub max: u32,
     pub slots: u32,
     pub idle_ms: u64,
-    pub ttl_ms: u64,
     pub tags: Vec<String>,
     /// Private key the hub opens SSH tunnels with; its `.pub` sibling is installed on servers.
     pub ssh_key: PathBuf,
@@ -153,7 +147,6 @@ impl Pool {
             "max": self.max,
             "slots": self.slots,
             "idleMs": self.idle_ms,
-            "ttlMs": self.ttl_ms,
             "tags": self.tags,
             "sshKey": self.ssh_key,
             "sshFrom": self.ssh_from,
@@ -201,7 +194,6 @@ pub(crate) enum LeasePhase {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TeardownReason {
     Idle,
-    Ttl,
     BootTimeout,
     /// The provider reported the server failed or gone while it booted.
     BootFailed,
@@ -221,8 +213,6 @@ pub(crate) struct Lease {
     /// Hub-side port of the SSH tunnel to the target.
     pub local_port: u16,
     pub created_at_ms: u64,
-    /// End of the TTL: the lease drains from here.
-    pub expires_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -268,7 +258,6 @@ impl Lease {
             phase: LeasePhase::Creating,
             local_port,
             created_at_ms: now,
-            expires_at_ms: now.saturating_add(pool.ttl_ms),
             server_id: None,
             firewall_id: None,
             volume_id: None,
@@ -283,20 +272,11 @@ impl Lease {
         }
     }
 
-    /// The reaper's deadline: TTL plus the backstop grace.
-    pub(crate) const fn hard_deadline_ms(&self) -> u64 {
-        self.expires_at_ms.saturating_add(BACKSTOP_GRACE_MS)
-    }
-
     /// Labels for every provider resource of this lease. IDs only, never secrets.
     pub(crate) fn labels(&self, hub_id: &str) -> BTreeMap<String, String> {
         BTreeMap::from([
             (LABEL_HUB.to_owned(), hub_id.to_owned()),
             (LABEL_LEASE.to_owned(), self.id.clone()),
-            (
-                LABEL_EXPIRES.to_owned(),
-                (self.hard_deadline_ms() / 1000).to_string(),
-            ),
         ])
     }
 
@@ -332,7 +312,6 @@ impl Lease {
             "serverId": self.server_id,
             "localPort": self.local_port,
             "createdAt": rfc3339(self.created_at_ms),
-            "expiresAt": rfc3339(self.expires_at_ms),
             "reason": self.reason,
             "attempts": self.attempts,
             "error": self.error,
@@ -462,7 +441,6 @@ pub(crate) fn teardown_due(state: &HubState, now: u64) -> Vec<(String, TeardownR
             LeasePhase::Creating | LeasePhase::Booting | LeasePhase::Connecting => (now
                 >= lease.created_at_ms.saturating_add(BOOT_DEADLINE_MS))
             .then_some(TeardownReason::BootTimeout),
-            LeasePhase::Active if now >= lease.expires_at_ms => Some(TeardownReason::Ttl),
             LeasePhase::Active => {
                 let idle_ms = pool.map_or(0, |pool| pool.idle_ms);
                 state
@@ -514,31 +492,17 @@ pub(crate) enum ResourceKind {
     Firewall,
 }
 
-/// Resources the reaper deletes: those whose lease the state does not hold, and those past
-/// their `zeroshot/expires` label whose lease has no run left to archive. A resource of a held
-/// lease that still has unarchived runs is kept even past its deadline: nothing is deleted
-/// before it is archived.
-pub(crate) fn orphans<'a>(
-    resources: &'a [Resource],
-    state: &HubState,
-    now_ms: u64,
-) -> Vec<&'a Resource> {
+/// Resources the reaper deletes: those whose lease the state does not hold. A resource of a
+/// held lease is kept until the lease's own teardown removes it: nothing is deleted before its
+/// runs are archived.
+pub(crate) fn orphans<'a>(resources: &'a [Resource], state: &HubState) -> Vec<&'a Resource> {
     resources
         .iter()
         .filter(|resource| {
-            let lease = resource
+            !resource
                 .labels
                 .get(LABEL_LEASE)
-                .and_then(|id| state.leases.iter().find(|lease| lease.id == *id));
-            let Some(lease) = lease else {
-                return true;
-            };
-            let expired = resource
-                .labels
-                .get(LABEL_EXPIRES)
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_some_and(|expires| expires.saturating_mul(1000) <= now_ms);
-            expired && unarchived(&state.jobs, &lease.name).is_empty()
+                .is_some_and(|id| state.leases.iter().any(|lease| lease.id == *id))
         })
         .collect()
 }
