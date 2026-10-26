@@ -446,6 +446,13 @@ async fn handshake_lists_cli_tools() {
             "hub_stats",
             "hub_logs",
             "hub_daemon_status",
+            "hub_dequeue",
+            "hub_add",
+            "hub_update",
+            "hub_remove",
+            "hub_dispatch",
+            "hub_force_stop",
+            "hub_watch",
         ]
     );
     for tool in tools {
@@ -461,6 +468,52 @@ async fn handshake_lists_cli_tools() {
             .contains("Read a run's current status as JSON")
     );
     assert_eq!(status["inputSchema"]["required"], json!(["runId"]));
+}
+
+#[test]
+fn hub_tools_are_listed_and_map_arguments() {
+    let listed = super::tools::list(&Value::Null).expect("list tools");
+    let names = listed["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    for name in [
+        "hub_dequeue",
+        "hub_add",
+        "hub_update",
+        "hub_remove",
+        "hub_dispatch",
+        "hub_force_stop",
+        "hub_watch",
+    ] {
+        assert!(names.contains(&name), "{name} is listed");
+    }
+
+    let arguments = json!({"job": "hj_1"})
+        .as_object()
+        .expect("arguments object")
+        .clone();
+    assert_eq!(
+        super::tools::argv_for_test("hub_dequeue", &arguments).expect("hub_dequeue argv"),
+        ["hub", "dequeue", "hj_1"]
+    );
+
+    let arguments = json!({"title": "Review", "taskFrom": "https://github.com/acme/repo/pull/1"})
+        .as_object()
+        .expect("arguments object")
+        .clone();
+    assert_eq!(
+        super::tools::argv_for_test("run", &arguments).expect("run argv"),
+        [
+            "run",
+            "--title",
+            "Review",
+            "--task-from",
+            "https://github.com/acme/repo/pull/1"
+        ]
+    );
 }
 
 #[tokio::test]

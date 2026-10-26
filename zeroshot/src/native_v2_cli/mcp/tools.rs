@@ -34,6 +34,7 @@ const INLINE_KEYS: &[&str] = &[
 const RUN_KEYS: &[&str] = &[
     "title",
     "input",
+    "taskFrom",
     "graph",
     "template",
     "runtimeConfig",
@@ -172,6 +173,63 @@ const TOOLS: &[Tool] = &[
         schema: hub_daemon_status_schema,
         argv: hub_daemon_status_argv,
     },
+    Tool {
+        name: "hub_dequeue",
+        cli: &["hub", "dequeue"],
+        allowed: &["job", "hub"],
+        schema: hub_dequeue_schema,
+        argv: hub_dequeue_argv,
+    },
+    Tool {
+        name: "hub_add",
+        cli: &["hub", "add"],
+        allowed: &["name", "tag", "slots", "priority", "hub"],
+        schema: hub_add_schema,
+        argv: hub_add_argv,
+    },
+    Tool {
+        name: "hub_update",
+        cli: &["hub", "update"],
+        allowed: &[
+            "name",
+            "addTag",
+            "removeTag",
+            "slots",
+            "priority",
+            "state",
+            "hub",
+        ],
+        schema: hub_update_schema,
+        argv: hub_update_argv,
+    },
+    Tool {
+        name: "hub_remove",
+        cli: &["hub", "remove"],
+        allowed: &["name", "hub"],
+        schema: hub_remove_schema,
+        argv: hub_remove_argv,
+    },
+    Tool {
+        name: "hub_dispatch",
+        cli: &["hub", "dispatch"],
+        allowed: &["hub"],
+        schema: hub_dispatch_schema,
+        argv: hub_dispatch_argv,
+    },
+    Tool {
+        name: "hub_force_stop",
+        cli: &["hub", "force-stop"],
+        allowed: &["job", "hub"],
+        schema: hub_force_stop_schema,
+        argv: hub_force_stop_argv,
+    },
+    Tool {
+        name: "hub_watch",
+        cli: &["hub", "watch"],
+        allowed: &["job", "after", "hub"],
+        schema: hub_watch_schema,
+        argv: hub_watch_argv,
+    },
 ];
 
 const HUB_SUBMIT_KEYS: &[&str] = &[
@@ -183,6 +241,7 @@ const HUB_SUBMIT_KEYS: &[&str] = &[
     "queue",
     "title",
     "input",
+    "taskFrom",
     "graph",
     "template",
     "runtimeConfig",
@@ -392,6 +451,27 @@ fn tool_matches(name: &str, command: &NativeV2CliCommand) -> bool {
         ("hub_daemon_status", NativeV2CliCommand::Hub(request)) => {
             matches!(request.command, HubCommand::DaemonStatus)
         }
+        ("hub_dequeue", NativeV2CliCommand::Hub(request)) => {
+            matches!(request.command, HubCommand::Dequeue { .. })
+        }
+        ("hub_add", NativeV2CliCommand::Hub(request)) => {
+            matches!(request.command, HubCommand::Add(_))
+        }
+        ("hub_update", NativeV2CliCommand::Hub(request)) => {
+            matches!(request.command, HubCommand::Update(_))
+        }
+        ("hub_remove", NativeV2CliCommand::Hub(request)) => {
+            matches!(request.command, HubCommand::Remove { .. })
+        }
+        ("hub_dispatch", NativeV2CliCommand::Hub(request)) => {
+            matches!(request.command, HubCommand::Dispatch)
+        }
+        ("hub_force_stop", NativeV2CliCommand::Hub(request)) => {
+            matches!(request.command, HubCommand::ForceStop { .. })
+        }
+        ("hub_watch", NativeV2CliCommand::Hub(request)) => {
+            matches!(request.command, HubCommand::Watch { .. })
+        }
         _ => false,
     }
 }
@@ -474,6 +554,7 @@ fn push_run_flags(
 ) -> Result<(), McpFailure> {
     push_opt(argv, map, "title", "--title")?;
     push_opt(argv, map, "input", "--input")?;
+    push_opt(argv, map, "taskFrom", "--task-from")?;
     push_opt(argv, map, "graph", "--graph")?;
     push_opt(argv, map, "template", "--template")?;
     push_opt(argv, map, "runtimeConfig", "--runtime-config")?;
@@ -791,6 +872,80 @@ fn hub_daemon_status_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFa
     hub_prefix(map, &["daemon", "status"])
 }
 
+fn hub_dequeue_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFailure> {
+    let mut argv = hub_prefix(map, &["dequeue"])?;
+    if let Some(job) = optional_string(map, "job")? {
+        argv.push(job);
+    }
+    Ok(argv)
+}
+
+fn hub_add_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFailure> {
+    let mut argv = hub_prefix(map, &["add"])?;
+    if let Some(name) = optional_string(map, "name")? {
+        argv.push(name);
+    }
+    push_repeat(&mut argv, map, "tag", "--tag")?;
+    push_u64(&mut argv, map, "slots", "--slots")?;
+    push_i64(&mut argv, map, "priority", "--priority")?;
+    Ok(argv)
+}
+
+fn hub_update_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFailure> {
+    let mut argv = hub_prefix(map, &["update"])?;
+    if let Some(name) = optional_string(map, "name")? {
+        argv.push(name);
+    }
+    push_repeat(&mut argv, map, "addTag", "--add-tag")?;
+    push_repeat(&mut argv, map, "removeTag", "--remove-tag")?;
+    push_u64(&mut argv, map, "slots", "--slots")?;
+    push_i64(&mut argv, map, "priority", "--priority")?;
+    push_opt(&mut argv, map, "state", "--state")?;
+    Ok(argv)
+}
+
+fn hub_remove_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFailure> {
+    let mut argv = hub_prefix(map, &["remove"])?;
+    if let Some(name) = optional_string(map, "name")? {
+        argv.push(name);
+    }
+    Ok(argv)
+}
+
+fn hub_dispatch_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFailure> {
+    hub_prefix(map, &["dispatch"])
+}
+
+fn hub_force_stop_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFailure> {
+    let mut argv = hub_prefix(map, &["force-stop"])?;
+    if let Some(job) = optional_string(map, "job")? {
+        argv.push(job);
+    }
+    Ok(argv)
+}
+
+fn hub_watch_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFailure> {
+    let mut argv = hub_prefix(map, &["watch"])?;
+    if let Some(job) = optional_string(map, "job")? {
+        argv.push(job);
+    }
+    push_opt(&mut argv, map, "after", "--after")?;
+    Ok(argv)
+}
+
+#[cfg(test)]
+pub(super) fn argv_for_test(
+    name: &str,
+    arguments: &Map<String, Value>,
+) -> Result<Vec<String>, McpFailure> {
+    let tool = TOOLS
+        .iter()
+        .find(|tool| tool.name == name)
+        .ok_or_else(|| McpFailure::invalid(format!("unknown tool {name}")))?;
+    reject_unknown(arguments, tool.allowed)?;
+    (tool.argv)(arguments)
+}
+
 fn selector_properties() -> Vec<(&'static str, Value)> {
     vec![
         ("runId", string_prop("Public run ID.")),
@@ -810,6 +965,13 @@ fn run_properties() -> Vec<(&'static str, Value)> {
         (
             "input",
             inline_json_prop("Inline JSON value for the graph's initial input."),
+        ),
+        (
+            "taskFrom",
+            string_prop(
+                "Resolve a GitHub issue or pull-request URL into the run input. \
+                Conflicts with input, repository, and sourceConnection.",
+            ),
         ),
         (
             "graph",
@@ -910,7 +1072,7 @@ fn placement_properties() -> Vec<(&'static str, Value)> {
 }
 
 fn run_schema() -> Value {
-    object_schema(&["title", "input"], run_properties())
+    object_schema(&["title"], run_properties())
 }
 
 fn status_schema() -> Value {
@@ -1062,7 +1224,7 @@ fn hub_submit_schema() -> Value {
             .into_iter()
             .filter(|(name, _)| !matches!(*name, "validateOnly")),
     );
-    object_schema(&["title", "input"], properties)
+    object_schema(&["title"], properties)
 }
 
 fn hub_enqueue_schema() -> Value {
@@ -1126,5 +1288,98 @@ fn hub_daemon_status_schema() -> Value {
             "hub",
             string_prop("Hub context. Omit for ZEROSHOT_HUB, then the current context."),
         )],
+    )
+}
+
+fn hub_dequeue_schema() -> Value {
+    object_schema(&["job"], hub_job_properties(Vec::new()))
+}
+
+fn hub_add_schema() -> Value {
+    object_schema(
+        &["name"],
+        vec![
+            (
+                "hub",
+                string_prop("Hub context. Omit for ZEROSHOT_HUB, then the current context."),
+            ),
+            (
+                "name",
+                string_prop("Registered target name, or `local` for the local controller."),
+            ),
+            (
+                "tag",
+                string_array_prop("Placement tag, such as gpu or project=citydiff. Repeatable."),
+            ),
+            (
+                "slots",
+                integer_prop("Concurrent runs the hub places on this member."),
+            ),
+            (
+                "priority",
+                integer_prop("Higher priority members are preferred by first-free placement."),
+            ),
+        ],
+    )
+}
+
+fn hub_update_schema() -> Value {
+    object_schema(
+        &["name"],
+        vec![
+            (
+                "hub",
+                string_prop("Hub context. Omit for ZEROSHOT_HUB, then the current context."),
+            ),
+            ("name", string_prop("Member name.")),
+            ("addTag", string_array_prop("Add this tag. Repeatable.")),
+            (
+                "removeTag",
+                string_array_prop("Remove this tag. Repeatable."),
+            ),
+            (
+                "slots",
+                integer_prop("Concurrent runs the hub places on this member."),
+            ),
+            ("priority", integer_prop("Placement priority.")),
+            ("state", string_prop("Member placement state.")),
+        ],
+    )
+}
+
+fn hub_remove_schema() -> Value {
+    object_schema(
+        &["name"],
+        vec![
+            (
+                "hub",
+                string_prop("Hub context. Omit for ZEROSHOT_HUB, then the current context."),
+            ),
+            ("name", string_prop("Member name.")),
+        ],
+    )
+}
+
+fn hub_dispatch_schema() -> Value {
+    object_schema(
+        &[],
+        vec![(
+            "hub",
+            string_prop("Hub context. Omit for ZEROSHOT_HUB, then the current context."),
+        )],
+    )
+}
+
+fn hub_force_stop_schema() -> Value {
+    object_schema(&["job"], hub_job_properties(Vec::new()))
+}
+
+fn hub_watch_schema() -> Value {
+    object_schema(
+        &["job"],
+        hub_job_properties(vec![(
+            "after",
+            string_prop("Resume strictly after this durable cursor."),
+        )]),
     )
 }
