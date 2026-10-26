@@ -293,7 +293,6 @@ async fn remote_client_drives_the_hub_and_replays_errors() {
             cron: None,
             cron_timezone: None,
             priority: 3,
-            expires: None,
         }))
     };
     let queued = run(&client, enqueue(None)).await.expect("enqueue");

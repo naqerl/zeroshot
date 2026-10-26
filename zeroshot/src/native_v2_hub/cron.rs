@@ -127,9 +127,6 @@ fn fire_job(schedule: &Schedule, now_ms: u64) -> Job {
     job.submission_key = None;
     job.submitted_at_ms = now_ms;
     job.not_before_ms = None;
-    job.expires_at_ms = schedule
-        .expires_after_ms
-        .map(|after| now_ms.saturating_add(after));
     // A schedule created by a client on another machine names a folder the hub host may not
     // have; it then keeps the revision pinned at acceptance.
     if let Some(folder) = schedule
@@ -174,7 +171,6 @@ impl Schedule {
             "lastJobId": self.last_job_id,
             "fired": self.fired,
             "skipped": self.skipped,
-            "expiresAfterMs": self.expires_after_ms,
             "removedAt": time(self.removed_at_ms),
             "error": self.error,
         })

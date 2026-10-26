@@ -830,44 +830,15 @@ impl HubService {
             .await?;
         let results = schedule::poll(polls, self.driver()).await;
         let now = now_ms();
-        let (finished, expiring, members) = self
+        let (finished, members) = self
             .mutate(|state| {
                 let finished = schedule::apply_polls(state, results, now);
-                let expiring = schedule::expiring_runs(&state.jobs, now);
-                Ok((finished, expiring, state.members.clone()))
+                Ok((finished, state.members.clone()))
             })
             .await?;
-        let stopped = self
-            .stop_runs(
-                expiring
-                    .iter()
-                    .map(|run| (&run.job_id, run.target.as_deref(), run.run_id.as_deref())),
-            )
-            .await;
-        let mut expired = self
-            .mutate(|state| {
-                Ok(schedule::settle_expiring(
-                    &mut state.jobs,
-                    now,
-                    &expiring,
-                    &stopped,
-                ))
-            })
-            .await?;
-        expired.extend(
-            self.mutate(|state| {
-                Ok(if stopped.is_empty() {
-                    schedule::expire(&mut state.jobs, now)
-                } else {
-                    schedule::expire_unconfirmed(&mut state.jobs, now)
-                })
-            })
-            .await?,
-        );
         let mut report = TickReport {
             fired,
             finished,
-            expired,
             ..TickReport::default()
         };
         if let Some(max_stall_ms) = self.max_stall_ms {

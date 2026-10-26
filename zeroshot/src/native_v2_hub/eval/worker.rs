@@ -447,7 +447,6 @@ impl HubService {
                     output: None,
                     submission_key: None,
                     not_before_ms: None,
-                    expires_at_ms: None,
                     ..candidate_job
                 };
                 self.mutate(|state| {

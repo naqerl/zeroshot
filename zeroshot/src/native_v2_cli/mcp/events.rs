@@ -18,6 +18,8 @@ use super::super::{NativeV2CliCommand, RunWatchCommand};
 
 pub(super) const EXTENSION_ID: &str = "io.modelcontextprotocol/events";
 const EVENT_NAME: &str = "run.event";
+const WARNING_NAME: &str = "run.warning";
+const HOUR_MS: u64 = 60 * 60 * 1000;
 const SUBSCRIPTION_META: &str = "io.modelcontextprotocol/subscriptionId";
 const FIRST_WAIT: Duration = Duration::from_secs(2);
 const IDLE_WAIT: Duration = Duration::from_millis(50);
@@ -31,7 +33,38 @@ const LOCAL_HUB_MEMBER: &str = "local";
 
 pub(super) struct Prepared {
     source: Source,
+    subscription: Subscription,
+}
+
+struct Subscription {
     filters: Filters,
+    name: EventName,
+    job_id: Option<String>,
+    run_id: Option<String>,
+}
+
+struct WatchRequest<'a> {
+    request: &'a PollRequest,
+    run_id: &'a str,
+    target: Option<&'a str>,
+    job_id: Option<String>,
+    started_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventName {
+    Run,
+    Warning,
+}
+
+impl EventName {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            EVENT_NAME => Some(Self::Run),
+            WARNING_NAME => Some(Self::Warning),
+            _ => None,
+        }
+    }
 }
 
 enum Source {
@@ -40,6 +73,7 @@ enum Source {
         cursor: Option<String>,
         run: Option<Value>,
         replayed: Vec<Value>,
+        started_at_ms: Option<u64>,
     },
     Discovery(Discovery),
 }
@@ -61,6 +95,7 @@ pub(super) enum EventError {
 }
 
 struct PollRequest {
+    name: EventName,
     selector: Selector,
     target: Option<String>,
     cursor: Option<String>,
@@ -78,10 +113,9 @@ struct JobSnapshot {
     view: Value,
     run_id: Option<String>,
     target: Option<String>,
-    state: String,
     terminal: bool,
-    error: Value,
     error_kind: Value,
+    started_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -152,17 +186,29 @@ pub(super) fn list(params: &Value) -> Result<Value, EventError> {
     }
     Ok(json!({
         "resultType": "complete",
-        "events": [{
-            "name": EVENT_NAME,
-            "description": "A durable run event from the same stream `zeroshot watch` reads. \
-                Subscribe with exactly one of runId or jobId and an optional target. Delivery is \
-                poll or push. Signed webhooks (events/subscribe) are unsupported. maxAgeMs is \
-                accepted at the subscription level but not applied because durable watch records \
-                carry no occurrence time; the event timestamp is delivery time.",
-            "delivery": ["poll", "push"],
-            "inputSchema": input_schema(),
-            "payloadSchema": payload_schema(),
-        }]
+        "events": [
+            {
+                "name": EVENT_NAME,
+                "description": "A durable run event from the same stream `zeroshot watch` reads. \
+                    Subscribe with exactly one of runId or jobId and an optional target. Delivery is \
+                    poll or push. Signed webhooks (events/subscribe) are unsupported. maxAgeMs is \
+                    accepted at the subscription level but not applied because durable watch records \
+                    carry no occurrence time; the event timestamp is delivery time.",
+                "delivery": ["poll", "push"],
+                "inputSchema": input_schema(),
+                "payloadSchema": payload_schema(),
+            },
+            {
+                "name": WARNING_NAME,
+                "description": "A liveness warning for a run that is still active. Subscribe with \
+                    exactly one of runId or jobId and an optional target. One warning is pushed for \
+                    each completed hour of run time while the subscription is active; earlier hours \
+                    are never replayed, and warnings stop at the terminal phase.",
+                "delivery": ["push"],
+                "inputSchema": input_schema(),
+                "payloadSchema": payload_schema(),
+            }
+        ]
     }))
 }
 
@@ -181,6 +227,24 @@ pub(super) fn unsupported_webhook() -> EventError {
 
 pub(super) async fn poll(host: &impl McpHost, params: &Value) -> Result<Value, EventError> {
     let request = parse_subscription(params, true)?;
+    if request.name == EventName::Warning {
+        let job = match request.selector.clone() {
+            Selector::Job(job_id) => Some(job_status(host, &job_id).await?.view),
+            Selector::Run(_) => None,
+        };
+        let mut result = json!({
+            "resultType": "complete",
+            "events": [],
+            "cursor": Value::Null,
+            "truncated": false,
+            "hasMore": false,
+            "nextPollMs": NEXT_POLL_MS,
+        });
+        if let Some(job) = job {
+            result["job"] = job;
+        }
+        return Ok(result);
+    }
     let (batch, job) = match request.selector.clone() {
         Selector::Run(run_id) => {
             let batch = collect(host, &request, &run_id, request.target.as_deref()).await?;
@@ -223,22 +287,51 @@ pub(super) async fn prepare(host: &impl McpHost, params: &Value) -> Result<Prepa
     let request = parse_subscription(params, false)?;
     match request.selector.clone() {
         Selector::Run(run_id) => {
-            prepare_watch(host, &request, &run_id, request.target.as_deref()).await
+            let started_at_ms = run_started_at_ms(&run_id);
+            prepare_watch(
+                host,
+                WatchRequest {
+                    request: &request,
+                    run_id: &run_id,
+                    target: request.target.as_deref(),
+                    job_id: None,
+                    started_at_ms,
+                },
+            )
+            .await
         }
         Selector::Job(job_id) => {
             let snapshot = job_status(host, &job_id).await?;
             if let Some(run_id) = snapshot.run_id.clone() {
                 let target = request.target.clone().or_else(|| snapshot.target.clone());
-                prepare_watch(host, &request, &run_id, target.as_deref()).await
+                let started_at_ms = snapshot
+                    .started_at_ms
+                    .or_else(|| run_started_at_ms(&run_id));
+                prepare_watch(
+                    host,
+                    WatchRequest {
+                        request: &request,
+                        run_id: &run_id,
+                        target: target.as_deref(),
+                        job_id: Some(job_id.clone()),
+                        started_at_ms,
+                    },
+                )
+                .await
             } else {
                 let target = request.target.clone().or_else(|| snapshot.target.clone());
                 Ok(Prepared {
                     source: Source::Discovery(Discovery {
-                        job_id,
+                        job_id: job_id.clone(),
                         target,
                         job: snapshot,
                     }),
-                    filters: request.filters,
+                    subscription: Subscription {
+                        filters: request.filters,
+                        name: request.name,
+                        job_id: Some(job_id),
+                        run_id: None,
+                    },
                 })
             }
         }
@@ -247,10 +340,15 @@ pub(super) async fn prepare(host: &impl McpHost, params: &Value) -> Result<Prepa
 
 async fn prepare_watch(
     host: &impl McpHost,
-    request: &PollRequest,
-    run_id: &str,
-    target: Option<&str>,
+    watch: WatchRequest<'_>,
 ) -> Result<Prepared, EventError> {
+    let WatchRequest {
+        request,
+        run_id,
+        target,
+        job_id,
+        started_at_ms,
+    } = watch;
     let command = watch_command(run_id, target, request.cursor.as_deref())?;
     let mut stream = host.open_watch(&command).await.map_err(classify)?;
     let (cursor, run, replayed) = if request.cursor.is_none() {
@@ -266,8 +364,14 @@ async fn prepare_watch(
             cursor,
             run,
             replayed,
+            started_at_ms,
         },
-        filters: request.filters.clone(),
+        subscription: Subscription {
+            filters: request.filters.clone(),
+            name: request.name,
+            job_id,
+            run_id: Some(run_id.to_owned()),
+        },
     })
 }
 
@@ -292,6 +396,76 @@ struct WatchState {
     cursor: Option<String>,
     run: Option<Value>,
     replayed: Vec<Value>,
+    started_at_ms: Option<u64>,
+}
+
+#[cfg(test)]
+pub(super) fn warning_test_prepared(
+    stream: WatchStream,
+    run_id: &str,
+    job_id: Option<&str>,
+    elapsed_ms: u64,
+) -> Prepared {
+    let now = now_ms();
+    Prepared {
+        source: Source::Watch {
+            stream,
+            cursor: None,
+            run: None,
+            replayed: Vec::new(),
+            started_at_ms: Some(now.saturating_sub(elapsed_ms)),
+        },
+        subscription: Subscription {
+            filters: Filters::default(),
+            name: EventName::Warning,
+            job_id: job_id.map(str::to_owned),
+            run_id: Some(run_id.to_owned()),
+        },
+    }
+}
+
+struct WarningState {
+    job_id: Option<String>,
+    run_id: String,
+    started_at_ms: u64,
+    elapsed_at_start_ms: u64,
+    next_hour: u64,
+    since: tokio::time::Instant,
+}
+
+impl WarningState {
+    fn new(job_id: Option<String>, run_id: String, now_ms: u64, started_at_ms: u64) -> Self {
+        let elapsed = now_ms.saturating_sub(started_at_ms);
+        Self {
+            job_id,
+            run_id,
+            started_at_ms,
+            elapsed_at_start_ms: elapsed,
+            next_hour: elapsed / HOUR_MS + 1,
+            since: tokio::time::Instant::now(),
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        let since = u64::try_from(self.since.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.elapsed_at_start_ms.saturating_add(since)
+    }
+
+    fn wait(&self) -> Duration {
+        let elapsed = self.elapsed_ms();
+        let boundary = self.next_hour.saturating_mul(HOUR_MS);
+        Duration::from_millis(boundary.saturating_sub(elapsed).max(1))
+    }
+
+    fn due(&mut self) -> Vec<u64> {
+        let completed = self.elapsed_ms() / HOUR_MS;
+        let mut due = Vec::new();
+        while self.next_hour <= completed {
+            due.push(self.next_hour);
+            self.next_hour = self.next_hour.saturating_add(1);
+        }
+        due
+    }
 }
 
 pub(super) async fn drive<W, H>(
@@ -303,39 +477,53 @@ where
     W: AsyncWrite + Unpin + Send,
     H: McpHost + 'static,
 {
-    let Prepared { source, filters } = prepared;
+    let Prepared {
+        source,
+        subscription,
+    } = prepared;
     match source {
         Source::Watch {
             stream,
             cursor,
             run,
             replayed,
+            started_at_ms,
         } => {
             let state = WatchState {
                 stream,
                 cursor,
                 run,
                 replayed,
+                started_at_ms,
             };
-            drive_watch(state, &filters, output).await
+            drive_watch(state, subscription, output).await
         }
-        Source::Discovery(discovery) => drive_discovery(host, discovery, filters, output).await,
+        Source::Discovery(discovery) => {
+            drive_discovery(host, discovery, subscription, output).await
+        }
     }
 }
 
 async fn drive_watch<W>(
     state: WatchState,
-    filters: &Filters,
+    subscription: Subscription,
     output: StreamOutput<W>,
 ) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin + Send,
 {
+    let Subscription {
+        filters,
+        name,
+        job_id,
+        run_id,
+    } = subscription;
     let WatchState {
         mut stream,
         mut cursor,
         mut run,
         replayed,
+        started_at_ms,
     } = state;
     let StreamOutput {
         id,
@@ -356,19 +544,43 @@ where
         },
     )
     .await?;
+    let warning = name == EventName::Warning;
+    let mut last_phase = None;
     let mut delivery = Delivery {
         cursor: &mut cursor,
         run: &mut run,
-        filters,
+        filters: &filters,
         replayed: true,
     };
     for event in replayed {
         if cancelled.load(Ordering::Relaxed) {
             return Ok(());
         }
-        emit_event(&writer, &id, &mut delivery, &event).await?;
+        if warning {
+            if let Ok(event_cursor) = watch_cursor(&event) {
+                *delivery.cursor = Some(event_cursor);
+            }
+            if delivery.run.is_none() {
+                *delivery.run = run_constants(&event);
+            }
+            last_phase = phase(&event).map(str::to_owned);
+        } else {
+            emit_event(&writer, &id, &mut delivery, &event).await?;
+        }
     }
     delivery.replayed = false;
+    if warning && last_phase.as_deref() == Some("finished") {
+        write_result(&writer, &id).await?;
+        return Ok(());
+    }
+    let mut warnings = warning.then(|| {
+        WarningState::new(
+            job_id,
+            run_id.unwrap_or_else(|| "run".to_owned()),
+            now_ms(),
+            started_at_ms.unwrap_or_else(now_ms),
+        )
+    });
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
@@ -393,27 +605,82 @@ where
                         return Ok(());
                     }
                     Some(Ok(event)) => {
-                        emit_event(&writer, &id, &mut delivery, &event).await?;
+                        if warning {
+                            if let Ok(event_cursor) = watch_cursor(&event) {
+                                *delivery.cursor = Some(event_cursor);
+                            }
+                            if delivery.run.is_none() {
+                                *delivery.run = run_constants(&event);
+                            }
+                            last_phase = phase(&event).map(str::to_owned);
+                            if last_phase.as_deref() == Some("finished") {
+                                write_result(&writer, &id).await?;
+                                return Ok(());
+                            }
+                        } else {
+                            emit_event(&writer, &id, &mut delivery, &event).await?;
+                        }
                     }
                 }
             }
             _ = heartbeat.tick() => {
                 write_heartbeat(&writer, &id, delivery.cursor).await?;
             }
+            _ = warning_due(&mut warnings) => {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                let phase = last_phase.clone().unwrap_or_else(|| "running".to_owned());
+                if phase == "finished" {
+                    continue;
+                }
+                if let Some(warnings) = warnings.as_mut() {
+                    for hours in warnings.due() {
+                        write_warning(
+                            &writer,
+                            &id,
+                            Warning {
+                                job_id: warnings.job_id.as_deref(),
+                                run_id: &warnings.run_id,
+                                started_at_ms: warnings.started_at_ms,
+                                hours,
+                                phase: &phase,
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
         }
+    }
+}
+
+async fn warning_due(warnings: &mut Option<WarningState>) {
+    match warnings {
+        Some(warnings) => {
+            let wait = warnings.wait();
+            tokio::time::sleep(wait).await;
+        }
+        None => std::future::pending().await,
     }
 }
 
 async fn drive_discovery<W, H>(
     host: Rc<H>,
     discovery: Discovery,
-    filters: Filters,
+    subscription: Subscription,
     output: StreamOutput<W>,
 ) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin + Send,
     H: McpHost + 'static,
 {
+    let Subscription {
+        filters,
+        name,
+        job_id: subscription_job_id,
+        run_id: _,
+    } = subscription;
     let StreamOutput {
         id,
         writer,
@@ -442,16 +709,18 @@ where
     .await?;
     if job.terminal {
         let terminal_cursor = next_discovery_cursor(&mut sequence);
-        write_discovery_terminal(
-            &writer,
-            &id,
-            DiscoveryTerminal {
-                job_id: &job_id,
-                job: &job,
-                cursor: &terminal_cursor,
-            },
-        )
-        .await?;
+        if name == EventName::Run {
+            write_discovery_terminal(
+                &writer,
+                &id,
+                DiscoveryTerminal {
+                    job_id: &job_id,
+                    job: &job,
+                    cursor: &terminal_cursor,
+                },
+            )
+            .await?;
+        }
         write_result(&writer, &id).await?;
         return Ok(());
     }
@@ -503,22 +772,36 @@ where
                         cursor: None,
                         run: None,
                         replayed: Vec::new(),
+                        started_at_ms: snapshot
+                            .started_at_ms
+                            .or_else(|| run_started_at_ms(&run_id)),
                     };
-                    return drive_watch(state, &filters, StreamOutput::new(id, writer, cancelled))
-                        .await;
+                    return drive_watch(
+                        state,
+                        Subscription {
+                            filters,
+                            name,
+                            job_id: subscription_job_id,
+                            run_id: Some(run_id),
+                        },
+                        StreamOutput::new(id, writer, cancelled),
+                    )
+                    .await;
                 }
                 if snapshot.terminal {
                     let terminal_cursor = next_discovery_cursor(&mut sequence);
-                    write_discovery_terminal(
-                        &writer,
-                        &id,
-                        DiscoveryTerminal {
-                            job_id: &job_id,
-                            job: &snapshot,
-                            cursor: &terminal_cursor,
-                        },
-                    )
-                    .await?;
+                    if name == EventName::Run {
+                        write_discovery_terminal(
+                            &writer,
+                            &id,
+                            DiscoveryTerminal {
+                                job_id: &job_id,
+                                job: &snapshot,
+                                cursor: &terminal_cursor,
+                            },
+                        )
+                        .await?;
+                    }
                     write_result(&writer, &id).await?;
                     return Ok(());
                 }
@@ -598,6 +881,14 @@ where
         job,
         cursor,
     } = terminal;
+    let mut data = job.view.clone();
+    let summary = json!({
+        "phase": Value::Null,
+        "node": Value::Null,
+        "terminal": true,
+        "reason": job.error_kind,
+    });
+    insert_envelope_data(&mut data, cursor, &summary);
     write_notification(
         writer,
         "notifications/events/event",
@@ -605,20 +896,62 @@ where
             "eventId": format!("{job_id}:{cursor}"),
             "name": EVENT_NAME,
             "timestamp": now_rfc3339(),
-            "cursor": cursor,
-            "replayed": false,
-            "data": job.view.clone(),
-            "job": job.view.clone(),
-            "jobId": job_id,
-            "state": job.state,
-            "error": job.error,
-            "errorKind": job.error_kind,
-            "summary": {
-                "phase": Value::Null,
-                "node": Value::Null,
-                "terminal": true,
-                "reason": job.error_kind,
-            },
+            "data": data,
+            "_meta": meta(id),
+        }),
+    )
+    .await
+}
+
+struct Warning<'a> {
+    job_id: Option<&'a str>,
+    run_id: &'a str,
+    started_at_ms: u64,
+    hours: u64,
+    phase: &'a str,
+}
+
+async fn write_warning<W>(
+    writer: &Mutex<W>,
+    id: &Value,
+    warning: Warning<'_>,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let Warning {
+        job_id,
+        run_id,
+        started_at_ms,
+        hours,
+        phase,
+    } = warning;
+    let unit = if hours == 1 { "hour" } else { "hours" };
+    let mut data = json!({
+        "runId": run_id,
+        "hours": hours,
+        "startedAt": rfc3339_ms(started_at_ms),
+        "phase": phase,
+        "message": format!("run has been active for {hours} {unit}"),
+        "summary": {
+            "phase": phase,
+            "node": Value::Null,
+            "terminal": false,
+            "reason": Value::Null,
+        },
+        "replayed": false,
+    });
+    if let Some(job_id) = job_id {
+        data["jobId"] = json!(job_id);
+    }
+    write_notification(
+        writer,
+        "notifications/events/event",
+        json!({
+            "eventId": format!("{run_id}:warning:{hours}"),
+            "name": WARNING_NAME,
+            "timestamp": now_rfc3339(),
+            "data": data,
             "_meta": meta(id),
         }),
     )
@@ -671,12 +1004,10 @@ fn parse_subscription(params: &Value, capped: bool) -> Result<PollRequest, Event
     };
     reject_unknown(map, allowed).map_err(EventError::Invalid)?;
     let name = optional_string(map, "name").map_err(EventError::Invalid)?;
-    let Some(name) = name else {
-        return Err(EventError::Invalid(McpFailure::invalid("name is required")));
+    let name = match name.as_deref() {
+        None => EventName::Run,
+        Some(name) => EventName::parse(name).ok_or(EventError::NotFound)?,
     };
-    if name != EVENT_NAME {
-        return Err(EventError::NotFound);
-    }
     // Watch records have no occurrence time, so maxAgeMs is accepted and not applied.
     if map.contains_key("maxAgeMs") && map.get("maxAgeMs").and_then(Value::as_u64).is_none() {
         return Err(EventError::Invalid(McpFailure::invalid(
@@ -723,6 +1054,7 @@ fn parse_subscription(params: &Value, capped: bool) -> Result<PollRequest, Event
     let target = optional_string(arguments, "target").map_err(EventError::Invalid)?;
     let filters = parse_filters(arguments)?;
     Ok(PollRequest {
+        name,
         selector,
         target,
         cursor,
@@ -894,9 +1226,7 @@ async fn collect_after(
             truncated = true;
         }
         cursor = event_cursor;
-        if let Some(occurrence) =
-            occurrence(&event, false, &request.filters, false).map_err(classify)?
-        {
+        if let Some(occurrence) = occurrence(&event, &request.filters, false).map_err(classify)? {
             events.push(occurrence);
         }
     }
@@ -949,11 +1279,6 @@ async fn job_status(host: &impl McpHost, job_id: &str) -> Result<JobSnapshot, Ev
         .and_then(Value::as_str)
         .filter(|run_id| !run_id.is_empty())
         .map(str::to_owned);
-    let state = view
-        .get("state")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
     Ok(JobSnapshot {
         target: view
             .get("target")
@@ -961,12 +1286,21 @@ async fn job_status(host: &impl McpHost, job_id: &str) -> Result<JobSnapshot, Ev
             .filter(|target| *target != LOCAL_HUB_MEMBER)
             .map(str::to_owned),
         terminal: run_id.is_none() && job_is_terminal(&view),
-        error: view.get("error").cloned().unwrap_or(Value::Null),
         error_kind: view.get("errorKind").cloned().unwrap_or(Value::Null),
+        started_at_ms: view
+            .get("dispatchedAt")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_ms),
         view,
         run_id,
-        state,
     })
+}
+
+fn parse_rfc3339_ms(text: &str) -> Option<u64> {
+    let time = OffsetDateTime::parse(text, &Rfc3339).ok()?;
+    let nanos = time.unix_timestamp_nanos();
+    let millis = nanos.checked_div(1_000_000)?;
+    u64::try_from(millis).ok()
 }
 
 fn invalid_hub_response(error: serde_json::Error) -> EventError {
@@ -1109,29 +1443,57 @@ fn summary(data: &Value) -> Value {
 
 fn occurrence(
     event: &Value,
-    include_cursor: bool,
     filters: &Filters,
     replayed: bool,
 ) -> Result<Option<Value>, McpFailure> {
     let cursor = watch_cursor(event)?;
     let run_id = event.get("runId").and_then(Value::as_str).unwrap_or("run");
-    let data = event_data(event, filters.verbose);
+    let mut data = event_data(event, filters.verbose);
     let terminal = data.pointer("/status/phase").and_then(Value::as_str) == Some("finished");
     if !filters.accepts(&data, terminal) {
         return Ok(None);
     }
-    let mut value = json!({
+    let summary = summary(&data);
+    insert_envelope_data(&mut data, &cursor, &summary);
+    data["replayed"] = json!(replayed);
+    Ok(Some(json!({
         "eventId": format!("{run_id}:{cursor}"),
         "name": EVENT_NAME,
         "timestamp": now_rfc3339(),
         "data": data,
-        "summary": summary(&data),
-        "replayed": replayed,
-    });
-    if include_cursor {
-        value["cursor"] = json!(cursor);
+        "_meta": json!({}),
+    })))
+}
+
+fn insert_envelope_data(data: &mut Value, cursor: &str, summary: &Value) {
+    if let Some(map) = data.as_object_mut() {
+        map.insert("cursor".to_owned(), json!(cursor));
+        map.insert("summary".to_owned(), summary.clone());
+        map.entry("replayed".to_owned()).or_insert(json!(false));
     }
-    Ok(Some(value))
+}
+
+fn phase(event: &Value) -> Option<&str> {
+    event.pointer("/status/phase").and_then(Value::as_str)
+}
+
+fn run_started_at_ms(run_id: &str) -> Option<u64> {
+    let timestamp = uuid::Uuid::parse_str(run_id).ok()?.get_timestamp()?;
+    let (seconds, nanos) = timestamp.to_unix();
+    seconds
+        .checked_mul(1000)?
+        .checked_add(u64::from(nanos / 1_000_000))
+}
+
+fn rfc3339_ms(ms: u64) -> String {
+    let nanos = i128::from(ms).checked_mul(1_000_000);
+    nanos
+        .and_then(|nanos| time::OffsetDateTime::from_unix_timestamp_nanos(nanos).ok())
+        .and_then(|time| {
+            time.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_default()
 }
 
 fn skipped(previous: &str, next: &str) -> bool {
@@ -1154,6 +1516,13 @@ fn cursor_value(cursor: &Option<String>) -> Value {
         Some(cursor) => Value::String(cursor.clone()),
         None => Value::Null,
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
 }
 
 fn now_rfc3339() -> String {
@@ -1216,14 +1585,27 @@ fn input_schema() -> Value {
 }
 
 fn payload_schema() -> Value {
+    let summary_schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["phase", "node", "terminal", "reason"],
+        "properties": {
+            "phase": {"type": ["string", "null"]},
+            "node": {"type": ["string", "null"]},
+            "terminal": {"type": "boolean"},
+            "reason": {"type": ["string", "null"]}
+        }
+    });
     let run_data = json!({
         "type": "object",
         "description": "Trimmed watch record. Run constants are sent once on notifications/events/active.",
         "additionalProperties": false,
-        "required": ["runId", "cursor", "status"],
+        "required": ["runId", "cursor", "status", "summary", "replayed"],
         "properties": {
             "runId": {"type": "string"},
             "cursor": {"type": "string"},
+            "summary": summary_schema,
+            "replayed": {"type": "boolean"},
             "status": {
                 "type": "object",
                 "description": "Public run status. status.metadata is present only when phase is finished.",
@@ -1247,7 +1629,7 @@ fn payload_schema() -> Value {
         "type": "object",
         "description": "Hub job state while a queued, scheduled, or placing job is followed before it has a run, and on its terminal event if it never runs.",
         "additionalProperties": true,
-        "required": ["jobId", "state"],
+        "required": ["jobId", "state", "summary", "replayed"],
         "properties": {
             "jobId": {"type": "string"},
             "state": {
@@ -1257,46 +1639,39 @@ fn payload_schema() -> Value {
             "runId": {"type": ["string", "null"]},
             "target": {"type": ["string", "null"]},
             "error": {"type": ["string", "null"]},
-            "errorKind": {"type": ["string", "null"]}
+            "errorKind": {"type": ["string", "null"]},
+            "summary": summary_schema.clone(),
+            "replayed": {"type": "boolean"}
+        }
+    });
+    let warning_data = json!({
+        "type": "object",
+        "description": "One completed hour of run time for a still-active run.",
+        "additionalProperties": false,
+        "required": ["runId", "hours", "startedAt", "phase", "message", "summary", "replayed"],
+        "properties": {
+            "runId": {"type": "string"},
+            "jobId": {"type": "string"},
+            "hours": {"type": "integer", "minimum": 1},
+            "startedAt": {"type": "string", "format": "date-time"},
+            "phase": {"type": "string", "enum": PHASES},
+            "message": {"type": "string"},
+            "summary": summary_schema,
+            "replayed": {"type": "boolean"}
         }
     });
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["eventId", "name", "timestamp", "data", "summary", "replayed", "_meta"],
+        "required": ["eventId", "name", "timestamp", "data", "_meta"],
         "properties": {
             "eventId": {
                 "type": "string",
-                "description": "Run events use <runId>:<cursor>; discovery-phase notifications use <jobId>:<cursor>."
+                "description": "Run events use <runId>:<cursor>, discovery events <jobId>:<cursor>, and warnings <runId>:warning:<hours>."
             },
-            "jobId": {"type": "string"},
-            "name": {"type": "string", "const": EVENT_NAME},
+            "name": {"type": "string", "enum": [EVENT_NAME, WARNING_NAME]},
             "timestamp": {"type": "string", "format": "date-time"},
-            "cursor": {
-                "type": "string",
-                "description": "Stream notification cursor; poll results return the next cursor separately."
-            },
-            "replayed": {"type": "boolean"},
-            "data": {"oneOf": [run_data, job_data.clone()]},
-            "job": job_data,
-            "state": {
-                "type": "string",
-                "description": "Terminal job state when the job never ran.",
-                "enum": ["queued", "scheduled", "running", "succeeded", "failed", "dequeued", "expired"]
-            },
-            "error": {"type": ["string", "null"]},
-            "errorKind": {"type": ["string", "null"]},
-            "summary": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["phase", "node", "terminal", "reason"],
-                "properties": {
-                    "phase": {"type": ["string", "null"]},
-                    "node": {"type": ["string", "null"]},
-                    "terminal": {"type": "boolean"},
-                    "reason": {"type": ["string", "null"]}
-                }
-            },
+            "data": {"oneOf": [run_data, job_data, warning_data]},
             "_meta": {"type": "object"}
         }
     })
@@ -1339,7 +1714,7 @@ where
         .cursor
         .as_deref()
         .is_some_and(|previous| skipped(previous, &event_cursor));
-    let occurrence = match occurrence(event, true, delivery.filters, delivery.replayed) {
+    let occurrence = match occurrence(event, delivery.filters, delivery.replayed) {
         Ok(occurrence) => occurrence,
         Err(failure) => return write_failure(writer, id, &failure).await,
     };

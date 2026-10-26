@@ -127,7 +127,6 @@ fn submit(job: HubJobSpec, queue: bool, wait: Option<Option<String>>) -> HubComm
         detach: true,
         wait,
         queue,
-        expires: None,
     }))
 }
 
@@ -170,7 +169,6 @@ async fn members_are_added_updated_listed_and_removed_through_the_api() {
             cron: None,
             cron_timezone: None,
             priority: 0,
-            expires: None,
         })),
     )
     .await
@@ -427,105 +425,33 @@ async fn submissions_place_queue_wait_and_refuse_through_the_api() {
 }
 
 #[tokio::test]
-async fn submit_expiry_is_validated_and_sent_with_the_job() {
-    let hub = hub_with(FakeDriver::default(), None).await;
-    let client = &hub.client;
-    run(client, add("local", 1)).await.expect("add");
-    let expiring = |title: &str, expires: &str, queue: bool| {
-        HubCommand::Submit(Box::new(HubSubmit {
-            job: spec(hub.directory.path(), title, None),
-            detach: true,
-            wait: None,
-            queue,
-            expires: Some(expires.to_owned()),
-        }))
-    };
-    let placed = run(client, expiring("deadline", "1h", false))
-        .await
-        .expect("submit");
-    assert_eq!(placed["job"]["state"], json!("running"));
-    assert!(placed["job"]["expiresAt"].is_string(), "{placed}");
-    let queued = run(client, expiring("queued-deadline", "1h", true))
-        .await
-        .expect("queue");
-    assert_eq!(queued["job"]["state"], json!("queued"));
-    assert!(queued["job"]["expiresAt"].is_string(), "{queued}");
-    expect_code(
-        client,
-        expiring("bad-deadline", "tomorrow", true),
-        "hub.invalid_request",
-    )
-    .await;
-    expect_code(
-        client,
-        expiring("zero-deadline", "0s", true),
-        "hub.invalid_request",
-    )
-    .await;
-    expect_code(
-        client,
-        expiring("past-deadline", "2020-01-01T00:00:00Z", true),
-        "hub.invalid_request",
-    )
-    .await;
-    let enqueue = |title: &str, expires: &str| {
-        HubCommand::Enqueue(Box::new(HubEnqueue {
-            job: spec(hub.directory.path(), title, None),
-            at: None,
-            cron: None,
-            cron_timezone: None,
-            priority: 0,
-            expires: Some(expires.to_owned()),
-        }))
-    };
-    expect_code(client, enqueue("zero-enqueue", "0s"), "hub.invalid_request").await;
-    expect_code(
-        client,
-        enqueue("past-enqueue", "2020-01-01T00:00:00Z"),
-        "hub.invalid_request",
-    )
-    .await;
-}
-
-#[tokio::test]
 async fn recurring_schedules_are_created_listed_and_removed() {
     let hub = hub_with(FakeDriver::default(), None).await;
     let client = &hub.client;
     run(client, add("local", 1)).await.expect("add");
     let mut job = spec(hub.directory.path(), "nightly", None);
     job.submission_key = Some("nightly-key".to_owned());
-    let enqueue = |job: HubJobSpec, expires: Option<&str>| {
+    let enqueue = |job: HubJobSpec| {
         HubCommand::Enqueue(Box::new(HubEnqueue {
             job,
             at: None,
             cron: Some("0 3 * * *".to_owned()),
             cron_timezone: Some("Europe/Belgrade".to_owned()),
             priority: 2,
-            expires: expires.map(str::to_owned),
         }))
     };
-    let created = run(client, enqueue(job.clone(), Some("2h")))
-        .await
-        .expect("schedule");
+    let created = run(client, enqueue(job.clone())).await.expect("schedule");
     let schedule_id = created["schedule"]["scheduleId"]
         .as_str()
         .expect("schedule id")
         .to_owned();
     assert!(schedule_id.starts_with("hs_"), "{created}");
     assert_eq!(created["schedule"]["timezone"], json!("Europe/Belgrade"));
-    let again = run(client, enqueue(job.clone(), Some("2h")))
-        .await
-        .expect("same key");
+    let again = run(client, enqueue(job.clone())).await.expect("same key");
     assert_eq!(again["schedule"]["scheduleId"], json!(schedule_id));
     expect_code(
         client,
-        enqueue(job.clone(), Some("tomorrow")),
-        "hub.invalid_request",
-    )
-    .await;
-    expect_code(
-        client,
-        enqueue(spec(hub.directory.path(), "nowhere", Some("box")), None),
+        enqueue(spec(hub.directory.path(), "nowhere", Some("box"))),
         "hub.no_eligible_target",
     )
     .await;
@@ -564,7 +490,6 @@ fn schedules_are_built_from_enqueue_flags() {
         cron: Some(cron.to_owned()),
         cron_timezone: zone.map(str::to_owned),
         priority: 5,
-        expires: None,
     };
     let (built, files) = schedule(request("*/5 * * * *", None)).expect("schedule");
     assert!(!built.timezone.is_empty(), "the local zone is the default");
@@ -824,7 +749,6 @@ async fn observations_stream_the_target_command_and_its_exit_code() {
             detach: false,
             wait: Some(None),
             queue: false,
-            expires: None,
         })),
         &mut output,
     )

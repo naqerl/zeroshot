@@ -118,14 +118,10 @@ it. The target may still hold a run under the job's submission key; the error na
 the hub never follows or adopts such a run. If a submission that was in flight when you dequeued
 is then accepted, the error also names the run ID so you can stop it on the target.
 
-## Deadlines and stalled runs
+## Stalled runs
 
-`zeroshot hub submit --expires DURATION|RFC3339` gives an immediately placed job a deadline;
-`zeroshot hub enqueue --expires` does the same for each scheduled fire. A queued job past its
-deadline becomes `expired` with `errorKind` `run_expired` without being submitted. A placed job
-past its deadline is force-stopped on its member through the same operation as
-`zeroshot hub force-stop`, then becomes `expired` with the same error kind. If the target had not
-yet confirmed a run ID, the error names the submission key that may still exist there.
+Lifetimes are observable events, not deadlines: a queued or running job is never expired by the
+hub. Use `zeroshot hub dequeue` or `zeroshot hub force-stop` when a job should stop.
 
 `zeroshot hub daemon run --max-stall DURATION` is opt-in; without it, a running job is never
 failed for inactivity. With it, every running job records the target status's `atCursor` and when

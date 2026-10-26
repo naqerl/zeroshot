@@ -1,4 +1,7 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -663,12 +666,14 @@ async fn failing_status_is_a_tool_error_with_the_cli_code() {
 }
 
 #[tokio::test]
-async fn events_list_describes_poll_and_push_only() {
+async fn events_list_describes_run_events_and_warnings() {
     let mut session = Session::spawn(ScriptHost);
     initialize(&mut session).await;
     let listed = session.request(2, "events/list", json!({})).await;
     assert_eq!(listed["result"]["resultType"], json!("complete"));
-    let event = &listed["result"]["events"][0];
+    let events = listed["result"]["events"].as_array().expect("events");
+    assert_eq!(events.len(), 2);
+    let event = &events[0];
     assert_eq!(event["name"], json!("run.event"));
     assert_eq!(event["delivery"], json!(["poll", "push"]));
     assert!(
@@ -677,6 +682,17 @@ async fn events_list_describes_poll_and_push_only() {
             .unwrap_or_default()
             .contains("unsupported")
     );
+    let warning = &events[1];
+    assert_eq!(warning["name"], json!("run.warning"));
+    assert_eq!(warning["delivery"], json!(["push"]));
+    assert!(
+        warning["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("each completed hour")
+    );
+    assert_eq!(warning["inputSchema"], event["inputSchema"]);
+    assert_eq!(warning["payloadSchema"], event["payloadSchema"]);
     assert_eq!(
         event["inputSchema"]["oneOf"],
         json!([{"required": ["runId"]}, {"required": ["jobId"]}])
@@ -686,24 +702,32 @@ async fn events_list_describes_poll_and_push_only() {
     assert!(event["inputSchema"]["properties"].get("target").is_some());
     assert_eq!(
         event["payloadSchema"]["required"],
+        json!(["eventId", "name", "timestamp", "data", "_meta"])
+    );
+    assert_eq!(event["payloadSchema"]["additionalProperties"], json!(false));
+    let shapes = event["payloadSchema"]["properties"]["data"]["oneOf"]
+        .as_array()
+        .expect("run, job, and warning data shapes");
+    assert_eq!(shapes.len(), 3);
+    assert_eq!(
+        shapes[0]["required"],
+        json!(["runId", "cursor", "status", "summary", "replayed"])
+    );
+    assert!(
+        shapes[1]["properties"].get("jobId").is_some(),
+        "job data documents jobId"
+    );
+    assert_eq!(
+        shapes[2]["required"],
         json!([
-            "eventId",
-            "name",
-            "timestamp",
-            "data",
+            "runId",
+            "hours",
+            "startedAt",
+            "phase",
+            "message",
             "summary",
-            "replayed",
-            "_meta"
+            "replayed"
         ])
-    );
-    assert!(
-        event["payloadSchema"]["properties"]["data"]["oneOf"][0]
-            .get("properties")
-            .is_some()
-    );
-    assert!(
-        event["payloadSchema"]["properties"]["jobId"].is_object(),
-        "payload documents jobId"
     );
     for filter in ["phases", "nodes", "terminalOnly", "verbose"] {
         assert!(
@@ -727,6 +751,227 @@ async fn events_list_describes_poll_and_push_only() {
     assert_eq!(subscribe["error"]["code"], json!(-32026));
     assert_eq!(subscribe["error"]["data"]["feature"], json!("deliveryMode"));
     assert_eq!(subscribe["error"]["data"]["value"], json!("webhook"));
+}
+
+#[tokio::test]
+async fn events_subscribe_accepts_run_warning() {
+    let mut session = Session::spawn(EventHost::new(vec![watch_event(
+        "run-public",
+        "v2:1",
+        finished_status(),
+    )]));
+    initialize(&mut session).await;
+    session
+        .send(&json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "events/subscribe",
+            "params": {
+                "name": "run.warning",
+                "arguments": {"runId": "run-public"}
+            }
+        }))
+        .await;
+    let frames = session.drain_frames();
+    let active = frames
+        .iter()
+        .find(|frame| frame["method"] == "notifications/events/active")
+        .expect("the warning subscription is active");
+    assert_eq!(
+        active["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        json!(7)
+    );
+    assert!(
+        frames.iter().all(|frame| {
+            !(frame["method"] == "notifications/events/event"
+                && frame["params"]["name"] == json!("run.warning"))
+        }),
+        "a terminal replay never writes a warning"
+    );
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame["id"] == json!(7) && frame.get("result").is_some()),
+        "the warning subscription completes at the terminal phase"
+    );
+}
+
+type WarningDrive = Pin<Box<dyn Future<Output = std::io::Result<()>>>>;
+
+struct WarningSession {
+    sender: mpsc::Sender<Result<Value, McpFailure>>,
+    drive: WarningDrive,
+    output: Arc<tokio::sync::Mutex<Vec<u8>>>,
+}
+
+fn warning_session(run_id: &str, elapsed_ms: u64) -> WarningSession {
+    let (sender, receiver) = mpsc::channel(8);
+    let stream = WatchStream::new(receiver, tokio::spawn(async {}));
+    let prepared = super::events::warning_test_prepared(stream, run_id, Some("job-1"), elapsed_ms);
+    let output = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let stream_output = super::events::StreamOutput::new(
+        json!(7),
+        Arc::clone(&output),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let drive = Box::pin(super::events::drive(
+        prepared,
+        stream_output,
+        Rc::new(ScriptHost),
+    ));
+    WarningSession {
+        sender,
+        drive,
+        output,
+    }
+}
+
+impl WarningSession {
+    async fn advance(&mut self, duration: Duration) {
+        tokio::select! {
+            _ = tokio::time::sleep(duration) => {}
+            result = &mut self.drive => panic!("warning subscription ended early: {result:?}"),
+        }
+    }
+
+    async fn finish(&mut self, event: Value) {
+        self.sender
+            .send(Ok(event))
+            .await
+            .expect("warning watch receives the terminal event");
+        (&mut self.drive)
+            .await
+            .expect("warning subscription completes");
+    }
+
+    async fn frames(&self) -> Vec<Value> {
+        let output = self.output.lock().await.clone();
+        String::from_utf8(output)
+            .expect("warning output is UTF-8")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("warning output is JSON"))
+            .collect()
+    }
+
+    async fn warnings(&self) -> Vec<Value> {
+        self.frames()
+            .await
+            .into_iter()
+            .filter(|frame| {
+                frame["method"] == json!("notifications/events/event")
+                    && frame["params"]["name"] == json!("run.warning")
+            })
+            .map(|frame| frame["params"].clone())
+            .collect()
+    }
+}
+
+fn assert_warning_envelope(warning: &Value) {
+    let mut keys = warning
+        .as_object()
+        .expect("warning notification is an object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(keys, vec!["_meta", "data", "eventId", "name", "timestamp"]);
+    assert_eq!(
+        warning["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        json!(7)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn warning_crossing_one_hour_emits_exactly_one_notification() {
+    const HOUR_MS: u64 = 3_600_000;
+    let mut session = warning_session("run-public", HOUR_MS - 500);
+    session.advance(Duration::from_millis(700)).await;
+
+    let warnings = session.warnings().await;
+    assert_eq!(warnings.len(), 1);
+    let warning = &warnings[0];
+    assert_warning_envelope(warning);
+    assert_eq!(warning["name"], json!("run.warning"));
+    assert_eq!(warning["eventId"], json!("run-public:warning:1"));
+    let data = &warning["data"];
+    assert_eq!(data["runId"], json!("run-public"));
+    assert_eq!(data["jobId"], json!("job-1"));
+    assert_eq!(data["hours"], json!(1));
+    assert_eq!(data["phase"], json!("running"));
+    assert_eq!(data["message"], json!("run has been active for 1 hour"));
+    assert_eq!(data["replayed"], json!(false));
+    assert!(
+        data["startedAt"]
+            .as_str()
+            .is_some_and(|started| started.contains('T')),
+        "startedAt is an RFC 3339 timestamp: {data}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn warning_crossing_two_and_three_hours_emits_each_hour_once() {
+    const HOUR_MS: u64 = 3_600_000;
+    let mut session = warning_session("run-public", HOUR_MS - 500);
+    session.advance(Duration::from_millis(700)).await;
+    session.advance(Duration::from_millis(HOUR_MS + 500)).await;
+
+    let warnings = session.warnings().await;
+    assert_eq!(warnings.len(), 2);
+    assert_eq!(
+        warnings
+            .iter()
+            .map(|warning| warning["data"]["hours"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(1), json!(2)],
+        "crossing the second hour adds the 2h warning, not another 1h warning"
+    );
+    assert_eq!(
+        warnings[1]["data"]["message"],
+        json!("run has been active for 2 hours")
+    );
+
+    session.advance(Duration::from_millis(HOUR_MS + 500)).await;
+    let warnings = session.warnings().await;
+    assert_eq!(
+        warnings
+            .iter()
+            .map(|warning| warning["data"]["hours"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(1), json!(2), json!(3)]
+    );
+    assert_eq!(warnings[2]["eventId"], json!("run-public:warning:3"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn warning_subscription_after_seventy_five_minutes_does_not_replay_first_hour() {
+    let mut session = warning_session("run-public", 75 * 60 * 1000);
+    session.advance(Duration::from_secs(30)).await;
+    assert!(
+        session.warnings().await.is_empty(),
+        "the completed first hour is never replayed"
+    );
+
+    session.advance(Duration::from_secs(46 * 60)).await;
+    let warnings = session.warnings().await;
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0]["data"]["hours"], json!(2));
+    assert_eq!(
+        warnings[0]["data"]["message"],
+        json!("run has been active for 2 hours")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn finished_run_emits_no_further_warnings() {
+    const HOUR_MS: u64 = 3_600_000;
+    let mut session = warning_session("run-public", HOUR_MS - 500);
+    session
+        .finish(watch_event("run-public", "v2:1", finished_status()))
+        .await;
+    assert!(
+        session.warnings().await.is_empty(),
+        "a run that finishes before the hour boundary never warns"
+    );
 }
 
 #[tokio::test]
@@ -758,6 +1003,11 @@ async fn events_poll_advances_the_cursor() {
         json!("v2:2")
     );
     assert!(response["result"]["events"][0].get("cursor").is_none());
+    assert_eq!(
+        response["result"]["events"][0]["_meta"],
+        json!({}),
+        "polled occurrences keep the envelope's object _meta"
+    );
 }
 
 #[tokio::test]
@@ -809,7 +1059,7 @@ async fn events_stream_pushes_a_notification() {
             );
         }
         if message["method"] == "notifications/events/event" {
-            assert_eq!(message["params"]["cursor"], json!("v2:2"));
+            assert!(message["params"].get("cursor").is_none());
             assert_eq!(message["params"]["data"]["cursor"], json!("v2:2"));
             assert_eq!(message["params"]["name"], json!("run.event"));
             assert_eq!(
@@ -982,15 +1232,15 @@ async fn events_end_a_job_that_fails_before_it_runs() {
         .iter()
         .find(|frame| {
             frame["method"] == "notifications/events/event"
-                && frame["params"]["state"] == json!("failed")
+                && frame["params"]["data"]["state"] == json!("failed")
         })
         .expect("terminal job notification");
     assert_eq!(
-        terminal["params"]["error"],
+        terminal["params"]["data"]["error"],
         json!("the target refused the submission")
     );
     assert_eq!(
-        terminal["params"]["errorKind"],
+        terminal["params"]["data"]["errorKind"],
         json!("submission_rejected")
     );
     assert!(
@@ -1074,7 +1324,7 @@ async fn events_trim_run_constants_and_collapse_terminal_errors() {
     assert!(running["data"].get("subscriptionId").is_none());
     assert!(running["data"]["status"].get("metadata").is_none());
     assert_eq!(
-        running["summary"],
+        running["data"]["summary"],
         json!({"phase": "running", "node": "worker", "terminal": false, "reason": null})
     );
 
@@ -1090,7 +1340,7 @@ async fn events_trim_run_constants_and_collapse_terminal_errors() {
         json!({"reason": "worker_failed", "lastError": "last error", "errorCount": 2})
     );
     assert_eq!(
-        finished["summary"],
+        finished["data"]["summary"],
         json!({
             "phase": "finished",
             "node": null,
@@ -1168,9 +1418,12 @@ async fn events_terminal_only_skips_nonterminal_events_and_advances_the_cursor()
     );
     assert_eq!(response["result"]["cursor"], json!("v2:3"));
     assert_eq!(response["result"]["truncated"], json!(false));
-    assert_eq!(response["result"]["events"][0]["replayed"], json!(false));
     assert_eq!(
-        response["result"]["events"][0]["summary"]["terminal"],
+        response["result"]["events"][0]["data"]["replayed"],
+        json!(false)
+    );
+    assert_eq!(
+        response["result"]["events"][0]["data"]["summary"]["terminal"],
         json!(true)
     );
 }
@@ -1200,7 +1453,7 @@ async fn events_node_filter_keeps_the_terminal_event() {
     assert_eq!(events.len(), 2);
     assert_eq!(events[0]["data"]["cursor"], json!("v2:2"));
     assert_eq!(events[1]["data"]["cursor"], json!("v2:4"));
-    assert_eq!(events[1]["summary"]["terminal"], json!(true));
+    assert_eq!(events[1]["data"]["summary"]["terminal"], json!(true));
     assert_eq!(response["result"]["cursor"], json!("v2:4"));
 
     let phased = session
@@ -1224,7 +1477,7 @@ async fn events_node_filter_keeps_the_terminal_event() {
     assert!(
         events
             .iter()
-            .all(|event| event["summary"]["terminal"] != json!(true))
+            .all(|event| event["data"]["summary"]["terminal"] != json!(true))
     );
 }
 
@@ -1295,9 +1548,9 @@ async fn events_mark_replayed_and_live_events() {
         .collect::<Vec<_>>();
     assert_eq!(events.len(), 2);
     assert_eq!(events[0]["params"]["data"]["cursor"], json!("v2:1"));
-    assert_eq!(events[0]["params"]["replayed"], json!(true));
+    assert_eq!(events[0]["params"]["data"]["replayed"], json!(true));
     assert_eq!(events[1]["params"]["data"]["cursor"], json!("v2:2"));
-    assert_eq!(events[1]["params"]["replayed"], json!(false));
+    assert_eq!(events[1]["params"]["data"]["replayed"], json!(false));
 }
 
 #[test]

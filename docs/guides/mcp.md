@@ -119,13 +119,34 @@ Read-only tools are `status`, `logs`, `watch`, `list`, `report`, `hub_list`, `hu
 members; `hub_dequeue` cancels queued jobs or schedules; `hub_dispatch` requests a dispatcher pass;
 `force-stop` and `hub_force_stop` stop runs.
 
-## Run events
+## Run events and warnings
 
-The server advertises `io.modelcontextprotocol/events` (SEP-3415). There is one event type,
-`run.event`. Subscription arguments take exactly one of `runId` or `jobId`, and an optional
-`target`; supplying both or neither is invalid params (`-32602`). The payload of a run event is
-the durable watch notification: `subscriptionId`, `runId`, `title`, optional `source`, `size`,
-`cursor`, and `status`.
+The server advertises `io.modelcontextprotocol/events` (SEP-3415) with two event types:
+
+- `run.event` delivers durable watch records and is available through both polling and push.
+- `run.warning` reports a run that is still active. It is push-only: one warning is sent for each
+  completed hour of run time while the subscription is open, with `hours` set to `1`, `2`, and so
+  on. Hours completed before the subscription opened are never replayed. Warnings stop at the
+  terminal phase.
+
+Subscription arguments take exactly one of `runId` or `jobId`, and an optional `target`;
+supplying both or neither is invalid params (`-32602`). `name` defaults to `run.event` for
+`events/poll`, `events/stream`, and `events/subscribe`.
+
+Every `notifications/events/event` payload has exactly five top-level fields:
+
+```json
+{"eventId": "...", "name": "run.event", "timestamp": "RFC3339", "data": {}, "_meta": {}}
+```
+
+`data` carries the event-specific document. For `run.event` it contains the durable watch fields
+(`runId`, `cursor`, and `status`) plus `summary` and `replayed`; run constants stay in
+`notifications/events/active`. For job discovery it contains the hub job view, including `state`,
+`error`, and `errorKind`, plus `cursor`, `summary`, and `replayed`. For `run.warning` it contains
+`runId`, optional `jobId`, integer `hours`, RFC 3339 `startedAt`, `phase`, `message` (for example
+`"run has been active for 2 hours"`), `summary`, and `replayed: false`. Run events use
+`eventId` `<runId>:<cursor>`, discovery events `<jobId>:<cursor>`, and warnings
+`<runId>:warning:<hours>`.
 
 A `jobId` that already has a run behaves exactly like that `runId`. A queued, scheduled, or
 placing job can be followed before its run exists, so one subscription can follow a job from the
@@ -133,17 +154,17 @@ queue to its terminal result. The stream opens immediately and sends
 `notifications/events/active` with `run: null` and the current hub `job` (including `state`,
 `error`, and `errorKind`). It keeps sending heartbeats, reads the hub job record every
 `nextPollMs` (1000 ms), and starts delivering ordinary `run.event` notifications as soon as the
-job has a run id. If the job fails, is dequeued, or expires before it runs, the server sends one
-terminal `notifications/events/event` carrying the job's `state`, `error`, and `errorKind`, then
-answers the request with `resultType: complete`. Discovery-phase notifications use
-`eventId` `<jobId>:<cursor>`. `events/poll` with a not-yet-placed job returns no events and
-includes the current `job` document so a poller can observe queue state without opening a stream.
+job has a run id. If the job fails or is dequeued before it runs, the server sends one terminal
+`notifications/events/event` with the job document in `data`, then answers the request with
+`resultType: complete`. `events/poll` with a not-yet-placed job returns no events and includes the
+current `job` document so a poller can observe queue state without opening a stream.
 
-`events/list` reports `delivery` as `poll` and `push`, and `resultType` `complete`. Signed
-webhooks are not offered. `events/subscribe` with a `runId` or `jobId` argument opens the same
-long-lived stream as `events/stream`; `events/subscribe` without an `arguments` object, and
-`events/unsubscribe`, returns JSON-RPC `Unsupported` (`-32026`) with `data.feature`
-`deliveryMode` and `data.value` `webhook`.
+`events/list` returns both event types and `resultType` `complete`. `run.event` reports
+`delivery` as `poll` and `push`; `run.warning` reports `push`. Signed webhooks are not offered.
+`events/subscribe` with a `runId` or `jobId` argument opens the same long-lived stream as
+`events/stream`; `events/subscribe` without an `arguments` object, and `events/unsubscribe`,
+returns JSON-RPC `Unsupported` (`-32026`) with `data.feature` `deliveryMode` and `data.value`
+`webhook`.
 
 `events/poll` returns occurrences after an opaque cursor:
 
@@ -159,7 +180,8 @@ long-lived stream as `events/stream`; `events/subscribe` without an `arguments` 
 `_meta["io.modelcontextprotocol/subscriptionId"]` set to the request id. A gap sends another
 `notifications/events/active` with `truncated: true`, then continues. When the watch stream ends,
 the server answers the request with `resultType: complete`. A queued job therefore ends either
-when its run stream ends, or with the terminal job notification when it never runs.
+when its run stream ends, or with the terminal job notification when it never runs. A
+`run.warning` subscription follows the same lifecycle but emits warnings instead of run events.
 
 Both modes open the same `run_watch` subscription `zeroshot watch` uses: the local ledger, or the
 named target's watch transport. There is no second event pipeline. Job discovery reads the same

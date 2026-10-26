@@ -301,7 +301,6 @@ impl super::schedule::TickReport {
         self.fired.is_empty()
             && self.dispatched.is_empty()
             && self.finished.is_empty()
-            && self.expired.is_empty()
             && self.stalled.is_empty()
             && self.failed.is_empty()
     }
