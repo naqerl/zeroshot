@@ -257,7 +257,7 @@ pub(crate) fn route(member: &str) -> Vec<String> {
     }
 }
 
-/// The exact `zeroshot` invocation used by `hub force-stop` and by deadline/stall enforcement.
+/// The exact `zeroshot` invocation used by `hub force-stop` and by stall enforcement.
 pub(crate) fn force_stop_arguments(member: &str, run_id: &str) -> Vec<String> {
     let mut arguments = vec!["force-stop".to_owned(), run_id.to_owned()];
     arguments.extend(route(member));

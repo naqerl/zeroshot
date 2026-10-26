@@ -434,10 +434,10 @@ pub(super) enum HubDaemonCommand {
     /// Serve the hub API and dispatch in the foreground until SIGTERM or Ctrl-C; the entrypoint
     /// of installed services.
     ///
-    /// Each pass fires due cron schedules, refreshes capabilities and running jobs, expires stale
-    /// jobs, and places due ones; target calls run outside the state lock, so API reads never
-    /// wait for a slow target. Passes with activity are written as NDJSON. Only one daemon may
-    /// own a hub folder at a time.
+    /// Each pass fires due cron schedules, refreshes capabilities and running jobs, and places
+    /// due ones; target calls run outside the state lock, so API reads never wait for a slow
+    /// target. Passes with activity are written as NDJSON. Only one daemon may own a hub folder
+    /// at a time.
     Run(HubDaemonRunArgs),
 
     /// Ask the selected hub's daemon for its heartbeat as JSON.
@@ -752,12 +752,6 @@ pub(super) struct HubSubmitArgs {
     #[arg(long)]
     queue: bool,
 
-    /// Expire the job if it has not finished after DURATION or at an RFC 3339 time. A queued
-    /// job is not submitted; a placed run is force-stopped when its deadline passes. A time in
-    /// the past or a zero duration is refused.
-    #[arg(long, value_name = "DURATION|RFC3339")]
-    expires: Option<String>,
-
     #[command(flatten)]
     run: RunArgs,
 }
@@ -794,12 +788,6 @@ pub(super) struct HubEnqueueArgs {
     )]
     priority: i32,
 
-    /// Expire the job if it has not finished after DURATION or at an RFC 3339 time. A queued
-    /// job is not submitted; a placed run is force-stopped. With --cron, each fired job expires
-    /// DURATION after its fire time. A time in the past or a zero duration is refused.
-    #[arg(long, value_name = "DURATION|TIME")]
-    expires: Option<String>,
-
     #[command(flatten)]
     run: RunArgs,
 }
@@ -807,8 +795,8 @@ pub(super) struct HubEnqueueArgs {
 #[derive(Debug, Args)]
 pub(super) struct HubPsArgs {
     /// Job state filter: active (queued, scheduled, running), queued, scheduled, running,
-    /// succeeded, failed, dequeued, expired, recurring (schedules only), or all. Active
-    /// schedules are listed with active and recurring; all schedules with all.
+    /// succeeded, failed, dequeued, recurring (schedules only), or all. Active schedules are
+    /// listed with active and recurring; all schedules with all.
     #[arg(long, value_name = "STATE", default_value = "active")]
     state: String,
 
@@ -1059,7 +1047,6 @@ impl HubSubmitArgs {
             detach,
             wait: self.wait,
             queue: self.queue,
-            expires: self.expires,
         })
     }
 }
@@ -1077,7 +1064,6 @@ impl HubEnqueueArgs {
             cron: self.cron,
             cron_timezone: self.cron_tz,
             priority: self.priority,
-            expires: self.expires,
         })
     }
 }

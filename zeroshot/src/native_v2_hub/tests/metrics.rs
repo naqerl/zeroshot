@@ -213,7 +213,6 @@ fn state_with_history(now: u64) -> HubState {
         timezone: "UTC".to_owned(),
         template: job("hs_1", now),
         repin_from: None,
-        expires_after_ms: None,
         submission_key: None,
         created_at_ms: now,
         next_fire_ms: None,
@@ -282,7 +281,10 @@ fn state_metrics_cover_jobs_queue_cron_members_and_durations() {
         Some(1.0)
     );
     assert_eq!(get("zeroshot_hub_jobs", &[("state", "running")]), Some(1.0));
-    assert_eq!(get("zeroshot_hub_jobs", &[("state", "expired")]), Some(0.0));
+    assert_eq!(
+        get("zeroshot_hub_jobs", &[("state", "dequeued")]),
+        Some(0.0)
+    );
     assert_eq!(
         get("zeroshot_hub_queue_depth", &[("kind", "due")]),
         Some(1.0)

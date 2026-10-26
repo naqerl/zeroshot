@@ -4,9 +4,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::clock::{
-    parse_duration_ms, parse_expiry_ms, parse_future_ms, parse_past_ms, rfc3339, utc_day,
-};
+use super::clock::{parse_duration_ms, parse_future_ms, parse_past_ms, rfc3339, utc_day};
 use super::driver::{HubDriver, SubmitRequest};
 use super::error::{EXIT_NO_CAPACITY, EXIT_NO_ELIGIBLE_TARGET, HubError};
 use super::jobs::{repository_name, runtime_models};
@@ -16,10 +14,7 @@ use super::model::{
 };
 use super::usage::{JobUsage, Tokens, reported};
 use super::placement::{Load, Placement, describe, place};
-use super::schedule::{
-    UNREACHABLE_REAP_THRESHOLD, active_runs, apply_status, due_jobs, expire, expire_unconfirmed,
-    tick,
-};
+use super::schedule::{UNREACHABLE_REAP_THRESHOLD, active_runs, apply_status, due_jobs, tick};
 use super::stats::{Dimension, ModelPrice, StatsQuery, aggregate, percentiles};
 
 #[path = "tests/api.rs"]
@@ -87,7 +82,6 @@ pub(super) fn job(id: &str, submitted_at_ms: u64) -> Job {
         submission_key: None,
         submitted_at_ms,
         not_before_ms: None,
-        expires_at_ms: None,
         attempts: 0,
         unconfirmed_submissions: 0,
         target: None,
@@ -241,158 +235,6 @@ fn due_jobs_order_by_priority_then_fifo_and_skip_scheduled() {
     );
     assert_eq!(jobs[3].display_state(100), "scheduled");
     assert_eq!(due_jobs(&jobs, 1_000).len(), 3);
-}
-
-#[test]
-fn expire_covers_queued_and_placed_deadlines() {
-    let mut jobs = vec![job("j1", 0), job("j2", 0), job("j3", 0)];
-    jobs[0].expires_at_ms = Some(50);
-    jobs[1].expires_at_ms = Some(500);
-    jobs[2].expires_at_ms = Some(50);
-    jobs[2].state = JobState::Running;
-    jobs[2].run_id = Some("run-j3".to_owned());
-    assert_eq!(expire(&mut jobs, 100), ["j1", "j3"]);
-    assert_eq!(jobs[0].state, JobState::Expired);
-    assert_eq!(jobs[1].state, JobState::Queued);
-    assert_eq!(jobs[2].state, JobState::Expired);
-    assert_eq!(
-        jobs[2].error.as_ref().map(|error| error.kind),
-        Some(JobErrorKind::RunExpired)
-    );
-}
-
-#[test]
-fn expire_unconfirmed_leaves_a_confirmed_run_for_the_stop_phase() {
-    let mut jobs = vec![job("queued", 0), job("placing", 0), job("running", 0)];
-    for job in &mut jobs {
-        job.expires_at_ms = Some(50);
-    }
-    jobs[1].state = JobState::Running;
-    jobs[2].state = JobState::Running;
-    jobs[2].run_id = Some("run-running".to_owned());
-    assert_eq!(expire_unconfirmed(&mut jobs, 100), ["queued", "placing"]);
-    assert_eq!(jobs[0].state, JobState::Expired);
-    assert_eq!(jobs[1].state, JobState::Expired);
-    assert_eq!(jobs[2].state, JobState::Running);
-    assert!(jobs[2].error.is_none());
-}
-
-#[tokio::test]
-async fn placed_jobs_past_their_deadline_stop_the_run_and_settle_expired() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let driver = std::sync::Arc::new(FakeDriver::default());
-    let service = super::service::HubService::open(
-        super::store::HubStore::new(directory.path().join("hub")),
-        driver.clone(),
-        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
-    )
-    .expect("service");
-    let mut running = job("hj_late", 0);
-    running.state = JobState::Running;
-    running.target = Some("box".to_owned());
-    running.run_id = Some("run-late".to_owned());
-    running.expires_at_ms = Some(50);
-    service
-        .mutate(|state| {
-            state.members.push(member("box", &[], 1, 0));
-            state.jobs.push(running);
-            Ok(())
-        })
-        .await
-        .expect("seed");
-    let (report, view) = service.pass().await.expect("pass");
-    assert_eq!(report.expired, ["hj_late"]);
-    assert_eq!(view["expired"], json!(["hj_late"]));
-    let settled = service.snapshot().await.jobs.remove(0);
-    assert_eq!(settled.state, JobState::Expired);
-    assert!(settled.finished_at_ms.is_some());
-    let error = settled.error.expect("expiry error");
-    assert_eq!(error.kind, JobErrorKind::RunExpired);
-    assert!(error.message.contains("run-late"), "{}", error.message);
-    assert_eq!(
-        driver.stops.lock().expect("fake lock").as_slice(),
-        [("box".to_owned(), "run-late".to_owned())]
-    );
-}
-
-#[tokio::test]
-async fn a_deadline_run_whose_stop_fails_stays_running_until_a_later_stop_succeeds() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let driver = std::sync::Arc::new(FakeDriver {
-        fail_stops: std::sync::atomic::AtomicBool::new(true),
-        ..FakeDriver::default()
-    });
-    let service = super::service::HubService::open(
-        super::store::HubStore::new(directory.path().join("hub")),
-        driver.clone(),
-        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
-    )
-    .expect("service");
-    let mut running = job("hj_late", 0);
-    running.state = JobState::Running;
-    running.target = Some("box".to_owned());
-    running.run_id = Some("run-late".to_owned());
-    running.expires_at_ms = Some(1);
-    service
-        .mutate(|state| {
-            state.members.push(member("box", &[], 1, 0));
-            state.jobs.push(running);
-            Ok(())
-        })
-        .await
-        .expect("seed");
-    let (report, _) = service.pass().await.expect("pass");
-    assert!(report.expired.is_empty(), "an unstopped run cannot expire");
-    let observed = service.snapshot().await.jobs.remove(0);
-    assert_eq!(observed.state, JobState::Running);
-    assert_eq!(observed.finished_at_ms, None);
-    let error = observed.error.expect("stop failure");
-    assert_eq!(error.kind, JobErrorKind::RunExpired);
-    assert!(
-        error.message.contains("could not be stopped"),
-        "{}",
-        error.message
-    );
-    assert!(error.message.contains("will retry"), "{}", error.message);
-    assert_eq!(driver.stops.lock().expect("fake lock").len(), 1);
-
-    driver
-        .fail_stops
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-    let (report, _) = service.pass().await.expect("retry pass");
-    assert_eq!(report.expired, ["hj_late"]);
-    assert_eq!(service.snapshot().await.jobs[0].state, JobState::Expired);
-    assert_eq!(driver.stops.lock().expect("fake lock").len(), 2);
-}
-
-#[tokio::test]
-async fn queued_jobs_past_their_deadline_expire_with_run_expired() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let driver = std::sync::Arc::new(FakeDriver::default());
-    let service = super::service::HubService::open(
-        super::store::HubStore::new(directory.path().join("hub")),
-        driver,
-        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
-    )
-    .expect("service");
-    let mut queued = job("hj_queued", 0);
-    queued.expires_at_ms = Some(1);
-    service
-        .mutate(|state| {
-            state.jobs.push(queued);
-            Ok(())
-        })
-        .await
-        .expect("seed");
-    let (report, view) = service.pass().await.expect("pass");
-    assert_eq!(report.expired, ["hj_queued"]);
-    assert_eq!(view["expired"], json!(["hj_queued"]));
-    let settled = service.snapshot().await.jobs.remove(0);
-    assert_eq!(settled.state, JobState::Expired);
-    assert_eq!(
-        settled.error.expect("expiry error").kind,
-        JobErrorKind::RunExpired
-    );
 }
 
 #[tokio::test]
@@ -615,6 +457,78 @@ async fn a_placed_job_whose_member_disappears_is_reaped_with_target_lost() {
         "{}",
         error.message
     );
+}
+
+#[tokio::test]
+async fn a_missing_members_job_is_reaped_while_a_placed_job_without_a_deadline_runs() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let driver = std::sync::Arc::new(FakeDriver::default());
+    let service = super::service::HubService::open(
+        super::store::HubStore::new(directory.path().join("hub")),
+        driver,
+        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
+    )
+    .expect("service");
+    let mut lost = job("hj_lost", 0);
+    lost.state = JobState::Running;
+    lost.target = Some("gone".to_owned());
+    lost.run_id = Some("run-lost".to_owned());
+    let mut placed = job("hj_placed", 0);
+    placed.state = JobState::Running;
+    placed.target = Some("box".to_owned());
+    placed.run_id = Some("run-placed".to_owned());
+    service
+        .mutate(|state| {
+            state.members.push(member("gone", &[], 1, 0));
+            state.members.push(member("box", &[], 1, 0));
+            state.jobs.push(lost);
+            state.jobs.push(placed);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+    let (report, _) = service.pass().await.expect("healthy pass");
+    assert!(report.target_lost.is_empty());
+
+    service
+        .mutate(|state| {
+            state.members.retain(|member| member.name != "gone");
+            Ok(())
+        })
+        .await
+        .expect("remove member");
+    let (report, view) = service.pass().await.expect("reap pass");
+    assert_eq!(report.target_lost.len(), 1);
+    assert_eq!(view["targetLost"], json!(report.target_lost));
+
+    for _ in 0..UNREACHABLE_REAP_THRESHOLD + 1 {
+        let (report, _) = service.pass().await.expect("later pass");
+        assert!(
+            report.target_lost.is_empty(),
+            "a failed job is not reaped again"
+        );
+    }
+    let observed = service.snapshot().await;
+    let lost = observed
+        .jobs
+        .iter()
+        .find(|job| job.job_id == "hj_lost")
+        .expect("lost job");
+    assert_eq!(lost.state, JobState::Failed);
+    assert_eq!(lost.failure_reason.as_deref(), Some("target_lost"));
+    assert_eq!(
+        lost.error.as_ref().map(|error| error.kind),
+        Some(JobErrorKind::TargetLost)
+    );
+    let placed = observed
+        .jobs
+        .iter()
+        .find(|job| job.job_id == "hj_placed")
+        .expect("placed job");
+    assert_eq!(placed.state, JobState::Running);
+    assert!(placed.error.is_none());
+    assert!(placed.finished_at_ms.is_none());
+    assert!(placed.target_last_ok_at_ms.is_some());
 }
 
 #[tokio::test]
@@ -1118,16 +1032,6 @@ fn durations_and_instants_parse() {
         );
     }
     assert_eq!(parse_future_ms("+2h", 1_000).expect("relative"), 7_201_000);
-    assert_eq!(
-        parse_expiry_ms("+2h", 1_000).expect("future expiry"),
-        7_201_000
-    );
-    for invalid in ["0s", "1970-01-01T00:00:01Z"] {
-        assert!(
-            parse_expiry_ms(invalid, 5_000).is_err(),
-            "{invalid:?} must not be a deadline in the past"
-        );
-    }
     assert_eq!(parse_past_ms("1s", 5_000).expect("ago"), 4_000);
     let instant = parse_future_ms("2026-10-20T03:00:00Z", 0).expect("rfc3339");
     assert_eq!(rfc3339(instant), "2026-10-20T03:00:00Z");
@@ -1225,6 +1129,18 @@ fn job_errors_are_typed_and_older_plain_messages_still_load() {
     let view = typed.view(0);
     assert_eq!(view["error"], json!("zeroshot run timed out"));
     assert_eq!(view["errorKind"], json!("submission_unconfirmed"));
+
+    let mut lost = job("j4", 0);
+    lost.error = Some(JobError::new(
+        JobErrorKind::TargetLost,
+        "box is no longer a hub member",
+    ));
+    let stored = serde_json::to_value(&lost).expect("store target-lost job");
+    assert_eq!(stored["error"]["kind"], json!("target_lost"));
+    assert_eq!(
+        serde_json::from_value::<Job>(stored).expect("reload target-lost job"),
+        lost
+    );
 
     let mut running = job("j3", 0);
     running.state = JobState::Running;

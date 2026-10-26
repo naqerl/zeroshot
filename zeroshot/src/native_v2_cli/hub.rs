@@ -301,7 +301,6 @@ pub struct HubSubmit {
     pub detach: bool,
     pub wait: Option<Option<String>>,
     pub queue: bool,
-    pub expires: Option<String>,
 }
 
 /// Deferred placement: once (`at`) or recurring (`cron`).
@@ -314,7 +313,6 @@ pub struct HubEnqueue {
     /// IANA time zone for `cron`; `None` uses the enqueuing machine's zone.
     pub cron_timezone: Option<String>,
     pub priority: i32,
-    pub expires: Option<String>,
 }
 
 /// Hub job listing filters.

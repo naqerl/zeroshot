@@ -566,14 +566,13 @@ fn spec_labels(spec: Option<&Spec>) -> (&'static str, String) {
     (source, spec.tag.clone().unwrap_or_default())
 }
 
-const JOB_STATES: [&str; 7] = [
+const JOB_STATES: [&str; 6] = [
     "queued",
     "scheduled",
     "running",
     "succeeded",
     "failed",
     "dequeued",
-    "expired",
 ];
 
 #[allow(clippy::cast_precision_loss)]

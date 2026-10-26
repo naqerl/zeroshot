@@ -20,7 +20,7 @@ pub(crate) const LOCAL_MEMBER: &str = "local";
 pub(crate) const STATE_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct HubState {
     pub version: u32,
     #[serde(default)]
@@ -63,7 +63,7 @@ impl HubState {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct Member {
     pub name: String,
     #[serde(default)]
@@ -162,7 +162,7 @@ impl Member {
 
 /// A recurring `enqueue --cron`: each fire queues a copy of `template`.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct Schedule {
     pub schedule_id: String,
     pub state: ScheduleState,
@@ -173,8 +173,6 @@ pub(crate) struct Schedule {
     /// Folder whose `HEAD` is re-pinned at each fire, when no explicit source was given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repin_from: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_after_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission_key: Option<String>,
     pub created_at_ms: u64,
@@ -274,7 +272,6 @@ pub(crate) enum JobState {
     Succeeded,
     Failed,
     Dequeued,
-    Expired,
 }
 
 impl JobState {
@@ -284,7 +281,7 @@ impl JobState {
 }
 
 /// What kind of problem the hub had with a job.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum JobErrorKind {
     /// The target refused the submission; the job failed without a run.
@@ -301,17 +298,33 @@ pub(crate) enum JobErrorKind {
     DequeuedWhilePlacing,
     /// Waited longer than its pool's `--wait-max` for a server; the job expired.
     PoolWaitTimeout,
-    /// The job's deadline passed. A placed run is stopped before the job settles; while a stop
-    /// keeps failing the job stays running with this error.
-    RunExpired,
-    /// The run stopped making progress and is stopped by `hub daemon run --max-stall`; while a
+        /// The run stopped making progress and is stopped by `hub daemon run --max-stall`; while a
     /// stop keeps failing the job stays running with this error.
     Stalled,
     /// The job's member left the hub or stayed unreachable for too many consecutive probes, so
     /// the hub cannot observe or stop its run.
     TargetLost,
-    /// Recorded as plain text by an earlier hub.
+    /// Recorded as plain text by an earlier hub, or a kind this hub no longer produces.
     Unclassified,
+}
+
+impl<'de> Deserialize<'de> for JobErrorKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let kind = String::deserialize(deserializer)?;
+        Ok(match kind.as_str() {
+            "submission_rejected" => Self::SubmissionRejected,
+            "submission_unconfirmed" => Self::SubmissionUnconfirmed,
+            "status_unavailable" => Self::StatusUnavailable,
+            "unconfirmed_limit" => Self::UnconfirmedLimit,
+            "dequeued_while_placing" => Self::DequeuedWhilePlacing,
+            "stalled" => Self::Stalled,
+            "target_lost" => Self::TargetLost,
+            _ => Self::Unclassified,
+        })
+    }
 }
 
 /// A hub-side problem with a job. Earlier hubs stored only the message; such records still
@@ -349,7 +362,7 @@ impl From<StoredJobError> for JobError {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct Job {
     pub job_id: String,
     pub state: JobState,
@@ -375,8 +388,6 @@ pub(crate) struct Job {
     pub submitted_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at_ms: Option<u64>,
     #[serde(default)]
     pub attempts: u32,
     /// Submissions of the current attempt its target did not confirm; apart from `attempts`.
@@ -439,7 +450,6 @@ impl Job {
             JobState::Succeeded => "succeeded",
             JobState::Failed => "failed",
             JobState::Dequeued => "dequeued",
-            JobState::Expired => "expired",
         }
     }
 
@@ -472,7 +482,6 @@ impl Job {
             "unconfirmedSubmissions": self.unconfirmed_submissions,
             "submittedAt": rfc3339(self.submitted_at_ms),
             "notBefore": time(self.not_before_ms),
-            "expiresAt": time(self.expires_at_ms),
             "dispatchedAt": time(self.dispatched_at_ms),
             "lastCursor": self.last_cursor,
             "lastCursorAt": time(self.last_cursor_at_ms),

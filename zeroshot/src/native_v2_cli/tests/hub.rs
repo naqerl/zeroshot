@@ -138,12 +138,10 @@ fn bare_wait_means_wait_without_deadline() {
 }
 
 #[test]
-fn submit_parses_expiry() {
+fn submit_parses_queue_and_wait() {
     let command = parse(&[
         "hub",
         "submit",
-        "--expires",
-        "2h",
         "--title",
         "T",
         "--profile",
@@ -151,11 +149,8 @@ fn submit_parses_expiry() {
         "--input",
         "in.json",
     ])
-    .expect("hub submit parses expiry");
-    let HubCommand::Submit(submit) = command else {
-        panic!("expected submit");
-    };
-    assert_eq!(submit.expires.as_deref(), Some("2h"));
+    .expect("hub submit parses");
+    assert!(matches!(command, HubCommand::Submit(_)));
 }
 
 #[test]
@@ -176,8 +171,6 @@ fn enqueue_parses_schedule_and_rejects_detach() {
         "+2h",
         "--priority",
         "-3",
-        "--expires",
-        "1d",
         "--title",
         "T",
         "--input",
@@ -189,7 +182,6 @@ fn enqueue_parses_schedule_and_rejects_detach() {
     };
     assert_eq!(enqueue.at.as_deref(), Some("+2h"));
     assert_eq!(enqueue.priority, -3);
-    assert_eq!(enqueue.expires.as_deref(), Some("1d"));
     assert!(
         parse(&["hub", "enqueue", "-d", "--title", "T", "--input", "in.json"]).is_err(),
         "enqueue always detaches"

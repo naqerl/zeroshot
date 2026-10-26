@@ -9,7 +9,7 @@ use super::super::install::{
     InstallEnv, Step, daemon_arguments, docker_install_plan, docker_run, docker_uninstall_plan,
     refuse_other_owner, systemd_install_plan, systemd_quote, systemd_uninstall_plan, systemd_unit,
 };
-use super::super::model::HubState;
+use super::super::model::{HubState, JobErrorKind, Schedule, ScheduleState};
 use super::super::service::HubService;
 use super::super::store::HubStore;
 use super::{FakeDriver, job, member};
@@ -575,7 +575,6 @@ async fn the_daemon_serves_the_api_dispatches_and_stops_on_shutdown() {
                     detach: true,
                     wait: None,
                     queue: true,
-                    expires: None,
                 })),
                 &mut output,
             )
@@ -923,6 +922,79 @@ fn the_store_refuses_malformed_state_and_defaults_beside_the_registry() {
     }
 }
 
+#[test]
+fn legacy_lifetimes_load_and_are_dropped_on_the_next_write() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = HubStore::new(directory.path().join("hub"));
+    let state = HubState {
+        members: vec![member("box", &[], 1, 0)],
+        jobs: vec![job("hj_legacy", 0)],
+        schedules: vec![Schedule {
+            schedule_id: "hs_legacy".to_owned(),
+            state: ScheduleState::Active,
+            cron: "* * * * *".to_owned(),
+            timezone: "UTC".to_owned(),
+            template: job("hs_legacy", 0),
+            repin_from: None,
+            submission_key: None,
+            created_at_ms: 0,
+            next_fire_ms: None,
+            last_fired_ms: None,
+            last_job_id: None,
+            fired: 0,
+            skipped: 0,
+            removed_at_ms: None,
+            error: None,
+        }],
+        ..HubState::default()
+    };
+    let mut legacy = serde_json::to_value(&state).expect("state json");
+    legacy["members"][0]["expiresAt"] = json!("2026-01-01T00:00:00Z");
+    legacy["members"][0]["ttlMs"] = json!(3_600_000);
+    legacy["jobs"][0]["expiresAt"] = json!("2026-01-01T00:00:00Z");
+    legacy["jobs"][0]["error"] = json!({
+        "kind": "run_expired",
+        "message": "the job reached its deadline",
+        "deadline": "2026-01-01T00:00:00Z"
+    });
+    legacy["schedules"][0]["expiresAfterMs"] = json!(7_200_000);
+    legacy["retiredField"] = json!(true);
+    std::fs::create_dir_all(directory.path().join("hub")).expect("hub folder");
+    std::fs::write(
+        directory.path().join("hub").join("state.json"),
+        serde_json::to_vec_pretty(&legacy).expect("legacy bytes"),
+    )
+    .expect("seed legacy state");
+
+    let lock = store.lock().expect("lock");
+    let loaded = store.load(&lock).expect("legacy state loads");
+    assert!(matches!(
+        loaded.jobs[0].error.as_ref().map(|error| error.kind),
+        Some(JobErrorKind::Unclassified)
+    ));
+    store.save(&lock, &loaded).expect("rewrite state");
+    let rewritten: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(directory.path().join("hub").join("state.json")).expect("rewritten bytes"),
+    )
+    .expect("rewritten json");
+    for pointer in [
+        "/members/0/expiresAt",
+        "/members/0/ttlMs",
+        "/jobs/0/expiresAt",
+        "/schedules/0/expiresAfterMs",
+        "/retiredField",
+    ] {
+        assert!(
+            rewritten.pointer(pointer).is_none(),
+            "{pointer} was dropped on write"
+        );
+    }
+    assert_eq!(
+        rewritten.pointer("/jobs/0/error/kind"),
+        Some(&json!("unclassified"))
+    );
+}
+
 #[tokio::test]
 async fn the_daemon_reports_failing_passes_and_keeps_serving() {
     use zeroshot_engine::native_v2_cli::hub::HubDaemonRun;
@@ -930,11 +1002,25 @@ async fn the_daemon_reports_failing_passes_and_keeps_serving() {
     let store = HubStore::new(directory.path().join("hub"));
     let registry = directory.path().join("targets.json");
     let state_file = directory.path().join("hub").join("state.json");
-    // A queued job past its expiry makes the first pass change, and so save, the state.
-    let mut expired = job("hj_expired", 0);
-    expired.expires_at_ms = Some(1);
+    // A due cron schedule makes the first pass change, and so save, the state.
     let seeded = HubState {
-        jobs: vec![expired],
+        schedules: vec![Schedule {
+            schedule_id: "hs_due".to_owned(),
+            state: ScheduleState::Active,
+            cron: "* * * * *".to_owned(),
+            timezone: "UTC".to_owned(),
+            template: job("hs_due", 0),
+            repin_from: None,
+            submission_key: None,
+            created_at_ms: 0,
+            next_fire_ms: Some(0),
+            last_fired_ms: None,
+            last_job_id: None,
+            fired: 0,
+            skipped: 0,
+            removed_at_ms: None,
+            error: None,
+        }],
         ..HubState::default()
     };
     store
