@@ -127,6 +127,7 @@ fn submit(job: HubJobSpec, queue: bool, wait: Option<Option<String>>) -> HubComm
         detach: true,
         wait,
         queue,
+        expires: None,
     }))
 }
 
@@ -426,6 +427,38 @@ async fn submissions_place_queue_wait_and_refuse_through_the_api() {
 }
 
 #[tokio::test]
+async fn submit_expiry_is_validated_and_sent_with_the_job() {
+    let hub = hub_with(FakeDriver::default(), None).await;
+    let client = &hub.client;
+    run(client, add("local", 1)).await.expect("add");
+    let expiring = |title: &str, expires: &str, queue: bool| {
+        HubCommand::Submit(Box::new(HubSubmit {
+            job: spec(hub.directory.path(), title, None),
+            detach: true,
+            wait: None,
+            queue,
+            expires: Some(expires.to_owned()),
+        }))
+    };
+    let placed = run(client, expiring("deadline", "1h", false))
+        .await
+        .expect("submit");
+    assert_eq!(placed["job"]["state"], json!("running"));
+    assert!(placed["job"]["expiresAt"].is_string(), "{placed}");
+    let queued = run(client, expiring("queued-deadline", "1h", true))
+        .await
+        .expect("queue");
+    assert_eq!(queued["job"]["state"], json!("queued"));
+    assert!(queued["job"]["expiresAt"].is_string(), "{queued}");
+    expect_code(
+        client,
+        expiring("bad-deadline", "tomorrow", true),
+        "hub.invalid_request",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn recurring_schedules_are_created_listed_and_removed() {
     let hub = hub_with(FakeDriver::default(), None).await;
     let client = &hub.client;
@@ -575,6 +608,7 @@ async fn machine_local_commands_are_refused_through_a_context() {
         metrics_listen: None,
         metrics_labels: Vec::new(),
         unconfirmed_limit: None,
+        max_stall: None,
     };
     for command in [
         HubCommand::Daemon(HubDaemonRun {
@@ -761,6 +795,7 @@ async fn observations_stream_the_target_command_and_its_exit_code() {
             detach: false,
             wait: Some(None),
             queue: false,
+            expires: None,
         })),
         &mut output,
     )

@@ -58,6 +58,9 @@ pub(crate) fn daemon_arguments(interval: &str, api: &HubApiOptions) -> Vec<Strin
     if let Some(limit) = api.unconfirmed_limit {
         arguments.extend(["--unconfirmed-limit".to_owned(), limit.to_string()]);
     }
+    if let Some(max_stall) = &api.max_stall {
+        arguments.extend(["--max-stall".to_owned(), max_stall.clone()]);
+    }
     arguments
 }
 

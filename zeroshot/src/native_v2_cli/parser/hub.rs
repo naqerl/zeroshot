@@ -206,6 +206,11 @@ pub(super) struct HubApiArgs {
     /// receipts) [default: 30]. Each is retried on the same member with the same key.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     unconfirmed_limit: Option<u32>,
+
+    /// Stop a running job whose watch cursor does not advance for DURATION, such as 30m. The
+    /// run is force-stopped and the job fails with error kind stalled. Disabled by default.
+    #[arg(long, value_name = "DURATION")]
+    max_stall: Option<String>,
 }
 
 impl HubApiArgs {
@@ -223,6 +228,7 @@ impl HubApiArgs {
             metrics_listen: self.metrics_listen,
             metrics_labels: self.metrics_labels,
             unconfirmed_limit: self.unconfirmed_limit,
+            max_stall: self.max_stall,
         })
     }
 }
@@ -449,6 +455,11 @@ pub(super) struct HubSubmitArgs {
     #[arg(long)]
     queue: bool,
 
+    /// Expire the job if it has not finished after DURATION or at an RFC 3339 time. A queued
+    /// job is not submitted; a placed run is force-stopped when its deadline passes.
+    #[arg(long, value_name = "DURATION|RFC3339")]
+    expires: Option<String>,
+
     #[command(flatten)]
     run: RunArgs,
 }
@@ -485,8 +496,9 @@ pub(super) struct HubEnqueueArgs {
     )]
     priority: i32,
 
-    /// Expire the job if it is still queued after DURATION or at an RFC 3339 time. With --cron,
-    /// each fired job expires DURATION after its fire time.
+    /// Expire the job if it has not finished after DURATION or at an RFC 3339 time. A queued
+    /// job is not submitted; a placed run is force-stopped. With --cron, each fired job expires
+    /// DURATION after its fire time.
     #[arg(long, value_name = "DURATION|TIME")]
     expires: Option<String>,
 
@@ -748,6 +760,7 @@ impl HubSubmitArgs {
             detach,
             wait: self.wait,
             queue: self.queue,
+            expires: self.expires,
         })
     }
 }

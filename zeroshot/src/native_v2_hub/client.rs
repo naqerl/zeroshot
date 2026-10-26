@@ -419,7 +419,12 @@ async fn submit(
     output: &mut impl Write,
 ) -> Result<i32, HubError> {
     let started = now_ms();
-    let job = jobs::new_job(&request.job, started)?;
+    let mut job = jobs::new_job(&request.job, started)?;
+    job.expires_at_ms = request
+        .expires
+        .as_deref()
+        .map(|expires| parse_future_ms(expires, started))
+        .transpose()?;
     let files = job_files(&job)?;
     let deadline = match &request.wait {
         None => None,

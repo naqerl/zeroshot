@@ -74,6 +74,8 @@ pub(super) fn job(id: &str, submitted_at_ms: u64) -> Job {
         target: None,
         run_id: None,
         dispatched_at_ms: None,
+        last_cursor: None,
+        last_cursor_at_ms: None,
         finished_at_ms: None,
         failure_reason: None,
         token_usage: None,
@@ -231,6 +233,189 @@ fn expire_only_affects_queued_jobs() {
     assert_eq!(jobs[2].state, JobState::Running);
 }
 
+#[tokio::test]
+async fn placed_jobs_past_their_deadline_stop_the_run_and_settle_expired() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let driver = std::sync::Arc::new(FakeDriver::default());
+    let service = super::service::HubService::open(
+        super::store::HubStore::new(directory.path().join("hub")),
+        driver.clone(),
+        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
+    )
+    .expect("service");
+    let mut running = job("hj_late", 0);
+    running.state = JobState::Running;
+    running.target = Some("box".to_owned());
+    running.run_id = Some("run-late".to_owned());
+    running.expires_at_ms = Some(50);
+    service
+        .mutate(|state| {
+            state.jobs.push(running);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+    let (report, view) = service.pass().await.expect("pass");
+    assert_eq!(report.expired, ["hj_late"]);
+    assert_eq!(view["expired"], json!(["hj_late"]));
+    let settled = service.snapshot().await.jobs.remove(0);
+    assert_eq!(settled.state, JobState::Expired);
+    assert!(settled.finished_at_ms.is_some());
+    let error = settled.error.expect("expiry error");
+    assert_eq!(error.kind, JobErrorKind::RunExpired);
+    assert!(error.message.contains("run-late"), "{}", error.message);
+    assert_eq!(
+        driver.stops.lock().expect("fake lock").as_slice(),
+        [("box".to_owned(), "run-late".to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn queued_jobs_past_their_deadline_expire_with_run_expired() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let driver = std::sync::Arc::new(FakeDriver::default());
+    let service = super::service::HubService::open(
+        super::store::HubStore::new(directory.path().join("hub")),
+        driver,
+        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
+    )
+    .expect("service");
+    let mut queued = job("hj_queued", 0);
+    queued.expires_at_ms = Some(1);
+    service
+        .mutate(|state| {
+            state.jobs.push(queued);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+    let (report, view) = service.pass().await.expect("pass");
+    assert_eq!(report.expired, ["hj_queued"]);
+    assert_eq!(view["expired"], json!(["hj_queued"]));
+    let settled = service.snapshot().await.jobs.remove(0);
+    assert_eq!(settled.state, JobState::Expired);
+    assert_eq!(
+        settled.error.expect("expiry error").kind,
+        JobErrorKind::RunExpired
+    );
+}
+
+#[tokio::test]
+async fn a_stalled_run_is_stopped_and_failed_with_its_cursor_and_still_time() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let driver = std::sync::Arc::new(FakeDriver::default());
+    let service = super::service::HubService::open(
+        super::store::HubStore::new(directory.path().join("hub")),
+        driver.clone(),
+        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
+    )
+    .expect("service")
+    .with_max_stall(Some(100));
+    let mut running = job("hj_stalled", 0);
+    running.state = JobState::Running;
+    running.target = Some("box".to_owned());
+    running.run_id = Some("run-stalled".to_owned());
+    running.last_cursor = Some("run-stalled-cursor".to_owned());
+    running.last_cursor_at_ms = Some(0);
+    service
+        .mutate(|state| {
+            state.jobs.push(running);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+    let (report, view) = service.pass().await.expect("pass");
+    assert_eq!(report.stalled.len(), 1);
+    assert_eq!(report.stalled[0]["runId"], json!("run-stalled"));
+    assert_eq!(report.stalled[0]["cursor"], json!("run-stalled-cursor"));
+    assert_eq!(view["stalled"], json!(report.stalled));
+    let settled = service.snapshot().await.jobs.remove(0);
+    assert_eq!(settled.state, JobState::Failed);
+    assert_eq!(settled.failure_reason.as_deref(), Some("stalled"));
+    let error = settled.error.expect("stall error");
+    assert_eq!(error.kind, JobErrorKind::Stalled);
+    assert!(
+        error.message.contains("run-stalled-cursor"),
+        "{}",
+        error.message
+    );
+    assert!(error.message.contains("ms"), "{}", error.message);
+    assert_eq!(
+        driver.stops.lock().expect("fake lock").as_slice(),
+        [("box".to_owned(), "run-stalled".to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn an_advancing_cursor_resets_the_stall_clock_and_without_max_stall_nothing_stops() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let driver = std::sync::Arc::new(FakeDriver::default());
+    let store = super::store::HubStore::new(directory.path().join("hub"));
+    let registry =
+        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json"));
+    let service = super::service::HubService::open(store.clone(), driver.clone(), registry.clone())
+        .expect("service")
+        .with_max_stall(Some(100));
+    let mut running = job("hj_cursor", 0);
+    running.state = JobState::Running;
+    running.target = Some("box".to_owned());
+    running.run_id = Some("run-cursor".to_owned());
+    running.last_cursor = Some("old-cursor".to_owned());
+    running.last_cursor_at_ms = Some(0);
+    driver
+        .cursors
+        .lock()
+        .expect("fake lock")
+        .insert("run-cursor".to_owned(), "new-cursor".to_owned());
+    service
+        .mutate(|state| {
+            state.jobs.push(running);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+    let (report, _) = service.pass().await.expect("pass");
+    assert!(report.stalled.is_empty(), "a fresh cursor cannot stall");
+    let observed = service.snapshot().await.jobs.remove(0);
+    assert_eq!(observed.state, JobState::Running);
+    assert_eq!(observed.last_cursor.as_deref(), Some("new-cursor"));
+    assert!(observed.last_cursor_at_ms.is_some_and(|at| at > 0));
+    assert!(driver.stops.lock().expect("fake lock").is_empty());
+
+    let disabled = super::service::HubService::open(store, driver.clone(), registry)
+        .expect("service")
+        .with_max_stall(None);
+    let mut running = observed;
+    running.last_cursor = Some("new-cursor".to_owned());
+    running.last_cursor_at_ms = Some(0);
+    disabled
+        .mutate(|state| {
+            state.jobs = vec![running];
+            Ok(())
+        })
+        .await
+        .expect("seed");
+    let (report, _) = disabled.pass().await.expect("pass");
+    assert!(report.stalled.is_empty());
+    assert_eq!(disabled.snapshot().await.jobs[0].state, JobState::Running);
+    assert!(driver.stops.lock().expect("fake lock").is_empty());
+}
+
+#[test]
+fn cursor_recording_keeps_time_until_the_cursor_advances() {
+    let mut running = job("j1", 0);
+    running.state = JobState::Running;
+    let status = json!({"atCursor": "c1"});
+    super::schedule::record_cursor(&mut running, &status, 10);
+    assert_eq!(running.last_cursor.as_deref(), Some("c1"));
+    assert_eq!(running.last_cursor_at_ms, Some(10));
+    super::schedule::record_cursor(&mut running, &status, 20);
+    assert_eq!(running.last_cursor_at_ms, Some(10));
+    super::schedule::record_cursor(&mut running, &json!({"atCursor": "c2"}), 30);
+    assert_eq!(running.last_cursor.as_deref(), Some("c2"));
+    assert_eq!(running.last_cursor_at_ms, Some(30));
+}
+
 #[test]
 fn finished_status_records_outcome_and_tokens() {
     let mut running = job("j1", 0);
@@ -286,6 +471,10 @@ pub(super) struct FakeDriver {
     pub submit_delay: Option<std::time::Duration>,
     /// Run IDs by submission key: the target's idempotency.
     pub accepted: Mutex<BTreeMap<String, String>>,
+    /// Watch cursor by run ID; defaults to `<run>-cursor`.
+    pub cursors: Mutex<BTreeMap<String, String>>,
+    /// `force-stop` calls as (member, run ID).
+    pub stops: Mutex<Vec<(String, String)>>,
 }
 
 impl FakeDriver {
@@ -355,20 +544,41 @@ impl HubDriver for FakeDriver {
         if let Some(delay) = self.status_delay {
             tokio::time::sleep(delay).await;
         }
+        let cursor = self
+            .cursors
+            .lock()
+            .expect("fake lock")
+            .get(run_id)
+            .cloned()
+            .unwrap_or_else(|| format!("{run_id}-cursor"));
         let runs = self.runs.lock().expect("fake lock");
         let phase = runs
             .get(member)
             .and_then(|runs| runs.iter().find(|(id, _)| id == run_id))
             .map_or("running", |(_, phase)| *phase);
         Ok(if phase == "finished" {
-            json!({"status": {
-                "phase": "finished",
-                "terminalResult": {"status": "succeeded", "output": self.output.clone().unwrap_or_else(|| json!({}))},
-                "metadata": {"tokenUsage": {"inputTokens": 1000, "outputTokens": 100, "complete": true}}
-            }})
+            json!({
+                "atCursor": cursor,
+                "status": {
+                    "phase": "finished",
+                    "terminalResult": {"status": "succeeded", "output": self.output.clone().unwrap_or_else(|| json!({}))},
+                    "metadata": {"tokenUsage": {"inputTokens": 1000, "outputTokens": 100, "complete": true}}
+                }
+            })
         } else {
-            json!({"status": {"phase": "running", "activeExecutions": []}})
+            json!({
+                "atCursor": cursor,
+                "status": {"phase": "running", "activeExecutions": []}
+            })
         })
+    }
+
+    async fn stop(&self, member: &str, run_id: &str) -> Result<(), HubError> {
+        self.stops
+            .lock()
+            .expect("fake lock")
+            .push((member.to_owned(), run_id.to_owned()));
+        Ok(())
     }
 
     async fn capabilities(&self, member: &str) -> Result<Vec<String>, HubError> {

@@ -138,6 +138,27 @@ fn bare_wait_means_wait_without_deadline() {
 }
 
 #[test]
+fn submit_parses_expiry() {
+    let command = parse(&[
+        "hub",
+        "submit",
+        "--expires",
+        "2h",
+        "--title",
+        "T",
+        "--profile",
+        "p",
+        "--input",
+        "in.json",
+    ])
+    .expect("hub submit parses expiry");
+    let HubCommand::Submit(submit) = command else {
+        panic!("expected submit");
+    };
+    assert_eq!(submit.expires.as_deref(), Some("2h"));
+}
+
+#[test]
 fn wait_and_queue_conflict() {
     let error = parse(&[
         "hub", "submit", "--wait", "1m", "--queue", "--title", "T", "--input", "in.json",
@@ -322,6 +343,8 @@ fn daemon_and_service_commands_parse() {
             "task",
             "--unconfirmed-limit",
             "5",
+            "--max-stall",
+            "30m",
         ])
         .expect("daemon run with API options"),
         HubCommand::Daemon(HubDaemonRun {
@@ -332,6 +355,7 @@ fn daemon_and_service_commands_parse() {
                 metrics_listen: Some("127.0.0.1:9383".to_owned()),
                 metrics_labels: vec!["task".to_owned()],
                 unconfirmed_limit: Some(5),
+                max_stall: Some("30m".to_owned()),
             },
         })
     );
