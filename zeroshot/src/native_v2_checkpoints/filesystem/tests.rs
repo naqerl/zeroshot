@@ -337,10 +337,10 @@ fn canonical_workspace_captures_and_restores_its_committed_git_head() {
 fn capture_is_immutable_and_restore_replaces_the_entire_selected_tree() {
     let fixture = Fixture::new();
     fs::write(fixture.workspace.join("source"), "checkpoint").assert_value();
-    fs::write(fixture.workspace.join(".gitignore"), "generated/\n").assert_value();
-    fs::create_dir(fixture.workspace.join("generated")).assert_value();
+    fs::write(fixture.workspace.join(".gitignore"), "build/\n").assert_value();
+    fs::create_dir(fixture.workspace.join("build")).assert_value();
     fs::write(
-        fixture.workspace.join("generated/output"),
+        fixture.workspace.join("build/generated"),
         "ignored artifact",
     )
     .assert_value();
@@ -351,7 +351,7 @@ fn capture_is_immutable_and_restore_replaces_the_entire_selected_tree() {
     )
     .assert_value();
     fs::write(fixture.workspace.join("source"), "later edits").assert_value();
-    fs::remove_dir_all(fixture.workspace.join("generated")).assert_value();
+    fs::remove_dir_all(fixture.workspace.join("build")).assert_value();
     fs::create_dir(fixture.workspace.join("later-directory")).assert_value();
     fs::write(fixture.workspace.join("later-directory/file"), "later").assert_value();
 
@@ -365,7 +365,7 @@ fn capture_is_immutable_and_restore_replaces_the_entire_selected_tree() {
         "checkpoint"
     );
     assert_eq!(
-        fs::read_to_string(fixture.workspace.join("generated/output")).assert_value(),
+        fs::read_to_string(fixture.workspace.join("build/generated")).assert_value(),
         "ignored artifact"
     );
     assert!(!fixture.workspace.join("later-directory").exists());
