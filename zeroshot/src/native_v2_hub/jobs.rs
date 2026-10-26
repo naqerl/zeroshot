@@ -84,6 +84,7 @@ pub(crate) fn new_job(spec: &HubJobSpec, now_ms: u64) -> Result<Job, HubError> {
         dispatched_at_ms: None,
         last_cursor: None,
         last_cursor_at_ms: None,
+        target_last_ok_at_ms: None,
         finished_at_ms: None,
         failure_reason: None,
         token_usage: None,

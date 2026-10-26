@@ -70,6 +70,9 @@ pub(super) enum HubCliCommand {
     Update(HubUpdateArgs),
 
     /// Remove a member from the hub. Its target registration is unchanged.
+    ///
+    /// Refuses while a job is placed on the member, naming the job IDs; stop or dequeue those
+    /// jobs first. A job whose member disappears or stays unreachable is failed as target_lost.
     #[command(visible_alias = "rm")]
     Remove(HubNameArgs),
 

@@ -233,13 +233,24 @@ impl HubService {
 
     pub(crate) async fn remove(&self, name: &str) -> Result<Value, HubError> {
         self.mutate(|state| {
-            let before = state.members.len();
-            state.members.retain(|member| member.name != name);
-            if state.members.len() == before {
+            if state.member(name).is_none() {
                 return Err(HubError::MemberNotFound(format!(
                     "{name} is not a hub member"
                 )));
             }
+            let placed = state
+                .jobs
+                .iter()
+                .filter(|job| job.state == JobState::Running && job.target.as_deref() == Some(name))
+                .map(|job| job.job_id.clone())
+                .collect::<Vec<_>>();
+            if !placed.is_empty() {
+                return Err(HubError::Conflict(format!(
+                    "{name} still has placed jobs: {}; stop or dequeue them before removing the member",
+                    placed.join(", ")
+                )));
+            }
+            state.members.retain(|member| member.name != name);
             Ok(json!({ "schema": "zeroshot.hub.member/v1", "removed": name }))
         })
         .await
@@ -898,6 +909,20 @@ impl HubService {
                 })
                 .await?;
         }
+        // Probe every member on this pass, so a placed job's member is observed even when no
+        // queued job needs placement. Health failures accumulate across passes.
+        let snapshot = self.snapshot().await;
+        let probed = snapshot.members.iter().collect::<Vec<_>>();
+        let mut loads = schedule::probe(&probed, &snapshot.jobs, self.driver()).await;
+        self.metrics.record_loads(&loads);
+        let now = now_ms();
+        report.target_lost = self
+            .mutate(|state| {
+                schedule::record_health(&mut state.members, &mut state.jobs, &loads, now);
+                let lost = schedule::lost_targets(state);
+                Ok(schedule::settle_lost_targets(&mut state.jobs, now, &lost))
+            })
+            .await?;
         let placing = schedule::placing(&self.snapshot().await);
         for (job_id, member) in placing {
             let (job, dispatched) = self.dispatch(&job_id, &member, now).await?;
@@ -913,20 +938,11 @@ impl HubService {
                 schedule::CAPABILITY_TTL_MS,
             )
             .await;
-            let state = self
-                .mutate(|state| {
-                    schedule::merge_capabilities(&mut state.members, &members);
-                    Ok(state.clone())
-                })
-                .await?;
-            let active = state
-                .members
-                .iter()
-                .filter(|member| member.state == MemberState::Active)
-                .collect::<Vec<_>>();
-            let mut loads: BTreeMap<_, _> =
-                schedule::probe(&active, &state.jobs, self.driver()).await;
-            self.metrics.record_loads(&loads);
+            self.mutate(|state| {
+                schedule::merge_capabilities(&mut state.members, &members);
+                Ok(())
+            })
+            .await?;
             let now = now_ms();
             let chosen = self
                 .mutate(|state| Ok(schedule::choose(state, now, &mut loads)))

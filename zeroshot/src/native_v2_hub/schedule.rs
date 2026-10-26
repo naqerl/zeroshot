@@ -11,6 +11,10 @@ use super::usage::JobUsage;
 use super::placement::{Load, Placement, place};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Consecutive failed member probes, one per dispatcher interval, after which a job placed on
+/// that member is failed as `target_lost`. A single failed probe, or a member that flaps below
+/// this threshold, keeps the job running.
+pub(crate) const UNREACHABLE_REAP_THRESHOLD: u32 = 3;
 /// Discovered capabilities are refreshed after this age by placement passes.
 pub(crate) const CAPABILITY_TTL_MS: u64 = 5 * 60 * 1000;
 
@@ -22,6 +26,7 @@ pub(crate) struct TickReport {
     pub finished: Vec<Value>,
     pub expired: Vec<String>,
     pub stalled: Vec<Value>,
+    pub target_lost: Vec<Value>,
     pub failed: Vec<Value>,
     pub unconfirmed: Vec<Value>,
     pub loads: Option<BTreeMap<String, Load>>,
@@ -53,6 +58,7 @@ impl TickReport {
             "finished": self.finished,
             "expired": self.expired,
             "stalled": self.stalled,
+            "targetLost": self.target_lost,
             "dispatchFailed": self.failed,
             "dispatchUnconfirmed": self.unconfirmed,
             "queued": queued,
@@ -118,6 +124,119 @@ pub(crate) async fn probe(
         }
     }
     loads
+}
+
+/// Record load probes on members and on the jobs placed there. A successful probe resets the
+/// member's failure streak and refreshes the last success on the member and its running jobs.
+pub(crate) fn record_health(
+    members: &mut [Member],
+    jobs: &mut [Job],
+    loads: &BTreeMap<String, Load>,
+    now_ms: u64,
+) {
+    for member in members {
+        let Some(load) = loads.get(&member.name) else {
+            continue;
+        };
+        if load.reachable {
+            member.unreachable_probes = 0;
+            member.last_probe_ok_at_ms = Some(now_ms);
+        } else {
+            member.unreachable_probes = member.unreachable_probes.saturating_add(1);
+        }
+    }
+    for job in jobs.iter_mut().filter(|job| job.state == JobState::Running) {
+        let Some(target) = job.target.as_deref() else {
+            continue;
+        };
+        if loads.get(target).is_some_and(|load| load.reachable) {
+            job.target_last_ok_at_ms = Some(now_ms);
+        }
+    }
+}
+
+/// A running job whose member left the hub or stayed unreachable for too many probes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LostTarget {
+    pub job_id: String,
+    pub member: String,
+    /// Consecutive failed probes; `None` when the member is no longer a hub member.
+    pub unreachable_probes: Option<u32>,
+    pub last_probe_ok_at_ms: Option<u64>,
+}
+
+/// Running jobs that can no longer be observed because their member is gone or unreachable.
+pub(crate) fn lost_targets(state: &HubState) -> Vec<LostTarget> {
+    state
+        .jobs
+        .iter()
+        .filter(|job| job.state == JobState::Running)
+        .filter_map(|job| {
+            let name = job.target.as_deref()?;
+            match state.member(name) {
+                None => Some(LostTarget {
+                    job_id: job.job_id.clone(),
+                    member: name.to_owned(),
+                    unreachable_probes: None,
+                    last_probe_ok_at_ms: job.target_last_ok_at_ms,
+                }),
+                Some(member) if member.unreachable_probes >= UNREACHABLE_REAP_THRESHOLD => {
+                    Some(LostTarget {
+                        job_id: job.job_id.clone(),
+                        member: member.name.clone(),
+                        unreachable_probes: Some(member.unreachable_probes),
+                        last_probe_ok_at_ms: member
+                            .last_probe_ok_at_ms
+                            .or(job.target_last_ok_at_ms),
+                    })
+                }
+                Some(_) => None,
+            }
+        })
+        .collect()
+}
+
+/// Fail lost-target jobs, naming the member and the last successful probe. Returns summaries.
+pub(crate) fn settle_lost_targets(
+    jobs: &mut [Job],
+    now_ms: u64,
+    lost: &[LostTarget],
+) -> Vec<Value> {
+    let mut failed = Vec::new();
+    for target in lost {
+        let Some(job) = jobs.iter_mut().find(|job| job.job_id == target.job_id) else {
+            continue;
+        };
+        if job.state != JobState::Running || job.target.as_deref() != Some(target.member.as_str()) {
+            continue;
+        }
+        let last = target.last_probe_ok_at_ms.map_or_else(
+            || "no successful probe was recorded".to_owned(),
+            |at| format!("last successful probe at {}", super::clock::rfc3339(at)),
+        );
+        let detail = match target.unreachable_probes {
+            Some(count) => format!(
+                "{} has been unreachable for {count} consecutive probes ({last})",
+                target.member
+            ),
+            None => format!("{} is no longer a hub member ({last})", target.member),
+        };
+        job.state = JobState::Failed;
+        job.finished_at_ms = Some(now_ms);
+        job.failure_reason = Some("target_lost".to_owned());
+        job.error = Some(JobError::new(
+            JobErrorKind::TargetLost,
+            format!("{detail}; the hub cannot observe or stop its run"),
+        ));
+        failed.push(json!({
+            "jobId": job.job_id,
+            "state": job.display_state(now_ms),
+            "target": job.target,
+            "runId": job.run_id,
+            "reason": "target_lost",
+        }));
+    }
+    failed
 }
 
 /// Refresh discovery capabilities of named, non-disabled members older than `max_age_ms`.
@@ -744,6 +863,13 @@ pub(crate) async fn tick(state: &mut HubState, driver: &dyn HubDriver, now_ms: u
     } else {
         expire_unconfirmed(&mut state.jobs, now_ms)
     });
+    // Probe every member on every pass, so a placed job's member is observed even when no
+    // queued job needs placement. Health failures accumulate across passes.
+    let members = state.members.iter().collect::<Vec<_>>();
+    let mut loads = probe(&members, &state.jobs, driver).await;
+    record_health(&mut state.members, &mut state.jobs, &loads, now_ms);
+    let lost = lost_targets(state);
+    report.target_lost = settle_lost_targets(&mut state.jobs, now_ms, &lost);
     for (job_id, member) in placing(state) {
         if let Some(job) = state.jobs.iter_mut().find(|job| job.job_id == job_id) {
             let dispatched =
@@ -756,12 +882,6 @@ pub(crate) async fn tick(state: &mut HubState, driver: &dyn HubDriver, now_ms: u
         return report;
     }
     discover(&mut state.members, driver, now_ms, CAPABILITY_TTL_MS).await;
-    let active = state
-        .members
-        .iter()
-        .filter(|member| member.state == MemberState::Active)
-        .collect::<Vec<_>>();
-    let mut loads = probe(&active, &state.jobs, driver).await;
     for (job_id, member) in choose(state, now_ms, &mut loads) {
         let Some(job) = state.jobs.iter_mut().find(|job| job.job_id == job_id) else {
             continue;

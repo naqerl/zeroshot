@@ -870,7 +870,10 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   `/.well-known/zeroshot-native-v2`. Cron schedules use `croner` with an explicit IANA zone (`jiff`
   bundled tzdb). Member capacity is hub-declared `slots`; load is the observed nonterminal runs.
   Dispatch submission keys are `hub-JOB_ID-ATTEMPT`. Exit code 3 means no capacity or an expired
-  wait, and 4 means that no active member matches or supports the job.
+  wait, and 4 means that no active member matches or supports the job. Every pass probes every
+  member, including when no job is due; a running job is failed as `target_lost` when its member
+  disappears or remains unreachable for three consecutive probes, and removing a member with a
+  placed job is refused with the job IDs.
 - `zeroshot/src/private_file.rs` owns owner-only file replacement for the shipped CLI: a random
   `create_new` sibling with mode `0600`, fsync, rename over the destination, and cleanup on failure,
   so readers never see a partial file and a link is replaced rather than written through. The target

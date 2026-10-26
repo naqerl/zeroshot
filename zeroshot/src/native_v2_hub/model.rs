@@ -62,6 +62,12 @@ pub(crate) struct Member {
     pub capabilities_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_error: Option<String>,
+    /// Consecutive failed load probes; a successful probe resets it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unreachable_probes: u32,
+    /// When a load probe last succeeded, in Unix epoch milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_probe_ok_at_ms: Option<u64>,
 }
 
 impl Member {
@@ -77,6 +83,8 @@ impl Member {
             capabilities: None,
             capabilities_at_ms: None,
             capability_error: None,
+            unreachable_probes: 0,
+            last_probe_ok_at_ms: None,
         }
     }
 
@@ -236,6 +244,9 @@ pub(crate) enum JobErrorKind {
     /// The run stopped making progress and is stopped by `hub daemon run --max-stall`; while a
     /// stop keeps failing the job stays running with this error.
     Stalled,
+    /// The job's member left the hub or stayed unreachable for too many consecutive probes, so
+    /// the hub cannot observe or stop its run.
+    TargetLost,
     /// Recorded as plain text by an earlier hub.
     Unclassified,
 }
@@ -319,6 +330,9 @@ pub(crate) struct Job {
     pub last_cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_cursor_at_ms: Option<u64>,
+    /// When a probe last found the job's member reachable; kept as target-lost evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_last_ok_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
