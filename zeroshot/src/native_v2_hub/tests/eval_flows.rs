@@ -126,6 +126,7 @@ async fn suites_and_cases_are_created_listed_and_shown() {
             detach: true,
             wait: None,
             queue: true,
+            expires: None,
         })),
         &mut output,
     )

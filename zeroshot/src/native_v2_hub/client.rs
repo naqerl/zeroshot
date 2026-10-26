@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use zeroshot_engine::native_v2_cli::hub::{HubCommand, HubEnqueue, HubPs, HubStats, HubSubmit};
 
 use super::api::EXIT_CODE_HEADER;
-use super::clock::{now_ms, parse_duration_ms, parse_future_ms, parse_past_ms};
+use super::clock::{now_ms, parse_duration_ms, parse_expiry_ms, parse_future_ms, parse_past_ms};
 use super::context::Resolved;
 use super::cron;
 use super::error::HubError;
@@ -419,7 +419,12 @@ async fn submit(
     output: &mut impl Write,
 ) -> Result<i32, HubError> {
     let started = now_ms();
-    let job = jobs::new_job(&request.job, started)?;
+    let mut job = jobs::new_job(&request.job, started)?;
+    job.expires_at_ms = request
+        .expires
+        .as_deref()
+        .map(|expires| parse_expiry_ms(expires, started))
+        .transpose()?;
     let files = job_files(&job)?;
     let deadline = match &request.wait {
         None => None,
@@ -489,7 +494,7 @@ async fn enqueue(client: &HubClient, request: HubEnqueue) -> Result<Value, HubEr
     job.expires_at_ms = request
         .expires
         .as_deref()
-        .map(|expires| parse_future_ms(expires, now))
+        .map(|expires| parse_expiry_ms(expires, now))
         .transpose()?;
     let files = job_files(&job)?;
     client

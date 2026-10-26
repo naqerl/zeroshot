@@ -73,6 +73,17 @@ fn installed_daemons_pass_listen_and_token_file_through() {
         limited.join(" "),
         "hub daemon run --interval 5s --unconfirmed-limit 5"
     );
+    let stalled = daemon_arguments(
+        "5s",
+        &HubApiOptions {
+            max_stall: Some("30m".to_owned()),
+            ..HubApiOptions::default()
+        },
+    );
+    assert_eq!(
+        stalled.join(" "),
+        "hub daemon run --interval 5s --max-stall 30m"
+    );
     let unit = systemd_unit(&env(), false, &arguments);
     assert!(unit.contains("\"--listen\" \"0.0.0.0:7383\" \"--token-file\" \"/srv/hub/token\""));
     let argv = docker_run(&env(), "zeroshot-hub:dev", &[], &arguments).join(" ");
@@ -514,6 +525,7 @@ async fn the_daemon_serves_the_api_dispatches_and_stops_on_shutdown() {
             metrics_listen: Some("127.0.0.1:0".to_owned()),
             metrics_labels: vec!["team".to_owned()],
             unconfirmed_limit: None,
+            max_stall: None,
         },
     };
     let registry = directory.path().join("targets.json");
@@ -562,6 +574,7 @@ async fn the_daemon_serves_the_api_dispatches_and_stops_on_shutdown() {
                     detach: true,
                     wait: None,
                     queue: true,
+                    expires: None,
                 })),
                 &mut output,
             )
@@ -656,6 +669,7 @@ async fn the_daemon_refuses_bad_options_before_serving() {
             metrics_listen: metrics.map(str::to_owned),
             metrics_labels: Vec::new(),
             unconfirmed_limit: None,
+            max_stall: None,
         },
     };
     // Each refusal gets its own hub folder: a just-released daemon lock can stay held for a
@@ -748,6 +762,7 @@ async fn install_and_uninstall_print_plans_on_dry_runs() {
             metrics_listen: None,
             metrics_labels: Vec::new(),
             unconfirmed_limit: None,
+            max_stall: None,
         },
         dry_run,
     };
@@ -941,6 +956,7 @@ async fn the_daemon_reports_failing_passes_and_keeps_serving() {
             metrics_listen: None,
             metrics_labels: Vec::new(),
             unconfirmed_limit: None,
+            max_stall: Some("1h".to_owned()),
         },
     };
     let mut output = Vec::new();
@@ -961,6 +977,10 @@ async fn the_daemon_reports_failing_passes_and_keeps_serving() {
         .collect::<Vec<_>>();
     assert_eq!(lines.first().expect("started")["event"], json!("started"));
     assert!(lines.first().expect("started")["metricsListen"].is_null());
+    assert_eq!(
+        lines.first().expect("started")["maxStallMs"],
+        json!(3_600_000)
+    );
     let failures = lines
         .iter()
         .filter(|line| line.to_string().contains("state could not be replaced"))

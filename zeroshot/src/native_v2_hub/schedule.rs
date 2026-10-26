@@ -21,6 +21,7 @@ pub(crate) struct TickReport {
     pub dispatched: Vec<Value>,
     pub finished: Vec<Value>,
     pub expired: Vec<String>,
+    pub stalled: Vec<Value>,
     pub failed: Vec<Value>,
     pub unconfirmed: Vec<Value>,
     pub loads: Option<BTreeMap<String, Load>>,
@@ -51,6 +52,7 @@ impl TickReport {
             "dispatched": self.dispatched,
             "finished": self.finished,
             "expired": self.expired,
+            "stalled": self.stalled,
             "dispatchFailed": self.failed,
             "dispatchUnconfirmed": self.unconfirmed,
             "queued": queued,
@@ -246,6 +248,26 @@ pub(crate) async fn dispatch(
     }
 }
 
+/// Record the status document's watch cursor on a running job. An unchanged cursor keeps the
+/// time it last advanced; a new cursor resets both fields.
+pub(crate) fn record_cursor(job: &mut Job, status: &Value, now_ms: u64) {
+    let cursor = status
+        .get("atCursor")
+        .or_else(|| status.pointer("/status/atCursor"))
+        .and_then(Value::as_str);
+    let Some(cursor) = cursor else {
+        return;
+    };
+    if job.last_cursor.as_deref() == Some(cursor) {
+        if job.last_cursor_at_ms.is_none() {
+            job.last_cursor_at_ms = Some(now_ms);
+        }
+        return;
+    }
+    job.last_cursor = Some(cursor.to_owned());
+    job.last_cursor_at_ms = Some(now_ms);
+}
+
 /// Apply a run status projection to a running job. Returns true when the job finished.
 pub(crate) fn apply_status(job: &mut Job, status: &Value, now_ms: u64) -> bool {
     let Some(phase) = status.pointer("/status/phase").and_then(Value::as_str) else {
@@ -283,6 +305,7 @@ pub(crate) fn apply_refresh(
 ) -> Option<Value> {
     match result {
         Ok(status) => {
+            record_cursor(job, &status, now_ms);
             apply_status(job, &status, now_ms);
             Some(status)
         }
@@ -456,18 +479,213 @@ pub(crate) fn recover_placing(state: &mut HubState) -> usize {
     recovered
 }
 
-/// Mark queued jobs past their expiry. Returns their IDs.
+/// Mark any job past its expiry, including a placed one. Returns their IDs.
 pub(crate) fn expire(jobs: &mut [Job], now_ms: u64) -> Vec<String> {
+    expire_matching(jobs, now_ms, true)
+}
+
+/// Mark queued jobs and placed jobs whose target has not confirmed a run past their expiry. A
+/// confirmed run is settled by [`settle_expiring`] only after its stop succeeds.
+pub(crate) fn expire_unconfirmed(jobs: &mut [Job], now_ms: u64) -> Vec<String> {
+    expire_matching(jobs, now_ms, false)
+}
+
+fn expire_matching(jobs: &mut [Job], now_ms: u64, confirmed: bool) -> Vec<String> {
     jobs.iter_mut()
         .filter(|job| {
-            job.state == JobState::Queued && job.expires_at_ms.is_some_and(|at| at <= now_ms)
+            let placed = job.state == JobState::Running;
+            (job.state == JobState::Queued || (placed && (confirmed || job.run_id.is_none())))
+                && job.expires_at_ms.is_some_and(|at| at <= now_ms)
         })
         .map(|job| {
+            let placed = job.state == JobState::Running;
+            let has_run = job.run_id.is_some();
             job.state = JobState::Expired;
             job.finished_at_ms = Some(now_ms);
+            job.error = Some(JobError::new(
+                JobErrorKind::RunExpired,
+                format!(
+                    "deadline passed at {}{}",
+                    super::clock::rfc3339(job.expires_at_ms.unwrap_or(now_ms)),
+                    if !placed {
+                        " before the job was placed"
+                    } else if has_run {
+                        " before the run could be stopped"
+                    } else {
+                        " before the target confirmed a run"
+                    }
+                ),
+            ));
             job.job_id.clone()
         })
         .collect()
+}
+
+/// A placed job whose deadline passed and whose run must be stopped before it is settled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExpiringRun {
+    pub job_id: String,
+    pub target: Option<String>,
+    pub run_id: Option<String>,
+    pub submission_key: String,
+}
+
+/// Running jobs (including jobs still placing) whose deadline has passed.
+pub(crate) fn expiring_runs(jobs: &[Job], now_ms: u64) -> Vec<ExpiringRun> {
+    jobs.iter()
+        .filter(|job| {
+            job.state == JobState::Running && job.expires_at_ms.is_some_and(|at| at <= now_ms)
+        })
+        .map(|job| ExpiringRun {
+            job_id: job.job_id.clone(),
+            target: job.target.clone(),
+            run_id: job.run_id.clone(),
+            submission_key: format!("hub-{}-{}", job.job_id, job.attempts + 1),
+        })
+        .collect()
+}
+
+/// Settle placed jobs past their deadline. `stop_errors` holds a failed stop by job ID: the job
+/// stays running, records the failure, and a later pass retries the stop. A job without a
+/// confirmed run names the submission key a target may still hold instead.
+pub(crate) fn settle_expiring(
+    jobs: &mut [Job],
+    now_ms: u64,
+    expiring: &[ExpiringRun],
+    stop_errors: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut expired = Vec::new();
+    for run in expiring {
+        let Some(job) = jobs.iter_mut().find(|job| job.job_id == run.job_id) else {
+            continue;
+        };
+        if job.state != JobState::Running
+            || job.run_id != run.run_id
+            || !job.expires_at_ms.is_some_and(|at| at <= now_ms)
+        {
+            continue;
+        }
+        let deadline = super::clock::rfc3339(job.expires_at_ms.unwrap_or(now_ms));
+        let target = run.target.as_deref().unwrap_or("its member");
+        if let Some(run_id) = &run.run_id {
+            if let Some(error) = stop_errors.get(&run.job_id) {
+                job.error = Some(JobError::new(
+                    JobErrorKind::RunExpired,
+                    format!(
+                        "deadline passed at {deadline}; run {run_id} on {target} could not be \
+                         stopped: {error}; the hub will retry"
+                    ),
+                ));
+                continue;
+            }
+        }
+        let detail = match &run.run_id {
+            Some(run_id) => format!("the hub stopped run {run_id} on {target}"),
+            None => format!(
+                "{target} had not confirmed a run; a run with submission key {} may still exist there",
+                run.submission_key
+            ),
+        };
+        job.state = JobState::Expired;
+        job.finished_at_ms = Some(now_ms);
+        job.error = Some(JobError::new(
+            JobErrorKind::RunExpired,
+            format!("deadline passed at {deadline}; {detail}"),
+        ));
+        expired.push(job.job_id.clone());
+    }
+    expired
+}
+
+/// A running job whose watch cursor stayed unchanged for the daemon's `--max-stall`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StalledRun {
+    pub job_id: String,
+    pub target: String,
+    pub run_id: String,
+    pub cursor: String,
+    pub still_ms: u64,
+}
+
+/// Running jobs whose cursor has stayed unchanged for at least `max_stall_ms`.
+pub(crate) fn stalled_runs(jobs: &[Job], now_ms: u64, max_stall_ms: u64) -> Vec<StalledRun> {
+    jobs.iter()
+        .filter(|job| job.state == JobState::Running)
+        .filter_map(|job| {
+            let target = job.target.clone()?;
+            let run_id = job.run_id.clone()?;
+            let cursor = job.last_cursor.clone()?;
+            let at = job.last_cursor_at_ms?;
+            let still_ms = now_ms.saturating_sub(at);
+            (still_ms >= max_stall_ms).then_some(StalledRun {
+                job_id: job.job_id.clone(),
+                target,
+                run_id,
+                cursor,
+                still_ms,
+            })
+        })
+        .collect()
+}
+
+/// The daemon policy and evidence for settling stalled jobs in one pass.
+pub(crate) struct StallSettlement<'a> {
+    pub now_ms: u64,
+    pub max_stall_ms: u64,
+    pub stalled: &'a [StalledRun],
+    pub stop_errors: &'a BTreeMap<String, String>,
+}
+
+/// Fail stalled jobs after their runs were stopped, naming the cursor and how long it was still.
+pub(crate) fn settle_stalled(jobs: &mut [Job], settlement: StallSettlement<'_>) -> Vec<Value> {
+    let StallSettlement {
+        now_ms,
+        max_stall_ms,
+        stalled,
+        stop_errors,
+    } = settlement;
+    let mut failed = Vec::new();
+    for run in stalled {
+        let Some(job) = jobs.iter_mut().find(|job| job.job_id == run.job_id) else {
+            continue;
+        };
+        if job.state != JobState::Running
+            || job.run_id.as_deref() != Some(run.run_id.as_str())
+            || job.last_cursor.as_deref() != Some(run.cursor.as_str())
+        {
+            continue;
+        }
+        if let Some(error) = stop_errors.get(&run.job_id) {
+            job.error = Some(JobError::new(
+                JobErrorKind::Stalled,
+                format!(
+                    "run {} on {} stayed at cursor {} for {}ms (max stall {}ms); stopping it \
+                     failed: {error}; the hub will retry",
+                    run.run_id, run.target, run.cursor, run.still_ms, max_stall_ms
+                ),
+            ));
+            continue;
+        }
+        job.state = JobState::Failed;
+        job.finished_at_ms = Some(now_ms);
+        job.failure_reason = Some("stalled".to_owned());
+        job.error = Some(JobError::new(
+            JobErrorKind::Stalled,
+            format!(
+                "run {} on {} stayed at cursor {} for {}ms (max stall {}ms); the hub stopped it",
+                run.run_id, run.target, run.cursor, run.still_ms, max_stall_ms
+            ),
+        ));
+        failed.push(json!({
+            "jobId": job.job_id,
+            "state": job.display_state(now_ms),
+            "target": job.target,
+            "runId": job.run_id,
+            "cursor": run.cursor,
+            "stillMs": run.still_ms,
+        }));
+    }
+    failed
 }
 
 /// Indexes of queued jobs whose start time has come: higher priority first, then FIFO.
@@ -502,7 +720,30 @@ pub(crate) async fn tick(state: &mut HubState, driver: &dyn HubDriver, now_ms: u
     };
     let results = poll(polls(state), driver).await;
     report.finished = apply_polls(state, results, now_ms);
-    report.expired = expire(&mut state.jobs, now_ms);
+    let expiring = expiring_runs(&state.jobs, now_ms);
+    let mut stop_errors = BTreeMap::new();
+    for run in &expiring {
+        if let Some(run_id) = &run.run_id {
+            let stopped = match &run.target {
+                Some(target) => driver.stop(target, run_id).await,
+                None => Err(HubError::Target {
+                    message: format!("run {run_id} has no member to stop it on"),
+                    diagnostic: None,
+                }),
+            };
+            if let Err(error) = stopped {
+                stop_errors.insert(run.job_id.clone(), error.to_string());
+            }
+        }
+    }
+    report.expired = settle_expiring(&mut state.jobs, now_ms, &expiring, &stop_errors);
+    // With every requested stop confirmed, any remaining expired job is queued or placing, so the
+    // broad sweep is safe. A failed stop keeps its confirmed run for the next pass.
+    report.expired.extend(if stop_errors.is_empty() {
+        expire(&mut state.jobs, now_ms)
+    } else {
+        expire_unconfirmed(&mut state.jobs, now_ms)
+    });
     for (job_id, member) in placing(state) {
         if let Some(job) = state.jobs.iter_mut().find(|job| job.job_id == job_id) {
             let dispatched =

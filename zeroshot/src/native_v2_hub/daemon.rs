@@ -108,6 +108,12 @@ pub(crate) async fn run_until<W: Write>(
         output,
     } = daemon;
     let pause = Duration::from_millis(parse_duration_ms(&options.interval)?);
+    let max_stall_ms = options
+        .api
+        .max_stall
+        .as_deref()
+        .map(parse_duration_ms)
+        .transpose()?;
     let Some(_instance) = store.try_daemon_lock()? else {
         return Err(HubError::DaemonRunning(format!(
             "another hub daemon already owns {}; check it with `zeroshot hub daemon status`",
@@ -133,7 +139,8 @@ pub(crate) async fn run_until<W: Write>(
     let service = Arc::new(
         open(store)?
             .with_metric_labels(options.api.metrics_labels.clone())
-            .with_unconfirmed_limit(options.api.unconfirmed_limit),
+            .with_unconfirmed_limit(options.api.unconfirmed_limit)
+            .with_max_stall(max_stall_ms),
     );
     let (mcp_router, mcp) = crate::mcp_host::spawn_production_mcp()
         .map_err(|error| HubError::storage("the MCP worker could not start", error))?;
@@ -153,6 +160,7 @@ pub(crate) async fn run_until<W: Write>(
             .and_then(|listener| listener.local_addr().ok())
             .map(|address| address.to_string()),
         "intervalMs": pause.as_millis(),
+        "maxStallMs": max_stall_ms,
         "startedAt": rfc3339(now_ms()),
         "lastPassAt": null,
         "lastError": null,
@@ -294,6 +302,7 @@ impl super::schedule::TickReport {
             && self.dispatched.is_empty()
             && self.finished.is_empty()
             && self.expired.is_empty()
+            && self.stalled.is_empty()
             && self.failed.is_empty()
     }
 }

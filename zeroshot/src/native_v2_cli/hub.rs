@@ -98,6 +98,8 @@ pub struct HubApiOptions {
     /// Submissions a target may leave unconfirmed before the job fails; `None` uses the
     /// daemon's default.
     pub unconfirmed_limit: Option<u32>,
+    /// Stop a running job whose watch cursor does not advance for this long; `None` disables it.
+    pub max_stall: Option<String>,
 }
 
 /// `hub context`: named hub endpoints, docker-context style.
@@ -226,6 +228,7 @@ pub struct HubSubmit {
     pub detach: bool,
     pub wait: Option<Option<String>>,
     pub queue: bool,
+    pub expires: Option<String>,
 }
 
 /// Deferred placement: once (`at`) or recurring (`cron`).

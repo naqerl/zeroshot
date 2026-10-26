@@ -118,6 +118,28 @@ it. The target may still hold a run under the job's submission key; the error na
 the hub never follows or adopts such a run. If a submission that was in flight when you dequeued
 is then accepted, the error also names the run ID so you can stop it on the target.
 
+## Deadlines and stalled runs
+
+`zeroshot hub submit --expires DURATION|RFC3339` gives an immediately placed job a deadline;
+`zeroshot hub enqueue --expires` does the same for each scheduled fire. A queued job past its
+deadline becomes `expired` with `errorKind` `run_expired` without being submitted. A placed job
+past its deadline is force-stopped on its member through the same operation as
+`zeroshot hub force-stop`, then becomes `expired` with the same error kind. If the target had not
+yet confirmed a run ID, the error names the submission key that may still exist there.
+
+`zeroshot hub daemon run --max-stall DURATION` is opt-in; without it, a running job is never
+failed for inactivity. With it, every running job records the target status's `atCursor` and when
+that cursor last changed. If the cursor stays unchanged for the configured duration, the daemon
+force-stops the run and fails the job with `failureReason` `stalled` and `errorKind` `stalled`.
+The error names the cursor and how long it stayed unchanged. A new cursor resets both fields.
+If the force-stop does not succeed, the job stays `running` with that `errorKind`; the next
+dispatcher pass retries the stop, and the job settles only after the target confirms it.
+
+Both fields are persisted in hub state as `lastCursor` and `lastCursorAt`, so a daemon restart
+does not lose the stall clock. The daemon heartbeat (`daemon.json` and the `started` record)
+reports the configured duration in milliseconds as `maxStallMs`; it is `null` when disabled.
+`zeroshot hub install` passes `--max-stall` through to the installed service.
+
 ## Evals
 
 `zeroshot hub eval` reruns captured tasks under other topologies, models, or runtime settings,
