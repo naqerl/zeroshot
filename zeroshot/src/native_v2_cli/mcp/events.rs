@@ -1,3 +1,5 @@
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,7 +9,7 @@ use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncWrite;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 
 use super::args::{
     bool_prop, object_schema, optional_string, reject_unknown, string_array_prop, string_prop,
@@ -18,6 +20,11 @@ use super::super::{NativeV2CliCommand, RunWatchCommand};
 
 pub(super) const EXTENSION_ID: &str = "io.modelcontextprotocol/events";
 const EVENT_NAME: &str = "run.event";
+const HUB_JOB: &str = "hub.job";
+const HUB_RUN: &str = "hub.run";
+const HUB_POOL: &str = "hub.pool";
+const HUB_WARNING: &str = "hub.warning";
+const HUB_EVENTS: &[&str] = &[HUB_JOB, HUB_RUN, HUB_POOL, HUB_WARNING];
 const SUBSCRIPTION_META: &str = "io.modelcontextprotocol/subscriptionId";
 const FIRST_WAIT: Duration = Duration::from_secs(2);
 const IDLE_WAIT: Duration = Duration::from_millis(50);
@@ -25,38 +32,44 @@ const DEFAULT_MAX_EVENTS: usize = 50;
 const MAX_EVENTS_LIMIT: u64 = 1000;
 const NEXT_POLL_MS: u64 = 1000;
 const DRAIN_LIMIT: usize = 10_000;
+#[cfg(test)]
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
+#[cfg(not(test))]
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const HUB_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const HUB_WARNING_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const HUB_LOG_LIMIT: usize = 4096;
+const HUB_BROADCAST_LIMIT: usize = 1024;
 const PHASES: &[&str] = &["admitted", "running", "stopping", "finished"];
 /// The hub's built-in local member is the default local backend, not a named target.
 const LOCAL_HUB_MEMBER: &str = "local";
 
+type HubSnapshot = (
+    broadcast::Receiver<Arc<HubEvent>>,
+    Vec<Arc<HubEvent>>,
+    Value,
+    Option<String>,
+);
+
 pub(super) struct Prepared {
-    source: Source,
+    subscription: HubSubscription,
     filters: Filters,
 }
 
-enum Source {
-    Watch {
-        stream: WatchStream,
-        cursor: Option<String>,
-        run: Option<Value>,
-        replayed: Vec<Value>,
-    },
-    Discovery(Discovery),
-}
-
-struct Discovery {
-    job_id: String,
+struct HubSubscription {
+    feed: Rc<HubFeed>,
+    receiver: broadcast::Receiver<Arc<HubEvent>>,
+    replay: Vec<Arc<HubEvent>>,
+    cursor: Option<String>,
+    truncated: Value,
+    selector: Selector,
     target: Option<String>,
-    job: JobSnapshot,
+    kinds: Option<Vec<String>>,
 }
 
 pub(super) enum EventError {
     Invalid(McpFailure),
     NotFound,
-    Unsupported {
-        feature: &'static str,
-        value: &'static str,
-    },
     Failed(McpFailure),
 }
 
@@ -66,28 +79,33 @@ struct PollRequest {
     cursor: Option<String>,
     max_events: usize,
     filters: Filters,
+    hub: bool,
 }
 
 #[derive(Clone)]
 enum Selector {
+    Hub,
     Run(String),
     Job(String),
+}
+
+impl Selector {
+    fn is_hub(&self) -> bool {
+        matches!(self, Self::Hub)
+    }
 }
 
 struct JobSnapshot {
     view: Value,
     run_id: Option<String>,
     target: Option<String>,
-    state: String,
-    terminal: bool,
-    error: Value,
-    error_kind: Value,
 }
 
 #[derive(Clone, Default)]
 struct Filters {
     phases: Option<Vec<String>>,
     nodes: Option<Vec<String>>,
+    kinds: Option<Vec<String>>,
     terminal_only: bool,
     verbose: bool,
 }
@@ -98,7 +116,11 @@ impl Filters {
             return false;
         }
         if let Some(phases) = &self.phases {
-            let phase = data.pointer("/status/phase").and_then(Value::as_str);
+            let phase = data
+                .pointer("/status/phase")
+                .or_else(|| data.get("state"))
+                .or_else(|| data.get("phase"))
+                .and_then(Value::as_str);
             if !phase.is_some_and(|phase| phases.iter().any(|allowed| allowed == phase)) {
                 return false;
             }
@@ -106,6 +128,9 @@ impl Filters {
         if let Some(nodes) = &self.nodes {
             // A terminal record carries no active executions, so a node filter would
             // otherwise swallow the one event that tells the caller the run ended.
+            if data.get("status").is_none() {
+                return true;
+            }
             let matched = data
                 .pointer("/status/activeExecutions")
                 .and_then(Value::as_array)
@@ -128,8 +153,198 @@ impl Filters {
 struct Batch {
     events: Vec<Value>,
     cursor: Option<String>,
-    truncated: bool,
+    truncated: Value,
     has_more: bool,
+}
+
+/// One event published on the hub-wide stream. The sequence is the hub cursor; it is
+/// deliberately independent from the sparse per-run `v2:` watch cursors.
+pub(super) struct HubEvent {
+    sequence: u64,
+    name: &'static str,
+    timestamp: String,
+    data: Value,
+    run_id: Option<String>,
+    job_id: Option<String>,
+    target: Option<String>,
+    phase: Option<String>,
+    terminal: bool,
+}
+
+struct HubLog {
+    events: VecDeque<Arc<HubEvent>>,
+    next_sequence: u64,
+}
+
+/// Resident hub event log shared by every subscription on one MCP worker. A slow
+/// subscriber reads the bounded log after a broadcast lag instead of blocking dispatch.
+pub(super) struct HubFeed {
+    log: RefCell<HubLog>,
+    snapshot: RefCell<Vec<Arc<HubEvent>>>,
+    sender: broadcast::Sender<Arc<HubEvent>>,
+    started: Cell<bool>,
+}
+
+impl HubFeed {
+    pub(super) fn new() -> Self {
+        let (sender, _) = broadcast::channel(HUB_BROADCAST_LIMIT);
+        Self {
+            log: RefCell::new(HubLog {
+                events: VecDeque::new(),
+                next_sequence: 1,
+            }),
+            snapshot: RefCell::new(Vec::new()),
+            sender,
+            started: Cell::new(false),
+        }
+    }
+
+    pub(super) fn ensure_started<H>(self: &Rc<Self>, host: Rc<H>)
+    where
+        H: McpHost + 'static,
+    {
+        if self.started.replace(true) {
+            return;
+        }
+        let feed = Rc::clone(self);
+        tokio::task::spawn_local(async move {
+            hub_poller(host, feed).await;
+        });
+    }
+
+    fn publish(&self, mut event: HubEvent) {
+        let mut log = self.log.borrow_mut();
+        event.sequence = log.next_sequence;
+        log.next_sequence = log.next_sequence.saturating_add(1);
+        let event = Arc::new(event);
+        log.events.push_back(Arc::clone(&event));
+        while log.events.len() > HUB_LOG_LIMIT {
+            log.events.pop_front();
+        }
+        drop(log);
+        self.remember(Arc::clone(&event));
+        let _ = self.sender.send(event);
+    }
+
+    /// Keep the latest state per job, run, and pool lease for a new subscription.
+    fn remember(&self, event: Arc<HubEvent>) {
+        let Some((kind, key)) = snapshot_key(&event) else {
+            return;
+        };
+        let mut snapshot = self.snapshot.borrow_mut();
+        snapshot.retain(|current| {
+            snapshot_key(current).is_none_or(|(current_kind, current_key)| {
+                current_kind != kind || current_key != key
+            })
+        });
+        if !event.terminal {
+            snapshot.push(event);
+        }
+    }
+
+    fn head(&self) -> u64 {
+        self.log.borrow().next_sequence.saturating_sub(1)
+    }
+
+    /// Subscribe before taking the replay snapshot. There is no await between the two,
+    /// so a single-threaded worker cannot lose or duplicate an event at the boundary.
+    fn snapshot(&self, after: Option<u64>) -> HubSnapshot {
+        let log = self.log.borrow();
+        let head = log.next_sequence.saturating_sub(1);
+        let start = after.unwrap_or(head);
+        let truncated = log.truncation_after(after);
+        let replay = if after.is_none() {
+            let mut replay = self.snapshot.borrow().clone();
+            replay.sort_by_key(|event| event.sequence);
+            replay
+        } else {
+            log.events
+                .iter()
+                .filter(|event| event.sequence > start)
+                .cloned()
+                .collect()
+        };
+        (
+            self.sender.subscribe(),
+            replay,
+            truncated,
+            Some(hub_cursor(start)),
+        )
+    }
+
+    fn after(&self, sequence: u64) -> (Vec<Arc<HubEvent>>, Value) {
+        let log = self.log.borrow();
+        let truncated = log.truncation_after(Some(sequence));
+        let replay = log
+            .events
+            .iter()
+            .filter(|event| event.sequence > sequence)
+            .cloned()
+            .collect();
+        (replay, truncated)
+    }
+}
+
+fn snapshot_key(event: &HubEvent) -> Option<(&'static str, String)> {
+    match event.name {
+        HUB_JOB => event.job_id.clone().map(|key| ("job", key)),
+        HUB_RUN => event.run_id.clone().map(|key| ("run", key)),
+        HUB_POOL => event.target.clone().map(|key| ("pool", key)),
+        _ => None,
+    }
+}
+
+impl HubLog {
+    fn truncation_after(&self, after: Option<u64>) -> Value {
+        let Some(after) = after else {
+            return json!(false);
+        };
+        let head = self.next_sequence.saturating_sub(1);
+        let first = self
+            .events
+            .front()
+            .map(|event| event.sequence)
+            .unwrap_or(head.saturating_add(1));
+        if after.saturating_add(1) < first {
+            truncated_range(after.saturating_add(1), first.saturating_sub(1))
+        } else {
+            json!(false)
+        }
+    }
+}
+
+fn hub_cursor(sequence: u64) -> String {
+    format!("hub:{sequence}")
+}
+
+fn cursor_sequence(cursor: &str) -> Option<u64> {
+    cursor.rsplit_once(':')?.1.parse().ok()
+}
+
+fn truncated_range(from: u64, to: u64) -> Value {
+    if from > to {
+        return json!(false);
+    }
+    json!({"from": hub_cursor(from), "to": hub_cursor(to)})
+}
+
+fn merge_truncation(current: Value, from: u64, to: u64) -> Value {
+    if from > to {
+        return current;
+    }
+    match current {
+        Value::Object(mut map) => {
+            let current_to = map
+                .get("to")
+                .and_then(Value::as_str)
+                .and_then(|cursor| cursor.strip_prefix("hub:"))
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(to);
+            map.insert("to".to_owned(), json!(hub_cursor(current_to.max(to))));
+            Value::Object(map)
+        }
+        _ => truncated_range(from, to),
+    }
 }
 
 pub(super) fn list(params: &Value) -> Result<Value, EventError> {
@@ -150,54 +365,106 @@ pub(super) fn list(params: &Value) -> Result<Value, EventError> {
     if paged {
         return Ok(json!({"resultType": "complete", "events": []}));
     }
+    let descriptions = [
+        (
+            HUB_JOB,
+            "A hub job lifecycle event for every submitted, queued, scheduled, placing, running, \
+             succeeded, failed, dequeued, or cancelled job.",
+        ),
+        (
+            HUB_RUN,
+            "A durable run event from the same record `zeroshot watch` reads. The hub stream \
+             carries the records of every run on one long-lived subscription.",
+        ),
+        (
+            HUB_POOL,
+            "A pool lease lifecycle event: provisioning, active, draining, deleted, or failed.",
+        ),
+        (
+            HUB_WARNING,
+            "An hourly warning for a running job, or a run-watch and stream failure.",
+        ),
+    ];
+    let events = descriptions
+        .into_iter()
+        .map(|(name, description)| {
+            json!({
+                "name": name,
+                "description": description,
+                "delivery": ["poll", "push"],
+                "inputSchema": input_schema(name),
+                "payloadSchema": payload_schema(name),
+            })
+        })
+        .collect::<Vec<_>>();
     Ok(json!({
         "resultType": "complete",
-        "events": [{
-            "name": EVENT_NAME,
-            "description": "A durable run event from the same stream `zeroshot watch` reads. \
-                Subscribe with exactly one of runId or jobId and an optional target. Delivery is \
-                poll or push. Signed webhooks (events/subscribe) are unsupported. maxAgeMs is \
-                accepted at the subscription level but not applied because durable watch records \
-                carry no occurrence time; the event timestamp is delivery time.",
-            "delivery": ["poll", "push"],
-            "inputSchema": input_schema(),
-            "payloadSchema": payload_schema(),
-        }]
+        "events": events,
     }))
 }
 
-pub(super) fn requests_subscription(params: &Value) -> bool {
-    params
-        .get("arguments")
-        .is_some_and(|arguments| !arguments.is_null())
-}
-
-pub(super) fn unsupported_webhook() -> EventError {
-    EventError::Unsupported {
-        feature: "deliveryMode",
-        value: "webhook",
+pub(super) fn unsubscribe(params: &Value) -> Result<Value, EventError> {
+    let map = match params {
+        Value::Null => {
+            return Err(EventError::Invalid(McpFailure::invalid(
+                "requestId is required",
+            )));
+        }
+        Value::Object(map) => map,
+        _ => {
+            return Err(EventError::Invalid(McpFailure::invalid(
+                "params must be an object",
+            )));
+        }
+    };
+    reject_unknown(map, &["requestId"]).map_err(EventError::Invalid)?;
+    let request_id = map
+        .get("requestId")
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| EventError::Invalid(McpFailure::invalid("requestId is required")))?;
+    if !(request_id.is_number() || request_id.is_string()) {
+        return Err(EventError::Invalid(McpFailure::invalid(
+            "requestId must be a string or number",
+        )));
     }
+    Ok(request_id.clone())
 }
 
-pub(super) async fn poll(host: &impl McpHost, params: &Value) -> Result<Value, EventError> {
+pub(super) async fn poll<H>(
+    host: &Rc<H>,
+    feed: &Rc<HubFeed>,
+    params: &Value,
+) -> Result<Value, EventError>
+where
+    H: McpHost + 'static,
+{
     let request = parse_subscription(params, true)?;
+    if request.hub {
+        return hub_poll(host, feed, &request).await;
+    }
     let (batch, job) = match request.selector.clone() {
+        Selector::Hub => {
+            return Err(EventError::Invalid(McpFailure::invalid(
+                "a hub poll requires the hub path",
+            )));
+        }
         Selector::Run(run_id) => {
-            let batch = collect(host, &request, &run_id, request.target.as_deref()).await?;
+            let batch =
+                collect(host.as_ref(), &request, &run_id, request.target.as_deref()).await?;
             (batch, None)
         }
         Selector::Job(job_id) => {
-            let snapshot = job_status(host, &job_id).await?;
+            let snapshot = job_status(host.as_ref(), &job_id).await?;
             if let Some(run_id) = snapshot.run_id.clone() {
                 let target = request.target.clone().or_else(|| snapshot.target.clone());
-                let batch = collect(host, &request, &run_id, target.as_deref()).await?;
+                let batch = collect(host.as_ref(), &request, &run_id, target.as_deref()).await?;
                 (batch, Some(snapshot.view))
             } else {
                 (
                     Batch {
                         events: Vec::new(),
                         cursor: None,
-                        truncated: false,
+                        truncated: json!(false),
                         has_more: false,
                     },
                     Some(snapshot.view),
@@ -219,53 +486,42 @@ pub(super) async fn poll(host: &impl McpHost, params: &Value) -> Result<Value, E
     Ok(result)
 }
 
-pub(super) async fn prepare(host: &impl McpHost, params: &Value) -> Result<Prepared, EventError> {
+pub(super) async fn prepare<H>(
+    host: &Rc<H>,
+    feed: &Rc<HubFeed>,
+    params: &Value,
+) -> Result<Prepared, EventError>
+where
+    H: McpHost + 'static,
+{
     let request = parse_subscription(params, false)?;
-    match request.selector.clone() {
-        Selector::Run(run_id) => {
-            prepare_watch(host, &request, &run_id, request.target.as_deref()).await
-        }
-        Selector::Job(job_id) => {
-            let snapshot = job_status(host, &job_id).await?;
-            if let Some(run_id) = snapshot.run_id.clone() {
-                let target = request.target.clone().or_else(|| snapshot.target.clone());
-                prepare_watch(host, &request, &run_id, target.as_deref()).await
-            } else {
-                let target = request.target.clone().or_else(|| snapshot.target.clone());
-                Ok(Prepared {
-                    source: Source::Discovery(Discovery {
-                        job_id,
-                        target,
-                        job: snapshot,
-                    }),
-                    filters: request.filters,
-                })
-            }
-        }
-    }
+    prepare_hub(host, feed, &request)
 }
 
-async fn prepare_watch(
-    host: &impl McpHost,
+fn prepare_hub<H>(
+    host: &Rc<H>,
+    feed: &Rc<HubFeed>,
     request: &PollRequest,
-    run_id: &str,
-    target: Option<&str>,
-) -> Result<Prepared, EventError> {
-    let command = watch_command(run_id, target, request.cursor.as_deref())?;
-    let mut stream = host.open_watch(&command).await.map_err(classify)?;
-    let (cursor, run, replayed) = if request.cursor.is_none() {
-        let drained = drain(&mut stream).await?;
-        let run = drained.first().and_then(run_constants);
-        (None, run, drained)
-    } else {
-        (request.cursor.clone(), None, Vec::new())
+) -> Result<Prepared, EventError>
+where
+    H: McpHost + 'static,
+{
+    feed.ensure_started(Rc::clone(host));
+    let after = match request.cursor.as_deref() {
+        Some(cursor) => Some(parse_hub_cursor(cursor)?),
+        None => None,
     };
+    let (receiver, replay, truncated, cursor) = feed.snapshot(after);
     Ok(Prepared {
-        source: Source::Watch {
-            stream,
+        subscription: HubSubscription {
+            feed: Rc::clone(feed),
+            receiver,
+            replay,
             cursor,
-            run,
-            replayed,
+            truncated,
+            selector: request.selector.clone(),
+            target: request.target.clone(),
+            kinds: request.filters.kinds.clone(),
         },
         filters: request.filters.clone(),
     })
@@ -287,145 +543,40 @@ impl<W> StreamOutput<W> {
     }
 }
 
-struct WatchState {
-    stream: WatchStream,
-    cursor: Option<String>,
-    run: Option<Value>,
-    replayed: Vec<Value>,
-}
-
-pub(super) async fn drive<W, H>(
-    prepared: Prepared,
-    output: StreamOutput<W>,
-    host: Rc<H>,
-) -> std::io::Result<()>
-where
-    W: AsyncWrite + Unpin + Send,
-    H: McpHost + 'static,
-{
-    let Prepared { source, filters } = prepared;
-    match source {
-        Source::Watch {
-            stream,
-            cursor,
-            run,
-            replayed,
-        } => {
-            let state = WatchState {
-                stream,
-                cursor,
-                run,
-                replayed,
-            };
-            drive_watch(state, &filters, output).await
-        }
-        Source::Discovery(discovery) => drive_discovery(host, discovery, filters, output).await,
-    }
-}
-
-async fn drive_watch<W>(
-    state: WatchState,
-    filters: &Filters,
-    output: StreamOutput<W>,
-) -> std::io::Result<()>
+pub(super) async fn drive<W>(prepared: Prepared, output: StreamOutput<W>) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin + Send,
 {
-    let WatchState {
-        mut stream,
-        mut cursor,
-        mut run,
-        replayed,
-    } = state;
-    let StreamOutput {
-        id,
-        writer,
-        cancelled,
-    } = output;
-    if cancelled.load(Ordering::Relaxed) {
-        return Ok(());
-    }
-    write_active(
-        &writer,
-        &id,
-        &ActiveView {
-            cursor: &cursor,
-            run: run.as_ref(),
-            truncated: false,
-            job: None,
-        },
-    )
-    .await?;
-    let mut delivery = Delivery {
-        cursor: &mut cursor,
-        run: &mut run,
+    let Prepared {
+        subscription,
         filters,
-        replayed: true,
-    };
-    for event in replayed {
-        if cancelled.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        emit_event(&writer, &id, &mut delivery, &event).await?;
-    }
-    delivery.replayed = false;
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    heartbeat.tick().await;
-    loop {
-        if cancelled.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        tokio::select! {
-            biased;
-            item = stream.recv() => {
-                if cancelled.load(Ordering::Relaxed) {
-                    return Ok(());
-                }
-                match item {
-                    None => {
-                        write_result(&writer, &id).await?;
-                        return Ok(());
-                    }
-                    Some(Err(failure)) => {
-                        write_failure(&writer, &id, &failure).await?;
-                        write_result(&writer, &id).await?;
-                        return Ok(());
-                    }
-                    Some(Ok(event)) => {
-                        emit_event(&writer, &id, &mut delivery, &event).await?;
-                    }
-                }
-            }
-            _ = heartbeat.tick() => {
-                write_heartbeat(&writer, &id, delivery.cursor).await?;
-            }
-        }
-    }
+    } = prepared;
+    drive_hub(subscription, filters, output).await
 }
 
-async fn drive_discovery<W, H>(
-    host: Rc<H>,
-    discovery: Discovery,
+async fn drive_hub<W>(
+    subscription: HubSubscription,
     filters: Filters,
     output: StreamOutput<W>,
 ) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin + Send,
-    H: McpHost + 'static,
 {
+    let HubSubscription {
+        feed,
+        mut receiver,
+        replay,
+        mut cursor,
+        mut truncated,
+        selector,
+        target,
+        kinds,
+    } = subscription;
     let StreamOutput {
         id,
         writer,
         cancelled,
     } = output;
-    let Discovery {
-        job_id,
-        mut target,
-        mut job,
-    } = discovery;
-    let mut sequence = 0_u64;
-    let mut cursor = Some(next_discovery_cursor(&mut sequence));
     if cancelled.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -435,205 +586,190 @@ where
         &ActiveView {
             cursor: &cursor,
             run: None,
-            truncated: false,
-            job: Some(&job.view),
+            truncated: truncated.clone(),
+            job: None,
         },
     )
     .await?;
-    if job.terminal {
-        let terminal_cursor = next_discovery_cursor(&mut sequence);
-        write_discovery_terminal(
-            &writer,
-            &id,
-            DiscoveryTerminal {
-                job_id: &job_id,
-                job: &job,
-                cursor: &terminal_cursor,
-            },
-        )
-        .await?;
-        write_result(&writer, &id).await?;
-        return Ok(());
+    let filter = HubFilter {
+        selector: &selector,
+        target: &target,
+        kinds: &kinds,
+        filters: &filters,
+    };
+    for event in replay {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if let Some(value) = hub_event_value(&event, &filter, true, Some(&id)) {
+            write_notification(&writer, "notifications/events/event", value).await?;
+        }
+        if cursor
+            .as_deref()
+            .and_then(cursor_sequence)
+            .is_none_or(|current| event.sequence > current)
+        {
+            cursor = Some(hub_cursor(event.sequence));
+        }
     }
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
-    let mut poll = tokio::time::interval(Duration::from_millis(NEXT_POLL_MS));
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    poll.tick().await;
     loop {
         if cancelled.load(Ordering::Relaxed) {
             return Ok(());
         }
         tokio::select! {
             biased;
-            _ = heartbeat.tick() => {
-                write_heartbeat(&writer, &id, &cursor).await?;
-            }
-            _ = poll.tick() => {
+            item = receiver.recv() => {
                 if cancelled.load(Ordering::Relaxed) {
                     return Ok(());
                 }
-                let snapshot = match job_status(host.as_ref(), &job_id).await {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        return finish_stream_error(&writer, &id, error).await;
+                match item {
+                    Ok(event) => {
+                        // The receiver resumes at the oldest value tokio still retains after a
+                        // lagged catch-up, so skip anything the cursor already crossed.
+                        let fresh = cursor
+                            .as_deref()
+                            .and_then(cursor_sequence)
+                            .is_none_or(|current| event.sequence > current);
+                        if fresh {
+                            if let Some(value) = hub_event_value(&event, &filter, false, Some(&id)) {
+                                write_notification(&writer, "notifications/events/event", value)
+                                    .await?;
+                            }
+                            cursor = Some(hub_cursor(event.sequence));
+                        }
                     }
-                };
-                if target.is_none() {
-                    target = snapshot.target.clone();
-                }
-                if let Some(run_id) = snapshot.run_id.clone() {
-                    let command = match watch_command(&run_id, target.as_deref(), None) {
-                        Ok(command) => command,
-                        Err(error) => {
-                            return finish_stream_error(&writer, &id, error).await;
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let after = cursor
+                            .as_deref()
+                            .and_then(|cursor| cursor.strip_prefix("hub:"))
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        let (missed, lost) = feed.after(after);
+                        if let (Some(from), Some(to)) = truncation_bounds(&lost) {
+                            truncated = merge_truncation(truncated, from, to);
                         }
-                    };
-                    let stream = match host.open_watch(&command).await {
-                        Ok(stream) => stream,
-                        Err(failure) => {
-                            write_failure(&writer, &id, &failure).await?;
-                            write_result(&writer, &id).await?;
-                            return Ok(());
+                        write_active(
+                            &writer,
+                            &id,
+                            &ActiveView {
+                                cursor: &cursor,
+                                run: None,
+                                truncated: truncated.clone(),
+                                job: None,
+                            },
+                        )
+                        .await?;
+                        for event in missed {
+                            if let Some(value) = hub_event_value(&event, &filter, true, Some(&id)) {
+                                write_notification(&writer, "notifications/events/event", value)
+                                    .await?;
+                            }
+                            cursor = Some(hub_cursor(event.sequence));
                         }
-                    };
-                    let state = WatchState {
-                        stream,
-                        cursor: None,
-                        run: None,
-                        replayed: Vec::new(),
-                    };
-                    return drive_watch(state, &filters, StreamOutput::new(id, writer, cancelled))
-                        .await;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 }
-                if snapshot.terminal {
-                    let terminal_cursor = next_discovery_cursor(&mut sequence);
-                    write_discovery_terminal(
-                        &writer,
-                        &id,
-                        DiscoveryTerminal {
-                            job_id: &job_id,
-                            job: &snapshot,
-                            cursor: &terminal_cursor,
-                        },
-                    )
-                    .await?;
-                    write_result(&writer, &id).await?;
-                    return Ok(());
-                }
-                if snapshot.view != job.view {
-                    job = snapshot;
-                    cursor = Some(next_discovery_cursor(&mut sequence));
-                    write_active(
-                        &writer,
-                        &id,
-                        &ActiveView {
-                            cursor: &cursor,
-                            run: None,
-                            truncated: false,
-                            job: Some(&job.view),
-                        },
-                    )
-                    .await?;
-                }
+            }
+            _ = heartbeat.tick() => {
+                write_heartbeat(&writer, &id, &cursor).await?;
             }
         }
     }
 }
 
-async fn finish_stream_error<W>(
-    writer: &Mutex<W>,
-    id: &Value,
-    error: EventError,
-) -> std::io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    match error {
-        EventError::Invalid(failure) | EventError::Failed(failure) => {
-            write_failure(writer, id, &failure).await?;
-        }
-        other => {
-            let (_, _, data) = rpc_error(other);
-            let failure = McpFailure {
-                code: data
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .unwrap_or("event.error")
-                    .to_owned(),
-                message: data
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("event stream failed")
-                    .to_owned(),
-            };
-            write_failure(writer, id, &failure).await?;
+struct HubFilter<'a> {
+    selector: &'a Selector,
+    target: &'a Option<String>,
+    kinds: &'a Option<Vec<String>>,
+    filters: &'a Filters,
+}
+
+fn hub_event_value(
+    event: &HubEvent,
+    filter: &HubFilter<'_>,
+    replayed: bool,
+    id: Option<&Value>,
+) -> Option<Value> {
+    if let Some(kinds) = filter.kinds {
+        if !kinds.iter().any(|kind| kind == event.name) {
+            return None;
         }
     }
-    write_result(writer, id).await
+    match filter.selector {
+        Selector::Hub => {}
+        Selector::Run(run_id) => {
+            if event.run_id.as_deref() != Some(run_id.as_str()) {
+                return None;
+            }
+        }
+        Selector::Job(job_id) => {
+            if event.job_id.as_deref() != Some(job_id.as_str()) {
+                return None;
+            }
+        }
+    }
+    if let Some(target) = filter.target {
+        if event.target.as_deref() != Some(target.as_str()) {
+            return None;
+        }
+    }
+    let mut data = if event.name == HUB_RUN {
+        event_data(&event.data, filter.filters.verbose)
+    } else {
+        event.data.clone()
+    };
+    if !filter.filters.accepts(&data, event.terminal) {
+        return None;
+    }
+    if event.name == HUB_RUN {
+        let summary = summary(&data);
+        if let Some(map) = data.as_object_mut() {
+            map.insert("summary".to_owned(), summary);
+            map.insert("replayed".to_owned(), json!(replayed));
+        }
+    } else {
+        if let Some(map) = data.as_object_mut() {
+            map.insert(
+                "summary".to_owned(),
+                json!({
+                    "phase": event.phase,
+                    "node": Value::Null,
+                    "terminal": event.terminal,
+                    "reason": map.get("reason").cloned().unwrap_or(Value::Null),
+                }),
+            );
+            map.insert("replayed".to_owned(), json!(replayed));
+        }
+    }
+    let value = json!({
+        "eventId": hub_cursor(event.sequence),
+        "name": event.name,
+        "timestamp": event.timestamp,
+        "cursor": hub_cursor(event.sequence),
+        "data": data,
+        "_meta": id.map(meta).unwrap_or_else(|| json!({})),
+    });
+    Some(value)
 }
 
-fn next_discovery_cursor(sequence: &mut u64) -> String {
-    *sequence = sequence.saturating_add(1);
-    format!("v2:{sequence}")
-}
-
-struct DiscoveryTerminal<'a> {
-    job_id: &'a str,
-    job: &'a JobSnapshot,
-    cursor: &'a str,
-}
-
-async fn write_discovery_terminal<W>(
-    writer: &Mutex<W>,
-    id: &Value,
-    terminal: DiscoveryTerminal<'_>,
-) -> std::io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let DiscoveryTerminal {
-        job_id,
-        job,
-        cursor,
-    } = terminal;
-    write_notification(
-        writer,
-        "notifications/events/event",
-        json!({
-            "eventId": format!("{job_id}:{cursor}"),
-            "name": EVENT_NAME,
-            "timestamp": now_rfc3339(),
-            "cursor": cursor,
-            "replayed": false,
-            "data": job.view.clone(),
-            "job": job.view.clone(),
-            "jobId": job_id,
-            "state": job.state,
-            "error": job.error,
-            "errorKind": job.error_kind,
-            "summary": {
-                "phase": Value::Null,
-                "node": Value::Null,
-                "terminal": true,
-                "reason": job.error_kind,
-            },
-            "_meta": meta(id),
-        }),
-    )
-    .await
+fn truncation_bounds(value: &Value) -> (Option<u64>, Option<u64>) {
+    let parse = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|cursor| cursor.strip_prefix("hub:"))
+            .and_then(|value| value.parse::<u64>().ok())
+    };
+    (parse("from"), parse("to"))
 }
 
 pub(super) fn rpc_error(error: EventError) -> (i64, &'static str, Value) {
     match error {
         EventError::Invalid(failure) => (-32602, "Invalid params", failure_data(failure)),
         EventError::NotFound => (-32023, "NotFound", json!({"kind": "event"})),
-        EventError::Unsupported { feature, value } => (
-            -32026,
-            "Unsupported",
-            json!({"feature": feature, "value": value}),
-        ),
         EventError::Failed(failure) if failure.code == "run.not_found" => (
             -32023,
             "NotFound",
@@ -659,10 +795,15 @@ fn classify(failure: McpFailure) -> EventError {
 }
 
 fn parse_subscription(params: &Value, capped: bool) -> Result<PollRequest, EventError> {
-    let Some(map) = params.as_object() else {
-        return Err(EventError::Invalid(McpFailure::invalid(
-            "params must be an object",
-        )));
+    let empty = Map::new();
+    let map = match params {
+        Value::Null => &empty,
+        Value::Object(map) => map,
+        _ => {
+            return Err(EventError::Invalid(McpFailure::invalid(
+                "params must be an object",
+            )));
+        }
     };
     let allowed: &[&str] = if capped {
         &["name", "arguments", "cursor", "maxAgeMs", "maxEvents"]
@@ -671,12 +812,13 @@ fn parse_subscription(params: &Value, capped: bool) -> Result<PollRequest, Event
     };
     reject_unknown(map, allowed).map_err(EventError::Invalid)?;
     let name = optional_string(map, "name").map_err(EventError::Invalid)?;
-    let Some(name) = name else {
-        return Err(EventError::Invalid(McpFailure::invalid("name is required")));
+    let name_kinds = match name.as_deref() {
+        None => None,
+        Some(EVENT_NAME) => None,
+        Some(name) if HUB_EVENTS.contains(&name) => Some(vec![name.to_owned()]),
+        Some("hub.event") => None,
+        Some(_) => return Err(EventError::NotFound),
     };
-    if name != EVENT_NAME {
-        return Err(EventError::NotFound);
-    }
     // Watch records have no occurrence time, so maxAgeMs is accepted and not applied.
     if map.contains_key("maxAgeMs") && map.get("maxAgeMs").and_then(Value::as_u64).is_none() {
         return Err(EventError::Invalid(McpFailure::invalid(
@@ -714,20 +856,32 @@ fn parse_subscription(params: &Value, capped: bool) -> Result<PollRequest, Event
     let selector = match (run_id, job_id) {
         (Some(run_id), None) => Selector::Run(run_id),
         (None, Some(job_id)) => Selector::Job(job_id),
+        (None, None) => Selector::Hub,
         _ => {
             return Err(EventError::Invalid(McpFailure::invalid(
-                "exactly one of runId or jobId is required",
+                "use at most one of runId or jobId; omit both to subscribe to the whole hub",
             )));
         }
     };
+    let hub = !capped
+        || name.is_none()
+        || selector.is_hub()
+        || name_kinds.is_some()
+        || matches!(name.as_deref(), Some("hub.event"));
     let target = optional_string(arguments, "target").map_err(EventError::Invalid)?;
-    let filters = parse_filters(arguments)?;
+    let mut filters = parse_filters(arguments)?;
+    if filters.kinds.is_none() {
+        filters.kinds = name_kinds.or_else(|| {
+            (hub && name.as_deref() == Some(EVENT_NAME)).then(|| vec![HUB_RUN.to_owned()])
+        });
+    }
     Ok(PollRequest {
         selector,
         target,
         cursor,
         max_events,
         filters,
+        hub,
     })
 }
 
@@ -738,6 +892,7 @@ fn parse_filters(arguments: &Map<String, Value>) -> Result<Filters, EventError> 
             "runId",
             "jobId",
             "target",
+            "kinds",
             "phases",
             "nodes",
             "terminalOnly",
@@ -790,9 +945,35 @@ fn parse_filters(arguments: &Map<String, Value>) -> Result<Filters, EventError> 
             )));
         }
     };
+    let kinds = match arguments.get("kinds") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(values)) => {
+            let mut kinds = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(kind) = value.as_str() else {
+                    return Err(EventError::Invalid(McpFailure::invalid(
+                        "kinds must be an array of hub event names",
+                    )));
+                };
+                if !HUB_EVENTS.contains(&kind) {
+                    return Err(EventError::Invalid(McpFailure::invalid(format!(
+                        "unknown hub event kind {kind}"
+                    ))));
+                }
+                kinds.push(kind.to_owned());
+            }
+            Some(kinds)
+        }
+        Some(_) => {
+            return Err(EventError::Invalid(McpFailure::invalid(
+                "kinds must be an array of hub event names",
+            )));
+        }
+    };
     Ok(Filters {
         phases,
         nodes,
+        kinds,
         terminal_only: optional_bool(arguments, "terminalOnly")?,
         verbose: optional_bool(arguments, "verbose")?,
     })
@@ -838,7 +1019,7 @@ async fn collect(
     Ok(Batch {
         events: Vec::new(),
         cursor: last_cursor(&drained)?,
-        truncated: false,
+        truncated: json!(false),
         has_more: false,
     })
 }
@@ -869,11 +1050,17 @@ async fn collect_after(
 ) -> Result<Batch, EventError> {
     let mut events = Vec::new();
     let mut cursor = requested.to_owned();
-    let mut truncated = false;
     let mut waiting = true;
     loop {
         if events.len() == request.max_events {
             let extra = next_event(stream, IDLE_WAIT).await?;
+            let truncated = match extra.as_ref() {
+                Some(event) => {
+                    let sequence = watch_cursor(event).map_err(classify)?;
+                    json!({"from": sequence.clone(), "to": sequence})
+                }
+                None => json!(false),
+            };
             return Ok(Batch {
                 events,
                 cursor: Some(cursor),
@@ -890,9 +1077,6 @@ async fn collect_after(
         if event_cursor == requested {
             continue;
         }
-        if skipped(&cursor, &event_cursor) {
-            truncated = true;
-        }
         cursor = event_cursor;
         if let Some(occurrence) =
             occurrence(&event, false, &request.filters, false).map_err(classify)?
@@ -903,7 +1087,7 @@ async fn collect_after(
     Ok(Batch {
         events,
         cursor: Some(cursor),
-        truncated,
+        truncated: json!(false),
         has_more: false,
     })
 }
@@ -949,23 +1133,14 @@ async fn job_status(host: &impl McpHost, job_id: &str) -> Result<JobSnapshot, Ev
         .and_then(Value::as_str)
         .filter(|run_id| !run_id.is_empty())
         .map(str::to_owned);
-    let state = view
-        .get("state")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
     Ok(JobSnapshot {
         target: view
             .get("target")
             .and_then(Value::as_str)
             .filter(|target| *target != LOCAL_HUB_MEMBER)
             .map(str::to_owned),
-        terminal: run_id.is_none() && job_is_terminal(&view),
-        error: view.get("error").cloned().unwrap_or(Value::Null),
-        error_kind: view.get("errorKind").cloned().unwrap_or(Value::Null),
         view,
         run_id,
-        state,
     })
 }
 
@@ -976,10 +1151,436 @@ fn invalid_hub_response(error: serde_json::Error) -> EventError {
     })
 }
 
-fn job_is_terminal(view: &Value) -> bool {
-    view.get("state")
+async fn hub_poll<H>(
+    host: &Rc<H>,
+    feed: &Rc<HubFeed>,
+    request: &PollRequest,
+) -> Result<Value, EventError>
+where
+    H: McpHost + 'static,
+{
+    feed.ensure_started(Rc::clone(host));
+    tokio::task::yield_now().await;
+    let after = match request.cursor.as_deref() {
+        Some(cursor) => Some(parse_hub_cursor(cursor)?),
+        None => None,
+    };
+    let (receiver, replay, mut truncated, _) = feed.snapshot(after);
+    drop(receiver);
+    let head = feed.head();
+    let filter = HubFilter {
+        selector: &request.selector,
+        target: &request.target,
+        kinds: &request.filters.kinds,
+        filters: &request.filters,
+    };
+    let mut selected = replay
+        .iter()
+        .filter_map(|event| {
+            hub_event_value(event, &filter, true, None).map(|value| (event.sequence, value))
+        })
+        .collect::<Vec<_>>();
+    let mut has_more = false;
+    let mut cursor = after.unwrap_or(head);
+    if selected.len() > request.max_events {
+        let lost_from = selected[request.max_events].0;
+        let lost_to = selected
+            .last()
+            .map(|(sequence, _)| *sequence)
+            .unwrap_or(lost_from);
+        selected.truncate(request.max_events);
+        if let Some((sequence, _)) = selected.last() {
+            cursor = *sequence;
+        }
+        // A cap hit is real truncation. Keep an earlier eviction range when replay already
+        // lost events, because a single range cannot describe two disjoint shortfalls.
+        if truncated == json!(false) {
+            truncated = truncated_range(lost_from, lost_to);
+        }
+        has_more = true;
+    } else if let Some((sequence, _)) = selected.last() {
+        if *sequence > cursor {
+            cursor = *sequence;
+        }
+    } else if !replay.is_empty() && cursor < head {
+        cursor = head;
+    }
+    let events = selected
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "resultType": "complete",
+        "events": events,
+        "cursor": hub_cursor(cursor),
+        "truncated": truncated,
+        "hasMore": has_more,
+        "nextPollMs": NEXT_POLL_MS,
+    }))
+}
+
+fn parse_hub_cursor(cursor: &str) -> Result<u64, EventError> {
+    let Some(rest) = cursor.strip_prefix("hub:") else {
+        return Err(EventError::Invalid(McpFailure::invalid(
+            "hub events use a hub:<sequence> cursor",
+        )));
+    };
+    if rest.is_empty() || !rest.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(EventError::Invalid(McpFailure::invalid(
+            "hub cursor must be hub:<sequence>",
+        )));
+    }
+    rest.parse().map_err(|_| {
+        EventError::Invalid(McpFailure::invalid("hub cursor sequence is out of range"))
+    })
+}
+
+async fn hub_poller<H>(host: Rc<H>, feed: Rc<HubFeed>)
+where
+    H: McpHost + 'static,
+{
+    let mut jobs: HashMap<String, String> = HashMap::new();
+    let mut members: HashMap<String, String> = HashMap::new();
+    let mut watched: HashSet<String> = HashSet::new();
+    let mut poll = tokio::time::interval(HUB_POLL_INTERVAL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut warning = tokio::time::interval(HUB_WARNING_INTERVAL);
+    warning.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    warning.tick().await;
+    loop {
+        tokio::select! {
+            _ = poll.tick() => {
+                poll_jobs(host.as_ref(), &feed, &mut jobs, &mut watched).await;
+                poll_members(host.as_ref(), &feed, &mut members).await;
+            }
+            _ = warning.tick() => {
+                publish_warnings(host.as_ref(), &feed).await;
+            }
+        }
+    }
+}
+
+async fn hub_job_views<H>(host: &H) -> Result<Vec<Value>, EventError>
+where
+    H: McpHost,
+{
+    let output = host
+        .execute(NativeV2CliCommand::Hub(HubRequest {
+            context: None,
+            command: HubCommand::Ps(super::super::hub::HubPs {
+                state: "all".to_owned(),
+                target: None,
+                labels: Vec::new(),
+                limit: None,
+            }),
+        }))
+        .await
+        .map_err(classify)?;
+    let document: Value = serde_json::from_str(output.trim()).map_err(invalid_hub_response)?;
+    Ok(document
+        .get("jobs")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
+async fn poll_jobs<H>(
+    host: &H,
+    feed: &Rc<HubFeed>,
+    jobs: &mut HashMap<String, String>,
+    watched: &mut HashSet<String>,
+) where
+    H: McpHost + 'static,
+{
+    let Ok(views) = hub_job_views(host).await else {
+        return;
+    };
+    for view in views {
+        let Some(job_id) = view.get("jobId").and_then(Value::as_str).map(str::to_owned) else {
+            continue;
+        };
+        let state = hub_job_state(&view);
+        let previous = jobs.get(&job_id).cloned();
+        if previous.is_none() {
+            publish_job(feed, &job_id, &view, "submitted");
+            jobs.insert(job_id.clone(), "submitted".to_owned());
+        }
+        if jobs.get(&job_id) != Some(&state) {
+            publish_job(feed, &job_id, &view, &state);
+            jobs.insert(job_id.clone(), state.clone());
+        }
+        let Some(run_id) = view
+            .get("runId")
+            .and_then(Value::as_str)
+            .filter(|run_id| !run_id.is_empty())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        if !watched.insert(run_id.clone()) {
+            continue;
+        }
+        let target = view
+            .get("target")
+            .and_then(Value::as_str)
+            .filter(|target| *target != LOCAL_HUB_MEMBER)
+            .map(str::to_owned);
+        let command = match watch_command(&run_id, target.as_deref(), None) {
+            Ok(command) => command,
+            Err(failure) => {
+                feed.publish_warning(&job_id, &run_id, rpc_error(failure).1);
+                continue;
+            }
+        };
+        let mut stream = match host.open_watch(&command).await {
+            Ok(stream) => stream,
+            Err(failure) => {
+                feed.publish_warning(&job_id, &run_id, &failure.message);
+                continue;
+            }
+        };
+        let feed = Rc::clone(feed);
+        let watched_run = run_id.clone();
+        tokio::task::spawn_local(async move {
+            while let Some(item) = stream.recv().await {
+                match item {
+                    Ok(event) => feed.publish_run(
+                        RunOrigin {
+                            run_id: &watched_run,
+                            job_id: &job_id,
+                            target: target.clone(),
+                        },
+                        event,
+                    ),
+                    Err(failure) => {
+                        feed.publish_warning(&job_id, &watched_run, &failure.message);
+                        break;
+                    }
+                }
+            }
+        });
+    }
+}
+
+fn hub_job_state(view: &Value) -> String {
+    let raw = view
+        .get("state")
         .and_then(Value::as_str)
-        .is_some_and(|state| matches!(state, "succeeded" | "failed" | "dequeued" | "expired"))
+        .unwrap_or("queued");
+    match raw {
+        "running" if view.get("runId").and_then(Value::as_str).is_none() => "placing".to_owned(),
+        "expired" => "failed".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+fn publish_job(feed: &HubFeed, job_id: &str, view: &Value, state: &str) {
+    let reason = view
+        .get("failureReason")
+        .or_else(|| view.get("error"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let at = view
+        .get("finishedAt")
+        .or_else(|| view.get("dispatchedAt"))
+        .or_else(|| view.get("submittedAt"))
+        .cloned()
+        .unwrap_or_else(|| json!(now_rfc3339()));
+    let data = json!({
+        "jobId": job_id,
+        "title": view.get("title").cloned().unwrap_or(Value::Null),
+        "state": state,
+        "target": view.get("target").cloned().unwrap_or(Value::Null),
+        "project": view.get("project").cloned().unwrap_or(Value::Null),
+        "reason": reason,
+        "at": at,
+    });
+    feed.publish(HubEvent {
+        sequence: 0,
+        name: HUB_JOB,
+        timestamp: now_rfc3339(),
+        data,
+        run_id: view.get("runId").and_then(Value::as_str).map(str::to_owned),
+        job_id: Some(job_id.to_owned()),
+        target: view
+            .get("target")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        phase: Some(state.to_owned()),
+        terminal: matches!(state, "succeeded" | "failed" | "dequeued" | "cancelled"),
+    });
+}
+
+async fn poll_members<H>(host: &H, feed: &HubFeed, members: &mut HashMap<String, String>)
+where
+    H: McpHost + 'static,
+{
+    let output = match host
+        .execute(NativeV2CliCommand::Hub(HubRequest {
+            context: None,
+            command: HubCommand::List {
+                tags: Vec::new(),
+                probe: false,
+            },
+        }))
+        .await
+    {
+        Ok(output) => output,
+        Err(_) => return,
+    };
+    let Ok(document) = serde_json::from_str::<Value>(output.trim()) else {
+        return;
+    };
+    let mut current = HashMap::new();
+    for member in document
+        .get("targets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(name) = member
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let phase = member_phase(member);
+        current.insert(name.clone(), phase.to_owned());
+        let first = members.get(&name).is_none();
+        if first && phase != "provisioning" {
+            publish_member(feed, &name, member, "provisioning");
+        }
+        if first || members.get(&name) != Some(&phase.to_owned()) {
+            publish_member(feed, &name, member, phase);
+        }
+    }
+    for (name, phase) in members.iter() {
+        if !current.contains_key(name) && phase != "deleted" {
+            publish_member(
+                feed,
+                name,
+                &json!({"name": name, "state": "deleted"}),
+                "deleted",
+            );
+        }
+    }
+    *members = current;
+}
+
+fn member_phase(member: &Value) -> &'static str {
+    match member.get("state").and_then(Value::as_str) {
+        Some("active") => "active",
+        Some("drain") => "draining",
+        Some("disabled") => "failed",
+        Some("deleted") => "deleted",
+        _ => "provisioning",
+    }
+}
+
+fn publish_member(feed: &HubFeed, name: &str, member: &Value, phase: &str) {
+    let reason = member
+        .get("probeError")
+        .or_else(|| member.get("error"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let at = member
+        .get("probedAt")
+        .cloned()
+        .unwrap_or_else(|| json!(now_rfc3339()));
+    let data = json!({
+        "pool": member
+            .get("pool")
+            .cloned()
+            .unwrap_or_else(|| json!(name)),
+        "leaseId": member.get("leaseId").cloned().unwrap_or_else(|| json!(name)),
+        "serverId": member.get("serverId").cloned().unwrap_or(Value::Null),
+        "machine": member.get("machine").cloned().unwrap_or_else(|| json!(name)),
+        "phase": phase,
+        "reason": reason,
+        "at": at,
+    });
+    feed.publish(HubEvent {
+        sequence: 0,
+        name: HUB_POOL,
+        timestamp: now_rfc3339(),
+        data,
+        run_id: None,
+        job_id: None,
+        target: Some(name.to_owned()),
+        phase: Some(phase.to_owned()),
+        terminal: matches!(phase, "deleted" | "failed"),
+    });
+}
+
+async fn publish_warnings<H>(host: &H, feed: &HubFeed)
+where
+    H: McpHost + 'static,
+{
+    let Ok(views) = hub_job_views(host).await else {
+        return;
+    };
+    for view in views {
+        if hub_job_state(&view) != "running" {
+            continue;
+        }
+        let Some(job_id) = view.get("jobId").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(run_id) = view.get("runId").and_then(Value::as_str) else {
+            continue;
+        };
+        feed.publish_warning(job_id, run_id, "run has been in progress for an hour");
+    }
+}
+
+struct RunOrigin<'a> {
+    run_id: &'a str,
+    job_id: &'a str,
+    target: Option<String>,
+}
+
+impl HubFeed {
+    fn publish_run(&self, origin: RunOrigin<'_>, mut event: Value) {
+        let phase = event
+            .pointer("/status/phase")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let terminal = phase.as_deref() == Some("finished");
+        if let Some(map) = event.as_object_mut() {
+            map.entry("runId").or_insert_with(|| json!(origin.run_id));
+        }
+        self.publish(HubEvent {
+            sequence: 0,
+            name: HUB_RUN,
+            timestamp: now_rfc3339(),
+            data: event,
+            run_id: Some(origin.run_id.to_owned()),
+            job_id: Some(origin.job_id.to_owned()),
+            target: origin.target,
+            phase,
+            terminal,
+        });
+    }
+
+    fn publish_warning(&self, job_id: &str, run_id: &str, message: &str) {
+        self.publish(HubEvent {
+            sequence: 0,
+            name: HUB_WARNING,
+            timestamp: now_rfc3339(),
+            data: json!({
+                "jobId": job_id,
+                "runId": run_id,
+                "message": message,
+                "at": now_rfc3339(),
+            }),
+            run_id: Some(run_id.to_owned()),
+            job_id: Some(job_id.to_owned()),
+            target: None,
+            phase: None,
+            terminal: false,
+        });
+    }
 }
 
 fn watch_command(
@@ -1013,19 +1614,6 @@ fn watch_cursor(event: &Value) -> Result<String, McpFailure> {
             code: "protocol.invalid".to_owned(),
             message: "watch event is missing a cursor".to_owned(),
         })
-}
-
-fn run_constants(event: &Value) -> Option<Value> {
-    let run_id = event.get("runId")?.as_str()?;
-    let mut run = Map::new();
-    run.insert("runId".to_owned(), json!(run_id));
-    for key in ["title", "size", "source"] {
-        run.insert(
-            key.to_owned(),
-            event.get(key).cloned().unwrap_or(Value::Null),
-        );
-    }
-    Some(Value::Object(run))
 }
 
 fn event_data(event: &Value, verbose: bool) -> Value {
@@ -1115,38 +1703,27 @@ fn occurrence(
 ) -> Result<Option<Value>, McpFailure> {
     let cursor = watch_cursor(event)?;
     let run_id = event.get("runId").and_then(Value::as_str).unwrap_or("run");
-    let data = event_data(event, filters.verbose);
+    let mut data = event_data(event, filters.verbose);
     let terminal = data.pointer("/status/phase").and_then(Value::as_str) == Some("finished");
     if !filters.accepts(&data, terminal) {
         return Ok(None);
+    }
+    let summary = summary(&data);
+    if let Some(map) = data.as_object_mut() {
+        map.insert("summary".to_owned(), summary);
+        map.insert("replayed".to_owned(), json!(replayed));
     }
     let mut value = json!({
         "eventId": format!("{run_id}:{cursor}"),
         "name": EVENT_NAME,
         "timestamp": now_rfc3339(),
         "data": data,
-        "summary": summary(&data),
-        "replayed": replayed,
+        "_meta": {},
     });
     if include_cursor {
         value["cursor"] = json!(cursor);
     }
     Ok(Some(value))
-}
-
-fn skipped(previous: &str, next: &str) -> bool {
-    match (cursor_sequence(previous), cursor_sequence(next)) {
-        (Some(earlier), Some(later)) => later > earlier.saturating_add(1),
-        _ => false,
-    }
-}
-
-fn cursor_sequence(cursor: &str) -> Option<u64> {
-    let rest = cursor.strip_prefix("v2:")?;
-    if rest.is_empty() || !rest.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    rest.parse().ok()
 }
 
 fn cursor_value(cursor: &Option<String>) -> Value {
@@ -1168,58 +1745,84 @@ fn meta(id: &Value) -> Value {
     Value::Object(object)
 }
 
-fn input_schema() -> Value {
+fn input_schema(name: &str) -> Value {
     let mut schema = object_schema(
         &[],
         vec![
-            ("runId", string_prop("Public run ID.")),
             (
-                "jobId",
+                "runId",
                 string_prop(
-                    "Hub job ID. A job that has a run behaves like that runId; a queued, scheduled, or placing job is followed until it has a run or reaches a terminal state.",
+                    "Only emit events for this run. Omit it and jobId to receive the whole hub.",
                 ),
             ),
             (
+                "jobId",
+                string_prop("Only emit events for this hub job and its run."),
+            ),
+            (
                 "target",
-                string_prop("Named target. Omit for the local controller."),
+                string_prop("Only emit events for this named target."),
+            ),
+            (
+                "kinds",
+                string_array_prop(
+                    "Only emit these event names: hub.job, hub.run, hub.pool, or hub.warning.",
+                ),
             ),
             (
                 "phases",
                 string_array_prop(
-                    "Only emit events whose status phase is one of admitted, running, stopping, \
-                     or finished.",
+                    "Only emit events whose run phase or job state is one of admitted, running, \
+                     stopping, or finished.",
                 ),
             ),
             (
                 "nodes",
                 string_array_prop(
-                    "Only emit events with an active execution at one of these graph nodes.",
+                    "Only emit run events with an active execution at one of these graph nodes.",
                 ),
             ),
-            (
-                "terminalOnly",
-                bool_prop("Only emit terminal (finished) events."),
-            ),
+            ("terminalOnly", bool_prop("Only emit terminal events.")),
             (
                 "verbose",
-                bool_prop("Keep the full recorded failure array on terminal events."),
+                bool_prop("Keep the full recorded failure array on terminal run events."),
             ),
         ],
     );
-    schema["oneOf"] = json!([{"required": ["runId"]}, {"required": ["jobId"]}]);
-    schema["description"] = json!(
-        "Subscription arguments. Provide exactly one of runId or jobId. A jobId may be combined \
-         with target. maxAgeMs is accepted but not applied because durable watch records carry \
-         no occurrence time; the event timestamp is delivery time."
-    );
+    schema["description"] = json!(format!(
+        "Long-lived {name} subscription. Omit runId and jobId to receive every hub.job, \
+         hub.run, hub.pool, and hub.warning event on one stream. The stream stays open after \
+         terminal run events and idle periods; stop it with events/unsubscribe, session end, or \
+         cancellation. Resume with the hub:N cursor from notifications/events/active. maxAgeMs \
+         is accepted but not applied because durable watch records carry no occurrence time."
+    ));
     schema
 }
 
-fn payload_schema() -> Value {
+fn truncated_schema() -> Value {
+    json!({
+        "description": "false when no event was lost. When replay or backpressure dropped a \
+            range, {from,to} names the first and last lost hub cursors.",
+        "oneOf": [
+            {"type": "boolean", "const": false},
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["from", "to"],
+                "properties": {
+                    "from": {"type": "string", "pattern": "^(hub|v2):[0-9]+$"},
+                    "to": {"type": "string", "pattern": "^(hub|v2):[0-9]+$"}
+                }
+            }
+        ]
+    })
+}
+
+fn payload_schema(name: &str) -> Value {
     let run_data = json!({
         "type": "object",
-        "description": "Trimmed watch record. Run constants are sent once on notifications/events/active.",
-        "additionalProperties": false,
+        "description": "Trimmed durable run watch record. data.cursor keeps the run's v2: cursor.",
+        "additionalProperties": true,
         "required": ["runId", "cursor", "status"],
         "properties": {
             "runId": {"type": "string"},
@@ -1229,10 +1832,7 @@ fn payload_schema() -> Value {
                 "description": "Public run status. status.metadata is present only when phase is finished.",
                 "additionalProperties": true,
                 "properties": {
-                    "phase": {
-                        "type": "string",
-                        "enum": PHASES
-                    },
+                    "phase": {"type": "string", "enum": PHASES},
                     "activeExecutions": {"type": "array"},
                     "terminalResult": {
                         "type": "object",
@@ -1240,124 +1840,94 @@ fn payload_schema() -> Value {
                     },
                     "metadata": {"type": "object"}
                 }
-            }
+            },
+            "summary": {"type": "object"},
+            "replayed": {"type": "boolean"}
         }
     });
     let job_data = json!({
         "type": "object",
-        "description": "Hub job state while a queued, scheduled, or placing job is followed before it has a run, and on its terminal event if it never runs.",
         "additionalProperties": true,
-        "required": ["jobId", "state"],
+        "required": ["jobId", "title", "state", "target", "project", "reason", "at"],
         "properties": {
             "jobId": {"type": "string"},
+            "title": {"type": ["string", "null"]},
             "state": {
                 "type": "string",
-                "enum": ["queued", "scheduled", "running", "succeeded", "failed", "dequeued", "expired"]
+                "enum": ["submitted", "queued", "scheduled", "placing", "running", "succeeded", "failed", "dequeued", "cancelled"]
             },
-            "runId": {"type": ["string", "null"]},
             "target": {"type": ["string", "null"]},
-            "error": {"type": ["string", "null"]},
-            "errorKind": {"type": ["string", "null"]}
+            "project": {"type": ["string", "object", "null"]},
+            "reason": {"type": ["string", "null"]},
+            "at": {"type": "string"},
+            "summary": {"type": "object"},
+            "replayed": {"type": "boolean"}
         }
     });
+    let pool_data = json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["pool", "leaseId", "serverId", "machine", "phase", "reason", "at"],
+        "properties": {
+            "pool": {"type": "string"},
+            "leaseId": {"type": "string"},
+            "serverId": {"type": ["integer", "string", "null"]},
+            "machine": {"type": ["string", "null"]},
+            "phase": {"type": "string", "enum": ["provisioning", "active", "draining", "deleted", "failed"]},
+            "reason": {"type": ["string", "null"]},
+            "at": {"type": "string"},
+            "summary": {"type": "object"},
+            "replayed": {"type": "boolean"}
+        }
+    });
+    let warning_data = json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["jobId", "runId", "message", "at"],
+        "properties": {
+            "jobId": {"type": "string"},
+            "runId": {"type": "string"},
+            "message": {"type": "string"},
+            "at": {"type": "string"},
+            "summary": {"type": "object"},
+            "replayed": {"type": "boolean"}
+        }
+    });
+    let data = match name {
+        HUB_JOB => job_data,
+        HUB_RUN => run_data,
+        HUB_POOL => pool_data,
+        HUB_WARNING => warning_data,
+        _ => json!({"oneOf": [job_data, run_data, pool_data, warning_data]}),
+    };
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["eventId", "name", "timestamp", "data", "summary", "replayed", "_meta"],
+        "required": ["eventId", "name", "timestamp", "data", "cursor", "_meta"],
         "properties": {
             "eventId": {
                 "type": "string",
-                "description": "Run events use <runId>:<cursor>; discovery-phase notifications use <jobId>:<cursor>."
+                "description": "hub:<sequence>; the same monotonic cursor spans every run, job, and pool event."
             },
-            "jobId": {"type": "string"},
-            "name": {"type": "string", "const": EVENT_NAME},
+            "name": {
+                "type": "string",
+                "description": "Event name carried by this multiplexed subscription.",
+                "enum": HUB_EVENTS
+            },
             "timestamp": {"type": "string", "format": "date-time"},
-            "cursor": {
-                "type": "string",
-                "description": "Stream notification cursor; poll results return the next cursor separately."
-            },
-            "replayed": {"type": "boolean"},
-            "data": {"oneOf": [run_data, job_data.clone()]},
-            "job": job_data,
-            "state": {
-                "type": "string",
-                "description": "Terminal job state when the job never ran.",
-                "enum": ["queued", "scheduled", "running", "succeeded", "failed", "dequeued", "expired"]
-            },
-            "error": {"type": ["string", "null"]},
-            "errorKind": {"type": ["string", "null"]},
-            "summary": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["phase", "node", "terminal", "reason"],
-                "properties": {
-                    "phase": {"type": ["string", "null"]},
-                    "node": {"type": ["string", "null"]},
-                    "terminal": {"type": "boolean"},
-                    "reason": {"type": ["string", "null"]}
-                }
-            },
+            "cursor": {"type": "string", "pattern": "^hub:[0-9]+$"},
+            "truncated": truncated_schema(),
+            "data": data,
             "_meta": {"type": "object"}
         }
     })
 }
 
-struct Delivery<'a> {
-    cursor: &'a mut Option<String>,
-    run: &'a mut Option<Value>,
-    filters: &'a Filters,
-    replayed: bool,
-}
-
 struct ActiveView<'a> {
     cursor: &'a Option<String>,
     run: Option<&'a Value>,
-    truncated: bool,
+    truncated: Value,
     job: Option<&'a Value>,
-}
-
-async fn emit_event<W>(
-    writer: &Mutex<W>,
-    id: &Value,
-    delivery: &mut Delivery<'_>,
-    event: &Value,
-) -> std::io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let event_cursor = match watch_cursor(event) {
-        Ok(cursor) => cursor,
-        Err(failure) => return write_failure(writer, id, &failure).await,
-    };
-    let discovered = if delivery.run.is_none() {
-        *delivery.run = run_constants(event);
-        delivery.run.is_some()
-    } else {
-        false
-    };
-    let gap = delivery
-        .cursor
-        .as_deref()
-        .is_some_and(|previous| skipped(previous, &event_cursor));
-    let occurrence = match occurrence(event, true, delivery.filters, delivery.replayed) {
-        Ok(occurrence) => occurrence,
-        Err(failure) => return write_failure(writer, id, &failure).await,
-    };
-    *delivery.cursor = Some(event_cursor);
-    let active = ActiveView {
-        cursor: &*delivery.cursor,
-        run: delivery.run.as_ref(),
-        truncated: gap,
-        job: None,
-    };
-    let Some(mut params) = occurrence else {
-        return write_active(writer, id, &active).await;
-    };
-    if gap || discovered {
-        write_active(writer, id, &active).await?;
-    }
-    params["_meta"] = meta(id);
-    write_notification(writer, "notifications/events/event", params).await
 }
 
 async fn write_active<W>(
@@ -1371,7 +1941,7 @@ where
     let mut params = json!({
         "cursor": cursor_value(active.cursor),
         "run": active.run.cloned().unwrap_or(Value::Null),
-        "truncated": active.truncated,
+        "truncated": active.truncated.clone(),
         "_meta": meta(id),
     });
     if let Some(job) = active.job {
@@ -1400,44 +1970,6 @@ where
         writer,
         "notifications/events/heartbeat",
         json!({"cursor": cursor_value(cursor), "_meta": meta(id)}),
-    )
-    .await
-}
-
-async fn write_failure<W>(
-    writer: &Mutex<W>,
-    id: &Value,
-    failure: &McpFailure,
-) -> std::io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    write_notification(
-        writer,
-        "notifications/events/error",
-        json!({
-            "error": {
-                "code": -32603,
-                "message": failure.message,
-                "data": {"code": failure.code}
-            },
-            "_meta": meta(id),
-        }),
-    )
-    .await
-}
-
-async fn write_result<W>(writer: &Mutex<W>, id: &Value) -> std::io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    super::serve::write_message(
-        writer,
-        &json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {"resultType": "complete", "_meta": meta(id)}
-        }),
     )
     .await
 }

@@ -4,7 +4,7 @@ The hub daemon is the Model Context Protocol server. It serves Streamable HTTP o
 its normal API listener, alongside `/v1/hub/*`. Start it with `zeroshot hub daemon run` or install
 it as a service with `zeroshot hub install`; there is no separate MCP process. Each tool runs the
 same command the CLI would. Run events come from the durable stream `zeroshot watch` already
-reads.
+reads, multiplexed with hub job, pool, and warning events on one cursor.
 
 The default endpoint is `http://127.0.0.1:7383/mcp`. MCP uses the same bearer token as the rest of
 the hub API: by default the contents of `~/.config/zeroshot/hub/api-token` (or the hub folder's
@@ -119,58 +119,97 @@ Read-only tools are `status`, `logs`, `watch`, `list`, `report`, `hub_list`, `hu
 members; `hub_dequeue` cancels queued jobs or schedules; `hub_dispatch` requests a dispatcher pass;
 `force-stop` and `hub_force_stop` stop runs.
 
-## Run events
+## Hub events
 
-The server advertises `io.modelcontextprotocol/events` (SEP-3415). There is one event type,
-`run.event`. Subscription arguments take exactly one of `runId` or `jobId`, and an optional
-`target`; supplying both or neither is invalid params (`-32602`). The payload of a run event is
-the durable watch notification: `subscriptionId`, `runId`, `title`, optional `source`, `size`,
-`cursor`, and `status`.
+The server advertises `io.modelcontextprotocol/events` (SEP-3415). One subscription covers the
+whole hub. `events/list` reports four event types, each with `delivery` `poll` and `push`:
 
-A `jobId` that already has a run behaves exactly like that `runId`. A queued, scheduled, or
-placing job can be followed before its run exists, so one subscription can follow a job from the
-queue to its terminal result. The stream opens immediately and sends
-`notifications/events/active` with `run: null` and the current hub `job` (including `state`,
-`error`, and `errorKind`). It keeps sending heartbeats, reads the hub job record every
-`nextPollMs` (1000 ms), and starts delivering ordinary `run.event` notifications as soon as the
-job has a run id. If the job fails, is dequeued, or expires before it runs, the server sends one
-terminal `notifications/events/event` carrying the job's `state`, `error`, and `errorKind`, then
-answers the request with `resultType: complete`. Discovery-phase notifications use
-`eventId` `<jobId>:<cursor>`. `events/poll` with a not-yet-placed job returns no events and
-includes the current `job` document so a poller can observe queue state without opening a stream.
+| Event         | Data                                                                                  |
+| ------------- | ------------------------------------------------------------------------------------- |
+| `hub.job`     | `jobId`, `title`, `state`, `target`, `project`, `reason`, `at`, `summary`, `replayed` |
+| `hub.run`     | the durable run watch record: `runId`, `cursor`, `status`, `summary`, `replayed`      |
+| `hub.pool`    | `pool`, `leaseId`, `serverId`, `machine`, `phase`, `reason`, `at`, `summary`          |
+| `hub.warning` | `jobId`, `runId`, `message`, `at`, `summary`, `replayed`                              |
 
-`events/list` reports `delivery` as `poll` and `push`, and `resultType` `complete`. Signed
-webhooks are not offered. `events/subscribe` with a `runId` or `jobId` argument opens the same
-long-lived stream as `events/stream`; `events/subscribe` without an `arguments` object, and
-`events/unsubscribe`, returns JSON-RPC `Unsupported` (`-32026`) with `data.feature`
-`deliveryMode` and `data.value` `webhook`.
+Every occurrence has the envelope `eventId`, `name`, `timestamp`, `data`, `cursor`, `_meta`.
+`eventId` and `cursor` are the same `hub:<sequence>` value. The sequence is monotonic across
+jobs, runs, pools, and warnings, so a client can keep one cursor and resume the whole feed.
+`hub.run` records keep their original `v2:<sequence>` value inside `data.cursor`.
 
-`events/poll` returns occurrences after an opaque cursor:
+Subscription arguments are all optional filters:
 
-- `cursor: null` means start from now. The response has no events and a cursor at the current head.
-- A cursor is exclusive. The response cursor advances to the last delivered event.
-- `truncated: true` means the retained window skipped events since the supplied cursor.
-- `hasMore: true` means the batch hit `maxEvents` (default 50) and another event was waiting.
-- `nextPollMs` is `1000`. `maxAgeMs` is accepted and not applied: watch records have no occurrence time.
+- No `runId` or `jobId`, and no `name`, subscribes to the whole hub.
+- `runId` narrows to that run, its job, and its warnings. `jobId` narrows to that job, its run,
+  and that run's warnings. Supplying both is invalid params (`-32602`).
+- `name` selects one event type: `hub.job`, `hub.run`, `hub.pool`, or `hub.warning`. `hub.event`
+  and `run.event` are aliases for every hub event and for `hub.run` respectively.
+- `target`, `kinds` (`hub.job`, `hub.run`, `hub.pool`, `hub.warning`), `phases`, `nodes`,
+  `terminalOnly`, and `verbose` further filter occurrences. `phases` accepts `admitted`,
+  `running`, `stopping`, and `finished`; `nodes` applies only to run records.
+- `maxAgeMs` is accepted and not applied because watch records carry no occurrence time.
 
-`events/stream` is the same subscription as a long-lived request. The server sends
-`notifications/events/active`, then one `notifications/events/event` per event, and
-`notifications/events/heartbeat` about every 30 seconds. Every notification carries
-`_meta["io.modelcontextprotocol/subscriptionId"]` set to the request id. A gap sends another
-`notifications/events/active` with `truncated: true`, then continues. When the watch stream ends,
-the server answers the request with `resultType: complete`. A queued job therefore ends either
-when its run stream ends, or with the terminal job notification when it never runs.
+`events/poll` returns occurrences after an opaque `hub:<sequence>` cursor:
 
-Both modes open the same `run_watch` subscription `zeroshot watch` uses: the local ledger, or the
-named target's watch transport. There is no second event pipeline. Job discovery reads the same
-hub job record as `hub_status`; once a run id exists, following uses that run's watch.
+```json
+{
+  "resultType": "complete",
+  "events": [],
+  "cursor": "hub:42",
+  "truncated": false,
+  "hasMore": false,
+  "nextPollMs": 1000
+}
+```
 
-## Stop polling
+- `cursor: null` starts from the current state: the latest live event for each job, run, and pool
+  lease, with no backfill of history.
+- A cursor is exclusive. The response cursor advances to the last delivered event and never moves
+  backwards.
+- `truncated` is `false` when nothing was lost. It is `{ "from": "hub:N", "to": "hub:M" }` when
+  replay, backpressure, or a `maxEvents` cap actually left events out. Sparse `v2:` watch cursors
+  are not evidence of loss, so a normal jump in a run's cursor never sets `truncated`.
+- `hasMore: true` means the batch reached `maxEvents` (default 50, maximum 1000); the returned
+  cursor resumes at the first event not in the batch. A capped batch also reports the omitted tail
+  in `truncated`, for example `{ "from": "hub:51", "to": "hub:120" }`.
+- `nextPollMs` is `1000`.
 
-Keep the cursor from the last `events/poll`, then open `events/stream` with that cursor, the same
-`name`, and the same `arguments`. The client receives events as notifications and does not call
-`events/poll` again.
+`events/stream` is the same subscription as a long-lived request. It sends
+`notifications/events/active`, replays the available window, then sends one
+`notifications/events/event` per occurrence and `notifications/events/heartbeat` about every five
+seconds while idle. Every notification carries
+`_meta["io.modelcontextprotocol/subscriptionId"]` set to the request id. `replayed` is `true` for
+the initial drain and `false` for live events. A real replay or backpressure shortfall sends
+another `notifications/events/active` with the `{from,to}` range before continuing.
 
-To stop the stream, send `notifications/cancelled` with `params.requestId` set to the
-`events/stream` request id. The server stops delivery and releases the watch. It does not send a
-final result for a cancelled stream.
+A terminal run or job is an ordinary event. It never completes the stream: the subscription stays
+open for later jobs, later runs, pool changes, warnings, and idle heartbeats. Only
+`events/unsubscribe`, MCP session shutdown, or request cancellation stops it. Streams do not
+accept `maxEvents`.
+
+`events/list` reports `resultType` `complete`. Signed webhooks are not offered.
+`events/subscribe` opens the same long-lived stream as `events/stream`; with no arguments it
+subscribes to the whole hub.
+
+`hub.job` follows the same hub record as `hub_status`, including `submitted`, `queued`,
+`scheduled`, `placing`, `running`, `succeeded`, `failed`, `dequeued`, and `cancelled`. A job that
+fails or is cancelled before it runs still produces a terminal `hub.job` event. `hub.pool`
+reports member leases as `provisioning`, `active`, `draining`, `deleted`, or `failed`. A running
+job receives one `hub.warning` per hour; a run-watch or stream failure also produces
+`hub.warning`, and the subscription continues.
+
+## Resume and stop
+
+Keep the `hub:<sequence>` cursor from `notifications/events/active`, an event, or an
+`events/poll` response, then open `events/stream` or call `events/poll` with that cursor and the
+same filters. The client receives only events after it. Because the cursor is hub-wide, a client
+can close a stream after a terminal run and later resume the same feed for a new job or run.
+
+Hub poll and stream cursors are interchangeable when the request uses hub events. The compatibility
+form `name: "run.event"` with an explicit `runId` or `jobId` still polls the legacy per-run watch
+and returns `v2:` cursors; do not feed a `hub:` cursor to that form or a `v2:` cursor to a hub
+subscription. Omit `name` (or use `name: "hub.run"`) when one hub cursor must span poll and stream.
+
+To stop a stream, send `notifications/cancelled` with `params.requestId` set to the stream's
+request id, or call `events/unsubscribe` with `{"requestId": <stream request id>}`. The method
+returns `{"resultType": "complete", "unsubscribed": true}` when it stopped that stream and
+`unsubscribed: false` when no active stream has that id. A cancelled stream sends no final result.

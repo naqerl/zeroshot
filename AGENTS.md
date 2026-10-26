@@ -767,10 +767,17 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   Each tool builds the same command value as the CLI and runs it through the existing public or hub
   executor. Tool parameters for graph, initial input, exact or uniform runtime, and environment
   definitions are inline JSON values materialized into private temporary files for the command's
-  lifetime. The `io.modelcontextprotocol/events` extension exposes one `run.event` type whose
-  payload is the durable notification `watch` already emits; `events/poll` and `events/stream` both
-  open that `run_watch` subscription. Signed webhooks are unsupported. The endpoint does not itself
-  start a run.
+  lifetime. The `io.modelcontextprotocol/events` extension exposes one session-spanning hub
+  subscription carrying `hub.job`, `hub.run`, `hub.pool`, and `hub.warning` over one monotonic
+  `hub:<sequence>` cursor. Omitting selectors subscribes to the whole hub; `runId`, `jobId`,
+  `target`, and other filters narrow that feed without binding it, and single-kind names select
+  one event kind (`run.event` is the `hub.run` alias). Terminal events are ordinary events; only
+  unsubscribe, session end, or cancellation closes a stream. Run records retain their durable
+  `v2:` cursors inside `hub.run` data. `events/poll` and `events/stream` both replay from the same
+  hub log, report an explicit `{from,to}` range only when replay, backpressure, or a bounded poll
+  actually dropped or clipped events, and keep the stream open after terminal or idle periods.
+  Explicit per-run `run.event` polls retain their legacy `v2:` cursors. Signed webhooks are unsupported.
+  The endpoint does not itself start a run.
 
 ## CLI and target contracts
 
