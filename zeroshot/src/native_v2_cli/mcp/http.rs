@@ -270,6 +270,7 @@ where
                 local
                     .run_until(async move {
                         let host = Rc::new(host);
+                        let feed = Rc::new(super::events::HubFeed::new());
                         let sessions: Sessions = Rc::new(RefCell::new(HashMap::new()));
                         let _ = ready.send(Ok(()));
                         loop {
@@ -280,9 +281,10 @@ where
                                         break;
                                     };
                                     let host = Rc::clone(&host);
+                                    let feed = Rc::clone(&feed);
                                     let sessions = Rc::clone(&sessions);
                                     tokio::task::spawn_local(async move {
-                                        process_job(&host, &sessions, job).await;
+                                        process_job(&host, &feed, &sessions, job).await;
                                     });
                                 }
                             }
@@ -321,7 +323,9 @@ enum SessionError {
 fn collect_idle_sessions(sessions: &mut HashMap<String, SessionEntry>) {
     let now = Instant::now();
     sessions.retain(|_, entry| {
-        if now.duration_since(entry.last_seen) > SESSION_IDLE_TIMEOUT {
+        if now.duration_since(entry.last_seen) > SESSION_IDLE_TIMEOUT
+            && !entry.state.borrow().has_active_streams()
+        {
             entry.state.borrow_mut().shutdown();
             false
         } else {
@@ -436,8 +440,12 @@ fn session_required_reply(message: &Value) -> WorkerReply {
     WorkerReply::Message(serve::error_message(id, -32600, "Invalid Request", data))
 }
 
-async fn process_job<H>(host: &Rc<H>, sessions: &Sessions, job: Job)
-where
+async fn process_job<H>(
+    host: &Rc<H>,
+    feed: &Rc<super::events::HubFeed>,
+    sessions: &Sessions,
+    job: Job,
+) where
     H: McpHost + 'static,
 {
     let resolved = match resolve_session(sessions, job.session, &job.message) {
@@ -462,7 +470,7 @@ where
             return;
         }
     };
-    let reply = process_request(host, &resolved.state, &job.message).await;
+    let reply = process_request(host, feed, &resolved.state, &job.message).await;
     let _ = job.reply.send(JobReply {
         session: resolved.id,
         reply,
@@ -471,6 +479,7 @@ where
 
 async fn process_request<H>(
     host: &Rc<H>,
+    feed: &Rc<super::events::HubFeed>,
     session: &Rc<RefCell<SessionState>>,
     message: &Value,
 ) -> WorkerReply
@@ -478,7 +487,7 @@ where
     H: McpHost + 'static,
 {
     let Value::Array(items) = message else {
-        return process_message(host, session, message).await;
+        return process_message(host, feed, session, message).await;
     };
     if items.is_empty() {
         return WorkerReply::Message(serve::error_message(
@@ -499,7 +508,7 @@ where
             ));
             continue;
         }
-        match process_message(host, session, item).await {
+        match process_message(host, feed, session, item).await {
             WorkerReply::None => {}
             WorkerReply::Message(value) => replies.push(value),
             WorkerReply::Stream(_) => {
@@ -517,6 +526,7 @@ where
 
 async fn process_message<H>(
     host: &Rc<H>,
+    feed: &Rc<super::events::HubFeed>,
     session: &Rc<RefCell<SessionState>>,
     message: &Value,
 ) -> WorkerReply
@@ -540,8 +550,7 @@ where
     if method == Some("initialize") {
         session.borrow_mut().reset_for_initialize();
     }
-    let initialized = session.borrow().initialized();
-    match serve::dispatch(host.as_ref(), message, initialized).await {
+    match serve::dispatch(host, feed, session, message).await {
         Action::Reply(result) => {
             if method == Some("initialize") {
                 session.borrow_mut().mark_initialized();
@@ -556,14 +565,11 @@ where
         Action::Stream(prepared) => {
             let (sender, receiver) = mpsc::unbounded_channel();
             let writer = Arc::new(Mutex::new(LineWriter::new(sender)));
-            session.borrow_mut().spawn_stream(
-                serve::StreamRequest {
-                    prepared,
-                    id,
-                    writer,
-                },
-                host,
-            );
+            session.borrow_mut().spawn_stream(serve::StreamRequest {
+                prepared,
+                id,
+                writer,
+            });
             WorkerReply::Stream(receiver)
         }
     }

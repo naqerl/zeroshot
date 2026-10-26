@@ -767,11 +767,20 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   Each tool builds the same command value as the CLI and runs it through the existing public or hub
   executor. Tool parameters for graph, initial input, exact or uniform runtime, and environment
   definitions are inline JSON values materialized into private temporary files for the command's
-  lifetime. The `io.modelcontextprotocol/events` extension exposes `run.event`, whose payload is
-  the durable notification `watch` already emits, and `run.warning`, which reports each completed
-  hour of an active run. Both use the same five-field envelope and move `summary` and `replayed`
-  into `data`; `events/poll` and `events/stream` open the same `run_watch` subscription. Signed
-  webhooks are unsupported. The endpoint does not itself start a run.
+  lifetime. The `io.modelcontextprotocol/events` extension exposes one session-spanning hub
+  subscription carrying `hub.job`, `hub.run`, `hub.pool`, and `hub.warning` over one monotonic
+  `hub:<sequence>` cursor. Omitting selectors subscribes to the whole hub; `runId`, `jobId`,
+  `target`, and other filters narrow that feed without binding it, and single-kind names select
+  one event kind (`run.event` is the `hub.run` alias). Occurrences keep the flattened five-field
+  envelope (`eventId`, `name`, `timestamp`, `data`, `_meta`); `summary`, `replayed`, and the hub
+  `cursor` live inside `data`, while run records retain their durable `v2:` cursor as
+  `data.runCursor`. `replayed` is true only for records drained at subscribe time. Terminal events
+  are ordinary events and heartbeats continue while idle; only unsubscribe, session end, or
+  cancellation closes a stream. `events/poll` and `events/stream` both replay from the same hub
+  log. `truncated` is false unless replay shortfall or backpressure permanently lost events, and
+  then carries the lost `{from,to}` range; a resumable `maxEvents` clip is only `hasMore`.
+  Explicit per-run `run.event` polls retain their legacy `v2:` cursors. Signed webhooks are
+  unsupported. The endpoint does not itself start a run.
 
 ## CLI and target contracts
 
@@ -845,7 +854,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   from `attempts`, until `--unconfirmed-limit` (default 30) fails it as `unconfirmed_limit`; and
   `Rejected`, the only other kind that fails the job. Hub jobs have no expiry: a job ends only when
   its run ends, it is force-stopped, or it is reaped with its member. Lifetimes are observable
-  events rather than deadlines, and active runs are reported hourly through `run.warning`. The
+  events rather than deadlines, and active runs are reported hourly through `hub.warning`. The
   opt-in `hub daemon run --max-stall` persists each running job's watch cursor and cursor-change
   time, resets both when the cursor advances, and force-stops a run whose cursor stayed unchanged for
   the configured duration, failing it with reason and error kind `stalled`. Its heartbeat reports

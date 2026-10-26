@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -22,7 +23,20 @@ const KNOWN_VERSIONS: &[&str] = &[
 
 struct StreamCancel {
     flag: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
     handle: AbortHandle,
+}
+
+struct StreamLease {
+    active: Rc<Cell<usize>>,
+    alive: Arc<AtomicBool>,
+}
+
+impl Drop for StreamLease {
+    fn drop(&mut self) {
+        self.active.set(self.active.get().saturating_sub(1));
+        self.alive.store(false, Ordering::Relaxed);
+    }
 }
 
 pub(super) enum Action {
@@ -46,6 +60,7 @@ pub(super) struct StreamRequest<W> {
 pub(super) struct SessionState {
     initialized: bool,
     cancellations: HashMap<String, StreamCancel>,
+    active_streams: Rc<Cell<usize>>,
 }
 
 impl SessionState {
@@ -70,12 +85,29 @@ impl SessionState {
         handle_notification(message, &mut self.cancellations);
     }
 
-    pub(super) fn spawn_stream<H, W>(&mut self, request: StreamRequest<W>, host: &Rc<H>)
+    pub(super) fn unsubscribe(&mut self, request_id: &Value) -> bool {
+        let Some(cancel) = self.cancellations.remove(&id_key(request_id)) else {
+            return false;
+        };
+        let stopped = cancel.alive.swap(false, Ordering::Relaxed);
+        cancel.flag.store(true, Ordering::Relaxed);
+        cancel.handle.abort();
+        stopped
+    }
+
+    pub(super) fn spawn_stream<W>(&mut self, request: StreamRequest<W>)
     where
-        H: McpHost + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        spawn_stream(request, host, &mut self.cancellations);
+        spawn_stream(
+            request,
+            &mut self.cancellations,
+            Rc::clone(&self.active_streams),
+        );
+    }
+
+    pub(super) fn has_active_streams(&self) -> bool {
+        self.active_streams.get() > 0
     }
 
     pub(super) fn shutdown(&mut self) {
@@ -102,12 +134,11 @@ where
     Ok(())
 }
 
-fn spawn_stream<H, W>(
+fn spawn_stream<W>(
     request: StreamRequest<W>,
-    host: &Rc<H>,
     cancellations: &mut HashMap<String, StreamCancel>,
+    active: Rc<Cell<usize>>,
 ) where
-    H: McpHost + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let StreamRequest {
@@ -116,11 +147,20 @@ fn spawn_stream<H, W>(
         writer,
     } = request;
     let flag = Arc::new(AtomicBool::new(false));
-    let host = Rc::clone(host);
+    let alive = Arc::new(AtomicBool::new(true));
     let output = events::StreamOutput::new(id.clone(), writer, Arc::clone(&flag));
-    let task = tokio::task::spawn_local(events::drive(*prepared, output, host));
+    active.set(active.get().saturating_add(1));
+    let lease = StreamLease {
+        active,
+        alive: Arc::clone(&alive),
+    };
+    let task = tokio::task::spawn_local(async move {
+        let _lease = lease;
+        let _ = events::drive(*prepared, output).await;
+    });
     let cancel = StreamCancel {
         flag,
+        alive,
         handle: task.abort_handle(),
     };
     if let Some(previous) = cancellations.insert(id_key(&id), cancel) {
@@ -129,7 +169,12 @@ fn spawn_stream<H, W>(
     }
 }
 
-pub(super) async fn dispatch<H>(host: &H, message: &Value, initialized: bool) -> Action
+pub(super) async fn dispatch<H>(
+    host: &Rc<H>,
+    feed: &Rc<events::HubFeed>,
+    session: &Rc<std::cell::RefCell<SessionState>>,
+    message: &Value,
+) -> Action
 where
     H: McpHost + 'static,
 {
@@ -161,7 +206,7 @@ where
             Err(failure) => invalid_params(failure),
         };
     }
-    if !initialized {
+    if !session.borrow().initialized() {
         return Action::Fail {
             code: -32600,
             message: "Invalid Request",
@@ -174,7 +219,7 @@ where
             Ok(result) => Action::Reply(result),
             Err(failure) => invalid_params(failure),
         },
-        "tools/call" => match tools::call(host, &params).await {
+        "tools/call" => match tools::call(host.as_ref(), &params).await {
             Ok(result) => Action::Reply(result),
             Err(failure) => invalid_params(failure),
         },
@@ -182,21 +227,28 @@ where
             Ok(result) => Action::Reply(result),
             Err(error) => event_failure(error),
         },
-        "events/poll" => match events::poll(host, &params).await {
+        "events/poll" => match events::poll(host, feed, &params).await {
             Ok(result) => Action::Reply(result),
             Err(error) => event_failure(error),
         },
-        "events/stream" => match events::prepare(host, &params).await {
+        "events/stream" => match events::prepare(host, feed, &params).await {
             Ok(prepared) => Action::Stream(Box::new(prepared)),
             Err(error) => event_failure(error),
         },
-        "events/subscribe" if events::requests_subscription(&params) => {
-            match events::prepare(host, &params).await {
-                Ok(prepared) => Action::Stream(Box::new(prepared)),
-                Err(error) => event_failure(error),
+        "events/subscribe" => match events::prepare(host, feed, &params).await {
+            Ok(prepared) => Action::Stream(Box::new(prepared)),
+            Err(error) => event_failure(error),
+        },
+        "events/unsubscribe" => match events::unsubscribe(&params) {
+            Ok(request_id) => {
+                let removed = session.borrow_mut().unsubscribe(&request_id);
+                Action::Reply(json!({
+                    "resultType": "complete",
+                    "unsubscribed": removed,
+                }))
             }
-        }
-        "events/subscribe" | "events/unsubscribe" => event_failure(events::unsupported_webhook()),
+            Err(error) => event_failure(error),
+        },
         _ => Action::Fail {
             code: -32601,
             message: "Method not found",
