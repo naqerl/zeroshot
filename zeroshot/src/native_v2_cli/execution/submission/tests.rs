@@ -624,3 +624,96 @@ fn prepare_intent_preserves_an_explicit_submission_key() {
     assert_eq!(intent.submission_key, command.submission_key.assert_value());
     assert_eq!(intent.initial_input, serde_json::json!({"task":"x"}));
 }
+
+#[test]
+fn template_binding_insertion_owns_comment_and_git_delivery_nodes() {
+    let mut runtime = RuntimePlan::Pi {
+        provider: PiProvider::Anthropic,
+        size: RunSize::Small,
+        active_memory: Default::default(),
+        global_agents: Default::default(),
+        nodes: BTreeMap::new(),
+    };
+    let delivery = openengine_cluster_protocol::NodeName::new("delivery").assert_value();
+    let comment = openengine_cluster_protocol::NodeName::new("comment").assert_value();
+    let push = git_delivery_binding(
+        PullRequestFeedback::Consider,
+        crate::native_v2_delivery::DeliveryMode::Push,
+    )
+    .assert_value();
+    let merge = git_delivery_binding(
+        PullRequestFeedback::Consider,
+        crate::native_v2_delivery::DeliveryMode::MergeV3,
+    )
+    .assert_value();
+    let comment_binding = NodeRuntimeBinding::CommentDelivery {
+        connections: connection(
+            crate::native_v2_contract::GITHUB_CONNECTION_KEY,
+            &[GITHUB_TOKEN_ENV],
+        )
+        .assert_value(),
+    };
+
+    insert_template_binding(&mut runtime, delivery.clone(), push, false).assert_value();
+    let encoded =
+        serde_json::to_value(runtime.nodes().get(&delivery).assert_value()).assert_value();
+    assert!(
+        encoded.get("pullRequestFeedback").is_none(),
+        "consider is the implicit pull-request feedback default"
+    );
+    assert!(
+        encoded.get("connections").is_none(),
+        "push delivery needs no GitHub connection"
+    );
+
+    insert_template_binding(&mut runtime, delivery.clone(), merge, true).assert_value();
+    assert_eq!(
+        serde_json::to_value(runtime.nodes().get(&delivery).assert_value())
+            .assert_value()
+            .get("pullRequestFeedback"),
+        Some(&serde_json::json!("ignore"))
+    );
+    assert!(matches!(
+        runtime.nodes().get(&delivery).assert_value(),
+        NodeRuntimeBinding::GitDelivery {
+            pull_request_feedback: PullRequestFeedback::Ignore,
+            ..
+        }
+    ));
+
+    insert_template_binding(
+        &mut runtime,
+        comment.clone(),
+        comment_binding.clone(),
+        false,
+    )
+    .assert_value();
+    insert_template_binding(
+        &mut runtime,
+        comment.clone(),
+        comment_binding.clone(),
+        false,
+    )
+    .assert_value();
+    assert!(
+        insert_template_binding(&mut runtime, delivery.clone(), comment_binding, false)
+            .assert_error()
+            .to_string()
+            .contains("comment_delivery")
+    );
+    assert!(
+        insert_template_binding(
+            &mut runtime,
+            comment,
+            git_delivery_binding(
+                PullRequestFeedback::Consider,
+                crate::native_v2_delivery::DeliveryMode::MergeV3,
+            )
+            .assert_value(),
+            false,
+        )
+        .assert_error()
+        .to_string()
+        .contains("git_delivery")
+    );
+}

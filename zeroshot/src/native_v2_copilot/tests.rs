@@ -492,6 +492,25 @@ async fn native_local_login_and_context_need_no_declared_token() {
 }
 
 #[tokio::test]
+async fn unsupported_requests_and_memory_hooks_are_answered_without_failing_the_turn() {
+    let fixture = Fixture::new("dispatch").await;
+    verified(complete(fixture.start(1).await).await.1);
+    let replies = fixture
+        .directory
+        .read("capture.dispatch")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).assert_value())
+        .collect::<Vec<_>>();
+    assert_eq!(replies.len(), 3, "every dispatched request is answered");
+    assert_eq!(replies[0]["id"], 9001);
+    assert_eq!(replies[0]["error"]["code"], -32601);
+    for (reply, identifier) in replies[1..].iter().zip([9002, 9003]) {
+        assert_eq!(reply["id"], identifier);
+        assert!(reply["result"]["output"].is_null());
+    }
+}
+
+#[tokio::test]
 async fn ambient_local_token_crosses_private_rpc_only() {
     let fixture = Fixture::ambient_token().await;
     verified(complete(fixture.start(1).await).await.1);

@@ -1143,3 +1143,119 @@ fn local_review_tokens_are_bounded_and_lease_paths_stay_private() {
     assert!(storage.is_dir());
     assert!(create_local_run_storage(&state, &RunId::new("invalid-local-run")).is_err());
 }
+
+#[test]
+fn local_bootstrap_scavenging_only_removes_stale_regular_files() {
+    let root = TestDirectory::new("local-bootstrap-scavenge");
+    let missing = root.child("missing-bootstrap");
+    remove_stale_bootstrap(&missing, Duration::ZERO).assert_value();
+
+    let fresh = root.child("fresh-bootstrap");
+    std::fs::write(&fresh, b"token").assert_value();
+    remove_stale_bootstrap(&fresh, Duration::from_secs(3600)).assert_value();
+    assert!(fresh.is_file(), "a recent bootstrap is still in use");
+    remove_stale_bootstrap(&fresh, Duration::ZERO).assert_value();
+    assert!(!fresh.exists(), "an aged bootstrap is reclaimed");
+
+    let directory = root.child("bootstrap-directory");
+    std::fs::create_dir(&directory).assert_value();
+    remove_stale_bootstrap(&directory, Duration::ZERO).assert_value();
+    assert!(directory.is_dir(), "directories are never reclaimed");
+
+    #[cfg(unix)]
+    {
+        let target = root.child("bootstrap-target");
+        std::fs::write(&target, b"token").assert_value();
+        let link = root.child("bootstrap-link");
+        std::os::unix::fs::symlink(&target, &link).assert_value();
+        remove_stale_bootstrap(&link, Duration::ZERO).assert_value();
+        assert!(link.symlink_metadata().is_ok(), "links are never followed");
+        assert!(target.is_file());
+    }
+}
+
+#[test]
+fn local_backend_guards_named_targets_and_controller_handoff_errors() {
+    require_local(None).assert_value();
+    assert!(require_local(Some("named-target")).is_err());
+
+    assert!(retryable_controller_handoff(&PortableControllerError::Io(
+        std::io::Error::other("busy")
+    )));
+    assert!(retryable_controller_handoff(
+        &PortableControllerError::Lease(ControllerLeaseError::Held)
+    ));
+    assert!(!retryable_controller_handoff(
+        &PortableControllerError::Readiness
+    ));
+    assert!(local_error("detail").to_string().contains("detail"));
+    assert!(
+        local_io(std::io::Error::other("io"))
+            .to_string()
+            .contains("io")
+    );
+}
+
+#[test]
+fn local_recovery_claims_are_exclusive_until_released() {
+    let root = TestDirectory::new("local-recovery-claim-contract");
+    let backend = contract_backend(root.path());
+    let run_id = RunId::new("0199f33f-3b44-7d21-9000-0000000000aa");
+    backend.create_run_storage(&run_id).assert_value();
+    assert_eq!(
+        backend.recovery_path(&run_id).assert_value(),
+        root.path()
+            .join("runs")
+            .join(run_id.as_str())
+            .join(RECOVERY_FILE)
+    );
+    assert!(
+        backend
+            .recovery_workspace_is_unclaimed(&run_id)
+            .assert_value()
+    );
+
+    let claim = backend.claim_recovery_workspace(&run_id).assert_value();
+    assert!(
+        !backend
+            .recovery_workspace_is_unclaimed(&run_id)
+            .assert_value()
+    );
+    drop(claim);
+    assert!(
+        backend
+            .recovery_workspace_is_unclaimed(&run_id)
+            .assert_value()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_controller_readiness_reports_exit_and_deadline() {
+    let root = TestDirectory::new("local-controller-readiness");
+    let run_id = RunId::new("0199f33f-3b44-7d21-9000-0000000000bb");
+
+    let exited = PortableControllerPaths::new(root.child("exited"));
+    let mut child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg("exit 7")
+        .spawn()
+        .assert_value();
+    let error = wait_for_controller(&mut child, &exited, &run_id, Duration::from_secs(30))
+        .await
+        .expect_err("an exited controller never becomes ready");
+    assert!(error.to_string().contains("exited before becoming ready"));
+
+    let waiting = PortableControllerPaths::new(root.child("waiting"));
+    let mut child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg("sleep 60")
+        .spawn()
+        .assert_value();
+    let error = wait_for_controller(&mut child, &waiting, &run_id, Duration::from_millis(50))
+        .await
+        .expect_err("a live controller must publish readiness before the deadline");
+    assert!(error.to_string().contains("before the deadline"));
+    child.kill().await.assert_value();
+    child.wait().await.assert_value();
+}
