@@ -276,6 +276,7 @@ const HUB_ENQUEUE_KEYS: &[&str] = &[
     "expires",
     "title",
     "input",
+    "taskFrom",
     "graph",
     "template",
     "runtimeConfig",
@@ -943,7 +944,11 @@ pub(super) fn argv_for_test(
         .find(|tool| tool.name == name)
         .ok_or_else(|| McpFailure::invalid(format!("unknown tool {name}")))?;
     reject_unknown(arguments, tool.allowed)?;
-    (tool.argv)(arguments)
+    let mut arguments = arguments.clone();
+    let materialized = materialize_inline(&mut arguments)?;
+    let argv = (tool.argv)(&arguments)?;
+    drop(materialized);
+    Ok(argv)
 }
 
 fn selector_properties() -> Vec<(&'static str, Value)> {
@@ -1253,7 +1258,7 @@ fn hub_enqueue_schema() -> Value {
             .into_iter()
             .filter(|(name, _)| !matches!(*name, "validateOnly" | "detach")),
     );
-    object_schema(&["title", "input"], properties)
+    object_schema(&["title"], properties)
 }
 
 fn hub_stats_schema() -> Value {

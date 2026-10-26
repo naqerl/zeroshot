@@ -63,9 +63,9 @@ tool name is a JSON-RPC invalid-params error.
 `input`, `graph`, `runtimeConfig`, `uniformRuntimeConfig`, and `environment` are inline JSON
 values, not file paths. `input` may be any JSON value; the other four are JSON objects. The server
 writes each supplied value to a private temporary file for the duration of that command, then
-removes it. On `run` and `hub_submit`, `taskFrom` resolves a GitHub issue or pull-request URL into
-the run input. It conflicts with `input`, `repository`, and `sourceConnection`; the CLI enforces
-that conflict. For example:
+removes it. On `run`, `hub_submit`, and `hub_enqueue`, `taskFrom` resolves a GitHub issue or
+pull-request URL into the run input. It conflicts with `input`, `repository`, and
+`sourceConnection`; the CLI enforces that conflict. For example:
 
 ```json
 {

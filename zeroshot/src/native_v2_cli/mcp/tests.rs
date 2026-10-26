@@ -516,6 +516,37 @@ fn hub_tools_are_listed_and_map_arguments() {
     );
 }
 
+#[test]
+fn every_advertised_tool_property_is_accepted() {
+    let listed = super::tools::list(&Value::Null).expect("list tools");
+    for tool in listed["tools"].as_array().expect("tools array") {
+        let name = tool["name"].as_str().expect("tool name");
+        let properties = tool["inputSchema"]["properties"]
+            .as_object()
+            .expect("tool properties");
+        for (property, schema) in properties {
+            let value = match schema.get("type") {
+                Some(Value::String(kind)) => match kind.as_str() {
+                    "string" => json!("value"),
+                    "boolean" => json!(true),
+                    "integer" => json!(0),
+                    "array" => json!(["value"]),
+                    "object" => json!({}),
+                    other => panic!("{name}.{property}: unhandled type {other}"),
+                },
+                Some(other) => panic!("{name}.{property}: unhandled schema {other}"),
+                None if schema.get("oneOf").is_some() => json!("10m"),
+                None => json!({}),
+            };
+            let mut arguments = Map::new();
+            arguments.insert(property.clone(), value);
+            super::tools::argv_for_test(name, &arguments).unwrap_or_else(|failure| {
+                panic!("{name}.{property} is advertised but rejected: {failure:?}")
+            });
+        }
+    }
+}
+
 #[tokio::test]
 async fn status_tool_uses_the_cli_backend() {
     let backend = CliTestBackend::default();

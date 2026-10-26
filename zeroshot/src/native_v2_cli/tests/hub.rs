@@ -88,6 +88,35 @@ fn submit_keeps_run_arguments_and_separates_placement() {
 }
 
 #[test]
+fn hub_jobs_preserve_task_from_and_reject_review_source_conflicts() {
+    let url = "https://github.com/owner/repo/pull/1";
+    let expected = ["--title", "Review", "--task-from", url];
+    let HubCommand::Submit(submit) =
+        parse(&["hub", "submit", "--title", "Review", "--task-from", url])
+            .expect("hub submit parses")
+    else {
+        panic!("expected submit");
+    };
+    assert_eq!(submit.job.run_args, expected);
+    let HubCommand::Enqueue(enqueue) =
+        parse(&["hub", "enqueue", "--title", "Review", "--task-from", url])
+            .expect("hub enqueue parses")
+    else {
+        panic!("expected enqueue");
+    };
+    assert_eq!(enqueue.job.run_args, expected);
+
+    for extra in [
+        ["--repository", "owner/repo"],
+        ["--source-connection", "review"],
+    ] {
+        let mut values = vec!["hub", "submit", "--title", "Review", "--task-from", url];
+        values.extend(extra);
+        assert!(parse(&values).is_err(), "task-from rejects {extra:?}");
+    }
+}
+
+#[test]
 fn bare_wait_means_wait_without_deadline() {
     let command = parse(&[
         "hub",
