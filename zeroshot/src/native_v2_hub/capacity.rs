@@ -314,7 +314,7 @@ pub(crate) fn note_waiting(state: &mut HubState, now: u64) -> Vec<String> {
         if let Some(limit) = pool.wait_max_ms
             && now >= queued_since.saturating_add(limit)
         {
-            job.state = JobState::Expired;
+            job.state = JobState::Failed;
             job.finished_at_ms = Some(now);
             job.error = Some(JobError::new(
                 JobErrorKind::PoolWaitTimeout,

@@ -275,7 +275,7 @@ async fn wait_max_expires_a_job_that_found_no_server() {
     let view = rig.pass().await;
     assert_eq!(view["pools"]["expired"], json!(["hj_one"]), "{view}");
     let job = job_named(&rig.state().await, "hj_one").clone();
-    assert_eq!(job.state, JobState::Expired);
+    assert_eq!(job.state, JobState::Failed);
     let error = job.error.expect("error");
     assert_eq!(error.kind, JobErrorKind::PoolWaitTimeout);
     assert!(
