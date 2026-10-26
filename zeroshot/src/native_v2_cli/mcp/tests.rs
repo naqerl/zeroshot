@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -6,6 +7,7 @@ use tokio::sync::mpsc;
 
 use super::super::{CliTestBackend, CliTestCall, NeverDetach, RunWatchCommand};
 use super::{McpFailure, McpHost, McpServer, WatchStream, serve_http_listener};
+use crate::native_v2_cli::hub::{HubCommand, HubRequest};
 use crate::native_v2_cli::{NativeV2CliCommand, execute_native_v2_cli};
 
 struct ToolHost {
@@ -133,6 +135,62 @@ impl McpHost for EventHost {
                 }
             }
         });
+        Ok(WatchStream::new(receiver, task))
+    }
+}
+
+/// A hub host whose job status advances through `statuses` on each read and whose
+/// placed run exposes the scripted watch events.
+struct JobHost {
+    statuses: Vec<Value>,
+    reads: AtomicUsize,
+    events: Vec<Value>,
+}
+
+impl JobHost {
+    fn new(statuses: Vec<Value>, events: Vec<Value>) -> Self {
+        assert!(!statuses.is_empty(), "a job host needs at least one status");
+        Self {
+            statuses,
+            reads: AtomicUsize::new(0),
+            events,
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl McpHost for JobHost {
+    async fn execute(&self, command: NativeV2CliCommand) -> Result<String, McpFailure> {
+        match command {
+            NativeV2CliCommand::Hub(HubRequest {
+                command: HubCommand::Status { job },
+                ..
+            }) => {
+                let read = self.reads.fetch_add(1, Ordering::SeqCst);
+                let index = read.min(self.statuses.len() - 1);
+                Ok(json!({
+                    "schema": "zeroshot.hub.job/v1",
+                    "job": self.statuses[index],
+                    "requestedJob": job,
+                })
+                .to_string())
+            }
+            _ => Err(McpFailure::invalid("job host only answers hub status")),
+        }
+    }
+
+    async fn open_watch(&self, command: &RunWatchCommand) -> Result<WatchStream, McpFailure> {
+        let run_id = command.run.run_id.as_str();
+        let (sender, receiver) = mpsc::channel(32);
+        for event in self.events.clone() {
+            let mut event = event;
+            event["runId"] = json!(run_id);
+            sender
+                .try_send(Ok(event))
+                .expect("scripted job run event fits the buffer");
+        }
+        drop(sender);
+        let task = tokio::spawn(async {});
         Ok(WatchStream::new(receiver, task))
     }
 }
@@ -608,7 +666,12 @@ async fn events_list_describes_poll_and_push_only() {
             .unwrap_or_default()
             .contains("unsupported")
     );
-    assert_eq!(event["inputSchema"]["required"], json!(["runId"]));
+    assert_eq!(
+        event["inputSchema"]["oneOf"],
+        json!([{"required": ["runId"]}, {"required": ["jobId"]}])
+    );
+    assert!(event["inputSchema"]["properties"].get("runId").is_some());
+    assert!(event["inputSchema"]["properties"].get("jobId").is_some());
     assert!(event["inputSchema"]["properties"].get("target").is_some());
     assert_eq!(
         event["payloadSchema"]["required"],
@@ -623,9 +686,13 @@ async fn events_list_describes_poll_and_push_only() {
         ])
     );
     assert!(
-        event["payloadSchema"]["properties"]["data"]
+        event["payloadSchema"]["properties"]["data"]["oneOf"][0]
             .get("properties")
             .is_some()
+    );
+    assert!(
+        event["payloadSchema"]["properties"]["jobId"].is_object(),
+        "payload documents jobId"
     );
     for filter in ["phases", "nodes", "terminalOnly", "verbose"] {
         assert!(
@@ -743,6 +810,170 @@ async fn events_stream_pushes_a_notification() {
         }
     }
     assert!(saw_event);
+}
+
+#[tokio::test]
+async fn events_job_with_a_run_delivers_that_runs_events() {
+    let mut session = Session::spawn(JobHost::new(
+        vec![json!({
+            "jobId": "hj_placed",
+            "state": "running",
+            "target": "builder",
+            "runId": "run-public"
+        })],
+        vec![watch_event("ignored", "v2:1", running_status("worker"))],
+    ));
+    initialize(&mut session).await;
+    session
+        .send(&json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "events/stream",
+            "params": {
+                "name": "run.event",
+                "arguments": {"jobId": "hj_placed"}
+            }
+        }))
+        .await;
+    let frames = session.drain_frames();
+    let event = frames
+        .iter()
+        .find(|frame| frame["method"] == "notifications/events/event")
+        .expect("the placed job's run event");
+    assert_eq!(event["params"]["eventId"], json!("run-public:v2:1"));
+    assert_eq!(event["params"]["data"]["runId"], json!("run-public"));
+    assert_eq!(
+        event["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        json!(8)
+    );
+    assert_eq!(
+        frames.last().unwrap()["result"]["resultType"],
+        json!("complete")
+    );
+}
+
+#[tokio::test]
+async fn events_follow_a_queued_job_until_its_run_appears() {
+    let mut session = Session::spawn(JobHost::new(
+        vec![
+            json!({"jobId": "hj_queued", "state": "queued", "runId": null}),
+            json!({
+                "jobId": "hj_queued",
+                "state": "running",
+                "target": "builder",
+                "runId": "run-public"
+            }),
+        ],
+        vec![watch_event("ignored", "v2:1", running_status("worker"))],
+    ));
+    initialize(&mut session).await;
+    session
+        .send(&json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "events/stream",
+            "params": {
+                "name": "run.event",
+                "arguments": {"jobId": "hj_queued"}
+            }
+        }))
+        .await;
+    let frames = session.drain_frames();
+    let queued = frames
+        .iter()
+        .find(|frame| {
+            frame["method"] == "notifications/events/active"
+                && frame["params"]["state"] == json!("queued")
+        })
+        .expect("active notification for the queued job");
+    assert_eq!(queued["params"]["run"], Value::Null);
+    assert_eq!(queued["params"]["job"]["jobId"], json!("hj_queued"));
+    assert_eq!(queued["params"]["job"]["state"], json!("queued"));
+    assert!(
+        queued["params"]["eventId"]
+            .as_str()
+            .is_some_and(|event_id| event_id.starts_with("hj_queued:"))
+    );
+    let event = frames
+        .iter()
+        .find(|frame| frame["method"] == "notifications/events/event")
+        .expect("run events after the job was placed");
+    assert_eq!(event["params"]["data"]["runId"], json!("run-public"));
+}
+
+#[tokio::test]
+async fn events_end_a_job_that_fails_before_it_runs() {
+    let mut session = Session::spawn(JobHost::new(
+        vec![json!({
+            "jobId": "hj_rejected",
+            "state": "failed",
+            "runId": null,
+            "error": "the target refused the submission",
+            "errorKind": "submission_rejected"
+        })],
+        Vec::new(),
+    ));
+    initialize(&mut session).await;
+    session
+        .send(&json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "events/stream",
+            "params": {
+                "name": "run.event",
+                "arguments": {"jobId": "hj_rejected"}
+            }
+        }))
+        .await;
+    let frames = session.drain_frames();
+    let terminal = frames
+        .iter()
+        .find(|frame| {
+            frame["method"] == "notifications/events/event"
+                && frame["params"]["state"] == json!("failed")
+        })
+        .expect("terminal job notification");
+    assert_eq!(
+        terminal["params"]["error"],
+        json!("the target refused the submission")
+    );
+    assert_eq!(
+        terminal["params"]["errorKind"],
+        json!("submission_rejected")
+    );
+    assert!(
+        terminal["params"]["eventId"]
+            .as_str()
+            .is_some_and(|event_id| event_id.starts_with("hj_rejected:"))
+    );
+    assert_eq!(
+        frames.last().unwrap()["result"]["resultType"],
+        json!("complete")
+    );
+}
+
+#[tokio::test]
+async fn event_subscriptions_require_exactly_one_selector() {
+    let mut session = Session::spawn(ScriptHost);
+    initialize(&mut session).await;
+    for (id, arguments) in [
+        (2, json!({"runId": "run-public", "jobId": "hj_1"})),
+        (3, json!({})),
+    ] {
+        let response = session
+            .request(
+                id,
+                "events/stream",
+                json!({"name": "run.event", "arguments": arguments}),
+            )
+            .await;
+        assert_eq!(response["error"]["code"], json!(-32602), "{response}");
+        assert_eq!(
+            response["error"]["data"]["code"],
+            json!("request.invalid"),
+            "{response}"
+        );
+    }
 }
 
 #[tokio::test]

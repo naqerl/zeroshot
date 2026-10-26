@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -63,11 +64,17 @@ impl SessionState {
         handle_notification(message, &mut self.cancellations);
     }
 
-    pub(super) fn spawn_stream<W>(&mut self, prepared: Prepared, id: Value, writer: &Arc<Mutex<W>>)
-    where
+    pub(super) fn spawn_stream<H, W>(
+        &mut self,
+        prepared: Prepared,
+        id: Value,
+        writer: &Arc<Mutex<W>>,
+        host: &Rc<H>,
+    ) where
+        H: McpHost + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        spawn_stream(prepared, id, writer, &mut self.cancellations);
+        spawn_stream(prepared, id, writer, host, &mut self.cancellations);
     }
 
     pub(super) fn shutdown(&mut self) {
@@ -94,20 +101,24 @@ where
     Ok(())
 }
 
-fn spawn_stream<W>(
+fn spawn_stream<H, W>(
     prepared: Prepared,
     id: Value,
     writer: &Arc<Mutex<W>>,
+    host: &Rc<H>,
     cancellations: &mut HashMap<String, StreamCancel>,
 ) where
+    H: McpHost + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let flag = Arc::new(AtomicBool::new(false));
-    let task = tokio::spawn(events::drive(
+    let host = Rc::clone(host);
+    let task = tokio::task::spawn_local(events::drive(
         prepared,
         id.clone(),
         Arc::clone(writer),
         Arc::clone(&flag),
+        host,
     ));
     let cancel = StreamCancel {
         flag,
@@ -180,6 +191,12 @@ where
             Ok(prepared) => Action::Stream(prepared),
             Err(error) => event_failure(error),
         },
+        "events/subscribe" if events::requests_subscription(&params) => {
+            match events::prepare(host, &params).await {
+                Ok(prepared) => Action::Stream(prepared),
+                Err(error) => event_failure(error),
+            }
+        }
         "events/subscribe" | "events/unsubscribe" => event_failure(events::unsupported_webhook()),
         _ => Action::Fail {
             code: -32601,
