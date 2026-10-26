@@ -39,7 +39,7 @@ fn foreground_failure_uses_structured_evidence_without_attributing_recorded_erro
     .expect("valid failure context");
     let failure = RunFailure::from_context(
         RunId::new("run-local"),
-        Some("cloud"),
+        Some("platform"),
         (
             openengine_cluster_protocol::EnumLabel::new("runtime_failed").expect("reason"),
             context,
@@ -50,7 +50,7 @@ fn foreground_failure_uses_structured_evidence_without_attributing_recorded_erro
         "run finished unsuccessfully: runtime_failed\nFailure:\n  Runtime cleanup failed\n\
          Recorded failures:\n  deliver: GitHub API request failed: base branch not found (log v2:4)\n\
          Additional failure details may be missing; see the full run log.\n\
-         Full run log: zeroshot logs run-local --target cloud"
+         Full run log: zeroshot logs run-local --target platform"
     );
 }
 

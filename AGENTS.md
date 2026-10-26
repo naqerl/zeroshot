@@ -28,8 +28,9 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   profile UI. The UI is served by Rust and never needs a production Node server.
 - Canonical releases are explicit `vX.Y.Z` tags with major version 8 or newer.
 - The npm package is `@the-open-engine-company/zeroshot`.
-- That package owns the canonical `zeroshot` and `zeroshot-memory-init` skills and installs managed
-  copies for Codex, GitHub Copilot, Pi, and Claude Code at their user scopes. Do not fork skills by host.
+- That package owns the canonical `zeroshot`, `zeroshot-memory-init`, and `zeroshot-graph-design`
+  skills and installs managed copies for Codex, GitHub Copilot, Pi, and Claude Code at their user
+  scopes. Do not fork skills by host.
 - The target image is `ghcr.io/the-open-engine/zeroshot-target`.
 - The Python distribution is `the-open-engine-zeroshot`; its import package remains `zeroshot`.
 - Python SDK tags are `zeroshot-python-vZEROSHOT_SDK` and package versions are
@@ -52,7 +53,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 
 - Active Memory is host-owned opt-out state, separate from the checkout. Local CLI runs use one
   database under local state; direct targets use one persistent target-wide database with repository
-  scopes. Generic hosting embedders explicitly select a namespace; Cloud and ACP integration are
+  scopes. Generic hosting embedders explicitly select a namespace; Platform and ACP integration are
   not enabled implicitly. Runtime `activeMemory` independently controls repository and graph
   collection/recall; `globalAgents.postmortem` controls the built-in after-run agent and inherits an
   existing agent node's provider/model/connections. Four isolated verifier specialists separately maintain
@@ -227,7 +228,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   policy parser and `apply_permission_default` entry point; `PermissionPolicy` distinguishes unset,
   configured, and unavailable inspection results. Codex browser/computer access controls and explicit
   approval-review features count as authored policy.
-- The local target registry initializes `cloud` at `https://api.cloud.zeroshot.sh` with a persistent hosted device identity.
+- The local target registry initializes `platform` at `https://api.cloud.zeroshot.sh` with a persistent hosted device identity.
 - Local runs select an optional `--cwd` workspace, defaulting to the invoking folder. File arguments
   stay relative to the invoking folder. A Git checkout uses its canonical root; plain, unborn, and
   detached folders are allowed when the graph has no Git delivery. Workspace and active Zeroshot
@@ -476,8 +477,8 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 - Hosted workspace recovery advertises `resume`, `checkpoints`, and `discard_workspace` in the
   separate `openengine.hosted-workspace-recovery/v1` outer discovery extension, leaving the strict
   `zeroshot.hosted-runs/v1` route object unchanged for older clients. POST bodies and results match
-  the OECP `Run*Params`/`Run*Result` types. These authenticated Cloud routes remain available after
-  capsule disposal. Cloud resolves the admitted connection references freshly; hosted recovery does
+  the OECP `Run*Params`/`Run*Result` types. These authenticated Platform routes remain available after
+  capsule disposal. Platform resolves the admitted connection references freshly; hosted recovery does
   not depend on local direct-target authorization or read local provider environment values.
   `ProductionHostingConfig` can accept host-owned `HostedWorkspaceStorage`; the allocator invokes
   it after source checkout and before provider dispatch, imports settled prerequisites, and
@@ -731,7 +732,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   services idempotently and keep live database state outside file checkpoint guarantees.
   Local runs reject hooks and use the invoking environment. Direct Docker setup modifies its
   operator-owned target container, shared by that target's runs; separate target containers are
-  needed for independent OS dependency sets. Cloud supplies its own disposable execution placement.
+  needed for independent OS dependency sets. Platform supplies its own disposable execution placement.
   Image-owned harness wrappers pin their Node interpreter independently of the project PATH.
 
 - Native local CLI and in-process execution support Unix and Windows. Shared OS facilities live in
@@ -777,6 +778,9 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   so local validation and hosted rejection report the same cause.
 - Do not hand-edit `docs/zeroshot-cli.md` or `docs/zeroshot-cli.html`; regenerate with
   `cargo run -p zeroshot --example generate_cli_docs -- --write` and verify with `--check`.
+- Page descriptions live in Markdown front matter; generated reference descriptions live in
+  `scripts/docs_hook.py`. `docs/overrides/main.html` renders social metadata and breadcrumbs.
+  Fonts are self-hosted in `docs/assets/fonts/` with their licenses.
 - The public documentation site is the root `mkdocs.yml`. Python API pages are generated from the
   curated SDK exports and docstrings. Do not restore a second SDK-only MkDocs site.
 - Keep `docs/reference/python/*.md` out of Prettier; its Markdown formatter removes the indentation
@@ -833,7 +837,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 | CLI self-update               | `zeroshot/src/native_v2_cli/update.rs`                                                                                                                                                            |
 | Built-in templates            | `zeroshot/src/native_v2_templates.rs`, `zeroshot/src/native_v2_templates/`                                                                                                                        |
 | Local run composition         | `zeroshot/src/native_v2_local.rs`                                                                                                                                                                 |
-| Hosted/cloud composition      | `zeroshot/src/native_v2_cloud.rs`, `zeroshot/src/native_v2_hosting.rs`                                                                                                                            |
+| Hosted/platform composition   | `zeroshot/src/native_v2_platform.rs`, `zeroshot/src/native_v2_hosting.rs`                                                                                                                         |
 | Hosted merge plans            | `crates/openengine-cluster-protocol/src/native_v2_hosted/merge_plan.rs`, `zeroshot/src/native_v2_cli/execution/merge_plans.rs`, `zeroshot/src/native_v2_target/controller_authority/hosted_runs/` |
 | Portable controller           | `zeroshot/src/native_v2_portable_controller.rs`, `zeroshot/src/native_v2_portable_controller/`                                                                                                    |
 | Provider/delivery composition | `zeroshot/src/native_v2_candidate.rs`, `zeroshot/src/native_v2_candidate/`                                                                                                                        |
@@ -890,6 +894,8 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 - Drafts/layout are scoped to workspace identity. Saves acknowledge only their captured document
   generation; imports carry no foreign revision. Pending numeric text belongs to the document,
   survives inspector navigation, and commits only when valid. Navigation must preserve unsaved work.
+  Hosted workspaces use the `platform` kind with their existing opaque workspace IDs. The tag
+  rename starts a new browser storage namespace; earlier drafts and preferences are not imported.
 - The structured graph is canonical; React Flow/ELK provide presentation only. Flattening sequences
   or folding standard error routes must preserve scopes, identities, priority, conditions, and
   runtime bindings. Custom/unfamiliar routes stay visible. Layout and themes stay out of profiles.
@@ -922,7 +928,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 - `native_v2_observability::history` owns admitted definitions, bounded native pages and canonical
   control records without the `ui` feature. Its exported semantic validators are the single host
   boundary for definition identity/version, canonical contiguous cursors, page/control coherence,
-  and the reserved `runtime_failed`/`runtime_lost` failure metadata; UI and Cloud readers must reuse
+  and the reserved `runtime_failed`/`runtime_lost` failure metadata; UI and Platform readers must reuse
   them after wire decoding. Definitions contain bounded admission and terminal facts, never the
   accumulated execution snapshot; readers accept that legacy field only to strip it. Observer clones
   share its bounded projection cache.
@@ -931,14 +937,14 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   u64 IDs. SSE resumes after `Last-Event-ID` and drains through the terminal cursor before closing.
 - Private targets export capability-authenticated `POST /native-v2/history/definition` and
   `POST /native-v2/history/page` over their already-owned observer. Direct and hosted access modes
-  cannot use these private exports; Cloud applies per-run authorization before using its capability.
+  cannot use these private exports; Platform applies per-run authorization before using its capability.
   Request bodies carry run identity and cursor, keeping the target query surface unchanged.
 - Status reads query only an already-owned controller. Unpersisted runtime failure stays separate
   from durable snapshots/events and marks history incomplete. Missing authority drains retained
   history before an explicit error. Never invent completion; a durable terminal record takes precedence.
   History observation availability is separate from terminal run status: an available runtime failure
   can be emitted at the same cursor while following continues toward the final durable record.
-  Cloud may remain `collecting` through target/archive handoff; `finished` alone cannot end follow.
+  Platform may remain `collecting` through target/archive handoff; `finished` alone cannot end follow.
 - `run-history.ts` projects only the selected history prefix. Rust's canonical reducer supplies
   structural visits/decisions with source cursors and stable identities; JavaScript never evaluates
   guards or invents worker executions. Keep loop visits, retries, and Map items distinct. Projection
@@ -962,7 +968,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   `embed.html` mounts the same editor/viewer without standalone menus. Its version-1 bridge
   validates the parent window and exact origin, binds workspace authority, and correlates document
   generations and save snapshots. Host service URLs remain same-origin; optional CSRF configuration
-  carries cookie/header names only. Cloud owns menus, authentication, profile CAS and live/archive
+  carries cookie/header names only. Platform owns menus, authentication, profile CAS and live/archive
   adapters ([zero-cloud #301](https://github.com/the-open-engine/zero-cloud/issues/301)).
 - Shared fetch-based SSE preserves HTTP and stream problem codes, accepted execution cursors,
   bounded frame buffering and owned reader cancellation. A host source change must preserve the
@@ -1018,7 +1024,10 @@ python -m mkdocs build --strict
 ## Release convention
 
 - CI has native, Python, repository-tooling, npm-package, and strict-documentation lanes plus stable
-  aggregate `required`. Native changes also require macOS product and test compilation with the UI
+  aggregate `required`. On PRs, that aggregate waits for Greptile's latest review check on the exact
+  head to complete; findings remain review input for the worker rather than automatic CI failures.
+  Merge groups use the completed PR gate because Greptile does not review merge-group commits.
+  Native changes also require macOS product and test compilation with the UI
   feature, focused Unix controller socket regression tests, and APFS workspace clone tests that
   `ZEROSHOT_REQUIRE_APFS_CLONE` keeps from skipping. `.github/ci-path-classifier.js` owns
   fail-closed path routing and cross-lane

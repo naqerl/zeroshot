@@ -1,10 +1,15 @@
+---
+description: "zeroshot enforces your team's QA process on coding agents through a graph of implementation, review, test, repair and delivery steps."
+---
+
 <p class="docs-kicker">Core documentation</p>
 
 # Build and review software through a graph
 
 <p class="docs-lede">
-A Zeroshot graph records implementation, review, repair, and delivery as bounded execution steps.
-Its authored transitions determine which node runs next.
+Zeroshot enforces your team's QA process on coding agents. You define it as a graph of
+implementation, review, test, repair, and delivery steps; its authored transitions decide which
+node runs next, so no agent skips a step.
 </p>
 
 [Run a first task](getting-started/first-run.md){ .md-button .md-button--primary }
@@ -55,12 +60,12 @@ graphs follow the same protocol contracts.
 
     [Understand targets](concepts/targets.md)
 
-- **Zeroshot Cloud**
+- **Zeroshot Platform**
 
-    Cloud accepts the same graph and runtime plan through a managed target. Its documentation covers
+    Platform accepts the same graph and runtime plan through a managed target. Its documentation covers
     accounts, organization policy, and queue behavior.
 
-    [Open the Cloud docs](https://cloud.zeroshot.sh/docs)
+    [Open the Platform docs](https://cloud.zeroshot.sh/docs)
 
 </div>
 
@@ -73,7 +78,7 @@ the checkout and run ledger on your infrastructure, but a harness using an exter
 sends that provider the code and context it needs. Self-hosting zeroshot does not make model
 processing local. Check the selected provider's data-handling terms before using client code.
 
-For Cloud-hosted execution, see the [Cloud privacy notice](https://cloud.zeroshot.sh/legal/privacy)
+For Platform-hosted execution, see the [Platform privacy notice](https://cloud.zeroshot.sh/legal/privacy)
 for data locations and [retention](https://cloud.zeroshot.sh/legal/privacy#retention).
 [Runtime connections](concepts/runtimes-and-connections.md) describe how to select providers and
 supply credentials.

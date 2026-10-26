@@ -417,6 +417,7 @@ jobs:
       - name: Test documentation and publication contracts
         run: >-
           node --test
+          tests/tooling/docs-agent-contract.test.js
           tests/tooling/docs-versions.test.js
           tests/tooling/release-contract.test.js
 
@@ -448,6 +449,7 @@ jobs:
 
       - name: Build strict documentation
         run: |
+          python tests/docs/render_metadata.py
           python -m mkdocs build --strict
           test -f site/manifest.json
           grep -q 'id="zeroshot.Client"' site/reference/python/client/index.html
@@ -542,6 +544,8 @@ jobs:
         target-image,
       ]
     runs-on: ubuntu-latest
+    permissions:
+      checks: read
     steps:
       - name: Require every selected lane
         shell: bash
@@ -589,3 +593,21 @@ jobs:
           require_result "$NATIVE_SELECTED" "$MACOS_RESULT" macos-check
           require_result "$NATIVE_SELECTED" "$IMAGE_RESULT" target-image
           require_result "$PYTHON_SELECTED" "$PYTHON_RESULT" python-check
+
+      - name: Wait for Greptile review
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          while true; do
+            review_status="$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/commits/$REVIEW_HEAD_SHA/check-runs?per_page=100" |
+              jq -r '[.[].check_runs[] | select(.app.id == 867647 and .name == "Greptile Review")] | max_by(.id) | .status // "pending"')"
+            if [[ "$review_status" == "completed" ]]; then
+              break
+            fi
+            echo "Waiting for Greptile to finish reviewing $REVIEW_HEAD_SHA ($review_status)"
+            sleep 15
+          done

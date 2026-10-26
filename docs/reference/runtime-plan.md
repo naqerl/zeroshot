@@ -1,3 +1,7 @@
+---
+description: "RuntimePlan selects execution settings and supplies bindings for graph nodes. It names models and connection fields without containing secrets."
+---
+
 # RuntimePlan
 
 A `RuntimePlan` says how each executable node in a graph runs. It selects the run size and a default
@@ -148,7 +152,7 @@ software-change --pr` prints a delivery node with the current contract.
 
 A graph can contain at most one delivery node, and no other executable node may run in parallel with
 it, either as a `par` sibling or inside a `map` that can have more than one item. A hosting service
-may require exactly one delivery node; Zeroshot Cloud quick runs require one. See
+may require exactly one delivery node; Zeroshot Platform quick runs require one. See
 [concurrent workspace changes](../concepts/execution.md#concurrent-workspace-changes).
 
 `ignore` skips pull-request discussion. CI, conflict, freshness, and merge-policy checks still apply.

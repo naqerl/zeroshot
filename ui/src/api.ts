@@ -59,7 +59,7 @@ export function createApiClient(base: URL, fetcher: typeof fetch = fetch): ApiCl
   };
 }
 
-export type WorkspaceIdentity = { kind: 'local' | 'target' | 'cloud'; id: string };
+export type WorkspaceIdentity = { kind: 'local' | 'target' | 'platform'; id: string };
 export type Bootstrap = {
   templates: Template[];
   workers?: WorkerOption[];
@@ -79,7 +79,7 @@ export function readBootstrap(value: unknown): Bootstrap {
   if (
     !Array.isArray(result.templates) ||
     !result.runtimeSchema ||
-    !['local', 'target', 'cloud'].includes(result.workspace?.kind ?? '') ||
+    !['local', 'target', 'platform'].includes(result.workspace?.kind ?? '') ||
     typeof result.workspace?.id !== 'string' ||
     !result.workspace.id.trim()
   )

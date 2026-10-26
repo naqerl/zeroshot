@@ -1,5 +1,5 @@
 site_name: Zeroshot
-site_description: Versioned documentation for the Zeroshot CLI, protocol, and Python SDK
+site_description: Zeroshot enforces your team's QA process on coding agents as a graph you define. Versioned docs for the CLI, protocol, and Python SDK.
 site_url: https://zeroshot.sh/docs/
 repo_url: https://github.com/the-open-engine/zeroshot
 repo_name: the-open-engine/zeroshot
@@ -12,14 +12,14 @@ exclude_docs: |
   brand/README.md
   requirements.lock
   requirements.txt
+  overrides/
 
 theme:
   name: material
+  custom_dir: docs/overrides
   logo: brand/oec-crow.png
   favicon: brand/oec-favicon.svg
-  font:
-    text: Spline Sans
-    code: Roboto Mono
+  font: false
   features:
     - content.code.copy
     - navigation.footer
@@ -82,7 +82,7 @@ nav:
       - Documentation versions: project/versioning.md
       - Distribution contract: zeroshot-distribution.md
       - Source-code adapters: project/source-code-adapters.md
-  - Zeroshot Cloud: https://cloud.zeroshot.sh/docs
+  - Zeroshot Platform: https://cloud.zeroshot.sh/docs
   - zeroshot.sh: https://zeroshot.sh/?utm_source=github&utm_medium=docs&utm_campaign=zeroshot
 
 plugins:
@@ -131,6 +131,7 @@ markdown_extensions:
       permalink: true
 
 extra_css:
+  - assets/fonts/fonts.css
   - stylesheets/extra.css
 
 extra:
@@ -149,4 +150,4 @@ extra:
     - icon: fontawesome/brands/linkedin
       link: https://www.linkedin.com/company/the-open-engine-company
     - icon: fontawesome/brands/x-twitter
-      link: https://x.com/OpenEngineHQ
+      link: https://x.com/OpenEngineCo

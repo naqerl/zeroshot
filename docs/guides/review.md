@@ -1,3 +1,7 @@
+---
+description: "Review a pull request with the pr-review template and publish its findings as a Markdown comment. Learn what the graph checks."
+---
+
 # Review a pull request
 
 The `pr-review` template checks a PR's implementation and posts a concise Markdown comment.
@@ -60,7 +64,7 @@ zeroshot run --title "Review PR 123" \
   --submission-key review-pr-123
 ```
 
-For hosted execution, add `--target cloud` and select a repository environment that prepares the
+For hosted execution, add `--target platform` and select a repository environment that prepares the
 required stack and browser tools. Source comes from URL resolution, so a client checkout is
 unnecessary. A saved PR review profile already contains its runtime and publisher; use
 `--profile org:pr-review` without template or delivery overrides.
