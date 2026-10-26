@@ -640,38 +640,39 @@ async fn environment_hooks_prepare_private_homes_without_starting_scripts() {
     std::fs::set_permissions(&run_root, std::fs::Permissions::from_mode(0o700)).assert_value();
     let runtime_home = root.child("runtime");
     std::fs::create_dir(&runtime_home).assert_value();
-    std::fs::set_permissions(&runtime_home, std::fs::Permissions::from_mode(0o700))
-        .assert_value();
+    std::fs::set_permissions(&runtime_home, std::fs::Permissions::from_mode(0o700)).assert_value();
     let workspace = root.child("workspace");
     std::fs::create_dir(&workspace).assert_value();
 
     let run_id = RunId::new("environment-hook-run");
-    let mut admitted = admit(serde_json::from_value(serde_json::json!({
-        "title":"Environment hook fixture",
-        "graph":crate::native_v2_candidate::test_support::full_graph(vec![
-            serde_json::json!({
-                "kind":"step","name":"work","worker":"agent.work@1",
-                "instructions":"This node must never start.",
-                "input":{"kind":"null"},"output":{"kind":"null"},
-                "inputBindings":[],"writeBindings":[],"attempts":1
-            }),
-            crate::native_v2_candidate::test_support::success_node()
-        ]),
-        "initialInput":null,
-        "runtime":{
-            "harness":"codex","provider":"openai","size":"small",
-            "nodes":{"work":{
-                "kind":"agent","model":"environment-hook-model","sessionScope":"execution",
-                "connections":{}
-            }}
-        },
-        "source":{
-            "repository":"acme/project","branch":"main",
-            "revision":"2222222222222222222222222222222222222222"
-        },
-        "submissionKey":"environment-hook-fixture"
-    }))
-    .assert_value())
+    let mut admitted = admit(
+        serde_json::from_value(serde_json::json!({
+            "title":"Environment hook fixture",
+            "graph":crate::native_v2_candidate::test_support::full_graph(vec![
+                serde_json::json!({
+                    "kind":"step","name":"work","worker":"agent.work@1",
+                    "instructions":"This node must never start.",
+                    "input":{"kind":"null"},"output":{"kind":"null"},
+                    "inputBindings":[],"writeBindings":[],"attempts":1
+                }),
+                crate::native_v2_candidate::test_support::success_node()
+            ]),
+            "initialInput":null,
+            "runtime":{
+                "harness":"codex","provider":"openai","size":"small",
+                "nodes":{"work":{
+                    "kind":"agent","model":"environment-hook-model","sessionScope":"execution",
+                    "connections":{}
+                }}
+            },
+            "source":{
+                "repository":"acme/project","branch":"main",
+                "revision":"2222222222222222222222222222222222222222"
+            },
+            "submissionKey":"environment-hook-fixture"
+        }))
+        .assert_value(),
+    )
     .await;
     admitted.environment = Some(openengine_cluster_protocol::RuntimeEnvironment {
         setup: None,
@@ -743,5 +744,10 @@ async fn environment_hooks_prepare_private_homes_without_starting_scripts() {
         )
         .await
         .assert_value();
-    assert!(!std::fs::read_dir(&workspace).assert_value().next().is_some());
+    assert!(
+        !std::fs::read_dir(&workspace)
+            .assert_value()
+            .next()
+            .is_some()
+    );
 }

@@ -471,11 +471,7 @@ async fn oecp_optional_authority_defaults_are_explicit_and_fail_closed() {
     };
     assert!(
         connector
-            .resolve_review(
-                "prod",
-                request.clone(),
-                &profile_set_request().runtime,
-            )
+            .resolve_review("prod", request.clone(), &profile_set_request().runtime,)
             .await
             .assert_error()
             .to_string()

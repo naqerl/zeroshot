@@ -449,7 +449,10 @@ async fn setup_hooks_run_for_an_unprivileged_supervisor_and_redact_output() {
     preparation.progress = log.clone();
     let values = BTreeMap::from([
         ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
-        ("HOME".to_owned(), root.path().to_string_lossy().into_owned()),
+        (
+            "HOME".to_owned(),
+            root.path().to_string_lossy().into_owned(),
+        ),
     ]);
     let processes = EnvironmentProcesses::default();
     let redactions = ["test-secret-credential".to_owned()];
@@ -478,7 +481,9 @@ async fn setup_hooks_run_for_an_unprivileged_supervisor_and_redact_output() {
         .assert_value();
     assert_eq!(
         processes
-            .run(request("printf 'failed-secret test-secret-credential\\n' >&2; exit 7"))
+            .run(request(
+                "printf 'failed-secret test-secret-credential\\n' >&2; exit 7"
+            ))
             .await,
         Err(CapsuleAllocationUnavailable::EnvironmentSetup)
     );

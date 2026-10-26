@@ -1002,12 +1002,10 @@ async fn websocket_dialer_rejects_cross_authority_before_network() {
 fn oecp_access_rejects_missing_or_mismatched_bearer_authority_and_redacts_tokens() {
     let hosted = hosted_target("local", "http://127.0.0.1:8080");
     for token in [None, Some(String::new()), Some("control\n".to_owned())] {
-        assert!(TargetOecpAccess::new(
-            "ws://127.0.0.1:8080/native-v2/oecp",
-            token,
-            &hosted.access,
-        )
-        .is_err());
+        assert!(
+            TargetOecpAccess::new("ws://127.0.0.1:8080/native-v2/oecp", token, &hosted.access,)
+                .is_err()
+        );
     }
     let direct = direct_target("http://127.0.0.1:8080");
     assert!(
@@ -1052,8 +1050,9 @@ async fn websocket_dialer_rejects_nonliteral_and_cross_scheme_endpoints_before_n
     for origin in ["mailto:oecp@example.test", "//127.0.0.1:8080"] {
         let mut malformed_origin = target.clone();
         malformed_origin.origin = origin.to_owned();
-        let session = TargetOecpAccess::new("ws://127.0.0.1:8080/native-v2/oecp", None, &target.access)
-            .assert_value();
+        let session =
+            TargetOecpAccess::new("ws://127.0.0.1:8080/native-v2/oecp", None, &target.access)
+                .assert_value();
         let error = TargetOecpWebSocketDialer
             .dial(&malformed_origin, session)
             .await
