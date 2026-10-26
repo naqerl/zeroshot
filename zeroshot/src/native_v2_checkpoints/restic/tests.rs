@@ -129,6 +129,40 @@ fn program_and_snapshot_validation_rejects_ambiguous_executables_and_identities(
     }
 }
 
+#[tokio::test]
+async fn backup_excludes_shared_build_output_directories() {
+    let root = tempfile::tempdir().assert_value();
+    let source = root.path().join("source");
+    std::fs::create_dir(&source).assert_value();
+    std::fs::write(source.join("source"), "content").assert_value();
+    let repository_root = root.path().join("restic");
+    let repository = Repository::new(
+        ResticProgram::fake(root.path()).assert_value(),
+        repository_root.clone(),
+    );
+    repository.initialize().await.assert_value();
+    repository.backup(&source, None).await.assert_value();
+
+    let recorded: Vec<String> = serde_json::from_slice(
+        &std::fs::read(repository_root.join("recorded-backup-arguments.json")).assert_value(),
+    )
+    .assert_value();
+    let excludes = recorded
+        .windows(2)
+        .filter(|pair| pair[0] == "--exclude")
+        .map(|pair| pair[1].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(excludes, vec!["target", "node_modules"]);
+    let pack_size = recorded
+        .iter()
+        .position(|argument| argument == "--pack-size")
+        .assert_value();
+    assert_eq!(
+        &recorded[pack_size + 2..pack_size + 6],
+        ["--exclude", "target", "--exclude", "node_modules"]
+    );
+}
+
 #[test]
 fn repository_rejects_an_unsafe_password_entry() {
     let root = tempfile::tempdir().assert_value();
