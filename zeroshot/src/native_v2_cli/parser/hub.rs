@@ -1,6 +1,7 @@
 use clap::{Args, Subcommand, ValueEnum};
 
 use super::RunArgs;
+use super::convert::validate_review_source;
 
 #[path = "hub/eval.rs"]
 mod eval;
@@ -1075,6 +1076,7 @@ fn job_spec(run: RunArgs, placement: HubPlacementArgs) -> Result<HubJobSpec, Nat
             "hub jobs cannot use --validate-only; validate with `zeroshot run --validate-only`",
         ));
     }
+    validate_review_source(&run)?;
     let target = run.target.clone().map(member_name).transpose()?;
     let runtime_files = [&run.runtime_config, &run.uniform_runtime_config]
         .into_iter()
@@ -1124,6 +1126,9 @@ fn placement_tags(placement: &HubPlacementArgs) -> Vec<String> {
 fn run_arguments(run: &RunArgs) -> Result<Vec<String>, NativeV2CliError> {
     let mut arguments = vec!["--title".to_owned(), run.title.clone()];
     arguments.extend(path_argument("--input", run.input.as_ref())?);
+    if let Some(task_from) = &run.task_from {
+        arguments.extend(["--task-from".to_owned(), task_from.clone()]);
+    }
     for (flag, path) in [
         ("--graph", &run.graph),
         ("--runtime-config", &run.runtime_config),

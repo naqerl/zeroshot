@@ -384,7 +384,7 @@ impl RunArgs {
     }
 }
 
-fn validate_review_source(args: &RunArgs) -> Result<(), NativeV2CliError> {
+pub(super) fn validate_review_source(args: &RunArgs) -> Result<(), NativeV2CliError> {
     if args.task_from.is_some() && (args.repository.is_some() || args.source_connection.is_some()) {
         return Err(usage(
             "--task-from selects its repository and does not accept --repository or --source-connection",

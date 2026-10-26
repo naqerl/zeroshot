@@ -63,7 +63,9 @@ tool name is a JSON-RPC invalid-params error.
 `input`, `graph`, `runtimeConfig`, `uniformRuntimeConfig`, and `environment` are inline JSON
 values, not file paths. `input` may be any JSON value; the other four are JSON objects. The server
 writes each supplied value to a private temporary file for the duration of that command, then
-removes it. For example:
+removes it. On `run`, `hub_submit`, and `hub_enqueue`, `taskFrom` resolves a GitHub issue or
+pull-request URL into the run input. It conflicts with `input`, `repository`, and
+`sourceConnection`; the CLI enforces that conflict. For example:
 
 ```json
 {
@@ -71,42 +73,51 @@ removes it. For example:
   "arguments": {
     "title": "Fix the parser",
     "template": "software-change",
-    "input": {"task": "Fix the parser"},
+    "input": { "task": "Fix the parser" },
     "runtimeConfig": {
       "agents": {
-        "worker": {"harness": "codex", "provider": "openai", "model": "gpt-5"}
+        "worker": { "harness": "codex", "provider": "openai", "model": "gpt-5" }
       }
     }
   }
 }
 ```
 
-| Tool                | Command                      | What it does                                      |
-| ------------------- | ---------------------------- | ------------------------------------------------- |
-| `run`               | `zeroshot run`               | Submit a run. `detach` returns after submission.  |
-| `status`            | `zeroshot status`            | Read one run's status JSON.                       |
-| `logs`              | `zeroshot logs`              | Follow one run's log stream until it ends.        |
-| `watch`             | `zeroshot watch`             | Follow one run's event stream until it ends.      |
-| `list`              | `zeroshot list`              | List runs as JSON.                                |
-| `resume`            | `zeroshot resume`            | Resume a failed run on its retained workspace.    |
-| `force-stop`        | `zeroshot force-stop`        | Stop a run.                                       |
-| `report`            | `zeroshot report`            | Print one lifecycle report from retained history. |
-| `hub_list`          | `zeroshot hub list`          | List hub members.                                 |
-| `hub_ps`            | `zeroshot hub ps`            | List hub jobs.                                    |
-| `hub_status`        | `zeroshot hub status`        | Read one hub job.                                 |
-| `hub_submit`        | `zeroshot hub submit`        | Place a run on a free member.                     |
-| `hub_enqueue`       | `zeroshot hub enqueue`       | Queue a run for later placement.                  |
-| `hub_stats`         | `zeroshot hub stats`         | Aggregate job outcomes and token usage.           |
-| `hub_logs`          | `zeroshot hub logs`          | Follow a placed job's logs until the stream ends. |
-| `hub_daemon_status` | `zeroshot hub daemon status` | Read the hub daemon heartbeat.                    |
+| Tool                | Command                      | What it does                                        |
+| ------------------- | ---------------------------- | --------------------------------------------------- |
+| `run`               | `zeroshot run`               | Submit a run. `detach` returns after submission.    |
+| `status`            | `zeroshot status`            | Read one run's status JSON.                         |
+| `logs`              | `zeroshot logs`              | Follow one run's log stream until it ends.          |
+| `watch`             | `zeroshot watch`             | Follow one run's event stream until it ends.        |
+| `list`              | `zeroshot list`              | List runs as JSON.                                  |
+| `resume`            | `zeroshot resume`            | Resume a failed run on its retained workspace.      |
+| `force-stop`        | `zeroshot force-stop`        | Stop a run.                                         |
+| `report`            | `zeroshot report`            | Print one lifecycle report from retained history.   |
+| `hub_list`          | `zeroshot hub list`          | List hub members.                                   |
+| `hub_add`           | `zeroshot hub add`           | Add a target or `local` as a hub member.            |
+| `hub_update`        | `zeroshot hub update`        | Change member tags, slots, priority, or state.      |
+| `hub_remove`        | `zeroshot hub remove`        | Remove a member from the hub.                       |
+| `hub_ps`            | `zeroshot hub ps`            | List hub jobs.                                      |
+| `hub_status`        | `zeroshot hub status`        | Read one hub job.                                   |
+| `hub_submit`        | `zeroshot hub submit`        | Place a run on a free member.                       |
+| `hub_enqueue`       | `zeroshot hub enqueue`       | Queue a run for later placement.                    |
+| `hub_watch`         | `zeroshot hub watch`         | Follow a placed job's events until the stream ends. |
+| `hub_dequeue`       | `zeroshot hub dequeue`       | Cancel a queued job or a recurring schedule.        |
+| `hub_dispatch`      | `zeroshot hub dispatch`      | Run one dispatcher pass now and print its summary.  |
+| `hub_force_stop`    | `zeroshot hub force-stop`    | Force a placed job's run to stop.                   |
+| `hub_stats`         | `zeroshot hub stats`         | Aggregate job outcomes and token usage.             |
+| `hub_logs`          | `zeroshot hub logs`          | Follow a placed job's logs until the stream ends.   |
+| `hub_daemon_status` | `zeroshot hub daemon status` | Read the hub daemon heartbeat.                      |
 
 `run` and `hub_submit` follow events until the run settles unless `detach` is true. `watch`,
-`logs`, and `hub_logs` do the same and hold the MCP session until that stream ends. For live run
-events, use the events extension instead of those tools.
+`logs`, `hub_watch`, and `hub_logs` do the same and hold the MCP session until that stream ends.
+For live run events, use the events extension instead of those tools.
 
 Read-only tools are `status`, `logs`, `watch`, `list`, `report`, `hub_list`, `hub_ps`,
-`hub_stats`, `hub_logs`, and `hub_daemon_status`. `run`, `resume`, `hub_submit`, and `hub_enqueue`
-submit work. `force-stop` stops a run.
+`hub_status`, `hub_watch`, `hub_stats`, `hub_logs`, and `hub_daemon_status`. `run`, `resume`,
+`hub_submit`, and `hub_enqueue` submit work. `hub_add`, `hub_update`, and `hub_remove` manage
+members; `hub_dequeue` cancels queued jobs or schedules; `hub_dispatch` requests a dispatcher pass;
+`force-stop` and `hub_force_stop` stop runs.
 
 ## Run events
 
