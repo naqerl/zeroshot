@@ -443,6 +443,78 @@ async fn a_placed_job_whose_member_disappears_is_reaped_with_target_lost() {
 }
 
 #[tokio::test]
+async fn a_missing_members_job_is_reaped_while_a_placed_job_without_a_deadline_runs() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let driver = std::sync::Arc::new(FakeDriver::default());
+    let service = super::service::HubService::open(
+        super::store::HubStore::new(directory.path().join("hub")),
+        driver,
+        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
+    )
+    .expect("service");
+    let mut lost = job("hj_lost", 0);
+    lost.state = JobState::Running;
+    lost.target = Some("gone".to_owned());
+    lost.run_id = Some("run-lost".to_owned());
+    let mut placed = job("hj_placed", 0);
+    placed.state = JobState::Running;
+    placed.target = Some("box".to_owned());
+    placed.run_id = Some("run-placed".to_owned());
+    service
+        .mutate(|state| {
+            state.members.push(member("gone", &[], 1, 0));
+            state.members.push(member("box", &[], 1, 0));
+            state.jobs.push(lost);
+            state.jobs.push(placed);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+    let (report, _) = service.pass().await.expect("healthy pass");
+    assert!(report.target_lost.is_empty());
+
+    service
+        .mutate(|state| {
+            state.members.retain(|member| member.name != "gone");
+            Ok(())
+        })
+        .await
+        .expect("remove member");
+    let (report, view) = service.pass().await.expect("reap pass");
+    assert_eq!(report.target_lost.len(), 1);
+    assert_eq!(view["targetLost"], json!(report.target_lost));
+
+    for _ in 0..UNREACHABLE_REAP_THRESHOLD + 1 {
+        let (report, _) = service.pass().await.expect("later pass");
+        assert!(
+            report.target_lost.is_empty(),
+            "a failed job is not reaped again"
+        );
+    }
+    let observed = service.snapshot().await;
+    let lost = observed
+        .jobs
+        .iter()
+        .find(|job| job.job_id == "hj_lost")
+        .expect("lost job");
+    assert_eq!(lost.state, JobState::Failed);
+    assert_eq!(lost.failure_reason.as_deref(), Some("target_lost"));
+    assert_eq!(
+        lost.error.as_ref().map(|error| error.kind),
+        Some(JobErrorKind::TargetLost)
+    );
+    let placed = observed
+        .jobs
+        .iter()
+        .find(|job| job.job_id == "hj_placed")
+        .expect("placed job");
+    assert_eq!(placed.state, JobState::Running);
+    assert!(placed.error.is_none());
+    assert!(placed.finished_at_ms.is_none());
+    assert!(placed.target_last_ok_at_ms.is_some());
+}
+
+#[tokio::test]
 async fn a_member_unreachable_once_keeps_its_job_until_the_reap_threshold() {
     let directory = tempfile::tempdir().expect("tempdir");
     let driver = std::sync::Arc::new(FakeDriver {
@@ -1017,6 +1089,18 @@ fn job_errors_are_typed_and_older_plain_messages_still_load() {
     let view = typed.view(0);
     assert_eq!(view["error"], json!("zeroshot run timed out"));
     assert_eq!(view["errorKind"], json!("submission_unconfirmed"));
+
+    let mut lost = job("j4", 0);
+    lost.error = Some(JobError::new(
+        JobErrorKind::TargetLost,
+        "box is no longer a hub member",
+    ));
+    let stored = serde_json::to_value(&lost).expect("store target-lost job");
+    assert_eq!(stored["error"]["kind"], json!("target_lost"));
+    assert_eq!(
+        serde_json::from_value::<Job>(stored).expect("reload target-lost job"),
+        lost
+    );
 
     let mut running = job("j3", 0);
     running.state = JobState::Running;

@@ -211,7 +211,6 @@ pub(crate) enum JobState {
     Succeeded,
     Failed,
     Dequeued,
-    Expired,
 }
 
 impl JobState {
@@ -259,9 +258,7 @@ impl<'de> Deserialize<'de> for JobErrorKind {
             "unconfirmed_limit" => Self::UnconfirmedLimit,
             "dequeued_while_placing" => Self::DequeuedWhilePlacing,
             "stalled" => Self::Stalled,
-            // `run_expired` was stored by hubs with job deadlines. Keep those records readable;
-            // the kind is no longer produced.
-            "unclassified" | "run_expired" => Self::Unclassified,
+            "target_lost" => Self::TargetLost,
             _ => Self::Unclassified,
         })
     }
@@ -380,7 +377,6 @@ impl Job {
             JobState::Succeeded => "succeeded",
             JobState::Failed => "failed",
             JobState::Dequeued => "dequeued",
-            JobState::Expired => "expired",
         }
     }
 

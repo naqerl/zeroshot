@@ -50,7 +50,7 @@ restarts. Pass, placement, and API series are counted since the daemon started.
 
 | Metric | Type | Labels |
 |---|---|---|
-| `zeroshot_hub_jobs` | gauge | `state` (queued, scheduled, running, succeeded, failed, dequeued, expired) |
+| `zeroshot_hub_jobs` | gauge | `state` (queued, scheduled, running, succeeded, failed, dequeued) |
 | `zeroshot_hub_queue_depth` | gauge | `kind` (due, scheduled) |
 | `zeroshot_hub_schedules` | gauge | active recurring schedules |
 | `zeroshot_hub_cron_fires_total`, `zeroshot_hub_cron_skips_total` | counter | none |

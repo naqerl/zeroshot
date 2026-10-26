@@ -1313,7 +1313,7 @@ fn invalid_hub_response(error: serde_json::Error) -> EventError {
 fn job_is_terminal(view: &Value) -> bool {
     view.get("state")
         .and_then(Value::as_str)
-        .is_some_and(|state| matches!(state, "succeeded" | "failed" | "dequeued" | "expired"))
+        .is_some_and(|state| matches!(state, "succeeded" | "failed" | "dequeued"))
 }
 
 fn watch_command(
@@ -1634,7 +1634,7 @@ fn payload_schema() -> Value {
             "jobId": {"type": "string"},
             "state": {
                 "type": "string",
-                "enum": ["queued", "scheduled", "running", "succeeded", "failed", "dequeued", "expired"]
+                "enum": ["queued", "scheduled", "running", "succeeded", "failed", "dequeued"]
             },
             "runId": {"type": ["string", "null"]},
             "target": {"type": ["string", "null"]},

@@ -591,7 +591,7 @@ impl HubService {
     }
 
     pub(crate) async fn ps(&self, query: JobQuery) -> Result<Value, HubError> {
-        const STATES: [&str; 10] = [
+        const STATES: [&str; 9] = [
             "active",
             "all",
             "recurring",
@@ -601,7 +601,6 @@ impl HubService {
             "succeeded",
             "failed",
             "dequeued",
-            "expired",
         ];
         if !STATES.contains(&query.state.as_str()) {
             return Err(HubError::Usage(format!(

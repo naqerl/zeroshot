@@ -222,7 +222,7 @@ pub(crate) enum SampleState {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct Outcome {
-    /// Terminal hub job state: succeeded, failed, dequeued, or expired.
+    /// Terminal hub job state: succeeded, failed, or dequeued.
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,

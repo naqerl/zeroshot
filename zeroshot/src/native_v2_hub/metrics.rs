@@ -390,14 +390,13 @@ impl Metrics {
     }
 }
 
-const JOB_STATES: [&str; 7] = [
+const JOB_STATES: [&str; 6] = [
     "queued",
     "scheduled",
     "running",
     "succeeded",
     "failed",
     "dequeued",
-    "expired",
 ];
 
 #[allow(clippy::cast_precision_loss)]
