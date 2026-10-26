@@ -446,18 +446,10 @@ impl HubService {
         let loads = schedule::probe(&matching, &state.jobs, self.driver()).await;
         self.metrics.record_loads(&loads);
         let now = now_ms();
-        let placement = match place(&state.members, &job.placement, &job.requirements, &loads) {
-            // A pool that serves the job starts a server for it once it is queued.
-            Placement::NoEligible { .. }
-                if pool::serving(&state.pools, &job.placement, &job.requirements).is_some() =>
-            {
-                Placement::Busy {
-                    matching: Vec::new(),
-                }
-            }
-            placement => placement,
-        };
-        match placement {
+        // A pool that serves the job starts a server for it once it is queued, so a job a
+        // pool can serve is parked exactly as `enqueue` parks it.
+        let pool_serves = pool::serving(&state.pools, &job.placement, &job.requirements).is_some();
+        match place(&state.members, &job.placement, &job.requirements, &loads) {
             Placement::Place(member) => {
                 job.state = JobState::Running;
                 job.target = Some(member.clone());
@@ -472,18 +464,12 @@ impl HubService {
                 }
                 Ok(job_document(&job, now))
             }
-            Placement::NoEligible { rejected } => {
+            Placement::NoEligible { rejected } if !pool_serves => {
                 self.metrics.record_rejection(Some(&rejected));
                 Err(HubError::no_eligible(describe(&job.placement), rejected))
             }
-            Placement::Busy { .. } if queue => {
-                self.mutate(|state| {
-                    state.jobs.push(job.clone());
-                    Ok(())
-                })
-                .await?;
-                Ok(job_document(&job, now))
-            }
+            Placement::NoEligible { .. } => self.park(job, now).await,
+            Placement::Busy { .. } if pool_serves || queue => self.park(job, now).await,
             Placement::Busy { .. } => {
                 self.metrics.record_rejection(None);
                 Err(HubError::NoCapacity(describe(&job.placement)))
@@ -515,6 +501,16 @@ impl HubService {
             .into_iter()
             .filter_map(|(job_id, result)| result.err().map(|error| (job_id, error.to_string())))
             .collect()
+    }
+
+    /// Keep a job for later placement, as `enqueue` does, and return it as queued.
+    async fn park(&self, job: Job, now: u64) -> Result<Value, HubError> {
+        self.mutate(|state| {
+            state.jobs.push(job.clone());
+            Ok(())
+        })
+        .await?;
+        Ok(job_document(&job, now))
     }
 
     /// Submit a job already marked as placing on `member`, outside the state lock, and record

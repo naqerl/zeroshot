@@ -1254,7 +1254,7 @@ Options:
 ```text
 Place a run on a free member now.
 
-Fails with exit code 3 when every matching member is busy, unless --wait or --queue is given. Without --detach, follows the placed run's events as NDJSON.
+A job a pool serves is parked as queued, as `hub enqueue` does, because the pool starts a server for it. It fails with exit code 3 only when no free member and no pool can take the job now. --wait blocks until the job is placed; --queue returns as soon as it is queued.
 
 Usage: zeroshot hub submit [OPTIONS] --title <TITLE>
 

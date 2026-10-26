@@ -137,8 +137,9 @@ job waits until its own expiry.
 
 ## What happens
 
-1. **Placement.** A pool with no live server still counts as eligible. A job that only a pool
-   matches queues (exit 3 without `--queue`) instead of failing with exit 4.
+1. **Placement.** A pool with no live server still counts as eligible: `hub submit` parks a
+   job that only a pool can serve, exactly as `hub enqueue` accepts it, and the daemon places it.
+   Submitting never fails just because the pool has not provisioned a server yet.
 2. **Scale up.** Each pass creates servers for queued jobs that no live or starting server can
    take, one per `--slots` jobs of the same machine choice, up to `--max`.
    The server is named `zs-<job>` and labelled `zeroshot/hub`, `zeroshot/lease`,
@@ -162,6 +163,13 @@ job waits until its own expiry.
 A server whose boot fails or times out is deleted. Its pool then pauses for 5 minutes, and the
 pause doubles on each further failure up to an hour, so a broken image does not keep creating
 billed servers.
+
+`zeroshot hub submit` does not require you to know whether a live member or a pool will take the
+job. When no free member can take it but a pool can serve its placement, submit parks the job as
+queued and returns it without an error, because that pool starts a server for it; exit 3 with
+`hub.no_capacity` remains for a placement that neither a free member nor a pool can serve now.
+`--wait` is how you block: it follows the parked job until the hub actually places it, and
+`--wait=DURATION` bounds that wait and ends in `hub.wait_timeout` when the job is still unplaced.
 
 ## The btrfs data folder
 
