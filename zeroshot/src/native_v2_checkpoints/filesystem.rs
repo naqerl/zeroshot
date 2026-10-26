@@ -1,10 +1,6 @@
 //! Immutable local workspace copies. Callers hold the workspace's execution barrier throughout
 //! capture and restore; this module does not stop providers or reconstruct scheduler state.
-//!
-//! Build output is not part of a checkpoint: the capture copy prunes reproducible build and
-//! dependency directories. Restoring a checkpoint therefore requires a rebuild.
 
-use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -22,29 +18,6 @@ mod tests;
 
 const MAX_METADATA_BYTES: u64 = 1_048_576;
 const FORMAT: u32 = 1;
-
-/// Reproducible build and dependency output that never belongs to a checkpoint.
-///
-/// `target`, `dist`, and `build` are matched only at the workspace root; `node_modules`,
-/// `.venv`, and `__pycache__` are matched at any depth. Directories are skipped whole, so a
-/// restore starts without stale build output and callers rebuild it.
-pub(super) const BUILD_OUTPUT: &[&str] = &[
-    "target",
-    "node_modules",
-    "dist",
-    "build",
-    ".venv",
-    "__pycache__",
-];
-
-const ROOT_BUILD_OUTPUT: &[&str] = &["target", "dist", "build"];
-
-fn is_build_output_directory(name: &OsStr, at_root: bool) -> bool {
-    let Some(name) = name.to_str() else {
-        return false;
-    };
-    BUILD_OUTPUT.contains(&name) && (at_root || !ROOT_BUILD_OUTPUT.contains(&name))
-}
 
 /// Opaque directory identity; deserialization rejects paths and noncanonical values.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -98,38 +71,8 @@ pub fn capture<T: Serialize>(
     let snapshots_root = prepare_snapshots_root(&workspace, snapshots_root)?;
     let stage = private_stage(&snapshots_root, ".capture-")?;
     let tree = stage.path().join("workspace");
-    copy_workspace_tree(&workspace, &tree)?;
+    copy_workspace_entry(&workspace, &tree)?;
     publish_capture(&workspace, stage.path(), &snapshots_root, metadata)
-}
-
-fn copy_workspace_tree(source: &Path, destination: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(source)?;
-    require_directory(&metadata)?;
-    copy_workspace_directory(source, destination, &metadata, true)
-}
-
-fn copy_workspace_directory(
-    source: &Path,
-    destination: &Path,
-    metadata: &fs::Metadata,
-    at_root: bool,
-) -> io::Result<()> {
-    platform::create_private_directory(destination)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let directory = file_type.is_dir() && !file_type.is_symlink();
-        if directory && is_build_output_directory(&entry.file_name(), at_root) {
-            continue;
-        }
-        let target = destination.join(entry.file_name());
-        if directory {
-            copy_workspace_directory(&entry.path(), &target, &entry.metadata()?, false)?;
-        } else {
-            copy_workspace_entry(&entry.path(), &target)?;
-        }
-    }
-    fs::set_permissions(destination, metadata.permissions())
 }
 
 fn publish_capture<T: Serialize>(

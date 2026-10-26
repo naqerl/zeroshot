@@ -1,7 +1,4 @@
 //! Supervised Restic access for private workspace checkpoint repositories.
-//!
-//! Build output is not part of a checkpoint. The backup also excludes `target` and
-//! `node_modules` from any restored tree, so restoring a checkpoint requires a rebuild.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -157,10 +154,6 @@ impl Repository {
             "zeroshot",
             "--pack-size",
             "16",
-            "--exclude",
-            "target",
-            "--exclude",
-            "node_modules",
         ]);
         if let Some(parent) = parent {
             arguments.push("--parent".into());
@@ -283,7 +276,7 @@ impl Repository {
             "cat" => std::fs::read(self.repository_path().join("config")),
             "init" => self.initialize_test_fake(),
             "unlock" => Ok(Vec::new()),
-            "backup" => self.backup_test_fake(directory, arguments),
+            "backup" => self.backup_test_fake(directory),
             "restore" => self.restore_test_fake(arguments),
             _ => Err(io::Error::other("fake restic command is unsupported")),
         }
@@ -297,15 +290,7 @@ impl Repository {
     }
 
     #[cfg(test)]
-    fn backup_test_fake(&self, source: &Path, arguments: &[OsString]) -> io::Result<Vec<u8>> {
-        let recorded = arguments
-            .iter()
-            .map(|argument| argument.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        std::fs::write(
-            self.root.join("recorded-backup-arguments.json"),
-            serde_json::to_vec(&recorded).map_err(io::Error::other)?,
-        )?;
+    fn backup_test_fake(&self, source: &Path) -> io::Result<Vec<u8>> {
         if self.root.join("fail-backup").exists() {
             return Err(io::Error::other("fake restic backup failed"));
         }
