@@ -735,7 +735,7 @@ fn render_members(out: &mut Exposition, state: &HubState, metrics: &Metrics) {
             out.sample(
                 "zeroshot_hub_member_up",
                 &[("member", &member.name)],
-                if load.reachable { 1.0 } else { 0.0 },
+                if load.reachable() { 1.0 } else { 0.0 },
             );
         }
     }

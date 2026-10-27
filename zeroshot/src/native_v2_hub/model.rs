@@ -324,8 +324,9 @@ pub(crate) enum JobErrorKind {
     /// The run stopped making progress and is stopped by `hub daemon run --max-stall`; while a
     /// stop keeps failing the job stays running with this error.
     Stalled,
-    /// The job's member left the hub or stayed unreachable for too many consecutive probes, so
-    /// the hub cannot observe or stop its run.
+    /// The job's member left the hub, or stayed unreachable through too many decisive probes and
+    /// the hub confirmed the loss with the provider or a direct TCP refusal, so the hub cannot
+    /// observe or stop its run.
     TargetLost,
     /// Recorded as plain text by an earlier hub, or a kind this hub no longer produces.
     Unclassified,
@@ -430,6 +431,10 @@ pub(crate) struct Job {
     /// When a probe last found the job's member reachable; kept as target-lost evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_last_ok_at_ms: Option<u64>,
+    /// Why the reaper withheld `target_lost`, such as an inconclusive probe or a provider that
+    /// confirmed the pool server still exists. Cleared by a successful probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reaper: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -508,6 +513,7 @@ impl Job {
             "dispatchedAt": time(self.dispatched_at_ms),
             "lastCursor": self.last_cursor,
             "lastCursorAt": time(self.last_cursor_at_ms),
+            "reaper": self.reaper,
             "finishedAt": time(self.finished_at_ms),
             "failureReason": self.failure_reason,
             "tokenUsage": self.token_usage,

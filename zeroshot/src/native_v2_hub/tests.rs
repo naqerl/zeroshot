@@ -12,10 +12,12 @@ use super::model::{
     HubState, Job, JobError, JobErrorKind, JobState, Member, MemberState, PlacementSpec,
     Requirements, Strategy,
 };
+use super::pool::{Lease, LeasePhase};
 use super::usage::{JobUsage, Tokens, reported};
 use super::placement::{Load, Placement, describe, place};
 use super::schedule::{UNREACHABLE_REAP_THRESHOLD, active_runs, apply_status, due_jobs, tick};
 use super::stats::{Dimension, ModelPrice, StatsQuery, aggregate, percentiles};
+use crate::native_v2_target::{FileTargetRegistry, TargetAccess, TargetRecord, TargetRegistry};
 
 #[path = "tests/api.rs"]
 mod api;
@@ -90,6 +92,7 @@ pub(super) fn job(id: &str, submitted_at_ms: u64) -> Job {
         last_cursor: None,
         last_cursor_at_ms: None,
         target_last_ok_at_ms: None,
+        reaper: None,
         finished_at_ms: None,
         failure_reason: None,
         token_usage: None,
@@ -117,7 +120,11 @@ pub(super) fn loads(entries: &[(&str, bool, u32)]) -> BTreeMap<String, Load> {
             (
                 (*name).to_owned(),
                 Load {
-                    reachable: *reachable,
+                    reachability: if *reachable {
+                        super::placement::Reachability::Reachable
+                    } else {
+                        super::placement::Reachability::Unreachable
+                    },
                     active: *active,
                     error: None,
                 },
@@ -462,7 +469,14 @@ async fn a_placed_job_whose_member_disappears_is_reaped_with_target_lost() {
 #[tokio::test]
 async fn a_missing_members_job_is_reaped_while_a_placed_job_without_a_deadline_runs() {
     let directory = tempfile::tempdir().expect("tempdir");
-    let driver = std::sync::Arc::new(FakeDriver::default());
+    let driver = std::sync::Arc::new(FakeDriver {
+        unreachable: vec![
+            "orphan".to_owned(),
+            "unfunded".to_owned(),
+            "zs-unfunded".to_owned(),
+        ],
+        ..FakeDriver::default()
+    });
     let service = super::service::HubService::open(
         super::store::HubStore::new(directory.path().join("hub")),
         driver,
@@ -477,12 +491,39 @@ async fn a_missing_members_job_is_reaped_while_a_placed_job_without_a_deadline_r
     placed.state = JobState::Running;
     placed.target = Some("box".to_owned());
     placed.run_id = Some("run-placed".to_owned());
+    let mut orphan = job("hj_orphan", 0);
+    orphan.state = JobState::Running;
+    orphan.target = Some("orphan".to_owned());
+    orphan.run_id = Some("run-orphan".to_owned());
+    let mut unfunded = job("hj_unfunded", 0);
+    unfunded.state = JobState::Running;
+    unfunded.target = Some("unfunded".to_owned());
+    unfunded.run_id = Some("run-unfunded".to_owned());
+    let pool = pool::pool_fixture();
+    let lease = Lease {
+        phase: LeasePhase::Active,
+        ..Lease::new(&pool, "hj_unfunded", 0, 0)
+    };
+    unfunded.target = Some(lease.name.clone());
+    let mut orphan_member = member("orphan", &[], 1, 0);
+    orphan_member.pool = Some(pool.name.clone());
+    orphan_member.unreachable_probes = UNREACHABLE_REAP_THRESHOLD;
+    orphan_member.last_probe_ok_at_ms = Some(1);
+    let mut unfunded_member = member(&lease.name, &[], 1, 0);
+    unfunded_member.pool = Some(pool.name.clone());
+    unfunded_member.unreachable_probes = UNREACHABLE_REAP_THRESHOLD;
+    unfunded_member.last_probe_ok_at_ms = Some(1);
     service
         .mutate(|state| {
             state.members.push(member("gone", &[], 1, 0));
             state.members.push(member("box", &[], 1, 0));
+            state.members.push(orphan_member);
+            state.members.push(unfunded_member);
             state.jobs.push(lost);
             state.jobs.push(placed);
+            state.jobs.push(orphan);
+            state.jobs.push(unfunded);
+            state.leases.push(lease);
             Ok(())
         })
         .await
@@ -529,6 +570,23 @@ async fn a_missing_members_job_is_reaped_while_a_placed_job_without_a_deadline_r
     assert!(placed.error.is_none());
     assert!(placed.finished_at_ms.is_none());
     assert!(placed.target_last_ok_at_ms.is_some());
+    for (job_id, evidence) in [
+        ("hj_orphan", "no pool lease record"),
+        ("hj_unfunded", "without a provider token"),
+    ] {
+        let job = observed
+            .jobs
+            .iter()
+            .find(|job| job.job_id == job_id)
+            .expect("withheld pool job");
+        assert_eq!(job.state, JobState::Running, "{job:?}");
+        assert!(
+            job.reaper
+                .as_deref()
+                .is_some_and(|reason| reason.contains(evidence)),
+            "{job:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -536,24 +594,65 @@ async fn a_member_unreachable_once_keeps_its_job_until_the_reap_threshold() {
     let directory = tempfile::tempdir().expect("tempdir");
     let driver = std::sync::Arc::new(FakeDriver {
         unreachable: vec!["box".to_owned()],
+        inconclusive: vec!["slow".to_owned()],
         ..FakeDriver::default()
     });
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("closed port");
+    let port = listener.local_addr().expect("address").port();
+    drop(listener);
+    // Prefer IPv6 so the endpoint check must handle a bracketed URL host, then a live IPv6 or
+    // IPv4 listener proves the reaper keeps a starved job whose endpoint still accepts.
+    let live = std::net::TcpListener::bind("[::1]:0")
+        .or_else(|_| std::net::TcpListener::bind("127.0.0.1:0"))
+        .expect("live listener");
+    let live_address = live.local_addr().expect("live address");
+    let live_origin = if live_address.is_ipv6() {
+        format!("http://[{}]:{}", live_address.ip(), live_address.port())
+    } else {
+        format!("http://{}:{}", live_address.ip(), live_address.port())
+    };
+    let registry = FileTargetRegistry::new(directory.path().join("targets.json"));
+    registry
+        .insert(TargetRecord {
+            id: "00000000-0000-4000-8000-0000000000b0".to_owned(),
+            name: "box".to_owned(),
+            origin: format!("http://127.0.0.1:{port}"),
+            access: TargetAccess::Direct,
+        })
+        .expect("register box");
+    registry
+        .insert(TargetRecord {
+            id: "00000000-0000-4000-8000-0000000000b1".to_owned(),
+            name: "slow".to_owned(),
+            origin: live_origin,
+            access: TargetAccess::Direct,
+        })
+        .expect("register slow");
     let service = super::service::HubService::open(
         super::store::HubStore::new(directory.path().join("hub")),
         driver,
-        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
+        registry,
     )
     .expect("service");
     let mut running = job("hj_flapping", 0);
     running.state = JobState::Running;
     running.target = Some("box".to_owned());
     running.run_id = Some("run-flapping".to_owned());
+    let mut starved = job("hj_starved", 0);
+    starved.state = JobState::Running;
+    starved.target = Some("slow".to_owned());
+    starved.run_id = Some("run-starved".to_owned());
     let mut boxed = member("box", &[], 1, 0);
     boxed.last_probe_ok_at_ms = Some(1);
+    let mut slow = member("slow", &[], 1, 0);
+    slow.last_probe_ok_at_ms = Some(1);
+    slow.unreachable_probes = UNREACHABLE_REAP_THRESHOLD;
     service
         .mutate(|state| {
             state.members.push(boxed);
+            state.members.push(slow);
             state.jobs.push(running);
+            state.jobs.push(starved);
             Ok(())
         })
         .await
@@ -581,6 +680,27 @@ async fn a_member_unreachable_once_keeps_its_job_until_the_reap_threshold() {
         "{}",
         error.message
     );
+    let observed = service.snapshot().await;
+    let starved = observed
+        .jobs
+        .iter()
+        .find(|job| job.job_id == "hj_starved")
+        .expect("starved job");
+    assert_eq!(starved.state, JobState::Running);
+    let note = starved.reaper.as_deref().expect("reaper note");
+    assert!(note.contains("probe 3x failed"), "{note}");
+    assert!(note.contains("inconclusive"), "{note}");
+    assert!(note.contains("still accepts TCP connections"), "{note}");
+    assert!(
+        note.contains("job kept running"),
+        "a starved probe never reaps a healthy job: {note}"
+    );
+    if live_address.is_ipv6() {
+        assert!(
+            note.contains("[::1]"),
+            "an IPv6 target endpoint must be checked without a host lookup: {note}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -681,6 +801,8 @@ fn active_runs_count_nonterminal_phases() {
 pub(super) struct FakeDriver {
     pub runs: Mutex<BTreeMap<String, Vec<(String, &'static str)>>>,
     pub unreachable: Vec<String>,
+    /// Members whose status probe times out without proving the target is gone.
+    pub inconclusive: Vec<String>,
     pub rejecting: Vec<String>,
     pub submissions: Mutex<Vec<(String, String)>>,
     /// Advertised discovery kinds per member; absent members fail discovery.
@@ -724,9 +846,15 @@ impl FakeDriver {
 #[async_trait]
 impl HubDriver for FakeDriver {
     async fn list_runs(&self, member: &str) -> Result<Vec<Value>, HubError> {
+        if self.inconclusive.iter().any(|name| name == member) {
+            return Err(HubError::Target {
+                message: format!("zeroshot status {member} timed out: status_unavailable"),
+                diagnostic: None,
+            });
+        }
         if self.unreachable.iter().any(|name| name == member) {
             return Err(HubError::Target {
-                message: "unreachable".to_owned(),
+                message: "unreachable: connection refused".to_owned(),
                 diagnostic: None,
             });
         }
@@ -1142,6 +1270,7 @@ fn job_errors_are_typed_and_older_plain_messages_still_load() {
 
     let mut running = job("j3", 0);
     running.state = JobState::Running;
+    running.target = Some("box".to_owned());
     let read = super::schedule::apply_refresh(
         &mut running,
         Err(HubError::Usage("status unreadable".to_owned())),
@@ -1149,9 +1278,25 @@ fn job_errors_are_typed_and_older_plain_messages_still_load() {
     );
     assert!(read.is_none());
     assert_eq!(
-        running.error.map(|error| error.kind),
+        running.error.as_ref().map(|error| error.kind),
         Some(JobErrorKind::StatusUnavailable)
     );
+    assert!(running.reaper.is_some());
+    let mut members = [member("box", &[], 1, 0)];
+    let mut jobs = [running];
+    super::schedule::record_health(&mut members, &mut jobs, &loads(&[("box", true, 0)]), 6);
+    assert!(
+        jobs[0].reaper.is_some(),
+        "a successful load probe must not erase a status-unavailable warning"
+    );
+    let read = super::schedule::apply_refresh(
+        &mut jobs[0],
+        Ok(json!({"status": {"phase": "running"}})),
+        7,
+    );
+    assert!(read.is_some());
+    assert!(jobs[0].reaper.is_none());
+    assert!(jobs[0].error.is_none());
 }
 
 #[tokio::test]

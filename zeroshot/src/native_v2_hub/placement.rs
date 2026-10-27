@@ -3,12 +3,34 @@ use std::collections::BTreeMap;
 use super::model::{LOCAL_MEMBER, Member, MemberState, PlacementSpec, Requirements, Strategy};
 use super::profile::SpecSource;
 
+/// What one member probe proved about reachability.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Reachability {
+    /// The member answered: its runs were read.
+    Reachable,
+    /// Decisive evidence the member is gone: connection refused, no route, an unknown host, or
+    /// an authentication refusal after rebuilding access.
+    Unreachable,
+    /// No usable answer: a timeout, rate limit, busy error or reset connection. A starved probe
+    /// proves nothing about the member, so an unclassified `Load` is never a placement fact.
+    #[default]
+    Inconclusive,
+}
+
 /// Observed reachability and active runs of one member.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Load {
-    pub reachable: bool,
+    pub reachability: Reachability,
     pub active: u32,
     pub error: Option<String>,
+}
+
+impl Load {
+    /// Whether the member answered this probe. Only a successful probe may place a job or
+    /// reset its failure streak.
+    pub(crate) const fn reachable(&self) -> bool {
+        matches!(self.reachability, Reachability::Reachable)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,7 +171,11 @@ pub(crate) fn place(
         .filter(|(_, member)| fit(member, requirements) == Fit::Supported)
         .filter_map(|(order, member)| {
             let load = loads.get(&member.name)?;
-            (load.reachable && load.active < member.slots).then_some((order, *member, load.active))
+            (load.reachable() && load.active < member.slots).then_some((
+                order,
+                *member,
+                load.active,
+            ))
         })
         .collect::<Vec<_>>();
     free.sort_by(|left, right| {

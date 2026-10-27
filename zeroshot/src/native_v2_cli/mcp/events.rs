@@ -1499,7 +1499,12 @@ where
         let Some(run_id) = view.get("runId").and_then(Value::as_str) else {
             continue;
         };
-        feed.publish_warning(job_id, run_id, "run has been in progress for an hour");
+        let mut message = "run has been in progress for an hour".to_owned();
+        if let Some(reason) = view.get("reaper").and_then(Value::as_str) {
+            message.push_str("; reaper withheld action: ");
+            message.push_str(reason);
+        }
+        feed.publish_warning(job_id, run_id, &message);
     }
 }
 

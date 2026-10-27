@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::data;
 use super::error::HubError;
-use super::pool::{Lease, Pool, Resource};
+use super::pool::{Lease, Pool, Resource, ResourceKind};
 
 /// Hetzner's limit on `user_data`.
 pub(crate) const USER_DATA_LIMIT: usize = 32 * 1024;
@@ -174,6 +174,16 @@ pub(crate) trait Provisioner: Send + Sync {
     async fn action(&self, action_id: u64) -> Result<Progress, HubError>;
     /// Servers, Volumes, primary IPs and firewalls matching a label selector.
     async fn list_by_label(&self, selector: &str) -> Result<Vec<Resource>, HubError>;
+    /// Only the servers matching a label selector. The reaper's loss confirmation uses this
+    /// narrow listing so one stuck lease cannot spend the provider's whole request budget.
+    async fn list_servers_by_label(&self, selector: &str) -> Result<Vec<Resource>, HubError> {
+        Ok(self
+            .list_by_label(selector)
+            .await?
+            .into_iter()
+            .filter(|resource| resource.kind == ResourceKind::Server)
+            .collect())
+    }
 }
 
 /// The cloud-init document of a lease's server. It runs the boot script of

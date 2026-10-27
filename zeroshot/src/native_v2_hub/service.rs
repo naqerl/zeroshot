@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::future::join_all;
 use serde_json::{Value, json};
@@ -27,7 +28,7 @@ use super::placement::{Fit, Placement, Rejection, describe, fit, matching_member
 use super::lease::{PoolReport, PoolRuntime};
 use super::pool;
 use super::profile;
-use super::schedule::{self, Dispatched, TickReport};
+use super::schedule::{self, Dispatched, LostTarget, TickReport, WithheldTarget};
 use super::stats;
 use super::store::HubStore;
 use super::wire::{
@@ -354,7 +355,7 @@ impl HubService {
                 view["queuedMatching"] = json!(matching);
                 view["rejects"] = json!(rejects);
                 if let Some(load) = loads.as_ref().and_then(|loads| loads.get(&member.name)) {
-                    view["health"] = json!(if load.reachable {
+                    view["health"] = json!(if load.reachable() {
                         "ready"
                     } else {
                         "unreachable"
@@ -950,13 +951,21 @@ impl HubService {
         let mut loads = schedule::probe(&probed, &snapshot.jobs, self.driver()).await;
         self.metrics.record_loads(&loads);
         let now = now_ms();
-        report.target_lost = self
+        let lost = self
             .mutate(|state| {
                 schedule::record_health(&mut state.members, &mut state.jobs, &loads, now);
-                let lost = schedule::lost_targets(state);
-                Ok(schedule::settle_lost_targets(&mut state.jobs, now, &lost))
+                Ok(schedule::lost_targets(state))
             })
             .await?;
+        if !lost.is_empty() {
+            let (lost, withheld) = self.confirm_lost_targets(lost, &loads).await;
+            report.target_lost = self
+                .mutate(|state| {
+                    schedule::note_withheld(&mut state.jobs, &withheld);
+                    Ok(schedule::settle_lost_targets(&mut state.jobs, now, &lost))
+                })
+                .await?;
+        }
         let placing = schedule::placing(&self.snapshot().await);
         for (job_id, member) in placing {
             let (job, dispatched) = self.dispatch(&job_id, &member, now).await?;
@@ -992,6 +1001,237 @@ impl HubService {
         let view = report.view(&self.snapshot().await, now_ms());
         Ok((report, view))
     }
+}
+
+/// Require decisive confirmation before failing a lost-target job. A pool member is checked
+/// against the provider; a named member gets a direct TCP check of its endpoint. An inconclusive
+/// probe, a rate-limited provider check, or an endpoint that still answers keeps the job running.
+impl HubService {
+    async fn confirm_lost_targets(
+        &self,
+        lost: Vec<LostTarget>,
+        loads: &BTreeMap<String, super::placement::Load>,
+    ) -> (Vec<LostTarget>, Vec<WithheldTarget>) {
+        let state = self.snapshot().await;
+        let mut confirmed = Vec::new();
+        let mut withheld = Vec::new();
+        for mut target in lost {
+            let Some(count) = target.unreachable_probes else {
+                confirmed.push(target);
+                continue;
+            };
+            if loads
+                .get(&target.member)
+                .is_some_and(super::placement::Load::reachable)
+            {
+                withheld.push(withhold(
+                    &target,
+                    count,
+                    "a probe succeeded: job kept running".to_owned(),
+                ));
+                continue;
+            }
+            let Some(member) = state.member(&target.member) else {
+                confirmed.push(target);
+                continue;
+            };
+            if member.pool.is_some() {
+                let lease = state
+                    .leases
+                    .iter()
+                    .find(|lease| lease.name == target.member);
+                let Some(lease) = lease else {
+                    withheld.push(withhold(
+                        &target,
+                        count,
+                        "no pool lease record is available to confirm the server: inconclusive, \
+                         job kept running"
+                            .to_owned(),
+                    ));
+                    continue;
+                };
+                let label = lease
+                    .server_id
+                    .map_or_else(|| lease.name.clone(), |id| id.to_string());
+                let Some(pools) = &self.pools else {
+                    withheld.push(withhold(
+                        &target,
+                        count,
+                        format!(
+                            "pool lease {label} cannot be checked without a provider token: \
+                             inconclusive, job kept running"
+                        ),
+                    ));
+                    continue;
+                };
+                let Some(hub_id) = state.hub_id.as_deref() else {
+                    withheld.push(withhold(
+                        &target,
+                        count,
+                        format!(
+                            "pool lease {label} has no hub label to check: inconclusive, job kept \
+                             running"
+                        ),
+                    ));
+                    continue;
+                };
+                match pools.server_exists(hub_id, lease).await {
+                    Ok(false) => {
+                        target.evidence = Some(format!(
+                            "pool lease {label} no longer exists (provider confirmed)"
+                        ));
+                        confirmed.push(target);
+                    }
+                    Ok(true) => withheld.push(withhold(
+                        &target,
+                        count,
+                        format!(
+                            "pool lease {label} still exists (provider confirmed): job kept running"
+                        ),
+                    )),
+                    Err(error) => withheld.push(withhold(
+                        &target,
+                        count,
+                        format!(
+                            "pool lease {label} could not be confirmed ({error}): inconclusive, \
+                             job kept running"
+                        ),
+                    )),
+                }
+                continue;
+            }
+            let endpoint = self.endpoint_check(&target.member).await;
+            match endpoint {
+                EndpointCheck::Alive(at) => withheld.push(withhold(
+                    &target,
+                    count,
+                    format!(
+                        "target endpoint {at} still accepts TCP connections: inconclusive, job kept \
+                         running"
+                    ),
+                )),
+                EndpointCheck::Refused(why) => {
+                    target.evidence = Some(format!(
+                        "target endpoint {} is not reachable: {why}",
+                        target.member
+                    ));
+                    confirmed.push(target);
+                }
+                EndpointCheck::Unknown(why) => withheld.push(withhold(
+                    &target,
+                    count,
+                    format!(
+                        "the target endpoint could not be checked ({why}): inconclusive, job kept \
+                         running"
+                    ),
+                )),
+            }
+        }
+        (confirmed, withheld)
+    }
+
+    async fn endpoint_check(&self, member: &str) -> EndpointCheck {
+        let Ok(record) = self.registry.get(member) else {
+            return EndpointCheck::Unknown("no stored target endpoint".to_owned());
+        };
+        let Ok(url) = reqwest::Url::parse(&record.origin) else {
+            return EndpointCheck::Unknown("the stored target origin is not a URL".to_owned());
+        };
+        let Some(port) = url.port_or_known_default() else {
+            return EndpointCheck::Unknown("the stored target origin has no port".to_owned());
+        };
+        // URL hosts keep IPv6 brackets in `host_str`, which `lookup_host` cannot resolve. Match
+        // the typed host instead: IP literals connect directly and only domain names are looked up.
+        let (host, at) = match url.host() {
+            Some(url::Host::Domain(name)) => (url::Host::Domain(name), format!("{name}:{port}")),
+            Some(url::Host::Ipv4(ip)) => (url::Host::Ipv4(ip), format!("{ip}:{port}")),
+            Some(url::Host::Ipv6(ip)) => (url::Host::Ipv6(ip), format!("[{ip}]:{port}")),
+            None => {
+                return EndpointCheck::Unknown("the stored target origin has no host".to_owned());
+            }
+        };
+        let addresses = match host {
+            url::Host::Ipv4(ip) => vec![std::net::SocketAddr::from((ip, port))],
+            url::Host::Ipv6(ip) => vec![std::net::SocketAddr::from((ip, port))],
+            url::Host::Domain(name) => {
+                let resolved = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    tokio::net::lookup_host((name, port)),
+                )
+                .await;
+                match resolved {
+                    Ok(Ok(addresses)) => {
+                        let addresses = addresses.collect::<Vec<_>>();
+                        if addresses.is_empty() {
+                            return EndpointCheck::Unknown(format!("{at} resolved to no address"));
+                        }
+                        addresses
+                    }
+                    Ok(Err(error)) => {
+                        return EndpointCheck::Unknown(format!(
+                            "{at} could not be resolved: {error}"
+                        ));
+                    }
+                    Err(_) => {
+                        return EndpointCheck::Unknown(format!("resolving {at} timed out"));
+                    }
+                }
+            }
+        };
+        let mut refused = Vec::new();
+        let mut other = Vec::new();
+        let mut timed_out = false;
+        for address in addresses {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::net::TcpStream::connect(address),
+            )
+            .await
+            {
+                Ok(Ok(_)) => return EndpointCheck::Alive(at),
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    refused.push(format!("{address}: {error}"));
+                }
+                Ok(Err(error)) => other.push(format!("{address}: {error}")),
+                Err(_) => timed_out = true,
+            }
+        }
+        // Only an actual TCP refusal is proof. A lookup, timeout or other connect error says
+        // nothing about whether the member is gone, and a mixed answer is not decisive.
+        if refused.is_empty() {
+            return EndpointCheck::Unknown(if timed_out {
+                format!("connecting to {at} timed out")
+            } else {
+                format!("connecting to {at} failed: {}", other.join("; "))
+            });
+        }
+        if timed_out || !other.is_empty() {
+            let mut why = Vec::new();
+            if timed_out {
+                why.push(format!("connecting to {at} timed out"));
+            }
+            if !other.is_empty() {
+                why.push(format!("{at}: {}", other.join("; ")));
+            }
+            why.push(format!("refused: {}", refused.join("; ")));
+            return EndpointCheck::Unknown(why.join("; "));
+        }
+        EndpointCheck::Refused(refused.join("; "))
+    }
+}
+
+fn withhold(target: &LostTarget, count: u32, reason: String) -> WithheldTarget {
+    WithheldTarget {
+        job_id: target.job_id.clone(),
+        member: target.member.clone(),
+        reason: format!("{} probe {count}x failed: {reason}", target.member),
+    }
+}
+
+enum EndpointCheck {
+    Alive(String),
+    Refused(String),
+    Unknown(String),
 }
 
 /// Dequeue a job placing on its member. The target may hold a run under the job's submission key

@@ -841,4 +841,8 @@ impl Provisioner for Hetzner {
         }
         Ok(found)
     }
+
+    async fn list_servers_by_label(&self, selector: &str) -> Result<Vec<Resource>, HubError> {
+        self.list(ResourceKind::Server, selector).await
+    }
 }

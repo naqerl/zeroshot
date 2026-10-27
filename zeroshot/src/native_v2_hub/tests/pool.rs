@@ -25,11 +25,12 @@ use super::super::provision::{
     self, Architecture, Catalog, Created, Failure, Location, Progress, Provisioner, Refusal,
     ServerRequest, ServerType,
 };
+use super::super::schedule::UNREACHABLE_REAP_THRESHOLD;
 use super::super::service::HubService;
 use super::super::store::{HubStore, migrate};
 use super::super::tunnel::{TunnelSpec, Tunnels, ssh_arguments};
 use super::super::wire::{AddMember, AddPool};
-use super::{FakeDriver, job, spec};
+use super::{FakeDriver, job, member, spec};
 use crate::native_v2_target::{FileTargetRegistry, TargetRegistry};
 
 pub(super) const TAG: &str = "hetzner";
@@ -65,6 +66,8 @@ pub(super) struct Cloud {
     pub(super) catalog_fails: bool,
     /// Delete actions still pending before they succeed.
     pub(super) pending_deletes: u32,
+    /// Fail every resource listing, like a provider error during confirmation.
+    pub(super) list_fails: bool,
 }
 
 impl FakeCloud {
@@ -211,9 +214,12 @@ impl Provisioner for FakeCloud {
             .filter_map(|pair| pair.split_once('='))
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect::<Vec<_>>();
-        Ok(self.with(|cloud| {
+        let (fails, resources) = self.with(|cloud| {
             cloud.lists.push(selector.to_owned());
-            cloud
+            if cloud.list_fails {
+                return (true, Vec::new());
+            }
+            let resources = cloud
                 .resources
                 .values()
                 .filter(|resource| {
@@ -222,8 +228,13 @@ impl Provisioner for FakeCloud {
                         .all(|(key, value)| resource.labels.get(key) == Some(value))
                 })
                 .cloned()
-                .collect()
-        }))
+                .collect();
+            (false, resources)
+        });
+        if fails {
+            return Err(HubError::Provider("provider list failed".to_owned()));
+        }
+        Ok(resources)
     }
 }
 
@@ -245,6 +256,14 @@ pub(super) fn offered(
             .map(|location| (location.to_owned(), format!("0.{:04}", cores * 37)))
             .collect(),
     }
+}
+
+fn running_job(job_id: &str, target: &str) -> Job {
+    let mut job = job(job_id, 0);
+    job.state = JobState::Running;
+    job.target = Some(target.to_owned());
+    job.run_id = Some(format!("run-{job_id}"));
+    job
 }
 
 /// Four current types and one deprecated, all offered and available in three locations.
@@ -325,11 +344,11 @@ pub(super) struct Rig {
     pub(super) directory: tempfile::TempDir,
 }
 
-pub(super) fn rig_with(cloud: FakeCloud) -> Rig {
+pub(super) fn rig_with_driver(cloud: FakeCloud, driver: FakeDriver) -> Rig {
     let directory = tempfile::tempdir().expect("tempdir");
     let driver = Arc::new(FakeDriver {
         discover_any: Some(Vec::new()),
-        ..FakeDriver::default()
+        ..driver
     });
     let cloud = Arc::new(cloud);
     let tunnels = Arc::new(FakeTunnels::default());
@@ -347,6 +366,10 @@ pub(super) fn rig_with(cloud: FakeCloud) -> Rig {
         tunnels,
         directory,
     }
+}
+
+pub(super) fn rig_with(cloud: FakeCloud) -> Rig {
+    rig_with_driver(cloud, FakeDriver::default())
 }
 
 pub(super) fn rig() -> Rig {
@@ -1164,6 +1187,146 @@ async fn the_reaper_deletes_orphans_but_keeps_live_leases() {
         rig.cloud.with(|cloud| cloud.lists.len()),
         1,
         "the reaper runs at most every {REAP_INTERVAL_MS} ms"
+    );
+
+    // A live pool server is confirmed by the provider and its job is kept; only a lease whose
+    // server is gone fails a job. A provider error, a missing lease or no provider token withhold
+    // action instead of guessing.
+    let pool = pool_fixture();
+    let mut live = Lease {
+        phase: LeasePhase::Active,
+        ipv4: Some("203.0.113.21".to_owned()),
+        ..Lease::new(&pool, "hj_confirmed_live", 40100, now_ms())
+    };
+    let gone = Lease {
+        phase: LeasePhase::Active,
+        ipv4: Some("203.0.113.22".to_owned()),
+        ..Lease::new(&pool, "hj_confirmed_gone", 40101, now_ms())
+    };
+    let rig = rig_with_driver(
+        FakeCloud::default(),
+        FakeDriver {
+            unreachable: vec![live.name.clone(), gone.name.clone()],
+            ..FakeDriver::default()
+        },
+    );
+    rig.add_pool(1).await;
+    let hub_id = rig.state().await.hub_id.clone().expect("hub id");
+    let live_server = rig.cloud.plant(
+        ResourceKind::Server,
+        &[(LABEL_HUB, &hub_id), (LABEL_LEASE, &live.id)],
+    );
+    live.server_id = Some(live_server);
+    let mut live_member = member(&live.name, &[TAG], 1, 0);
+    live_member.pool = Some(pool.name.clone());
+    live_member.server_id = Some(live_server);
+    live_member.unreachable_probes = UNREACHABLE_REAP_THRESHOLD;
+    live_member.last_probe_ok_at_ms = Some(1);
+    let mut gone_member = member(&gone.name, &[TAG], 1, 0);
+    gone_member.pool = Some(pool.name.clone());
+    gone_member.unreachable_probes = UNREACHABLE_REAP_THRESHOLD;
+    gone_member.last_probe_ok_at_ms = Some(1);
+    rig.set(|state| {
+        state.leases.push(live.clone());
+        state.leases.push(gone.clone());
+        state.members.push(live_member);
+        state.members.push(gone_member);
+        state
+            .jobs
+            .push(running_job("hj_confirmed_live", &live.name));
+        state
+            .jobs
+            .push(running_job("hj_confirmed_gone", &gone.name));
+    })
+    .await;
+    let (report, _view) = rig.service.pass().await.expect("confirmation pass");
+    assert_eq!(report.target_lost.len(), 1);
+    assert_eq!(report.target_lost[0]["jobId"], json!("hj_confirmed_gone"));
+    let state = rig.state().await;
+    let kept = state
+        .jobs
+        .iter()
+        .find(|job| job.job_id == "hj_confirmed_live")
+        .expect("kept job");
+    assert_eq!(kept.state, JobState::Running);
+    assert!(
+        kept.reaper
+            .as_deref()
+            .is_some_and(|reason| reason.contains("still exists (provider confirmed)")),
+        "{kept:?}"
+    );
+    let lost = state
+        .jobs
+        .iter()
+        .find(|job| job.job_id == "hj_confirmed_gone")
+        .expect("lost job");
+    assert_eq!(lost.state, JobState::Failed);
+    assert_eq!(lost.failure_reason.as_deref(), Some("target_lost"));
+    assert!(
+        lost.error.as_ref().is_some_and(|error| error
+            .message
+            .contains("no longer exists (provider confirmed)")),
+        "{lost:?}"
+    );
+    let confirmations = || {
+        rig.cloud.with(|cloud| {
+            cloud
+                .lists
+                .iter()
+                .filter(|selector| selector.contains(LABEL_LEASE))
+                .count()
+        })
+    };
+    assert_eq!(confirmations(), 2, "one provider check per lease");
+    let (report, _view) = rig.service.pass().await.expect("cached pass");
+    assert!(report.target_lost.is_empty());
+    assert_eq!(
+        confirmations(),
+        2,
+        "a repeated pass reuses the provider confirmation instead of spending its budget"
+    );
+
+    let cloud = FakeCloud::default();
+    cloud.with(|cloud| cloud.list_fails = true);
+    let error_lease = Lease {
+        phase: LeasePhase::Active,
+        ipv4: Some("203.0.113.23".to_owned()),
+        ..Lease::new(&pool, "hj_confirmation_error", 40102, now_ms())
+    };
+    let rig = rig_with_driver(
+        cloud,
+        FakeDriver {
+            unreachable: vec![error_lease.name.clone()],
+            ..FakeDriver::default()
+        },
+    );
+    rig.add_pool(1).await;
+    let mut error_member = member(&error_lease.name, &[TAG], 1, 0);
+    error_member.pool = Some(pool.name.clone());
+    error_member.unreachable_probes = UNREACHABLE_REAP_THRESHOLD;
+    error_member.last_probe_ok_at_ms = Some(1);
+    rig.set(|state| {
+        state.leases.push(error_lease.clone());
+        state.members.push(error_member);
+        state
+            .jobs
+            .push(running_job("hj_confirmation_error", &error_lease.name));
+    })
+    .await;
+    let (report, _view) = rig.service.pass().await.expect("error confirmation pass");
+    assert!(report.target_lost.is_empty(), "{report:?}");
+    let state = rig.state().await;
+    let kept = state
+        .jobs
+        .iter()
+        .find(|job| job.job_id == "hj_confirmation_error")
+        .expect("kept job");
+    assert_eq!(kept.state, JobState::Running);
+    assert!(
+        kept.reaper
+            .as_deref()
+            .is_some_and(|reason| reason.contains("could not be confirmed")),
+        "{kept:?}"
     );
 }
 

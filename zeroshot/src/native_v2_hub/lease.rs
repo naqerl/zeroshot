@@ -7,6 +7,7 @@
 //! Every provider failure is retried with backoff; an unconfirmed step never counts as done.
 //! Nothing is deleted while a run on it is unarchived.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -38,6 +39,16 @@ pub(crate) struct PoolRuntime {
     provisioner: Arc<dyn Provisioner>,
     tunnels: Arc<dyn Tunnels>,
     reaped_at: std::sync::Mutex<Option<u64>>,
+    /// Last loss-confirmation answer per lease, so a wedged target cannot spend the provider's
+    /// request budget on every dispatcher pass.
+    confirmations: std::sync::Mutex<BTreeMap<String, ServerCheck>>,
+}
+
+/// One cached provider confirmation of a lease's server.
+#[derive(Clone, Debug)]
+struct ServerCheck {
+    at_ms: u64,
+    exists: Result<bool, String>,
 }
 
 impl PoolRuntime {
@@ -46,7 +57,55 @@ impl PoolRuntime {
             provisioner,
             tunnels,
             reaped_at: std::sync::Mutex::new(None),
+            confirmations: std::sync::Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Whether the provider still lists the lease's server. A spent request budget, timeout or
+    /// provider error is an error rather than `false`, so an unconfirmed check can never be read
+    /// as a deleted server.
+    ///
+    /// The answer is cached per lease for [`REAP_INTERVAL_MS`] and lists only servers, so a
+    /// server that is still there does not cost four collection requests every dispatcher pass.
+    pub(crate) async fn server_exists(
+        &self,
+        hub_id: &str,
+        lease: &Lease,
+    ) -> Result<bool, HubError> {
+        let key = format!("{hub_id}:{}:{:?}", lease.id, lease.server_id);
+        let now = now_ms();
+        {
+            let mut confirmations = self
+                .confirmations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            confirmations.retain(|_, check| now.saturating_sub(check.at_ms) < REAP_INTERVAL_MS);
+            if let Some(check) = confirmations.get(&key) {
+                return check.exists.clone().map_err(HubError::Provider);
+            }
+        }
+        let result = self
+            .provisioner
+            .list_servers_by_label(&lease_selector(hub_id, lease))
+            .await
+            .map(|resources| {
+                resources.iter().any(|resource| {
+                    resource.kind == ResourceKind::Server
+                        && lease.server_id.is_none_or(|id| resource.id == id)
+                })
+            })
+            .map_err(|error| error.to_string());
+        self.confirmations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                key,
+                ServerCheck {
+                    at_ms: now,
+                    exists: result.clone(),
+                },
+            );
+        result.map_err(HubError::Provider)
     }
 
     /// Whether a reaper pass is due, and if so record it as started at `now`.

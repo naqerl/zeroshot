@@ -148,11 +148,26 @@ reports the configured duration in milliseconds as `maxStallMs`; it is `null` wh
 ## Lost members and removing a member
 
 The dispatcher probes every member on every pass, not only when a queued job needs placement.
-A running job is failed with `failureReason` `target_lost` and `errorKind` `target_lost` when its
-member is no longer in the hub, or when that member fails three consecutive load probes (one per
-`--interval`). A single failed probe, or a member that flaps below that threshold, leaves the job
-running. The error message names the member and the last successful probe. A member that is merely
-in the `drain` state still answers probes, so its jobs keep running.
+The hub has no in-tree anonymous rate limiter: its API is bearer-only, and probes go through the
+same target-credential path as `zeroshot list` rather than a separate anonymous visitor bucket. A
+rate-limit, timeout, busy or `status_unavailable` answer from a target is therefore inconclusive
+rather than evidence that the target is gone. A failed status read never fails the job: it is
+recorded as `errorKind` `status_unavailable`, the job keeps running, and the retryable warning
+stays visible through `hub.warning` until a later status read succeeds.
+
+A running job is failed with `failureReason` `target_lost` and `errorKind` `target_lost` only after
+decisive confirmation: its member is gone from the hub, or it failed three consecutive decisive
+load probes (one per `--interval`) and the provider confirms that a pool lease's server no longer
+exists or a named member's registered target endpoint refuses a direct TCP connection. A timeout,
+rate limit, busy target or reset connection never counts toward that threshold, and neither does a
+member that flaps below it; such a job stays running. A pool confirmation is cached per lease for
+at least the five-minute reaper interval and lists only the server resource, so a stuck lease
+cannot exhaust the provider's request budget. When the reaper withholds action it records why on
+the job as `reaper`, for example `slow probe 3x failed: target endpoint 127.0.0.1:8080 still
+accepts TCP connections: inconclusive, job kept running`, and publishes that reason alongside the
+hourly in-progress warning through `hub.warning`. The `target_lost` error message names the
+deciding signal and the last successful probe. A member that is merely in the `drain` state still
+answers probes, so its jobs keep running.
 
 `zeroshot hub remove MEMBER` refuses while any job is placed on that member and names the job IDs.
 Stop placed jobs with `zeroshot hub force-stop JOB`, or dequeue jobs that are still placing, before
