@@ -41,9 +41,6 @@ pub(crate) struct AddPool {
     pub tags: Vec<String>,
     pub ssh_key: std::path::PathBuf,
     pub ssh_from: Vec<String>,
-    /// The servers' btrfs data folder; default: a file on the local disk.
-    #[serde(default)]
-    pub data: super::data::DataSettings,
 }
 
 /// `PUT /v1/hub/pools/{name}/tags/{tag}`: the machines a pool creates for jobs with a tag.
@@ -102,13 +99,11 @@ pub(crate) struct JobFile {
     pub content: String,
 }
 
-/// `POST /v1/hub/jobs`: place now; queue when busy only with `queue`.
+/// `POST /v1/hub/jobs`: place now.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct SubmitJob {
     pub job: Job,
-    #[serde(default)]
-    pub queue: bool,
     #[serde(default)]
     pub files: Vec<JobFile>,
 }

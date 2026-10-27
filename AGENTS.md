@@ -349,10 +349,18 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   documents use atomic private-file replacement with descriptor-based ownership; Linux pins the
   private home before publication and never follows a worker-created destination link.
 - Structured-output correction runs in the same provider session under the node's existing
-  execution policy; local response validation remains authoritative.
+  execution policy; local response validation remains authoritative. Provider responses are read
+  tolerantly before contract validation: surrounding whitespace, one Markdown JSON fence, and a
+  first-`{`/last-`}` JSON span are accepted, and a verifier may omit the `response` envelope by
+  returning its channel (`output`, `signals`, and/or `diagnostic`; absent members take the contract
+  defaults and an unused `artifacts` member is ignored), while workers still require the envelope. A
+  format fault (unreadable envelope or unknown top-level shape) has its own three-correction budget
+  per node visit, does not consume the contract-correction budget, and publishes a debug record
+  naming its count and reason.
 - Provider continuation is bounded: Claude continues once after `system/api_retry`; Codex continues
   once after a terminal execution error. Both send literal `Continue` in the same session when one
-  exists. Structured output receives at most two correction turns before `malformed`.
+  exists. Structured output that violates a valid envelope receives at most two correction turns
+  before `malformed`.
 - Pi drives one `pi --mode json` process per turn, with the node prompt on stdin so a large input
   payload can never exceed the platform argument limit. Model identifiers stay caller-owned and Pi
   owns their resolution. Its provider lanes are `anthropic`, `openai`, `openrouter`, `bedrock`, and
@@ -888,8 +896,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   `provision.rs` `Provisioner` trait plus cloud-init, `hetzner.rs` reqwest client, `tunnel.rs`
   `ssh -N -L`, `archive.rs`) create Hetzner servers for queued jobs only a pool matches. An empty
   pool is eligible, so such jobs queue rather than exit 4, and `hub submit` parks a job a pool
-  serves instead of failing as no-capacity; `--wait` follows that parked job until placement. A
-  lease steps one phase per pass:
+  serves instead of failing as no-capacity. A lease steps one phase per pass:
   Creating, Booting, Connecting, Active, Draining, Deleting, Done. A server is deleted only after
   each of its runs is terminal, has its postmortem, and is archived to `hub/archive/JOB_ID/`. The
   reaper (start, then every 5 min) deletes resources labelled `zeroshot/hub=ID` that state does not
@@ -899,11 +906,11 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   reuses an existing key by public key or MD5 fingerprint, attaches it to the server by key ID,
   and also writes it plus a non-expiring login in user data; key-registration failures remain
   distinct from server create/delete errors. No secret enters either. `data.rs` owns the btrfs
-  data folder: pool `--data-fs btrfs` (only),
-  `--data-size` or `--data-volume` (a labelled Hetzner Volume deleted after its server), and the
-  idempotent, strict boot script (file or Volume, mkfs.btrfs, fstab, snapshot and reflink
-  probe, then the target). `health.rs` is the SSH check run in Connecting before registration;
-  its failure is a failed boot. zeroshot itself needs only reflinks (`FICLONE`). Pools take
+  data folder: an automatically sized file on the server's local disk and the idempotent, strict
+  boot script (mkfs.btrfs, fstab, snapshot and reflink probe, then the target). `health.rs` is the
+  SSH check run in Connecting before registration; its failure is a failed boot, and a joined
+  member reports the observed `data: {fs: "btrfs", mode: "file", sizeBytes: N}` in `hub list` and
+  `hub pool list`. zeroshot itself needs only reflinks (`FICLONE`). Pools take
   ordered `--type`/`--location` lists with no default type, checked against the provider catalog
   (`cax*` needs `--multi-arch`). `profile.rs` owns tag profiles and resolves a job's machine
   (`Spec`): job size tags (`server-type=`, `min-vcpu=`, `min-ram-gb=`), else the highest-ranked

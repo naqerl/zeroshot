@@ -509,17 +509,19 @@ async fn resolve_codex_output(
     if let Some(failure) = output.failure_message() {
         return Ok(CodexTurnAdvance::ProviderFailure(failure.to_owned()));
     }
-    let response = resolve_agent_response_with_dialect(
-        &turn.invocation.response,
-        output.final_message()?,
-        ProviderSchemaDialect::OpenAiStrict,
-    )?;
+    let response = state
+        .retry
+        .redact_response(resolve_agent_response_with_dialect(
+            &turn.invocation.response,
+            output.final_message()?,
+            ProviderSchemaDialect::OpenAiStrict,
+        )?);
     state
         .retry
         .report_correction(
             turn.control,
             &response,
-            state.response.corrections_exhausted(),
+            state.response.corrections_exhausted(&response),
         )
         .await?;
     if let Some(diagnostic) = turn

@@ -139,6 +139,48 @@ async fn malformed_output_stops_after_two_correction_turns() {
 }
 
 #[tokio::test]
+async fn format_correction_detail_is_redacted_across_every_emitted_event() {
+    let directory = TestDirectory::new("codex-format-secret");
+    let capture = directory.child("capture");
+    let (admitted, runtime) = openai_runtime(
+        &directory,
+        SessionScope::Execution,
+        &["FORMAT_SECRET", "CAPTURE_PATH", "OPENAI_API_KEY"],
+    )
+    .await;
+    let mut handle = start(
+        &runtime,
+        &admitted,
+        1,
+        &[
+            ("FORMAT_SECRET", "true".to_owned()),
+            ("CAPTURE_PATH", capture.display().to_string()),
+            ("OPENAI_API_KEY", "fake-openai-key".to_owned()),
+        ],
+    )
+    .await;
+
+    let mut output = handle.take_initial_output().assert_value();
+    let (logs, outcome) = tokio::join!(
+        async {
+            let mut logs = Vec::new();
+            while let Ok(entry) = output.recv_output().await {
+                logs.push(entry.text);
+            }
+            logs.join("\n")
+        },
+        handle.completion()
+    );
+    assert!(matches!(
+        outcome.assert_value().outcome,
+        WorkerOutcome::Verified { output, .. } if output == json!({"answer": 43})
+    ));
+    assert!(logs.contains("format correction 1/3"), "{logs}");
+    assert!(logs.contains("[REDACTED]"), "{logs}");
+    assert!(!logs.contains("fake-openai-key"), "{logs}");
+}
+
+#[tokio::test]
 async fn gateway_correction_keeps_endpoint_auth_and_model_on_resume() {
     let directory = TestDirectory::new("codex-gateway-correction");
     let (outcome, capture, logs) = corrected_output(&directory, CodexProvider::Gateway).await;

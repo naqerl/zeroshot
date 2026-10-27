@@ -3,7 +3,8 @@ use std::{collections::BTreeMap, fmt};
 use openengine_cluster_protocol::{
     EnumLabel, FieldName, NodeInstructions, NonEmptyEnumSet, PayloadType, WorkerOutcome,
 };
-use serde::{Deserialize, Serialize};
+use serde::de::{self, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 
 use super::{DriverControl, LiveOutput, LiveOutputStream, NodeRunnerError};
@@ -13,6 +14,7 @@ mod guidance;
 
 const MAX_RESPONSE_ERROR_BYTES: usize = 8 * 1024;
 const MAX_OUTPUT_CORRECTIONS: usize = 2;
+const MAX_FORMAT_CORRECTIONS: usize = 3;
 const OPENAI_OPTIONAL_NULL_OMISSION: &str = "__zeroshot_omitted_optional_null__";
 
 /// Ephemeral response contract derived from the admitted graph leaf.
@@ -190,14 +192,25 @@ impl NodeResponseError {
         // bounds correction prompts; public diagnostics are bounded only after redaction.
         Self(message.into_boxed_str())
     }
+
+    fn redact(self, redact: impl FnOnce(&str) -> String) -> Self {
+        Self::new(redact(&self.0))
+    }
 }
 
 pub(crate) enum AgentResponse {
     Complete(WorkerOutcome),
     Correction {
+        kind: AgentCorrectionKind,
         prompt: String,
         diagnostic: NodeResponseError,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AgentCorrectionKind {
+    Format,
+    Contract,
 }
 
 impl AgentResponse {
@@ -210,18 +223,35 @@ impl AgentResponse {
             Self::Complete(_) => None,
         }
     }
+
+    pub(crate) fn redact_diagnostic(self, redact: impl FnOnce(&str) -> String) -> AgentResponse {
+        match self {
+            Self::Correction {
+                kind,
+                prompt,
+                diagnostic,
+            } => Self::Correction {
+                kind,
+                prompt,
+                diagnostic: diagnostic.redact(redact),
+            },
+            Self::Complete(outcome) => Self::Complete(outcome),
+        }
+    }
 }
 
 pub(crate) struct AgentResponseState {
     prompt: String,
-    corrections: usize,
+    format_corrections: usize,
+    contract_corrections: usize,
 }
 
 impl AgentResponseState {
     pub(crate) fn new(prompt: String) -> Self {
         Self {
             prompt,
-            corrections: 0,
+            format_corrections: 0,
+            contract_corrections: 0,
         }
     }
 
@@ -229,8 +259,18 @@ impl AgentResponseState {
         &self.prompt
     }
 
-    pub(crate) fn corrections_exhausted(&self) -> bool {
-        self.corrections == MAX_OUTPUT_CORRECTIONS
+    pub(crate) fn corrections_exhausted(&self, response: &AgentResponse) -> bool {
+        match response {
+            AgentResponse::Correction { kind, .. } => self.exhausted(*kind),
+            AgentResponse::Complete(_) => false,
+        }
+    }
+
+    fn exhausted(&self, kind: AgentCorrectionKind) -> bool {
+        match kind {
+            AgentCorrectionKind::Format => self.format_corrections >= MAX_FORMAT_CORRECTIONS,
+            AgentCorrectionKind::Contract => self.contract_corrections >= MAX_OUTPUT_CORRECTIONS,
+        }
     }
 
     pub(crate) fn replace_prompt(&mut self, prompt: String) {
@@ -245,17 +285,42 @@ impl AgentResponseState {
     ) -> Result<Option<WorkerOutcome>, NodeRunnerError> {
         match response {
             AgentResponse::Complete(outcome) => Ok(Some(outcome)),
-            AgentResponse::Correction { .. } if self.corrections_exhausted() => {
+            AgentResponse::Correction { kind, .. } if self.exhausted(kind) => {
+                let message = match kind {
+                    AgentCorrectionKind::Format => format!(
+                        "{provider} final output remained malformed after {MAX_FORMAT_CORRECTIONS} format corrections"
+                    ),
+                    AgentCorrectionKind::Contract => format!(
+                        "{provider} final output remained malformed after {MAX_OUTPUT_CORRECTIONS} corrections"
+                    ),
+                };
                 control
-                    .emit(LiveOutput::new(
-                        LiveOutputStream::System,
-                        format!("{provider} final output remained malformed after two corrections"),
-                    )?)
+                    .emit(LiveOutput::new(LiveOutputStream::System, message)?)
                     .await?;
                 Ok(Some(WorkerOutcome::malformed()))
             }
-            AgentResponse::Correction { prompt, .. } => {
-                self.corrections += 1;
+            AgentResponse::Correction {
+                kind,
+                prompt,
+                diagnostic,
+            } => {
+                match kind {
+                    AgentCorrectionKind::Format => {
+                        self.format_corrections += 1;
+                        control
+                            .emit(LiveOutput::new(
+                                LiveOutputStream::System,
+                                format!(
+                                    "{provider} format correction {}/{}: {diagnostic}",
+                                    self.format_corrections, MAX_FORMAT_CORRECTIONS
+                                ),
+                            )?)
+                            .await?;
+                    }
+                    AgentCorrectionKind::Contract => {
+                        self.contract_corrections += 1;
+                    }
+                }
                 self.prompt = prompt;
                 Ok(None)
             }
@@ -307,19 +372,20 @@ fn resolve_agent_response_rendering(
     dialect: ProviderSchemaDialect,
     correction: CorrectionRendering,
 ) -> Result<AgentResponse, NodeRunnerError> {
-    let semantic_response = parse_provider_envelope(response);
-    let parsed = match semantic_response {
+    let parsed = match parse_provider_envelope(contract, response) {
         Ok(mut response) => {
             if dialect == ProviderSchemaDialect::OpenAiStrict {
                 contract.normalize_openai_response(&mut response);
             }
-            contract.parse_agent_value(response)
+            contract
+                .parse_agent_value(response)
+                .map_err(|error| (AgentCorrectionKind::Contract, error))
         }
-        Err(error) => Err(error),
+        Err(error) => Err((AgentCorrectionKind::Format, error)),
     };
     Ok(match parsed {
         Ok(outcome) => AgentResponse::Complete(outcome),
-        Err(error) => {
+        Err((kind, error)) => {
             let prompt = match correction {
                 CorrectionRendering::Contract => render_agent_correction(contract, &error)?,
                 CorrectionRendering::Schema(dialect) => {
@@ -327,6 +393,7 @@ fn resolve_agent_response_rendering(
                 }
             };
             AgentResponse::Correction {
+                kind,
                 prompt,
                 diagnostic: error,
             }
@@ -334,19 +401,174 @@ fn resolve_agent_response_rendering(
     })
 }
 
-fn parse_provider_envelope(response: &str) -> Result<Value, NodeResponseError> {
-    let envelope: ProviderResponseEnvelope = serde_json::from_str(response).map_err(|error| {
+fn parse_provider_envelope(
+    contract: &NodeResponseContract,
+    response: &str,
+) -> Result<Value, NodeResponseError> {
+    let value = parse_json_with_recovery(response).map_err(|error| {
         NodeResponseError::new(format!(
             "provider response must be exactly an object containing response: {error}"
         ))
     })?;
-    Ok(envelope.response)
+    let Some(object) = value.as_object() else {
+        return Err(invalid_envelope_shape(contract, &value));
+    };
+    if object.len() == 1 {
+        if let Some(response) = object.get("response") {
+            return Ok(response.clone());
+        }
+    }
+    if matches!(contract, NodeResponseContract::Verifier { .. })
+        && is_verifier_channel_response(object)
+    {
+        return Ok(materialize_verifier_channel_response(object));
+    }
+    Err(invalid_envelope_shape(contract, &value))
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProviderResponseEnvelope {
-    response: Value,
+fn parse_json_with_recovery(response: &str) -> Result<Value, serde_json::Error> {
+    let trimmed = response.trim();
+    let fenced = strip_markdown_fence(trimmed);
+    let mut candidates = vec![trimmed];
+    if let Some(fenced) = fenced {
+        candidates.push(fenced);
+    }
+    for candidate in [fenced.unwrap_or(trimmed), trimmed] {
+        if let Some(json) = brace_span(candidate) {
+            if !candidates.contains(&json) {
+                candidates.push(json);
+            }
+        }
+    }
+    let mut error = None;
+    for candidate in candidates {
+        match serde_json::from_str::<Value>(candidate) {
+            Ok(value) => {
+                if value.is_object() {
+                    // `Value` keeps the last duplicate key. The envelope's previous struct parser
+                    // rejected duplicate fields, so retain that strictness at the top level.
+                    serde_json::from_str::<UniqueObject>(candidate)?;
+                }
+                return Ok(value);
+            }
+            Err(candidate_error) => error = Some(candidate_error),
+        }
+    }
+    Err(error.expect("the trimmed response is always a parse candidate"))
+}
+
+struct UniqueObject;
+
+impl<'de> Deserialize<'de> for UniqueObject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct UniqueObjectVisitor;
+
+        impl<'de> Visitor<'de> for UniqueObjectVisitor {
+            type Value = UniqueObject;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON object without duplicate top-level fields")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut object = Map::new();
+                while let Some((key, value)) = map.next_entry::<String, Value>()? {
+                    if object.insert(key.clone(), value).is_some() {
+                        return Err(de::Error::custom(format!("duplicate field `{key}`")));
+                    }
+                }
+                Ok(UniqueObject)
+            }
+        }
+
+        deserializer.deserialize_map(UniqueObjectVisitor)
+    }
+}
+
+fn strip_markdown_fence(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("```")?;
+    let body = match rest.split_once('\n') {
+        Some((language, body)) => {
+            let language = language.trim();
+            if !language.is_empty() && !language.eq_ignore_ascii_case("json") {
+                return None;
+            }
+            body
+        }
+        None => {
+            let body = rest.trim_start();
+            match body.get(..4) {
+                Some(prefix) if prefix.eq_ignore_ascii_case("json") => &body[4..],
+                _ => body,
+            }
+        }
+    };
+    let body = body.trim_end().strip_suffix("```")?;
+    Some(body.trim())
+}
+
+fn brace_span(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    (start <= end).then(|| &text[start..=end])
+}
+
+fn is_verifier_channel_response(object: &Map<String, Value>) -> bool {
+    let is_channel = |key: &str| matches!(key, "output" | "signals" | "diagnostic");
+    object
+        .keys()
+        .all(|key| is_channel(key) || key == "artifacts")
+        && object.keys().any(|key| is_channel(key))
+}
+
+fn materialize_verifier_channel_response(object: &Map<String, Value>) -> Value {
+    let mut response = object.clone();
+    response.entry("output").or_insert(Value::Null);
+    response
+        .entry("signals")
+        .or_insert_with(|| Value::Object(Map::new()));
+    // An absent diagnostic stays absent: the strict `VerifierResponse` shape rejects it rather
+    // than the outer parser inventing a value. Providers that add an artifacts member to the
+    // channel are tolerated, but artifacts are not part of the provider response contract.
+    response.remove("artifacts");
+    Value::Object(response)
+}
+
+fn invalid_envelope_shape(contract: &NodeResponseContract, value: &Value) -> NodeResponseError {
+    let expected = match contract {
+        NodeResponseContract::Worker { .. } => "an object containing response",
+        NodeResponseContract::Verifier { .. } => {
+            "an object containing response or a verifier response with output, signals, and diagnostic"
+        }
+    };
+    let found = match value.as_object() {
+        Some(object) => {
+            let mut keys = object.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            format!("top-level keys [{}]", keys.join(", "))
+        }
+        None => format!("top-level {}", json_value_kind(value)),
+    };
+    NodeResponseError::new(format!(
+        "provider response must be exactly {expected}; found {found}"
+    ))
+}
+
+fn json_value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 impl fmt::Display for NodeResponseError {

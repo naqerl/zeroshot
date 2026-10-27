@@ -823,6 +823,30 @@ fn every_advertised_tool_property_is_accepted() {
 }
 
 #[tokio::test]
+async fn hub_submit_schema_has_no_wait_or_queue() {
+    let mut session = Session::spawn(ToolHost {
+        backend: CliTestBackend::default(),
+    });
+    initialize(&mut session).await;
+    let listed = session.request(2, "tools/list", json!({})).await;
+    let tools = listed["result"]["tools"].as_array().expect("tools array");
+    let submit = tools
+        .iter()
+        .find(|tool| tool["name"] == "hub_submit")
+        .expect("hub_submit tool");
+    let properties = submit["inputSchema"]["properties"]
+        .as_object()
+        .expect("hub_submit properties");
+    for removed in ["wait", "queue"] {
+        assert!(
+            !properties.contains_key(removed),
+            "{removed} is still in the hub_submit schema: {submit}"
+        );
+    }
+    assert!(properties.contains_key("tag"), "{submit}");
+}
+
+#[tokio::test]
 async fn status_tool_uses_the_cli_backend() {
     let backend = CliTestBackend::default();
     let mut session = Session::spawn(ToolHost {

@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use super::placement::Rejection;
 
-/// Exit code for retryable placement outcomes: busy members or an expired --wait.
+/// Exit code when no active member is free and no pool can serve the job.
 pub(crate) const EXIT_NO_CAPACITY: i32 = 3;
 /// Exit code when no active member matches the placement at all.
 pub(crate) const EXIT_NO_ELIGIBLE_TARGET: i32 = 4;
@@ -21,10 +21,8 @@ pub(crate) enum HubError {
         placement: String,
         rejected: Vec<Rejection>,
     },
-    #[error("no free hub member for {0}; retry, or use --wait or --queue")]
+    #[error("no free hub member for {0}")]
     NoCapacity(String),
-    #[error("timed out waiting for a free hub member for {0}")]
-    WaitTimeout(String),
     #[error("hub job {0} was not found")]
     JobNotFound(String),
     #[error("{0}")]
@@ -81,7 +79,7 @@ pub(crate) enum HubError {
 impl HubError {
     pub(crate) const fn exit_code(&self) -> i32 {
         match self {
-            Self::NoCapacity(_) | Self::WaitTimeout(_) => EXIT_NO_CAPACITY,
+            Self::NoCapacity(_) => EXIT_NO_CAPACITY,
             Self::NoEligibleTarget { .. } => EXIT_NO_ELIGIBLE_TARGET,
             Self::Unreachable { .. } => EXIT_UNREACHABLE,
             Self::Remote { exit_code, .. } => *exit_code,
@@ -96,7 +94,7 @@ impl HubError {
             Self::JobNotFound(_) | Self::MemberNotFound(_) | Self::EvalNotFound(_) => 404,
             Self::InvalidState(_) | Self::Conflict(_) | Self::DaemonRunning(_) => 409,
             Self::NoEligibleTarget { .. } => 422,
-            Self::NoCapacity(_) | Self::WaitTimeout(_) => 503,
+            Self::NoCapacity(_) => 503,
             Self::Unauthorized { .. } => 401,
             Self::Target { .. }
             | Self::Unreachable { .. }
@@ -112,7 +110,6 @@ impl HubError {
             Self::Usage(_) => ("invalid_request", "hub.invalid_request"),
             Self::NoEligibleTarget { .. } => ("target", "hub.no_eligible_target"),
             Self::NoCapacity(_) => ("target", "hub.no_capacity"),
-            Self::WaitTimeout(_) => ("target", "hub.wait_timeout"),
             Self::JobNotFound(_) => ("invalid_request", "hub.job_not_found"),
             Self::MemberNotFound(_) => ("invalid_request", "hub.member_not_found"),
             Self::EvalNotFound(_) => ("invalid_request", "hub.eval_not_found"),

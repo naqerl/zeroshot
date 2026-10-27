@@ -626,41 +626,18 @@ impl Hetzner {
         }
     }
 
-    /// An unformatted Volume beside the server, carrying the lease's labels: the boot script
-    /// formats it btrfs.
-    async fn create_volume(&self, request: &ServerRequest, size: u32) -> Result<u64, Failure> {
-        self.call(
-            Method::POST,
-            "/volumes",
-            Some(&json!({
-                "name": request.name,
-                "size": size,
-                "location": request.location,
-                "labels": request.labels,
-                "automount": false,
-            })),
-        )
-        .await?
-        .and_then(|document| document.pointer("/volume/id").and_then(Value::as_u64))
-        .ok_or_else(|| Failure::new(Refusal::Transient, "Hetzner created no volume"))
-    }
-
-    /// Delete what a failed create made, the Volume before the firewall. Anything still
-    /// attached to a server that was created after all is refused here; it carries the lease's
-    /// labels, so the lease's cleanup or the reaper removes it.
-    async fn undo(&self, mut failure: Failure, volume: Option<u64>, firewall: u64) -> Failure {
-        let made = volume
-            .map(|id| ("volume", "volumes", id))
-            .into_iter()
-            .chain([("firewall", "firewalls", firewall)]);
-        for (kind, collection, id) in made {
-            if let Err(left) = self
-                .call(Method::DELETE, &format!("/{collection}/{id}"), None)
-                .await
-            {
-                failure.message =
-                    format!("{}; {kind} {id} left for cleanup: {left}", failure.message);
-            }
+    /// Delete the firewall a failed create made. Anything still attached to a server that was
+    /// created after all carries the lease's labels, so the lease's cleanup or the reaper
+    /// removes it.
+    async fn undo(&self, mut failure: Failure, firewall: u64) -> Failure {
+        if let Err(left) = self
+            .call(Method::DELETE, &format!("/firewalls/{firewall}"), None)
+            .await
+        {
+            failure.message = format!(
+                "{}; firewall {firewall} left for cleanup: {left}",
+                failure.message
+            );
         }
         failure
     }
@@ -752,13 +729,6 @@ impl Provisioner for Hetzner {
             .await?
             .and_then(|document| document.pointer("/firewall/id").and_then(Value::as_u64))
             .ok_or_else(|| Failure::new(Refusal::Transient, "Hetzner created no firewall"))?;
-        let volume = match request.volume_gb {
-            Some(size) => match self.create_volume(request, size).await {
-                Ok(volume) => Some(volume),
-                Err(failure) => return Err(self.undo(failure, None, firewall).await),
-            },
-            None => None,
-        };
         let created = self
             .call(
                 Method::POST,
@@ -772,7 +742,6 @@ impl Provisioner for Hetzner {
                     "ssh_keys": [ssh_key],
                     "labels": request.labels,
                     "firewalls": [{ "firewall": firewall }],
-                    "volumes": volume.into_iter().collect::<Vec<_>>(),
                     "automount": false,
                     "start_after_create": true,
                     "public_net": { "enable_ipv4": true, "enable_ipv6": true },
@@ -786,7 +755,7 @@ impl Provisioner for Hetzner {
                 let failure = outcome.err().unwrap_or_else(|| {
                     Failure::new(Refusal::Invalid, "Hetzner POST /servers is 404")
                 });
-                return Err(self.undo(failure, volume, firewall).await);
+                return Err(self.undo(failure, firewall).await);
             }
         };
         let server_id = document
@@ -796,7 +765,6 @@ impl Provisioner for Hetzner {
         Ok(Created {
             server_id,
             firewall_id: Some(firewall),
-            volume_id: volume,
             action_id: document.pointer("/action/id").and_then(Value::as_u64),
         })
     }

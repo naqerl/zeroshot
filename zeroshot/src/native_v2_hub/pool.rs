@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::capacity::{self, Machine, PoolType, Shortage};
+use super::health::{DataHealth, FILE_MODE};
 use super::profile::{self, Spec, TagProfile};
 use super::clock::rfc3339;
-use super::data::DataSettings;
-use super::model::{HubState, Job, JobState, PlacementSpec, Requirements};
+use super::model::{HubState, Job, JobState, Member, PlacementSpec, Requirements};
 
 /// Label naming the hub that owns a provider resource.
 pub(crate) const LABEL_HUB: &str = "zeroshot/hub";
@@ -140,9 +140,6 @@ pub(crate) struct Pool {
     /// Capacity refusals by server type and location.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub unavailable: BTreeMap<String, BTreeMap<String, u64>>,
-    /// The servers' btrfs data folder (`--data-fs`, `--data-size`, `--data-volume`).
-    #[serde(default)]
-    pub data: DataSettings,
 }
 
 /// First pause after a failed boot; it doubles per further failure up to [`MAX_PAUSE_MS`].
@@ -182,7 +179,20 @@ impl Pool {
             && !capacity::candidates(self, &profile::resolve_spec(self, &spec.tags)).is_empty()
     }
 
-    pub(crate) fn view(&self, leases: &[Lease], now: u64) -> Value {
+    /// The data folder the pool's servers report: the last health check's filesystem, mode
+    /// and size. A pool with no joined server yet reports the fixed layout it will use.
+    fn data(&self, members: &[Member]) -> Value {
+        members
+            .iter()
+            .filter(|member| member.pool.as_deref() == Some(self.name.as_str()))
+            .find_map(|member| member.data.as_ref())
+            .map_or_else(
+                || json!({"fs": "btrfs", "mode": FILE_MODE, "sizeBytes": null}),
+                DataHealth::view,
+            )
+    }
+
+    pub(crate) fn view(&self, leases: &[Lease], members: &[Member], now: u64) -> Value {
         let mine = leases
             .iter()
             .filter(|lease| lease.pool == self.name)
@@ -211,7 +221,7 @@ impl Pool {
             "waiting": capacity::hold_reason(self, None, now),
             "profiles": self.profiles.iter().map(TagProfile::view).collect::<Vec<_>>(),
             "unavailable": self.unavailable,
-            "data": self.data.view(),
+            "data": self.data(members),
             "leases": mine,
         })
     }
@@ -270,9 +280,6 @@ pub(crate) struct Lease {
     pub server_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub firewall_id: Option<u64>,
-    /// The Volume of a `--data-volume` pool's lease.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub volume_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipv4: Option<String>,
     /// Provider action being awaited (create or delete).
@@ -465,7 +472,6 @@ impl Lease {
             created_at_ms: now,
             server_id: None,
             firewall_id: None,
-            volume_id: None,
             ipv4: None,
             action_id: None,
             reason: None,
@@ -707,8 +713,7 @@ pub(crate) struct Resource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ResourceKind {
     Server,
-    /// A Hetzner Volume holding a lease's btrfs data folder; deleted after its server, which
-    /// detaches it.
+    /// A Hetzner Volume left by an older pool; the reaper deletes those it no longer holds.
     Volume,
     PrimaryIp,
     Firewall,

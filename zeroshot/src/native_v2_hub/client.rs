@@ -15,11 +15,10 @@ use zeroshot_engine::native_v2_cli::hub::{
 use super::api::EXIT_CODE_HEADER;
 use super::clock::{now_ms, parse_duration_ms, parse_future_ms, parse_past_ms};
 use super::context::Resolved;
-use super::data::{DataFs, DataSettings};
 use super::cron;
 use super::error::HubError;
 use super::jobs;
-use super::model::{Job, PlacementSpec, Schedule, ScheduleState};
+use super::model::{Job, Schedule, ScheduleState};
 use super::pool::Provider;
 use super::service::FILE_FLAGS;
 use super::wire::{
@@ -28,7 +27,6 @@ use super::wire::{
 };
 use super::write_json;
 
-const WAIT_POLL: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound for one request; placement may discover and probe several targets.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
@@ -423,46 +421,10 @@ async fn submit(
     request: HubSubmit,
     output: &mut impl Write,
 ) -> Result<i32, HubError> {
-    let started = now_ms();
-    let job = jobs::new_job(&request.job, started)?;
+    let job = jobs::new_job(&request.job, now_ms())?;
     let files = job_files(&job)?;
-    let deadline = match &request.wait {
-        None => None,
-        Some(None) => Some(u64::MAX),
-        Some(Some(duration)) => Some(started.saturating_add(parse_duration_ms(duration)?)),
-    };
-    let body = SubmitJob {
-        job,
-        queue: request.queue,
-        files,
-    };
-    let document = loop {
-        match client.post(&["v1", "hub", "jobs"], &body).await {
-            Ok(document) => break document,
-            Err(HubError::Remote { diagnostic, .. })
-                if deadline.is_some()
-                    && diagnostic.get("code") == Some(&json!("hub.no_capacity")) =>
-            {
-                let deadline = deadline.unwrap_or(u64::MAX);
-                if now_ms() >= deadline {
-                    return Err(HubError::WaitTimeout(super::placement::describe(
-                        &body.job.placement,
-                    )));
-                }
-                let remaining = Duration::from_millis(deadline.saturating_sub(now_ms()));
-                tokio::time::sleep(remaining.min(WAIT_POLL)).await;
-            }
-            Err(error) => return Err(error),
-        }
-    };
-    // A job the hub parked for a pool is already accepted: waiting reads it back instead of
-    // submitting it again.
-    let document = match deadline {
-        Some(deadline) if !placed(&document) => {
-            wait_for_placement(client, &document, deadline, &body.job.placement).await?
-        }
-        _ => document,
-    };
+    let body = SubmitJob { job, files };
+    let document = client.post(&["v1", "hub", "jobs"], &body).await?;
     write_json(output, &document)?;
     let running = document
         .pointer("/job/runId")
@@ -479,48 +441,6 @@ async fn submit(
     client
         .stream(&job_id, &StreamRequest::Watch { after: None })
         .await
-}
-
-/// Whether the hub has placed the job on a member.
-fn placed(document: &Value) -> bool {
-    document
-        .pointer("/job/runId")
-        .and_then(Value::as_str)
-        .is_some()
-        || document.pointer("/job/state").and_then(Value::as_str) == Some("running")
-}
-
-/// `--wait` for a job the hub parked: read it back until it is placed, or fail once the
-/// deadline passes or the job ends without ever being placed.
-async fn wait_for_placement(
-    client: &HubClient,
-    document: &Value,
-    deadline: u64,
-    placement: &PlacementSpec,
-) -> Result<Value, HubError> {
-    let job_id = document
-        .pointer("/job/jobId")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    loop {
-        if now_ms() >= deadline {
-            return Err(HubError::WaitTimeout(super::placement::describe(placement)));
-        }
-        let remaining = Duration::from_millis(deadline.saturating_sub(now_ms()));
-        tokio::time::sleep(remaining.min(WAIT_POLL)).await;
-        let observed = client.get(&["v1", "hub", "jobs", &job_id]).await?;
-        if placed(&observed) {
-            return Ok(observed);
-        }
-        let ended = observed
-            .pointer("/job/state")
-            .and_then(Value::as_str)
-            .is_some_and(|state| matches!(state, "succeeded" | "failed" | "dequeued" | "expired"));
-        if ended {
-            return Err(HubError::WaitTimeout(super::placement::describe(placement)));
-        }
-    }
 }
 
 async fn enqueue(client: &HubClient, request: HubEnqueue) -> Result<Value, HubError> {
@@ -709,10 +629,5 @@ pub(crate) fn add_pool(request: HubPoolAdd) -> Result<AddPool, HubError> {
         tags: request.tags,
         ssh_key: super::paths::absolute(&request.ssh_key)?,
         ssh_from: request.ssh_from,
-        data: DataSettings {
-            fs: DataFs::parse(&request.data_fs)?,
-            size_gb: request.data_size_gb,
-            volume_gb: request.data_volume_gb,
-        },
     })
 }

@@ -13,7 +13,6 @@ use time::format_description::well_known::Rfc3339;
 use super::super::archive::{self, FILES};
 use super::super::capacity;
 use super::super::clock::now_ms;
-use super::super::data::DataSettings;
 use super::super::error::{EXIT_NO_CAPACITY, EXIT_NO_ELIGIBLE_TARGET, HubError};
 use super::super::lease::{PoolRuntime, REAP_INTERVAL_MS, production_runtime};
 use super::super::model::{HubState, Job, JobState, MemberState, STATE_VERSION, Strategy};
@@ -145,11 +144,7 @@ impl Provisioner for FakeCloud {
             }
             cloud.created.push(request.clone());
             let mut ids = Vec::new();
-            let volume = request.volume_gb.map(|_| ResourceKind::Volume);
-            for kind in [ResourceKind::Firewall, ResourceKind::Server]
-                .into_iter()
-                .chain(volume)
-            {
+            for kind in [ResourceKind::Firewall, ResourceKind::Server] {
                 cloud.next_id += 1;
                 ids.push(cloud.next_id);
                 cloud.resources.insert(
@@ -165,7 +160,6 @@ impl Provisioner for FakeCloud {
             Ok(Created {
                 server_id: ids[1],
                 firewall_id: Some(ids[0]),
-                volume_id: ids.get(2).copied(),
                 action_id: Some(ids[1] + 1000),
             })
         })
@@ -382,7 +376,6 @@ pub(super) fn add_request(folder: &Path, max: u32) -> AddPool {
         tags: vec![TAG.to_owned()],
         ssh_key: key,
         ssh_from: vec!["198.51.100.7/32".to_owned()],
-        data: DataSettings::default(),
     }
 }
 
@@ -499,7 +492,7 @@ async fn a_pool_with_no_servers_makes_tagged_jobs_queue_instead_of_failing() {
     rig.add_pool(1).await;
     let parked = rig
         .service
-        .submit(tagged("hj_early"), false, Vec::new())
+        .submit(tagged("hj_early"), Vec::new())
         .await
         .expect("the pool will provision a server for it");
     assert_eq!(parked["job"]["state"], json!("queued"), "{parked}");
@@ -529,7 +522,7 @@ async fn submit_refuses_with_no_capacity_only_when_no_pool_serves_the_tags() {
     let mut first = job("hj_first", 1);
     first.placement = spec(None, &["solo"], Strategy::FirstFree);
     rig.service
-        .submit(first, false, Vec::new())
+        .submit(first, Vec::new())
         .await
         .expect("placed on the free member");
 
@@ -538,7 +531,7 @@ async fn submit_refuses_with_no_capacity_only_when_no_pool_serves_the_tags() {
     second.placement = spec(None, &["solo"], Strategy::FirstFree);
     let error = rig
         .service
-        .submit(second, false, Vec::new())
+        .submit(second, Vec::new())
         .await
         .expect_err("no member and no pool can serve it now");
     assert!(matches!(error, HubError::NoCapacity(_)), "{error:?}");
@@ -562,7 +555,7 @@ async fn submit_still_runs_a_job_immediately_on_a_free_member() {
 
     let placed = rig
         .service
-        .submit(tagged("hj_now"), false, Vec::new())
+        .submit(tagged("hj_now"), Vec::new())
         .await
         .expect("placed immediately");
     assert_eq!(placed["job"]["state"], json!("running"), "{placed}");
@@ -575,7 +568,7 @@ async fn a_job_submit_parked_for_a_pool_is_placed_once_its_server_joins() {
     let rig = rig();
     rig.add_pool(1).await;
     rig.service
-        .submit(tagged("hj_parked"), false, Vec::new())
+        .submit(tagged("hj_parked"), Vec::new())
         .await
         .expect("parked for the pool");
     assert_eq!(
@@ -1085,6 +1078,26 @@ async fn the_reaper_deletes_orphans_but_keeps_live_leases() {
     );
 }
 
+#[tokio::test]
+async fn the_reaper_deletes_labelled_legacy_volumes() {
+    let rig = rig();
+    rig.add_pool(1).await;
+    let hub_id = rig.state().await.hub_id.expect("hub id");
+    let volume = rig.cloud.plant(
+        ResourceKind::Volume,
+        &[(LABEL_HUB, &hub_id), (LABEL_LEASE, "gone")],
+    );
+
+    let view = rig.pass().await;
+    assert_eq!(
+        rig.cloud.with(|cloud| cloud.destroyed.clone()),
+        [(ResourceKind::Volume, volume)],
+        "a Volume an older pool left behind is reaped"
+    );
+    assert_eq!(view["pools"]["reaped"].as_array().map(Vec::len), Some(1));
+    assert!(!rig.cloud.holds(ResourceKind::Volume, volume));
+}
+
 #[test]
 fn orphans_keep_a_held_lease_however_long_it_has_run() {
     let lease = Lease::new(&pool_fixture(), "hj_keep", 1, 0);
@@ -1358,6 +1371,24 @@ async fn pool_config_is_validated_listed_and_unique() {
     assert_eq!(listed["schema"], json!("zeroshot.hub.pools/v1"));
     assert_eq!(listed["pools"][0]["name"], json!("burst"));
     assert_eq!(listed["pools"][0]["targetImage"], json!(IMAGE));
+    let data = &listed["pools"][0]["data"];
+    assert_eq!(data["fs"], json!("btrfs"), "{data}");
+    assert_eq!(data["mode"], json!("file"), "{data}");
+    assert!(data["sizeBytes"].is_null(), "{data}");
+    assert!(data.get("sizeGb").is_none(), "{data}");
+    assert!(data.get("volumeGb").is_none(), "{data}");
+    for removed in [
+        "dataFs",
+        "dataSizeGb",
+        "dataVolumeGb",
+        "dataSize",
+        "dataVolume",
+    ] {
+        assert!(
+            listed["pools"][0].get(removed).is_none(),
+            "{removed} is a removed knob: {listed}"
+        );
+    }
     let metrics = rig.service.render_metrics().await;
     assert!(
         metrics.contains(r#"zeroshot_hub_pool_leases{pool="burst",phase="active"} 0"#),
@@ -1430,6 +1461,13 @@ fn pool_lease_and_member_records_serialize_without_ttl_or_expiry() {
     let pool_json = serde_json::to_value(&pool).expect("pool json");
     assert!(pool_json.get("ttlMs").is_none(), "{pool_json}");
     assert!(!pool_json.to_string().contains("ttl"), "{pool_json}");
+    let serialized = pool_json.to_string();
+    for knob in ["sizeGb", "volumeGb", "dataFs", "dataSize", "dataVolume"] {
+        assert!(
+            !serialized.contains(knob),
+            "{knob} is a removed knob: {pool_json}"
+        );
+    }
 
     let lease = Lease::new(&pool, "hj_one", 40123, 1_000);
     let lease_json = serde_json::to_value(&lease).expect("lease json");
@@ -1446,7 +1484,7 @@ fn pool_lease_and_member_records_serialize_without_ttl_or_expiry() {
 }
 
 #[test]
-fn legacy_pool_ttl_and_expiry_fields_load_and_are_dropped() {
+fn legacy_removed_pool_and_lease_fields_load_and_are_dropped() {
     let pool = pool_fixture();
     let lease = Lease::new(&pool, "hj_one", 40123, 1_000);
     let mut member = super::member("zs-one", &[TAG], 1, 0);
@@ -1461,8 +1499,20 @@ fn legacy_pool_ttl_and_expiry_fields_load_and_are_dropped() {
     })
     .expect("state json");
     document["pools"][0]["ttlMs"] = json!(7_200_000);
+    document["pools"][0]["data"] = json!({
+        "fs": "btrfs",
+        "sizeGb": 50,
+        "volumeGb": 200
+    });
+    document["leases"][0]["volumeId"] = json!(44);
     document["leases"][0]["expiresAtMs"] = json!(1);
     document["members"][0]["expiresAtMs"] = json!(1);
+    document["members"][0]["data"] = json!({
+        "fs": "btrfs",
+        "mode": "file",
+        "sizeBytes": 1_073_741_824,
+        "checkedAtMs": 1
+    });
     document["leases"][0]["phase"] = json!("draining");
     document["leases"][0]["reason"] = json!("ttl");
 
@@ -1473,9 +1523,17 @@ fn legacy_pool_ttl_and_expiry_fields_load_and_are_dropped() {
     assert!(migrated.leases[0].reason.is_none());
     let saved = serde_json::to_value(&migrated).expect("state json");
     assert!(saved["pools"][0].get("ttlMs").is_none(), "{saved}");
+    assert!(saved["pools"][0].get("data").is_none(), "{saved}");
+    assert!(saved["leases"][0].get("volumeId").is_none(), "{saved}");
     assert!(saved["leases"][0].get("expiresAtMs").is_none(), "{saved}");
     assert!(saved["leases"][0].get("reason").is_none(), "{saved}");
     assert!(saved["members"][0].get("expiresAtMs").is_none(), "{saved}");
+    assert_eq!(saved["members"][0]["data"]["fs"], "btrfs", "{saved}");
+    assert_eq!(saved["members"][0]["data"]["mode"], "file", "{saved}");
+    assert_eq!(
+        saved["members"][0]["data"]["sizeBytes"], 1_073_741_824_u64,
+        "{saved}"
+    );
 }
 
 #[test]
@@ -1625,7 +1683,6 @@ pub(super) fn pool_fixture() -> Pool {
         shortages: std::collections::BTreeMap::new(),
         profiles: Vec::new(),
         unavailable: BTreeMap::new(),
-        data: DataSettings::default(),
     }
 }
 
