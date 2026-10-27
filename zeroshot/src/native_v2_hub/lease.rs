@@ -17,7 +17,7 @@ use super::capacity::{self, Machine, PoolType};
 use super::profile::{self, Spec};
 use super::clock::now_ms;
 use super::error::HubError;
-use super::health::{self, DataHealth, Health};
+use super::health::{self, DataHealth, FILE_MODE, Health};
 use super::model::{HubState, Member, MemberState};
 use super::pool::{
     self, LABEL_HUB, LABEL_LEASE, LABEL_LOCATION, LABEL_SERVER_TYPE, Lease, LeasePhase, Pool,
@@ -369,14 +369,10 @@ impl HubService {
             .find(|resource| resource.kind == ResourceKind::Server)
         {
             lease.server_id = Some(server.id);
-            let held = |kind| {
-                existing
-                    .iter()
-                    .find(|resource| resource.kind == kind)
-                    .map(|resource| resource.id)
-            };
-            lease.firewall_id = held(ResourceKind::Firewall);
-            lease.volume_id = held(ResourceKind::Volume);
+            lease.firewall_id = existing
+                .iter()
+                .find(|resource| resource.kind == ResourceKind::Firewall)
+                .map(|resource| resource.id);
             lease.machine = adopted_machine(pool, server);
             lease.advance(LeasePhase::Booting);
             return Ok(Creation::Created(false));
@@ -402,13 +398,11 @@ impl HubService {
                 public_key: public_key.clone(),
                 labels,
                 ssh_from: pool.ssh_from.clone(),
-                volume_gb: pool.data.volume_gb,
             };
             match runtime.provisioner.create(&request).await {
                 Ok(created) => {
                     lease.server_id = Some(created.server_id);
                     lease.firewall_id = created.firewall_id;
-                    lease.volume_id = created.volume_id;
                     lease.action_id = created.action_id;
                     lease.machine = Some(machine(server_type, location));
                     lease.advance(LeasePhase::Booting);
@@ -473,7 +467,7 @@ impl HubService {
     }
 
     /// Delete whatever refused create attempts of a lease left behind, servers first, keeping
-    /// the server, Volume and firewall the lease holds. What fails here stays labelled for the reaper.
+    /// the server and firewall the lease holds. What fails here stays labelled for the reaper.
     async fn sweep(&self, runtime: &PoolRuntime, lease: &Lease, report: &mut PoolReport) {
         let Some(hub_id) = self.snapshot().await.hub_id else {
             return;
@@ -495,8 +489,7 @@ impl HubService {
             let held = match resource.kind {
                 ResourceKind::Server => lease.server_id,
                 ResourceKind::Firewall => lease.firewall_id,
-                ResourceKind::Volume => lease.volume_id,
-                ResourceKind::PrimaryIp => None,
+                ResourceKind::Volume | ResourceKind::PrimaryIp => None,
             };
             held != Some(resource.id)
         });
@@ -522,7 +515,7 @@ impl HubService {
     ) -> Result<(), HubError> {
         let spec = self.tunnel_spec(pool, lease)?;
         runtime.tunnels.open(&spec)?;
-        let Some(data) = check_data(runtime, spec, pool, lease).await? else {
+        let Some(data) = check_data(runtime, spec, lease).await? else {
             return Ok(());
         };
         let origin = format!("http://127.0.0.1:{}", lease.local_port);
@@ -655,7 +648,7 @@ impl HubService {
         };
         let state = self.snapshot().await;
         let mut orphans = pool::orphans(&resources, &state);
-        // Servers first: a Volume or firewall is deletable only once its server is gone.
+        // Servers first: a firewall is deletable only once its server is gone.
         orphans.sort_by_key(|resource| resource.kind);
         for resource in orphans {
             match runtime.provisioner.destroy(resource).await {
@@ -684,7 +677,6 @@ fn begin_teardown(state: &mut HubState, name: &str, reason: TeardownReason) {
 async fn check_data(
     runtime: &PoolRuntime,
     spec: TunnelSpec,
-    pool: &Pool,
     lease: &mut Lease,
 ) -> Result<Option<DataHealth>, HubError> {
     let tunnels = Arc::clone(&runtime.tunnels);
@@ -710,7 +702,7 @@ async fn check_data(
         }
         Health::Healthy { size_bytes } => Ok(Some(DataHealth {
             fs: "btrfs".to_owned(),
-            mode: pool.data.mode(),
+            mode: FILE_MODE.to_owned(),
             size_bytes,
             checked_at_ms: now_ms(),
         })),
@@ -741,8 +733,7 @@ async fn boot(runtime: &PoolRuntime, lease: &mut Lease) -> Result<(), HubError> 
     Ok(())
 }
 
-/// Delete the server, await its action, then delete its Volume, which the deletion detached,
-/// and its firewall. Returns whether every
+/// Delete the server, await its action, then delete its firewall. Returns whether every
 /// resource of the lease is confirmed gone.
 async fn delete(runtime: &PoolRuntime, lease: &mut Lease) -> Result<bool, HubError> {
     if let Some(action_id) = lease.action_id {
@@ -772,11 +763,6 @@ async fn delete(runtime: &PoolRuntime, lease: &mut Lease) -> Result<bool, HubErr
             }
             None => lease.server_id = None,
         }
-    }
-    if let Some(volume_id) = lease.volume_id {
-        let resource = resource(ResourceKind::Volume, volume_id, lease);
-        runtime.provisioner.destroy(&resource).await?;
-        lease.volume_id = None;
     }
     if let Some(firewall_id) = lease.firewall_id {
         let resource = resource(ResourceKind::Firewall, firewall_id, lease);
@@ -891,7 +877,6 @@ impl HubService {
             shortages: std::collections::BTreeMap::new(),
             profiles: Vec::new(),
             unavailable: std::collections::BTreeMap::new(),
-            data: request.data,
         };
         read_public_key(&pool)?;
         self.mutate(|state| {
@@ -908,7 +893,7 @@ impl HubService {
             if state.hub_id.is_none() {
                 state.hub_id = Some(uuid::Uuid::now_v7().simple().to_string());
             }
-            let document = pool_document(&pool, &state.leases);
+            let document = pool_document(&pool, &state.leases, &state.members);
             state.pools.push(pool);
             Ok(document)
         })
@@ -924,7 +909,7 @@ impl HubService {
             "pools": state
                 .pools
                 .iter()
-                .map(|pool| pool.view(&state.leases, now))
+                .map(|pool| pool.view(&state.leases, &state.members, now))
                 .collect::<Vec<_>>(),
         })
     }
@@ -955,7 +940,7 @@ impl HubService {
             pool.boot_failures = 0;
             pool.paused_until_ms = None;
             let pool = pool.clone();
-            Ok(pool_document(&pool, &state.leases))
+            Ok(pool_document(&pool, &state.leases, &state.members))
         })
         .await
     }
@@ -983,8 +968,8 @@ impl HubService {
     }
 }
 
-fn pool_document(pool: &Pool, leases: &[Lease]) -> Value {
-    json!({ "schema": "zeroshot.hub.pool/v1", "pool": pool.view(leases, now_ms()) })
+fn pool_document(pool: &Pool, leases: &[Lease], members: &[Member]) -> Value {
+    json!({ "schema": "zeroshot.hub.pool/v1", "pool": pool.view(leases, members, now_ms()) })
 }
 
 fn validate_pool(request: &AddPool) -> Result<(), HubError> {
@@ -1037,7 +1022,7 @@ fn validate_pool(request: &AddPool) -> Result<(), HubError> {
     if let Some(0) = request.wait_max_ms {
         return usage("--wait-max must be positive".to_owned());
     }
-    request.data.validate()
+    Ok(())
 }
 
 fn valid_cidr(cidr: &str) -> bool {

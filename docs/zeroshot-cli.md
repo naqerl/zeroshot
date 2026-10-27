@@ -1120,7 +1120,7 @@ ranked by --strategy. Hub documents carry a `schema` field.
 EXIT CODES
   0  success
   1  error (ZEROSHOT_ERROR_FORMAT=json writes a zeroshot.error/v1 diagnostic)
-  3  no capacity: matching members are busy or unreachable, or --wait timed out (retryable)
+  3  no capacity: matching members are busy or unreachable (retryable)
   4  no eligible target: no active member matches the placement, or none supports the run
      (not retryable; details.rejected lists each member's reason)
   5  hub.unreachable: the selected hub context's daemon does not answer
@@ -1252,7 +1252,7 @@ Options:
 ```text
 Place a run on a free member now.
 
-A job a pool serves is parked as queued, as `hub enqueue` does, because the pool starts a server for it. It fails with exit code 3 only when no free member and no pool can take the job now. --wait blocks until the job is placed; --queue returns as soon as it is queued.
+A job a pool serves is parked as queued, as `hub enqueue` does, because the pool starts a server for it. It fails with exit code 3 and the `hub.no_capacity` diagnostic only when no free member and no pool can take the job now. Use `hub enqueue` to queue a job when no pool serves it.
 
 Usage: zeroshot hub submit [OPTIONS] --title <TITLE>
 
@@ -1283,12 +1283,6 @@ Options:
 
       --label <KEY=VALUE>
           Job label for ps filters and stats, such as task=parser. Repeat for several
-
-      --wait [<DURATION>]
-          Wait for a free member, optionally up to DURATION such as 10m
-
-      --queue
-          Queue the job when every matching member is busy instead of failing
 
       --title <TITLE>
           Human-readable title recorded with the run
@@ -2849,18 +2843,6 @@ Options:
 
       --ssh-from <CIDR>
           CIDR allowed to reach servers over SSH (the hub's public address). Repeat for several
-
-      --data-fs <FS>
-          Filesystem of the servers' data folder. Zeroshot copies workspaces with reflinks, so it must be copy-on-write: btrfs, formatted at boot
-
-          [default: btrfs]
-          [possible values: btrfs]
-
-      --data-size <GB>
-          Size of the btrfs data file on the server's local disk, in GB. Default: the free disk after the target image, less 8 GB for Docker
-
-      --data-volume <GB>
-          Keep the data on a btrfs Hetzner Volume of this many GB, created with each server and deleted with it, instead of a file on the local disk
 
   -h, --help
           Print help

@@ -127,8 +127,8 @@ pub(crate) enum Migration {
 /// Parse `state.json` of any supported version and upgrade it to [`STATE_VERSION`]. Version 1
 /// lacks pools, leases and job archives, which all default to empty, so its upgrade only bumps
 /// the version; strict field checking still applies to the result. Earlier version 2 files may
-/// carry pool leases' removed TTL and expiry fields, which are dropped here so they load and
-/// disappear on the next save.
+/// carry removed pool data settings, lease TTL/expiry values, and lease Volume IDs, which are
+/// dropped here so they load and disappear on the next save.
 pub(crate) fn migrate(bytes: &[u8]) -> Result<HubState, Migration> {
     let mut document: serde_json::Value =
         serde_json::from_slice(bytes).map_err(Migration::Malformed)?;
@@ -139,17 +139,17 @@ pub(crate) fn migrate(bytes: &[u8]) -> Result<HubState, Migration> {
     if version > u64::from(STATE_VERSION) {
         return Err(Migration::Newer(version));
     }
-    drop_legacy_pool_expiry(&mut document);
+    drop_removed_fields(&mut document);
     if let Some(object) = document.as_object_mut() {
         object.insert("version".to_owned(), STATE_VERSION.into());
     }
     serde_json::from_value(document).map_err(Migration::Malformed)
 }
 
-/// Remove the TTL, lease-expiry and legacy TTL-reason values of earlier version 2 files from the
+/// Remove fields earlier version 2 files carry but this version no longer defines, from the
 /// pool, lease and member records only. A job's own `expiresAtMs` (from `--wait-max` or a
 /// schedule) remains.
-fn drop_legacy_pool_expiry(document: &mut serde_json::Value) {
+fn drop_removed_fields(document: &mut serde_json::Value) {
     if let Some(pools) = document
         .get_mut("pools")
         .and_then(serde_json::Value::as_array_mut)
@@ -157,6 +157,7 @@ fn drop_legacy_pool_expiry(document: &mut serde_json::Value) {
         for pool in pools {
             if let Some(pool) = pool.as_object_mut() {
                 pool.remove("ttlMs");
+                pool.remove("data");
             }
         }
     }
@@ -168,10 +169,11 @@ fn drop_legacy_pool_expiry(document: &mut serde_json::Value) {
             for record in records {
                 if let Some(record) = record.as_object_mut() {
                     record.remove("expiresAtMs");
-                    if key == "leases"
-                        && record.get("reason").and_then(serde_json::Value::as_str) == Some("ttl")
-                    {
-                        record.remove("reason");
+                    if key == "leases" {
+                        record.remove("volumeId");
+                        if record.get("reason").and_then(serde_json::Value::as_str) == Some("ttl") {
+                            record.remove("reason");
+                        }
                     }
                 }
             }

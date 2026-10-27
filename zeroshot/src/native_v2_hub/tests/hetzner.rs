@@ -123,7 +123,6 @@ fn request() -> ServerRequest {
         public_key: PUBLIC_KEY.to_owned(),
         labels: BTreeMap::from([("zeroshot/hub".to_owned(), "h1".to_owned())]),
         ssh_from: vec!["198.51.100.7/32".to_owned()],
-        volume_gb: None,
     }
 }
 
@@ -189,7 +188,7 @@ async fn create_puts_an_ssh_only_firewall_in_front_of_the_labelled_server() {
     assert_eq!(server["name"], json!("zs-one"));
     assert_eq!(server["server_type"], json!("cpx31"));
     assert_eq!(server["firewalls"], json!([{"firewall": 11}]));
-    assert_eq!(server["volumes"], json!([]));
+    assert!(server.get("volumes").is_none(), "{server}");
     assert_eq!(server["ssh_keys"], json!([7]));
     assert_eq!(server["labels"]["zeroshot/hub"], json!("h1"));
     for call in &seen {
@@ -796,177 +795,4 @@ fn tokens_load_from_a_file_trimmed_and_never_print() {
     assert!(Token::load(Some(&directory.path().join("absent"))).is_err());
     assert!(Token::parse("  ").is_err());
     assert!(Token::parse("two words").is_err());
-}
-
-fn empty(status: u16) -> Answer {
-    Answer {
-        status,
-        body: None,
-        headers: Vec::new(),
-    }
-}
-
-#[tokio::test]
-async fn a_data_volume_is_created_unformatted_attached_and_undone_on_failure() {
-    let (hetzner, mock) = serve().await;
-    register_key(&mock, 5);
-    let with_volume = ServerRequest {
-        volume_gb: Some(200),
-        ..request()
-    };
-    mock.on(
-        "POST /v1/firewalls",
-        answer(201, json!({"firewall": {"id": 11}})),
-    );
-    mock.on(
-        "POST /v1/volumes",
-        answer(201, json!({"volume": {"id": 44}, "action": {"id": 45}})),
-    );
-    mock.on(
-        "POST /v1/servers",
-        answer(201, json!({"server": {"id": 22}, "action": {"id": 33}})),
-    );
-    let created = hetzner.create(&with_volume).await.expect("created");
-    assert_eq!(
-        (created.server_id, created.volume_id, created.firewall_id),
-        (22, Some(44), Some(11))
-    );
-    let seen = mock.seen();
-    let volume = &seen[2].body;
-    assert_eq!(seen[2].uri, "/v1/volumes");
-    assert_eq!(volume["size"], json!(200));
-    assert_eq!(volume["location"], json!("fsn1"));
-    assert_eq!(volume["name"], json!("zs-one"));
-    assert_eq!(volume["automount"], json!(false));
-    assert_eq!(volume["labels"]["zeroshot/hub"], json!("h1"));
-    assert!(
-        volume.get("format").is_none(),
-        "the boot script formats it btrfs"
-    );
-    assert_eq!(seen[3].body["volumes"], json!([44]));
-    assert_eq!(seen[3].body["automount"], json!(false));
-
-    // A refused server deletes the Volume, then the firewall.
-    mock.on(
-        "POST /v1/firewalls",
-        answer(201, json!({"firewall": {"id": 12}})),
-    );
-    mock.on(
-        "POST /v1/volumes",
-        answer(201, json!({"volume": {"id": 46}})),
-    );
-    mock.on(
-        "POST /v1/servers",
-        answer(
-            412,
-            json!({"error": {"code": "resource_unavailable", "message": "no room"}}),
-        ),
-    );
-    mock.on("DELETE /v1/volumes/46", empty(204));
-    mock.on("DELETE /v1/firewalls/12", empty(204));
-    let error = hetzner.create(&with_volume).await.expect_err("no room");
-    assert_eq!(error.refusal, Refusal::Capacity);
-    let deletes = mock
-        .seen()
-        .into_iter()
-        .filter(|call| call.method == "DELETE")
-        .map(|call| call.uri)
-        .collect::<Vec<_>>();
-    assert_eq!(deletes, ["/v1/volumes/46", "/v1/firewalls/12"]);
-
-    // A refused Volume deletes the firewall and creates no server.
-    mock.on(
-        "POST /v1/firewalls",
-        answer(201, json!({"firewall": {"id": 13}})),
-    );
-    mock.on(
-        "POST /v1/volumes",
-        answer(
-            403,
-            json!({"error": {"code": "resource_limit_exceeded", "message": "volume limit"}}),
-        ),
-    );
-    mock.on(
-        "DELETE /v1/firewalls/13",
-        answer(
-            409,
-            json!({"error": {"code": "conflict", "message": "busy"}}),
-        ),
-    );
-    let servers_before = mock
-        .seen()
-        .iter()
-        .filter(|call| call.uri == "/v1/servers")
-        .count();
-    let error = hetzner
-        .create(&with_volume)
-        .await
-        .expect_err("volume limit");
-    assert_eq!(error.refusal, Refusal::Quota);
-    assert!(error.message.contains("volume limit"), "{}", error.message);
-    assert!(
-        error.message.contains("firewall 13 left for cleanup"),
-        "{}",
-        error.message
-    );
-    let servers_after = mock
-        .seen()
-        .iter()
-        .filter(|call| call.uri == "/v1/servers")
-        .count();
-    assert_eq!(servers_before, servers_after);
-
-    // A Volume answer without an ID is retried later.
-    mock.on(
-        "POST /v1/firewalls",
-        answer(201, json!({"firewall": {"id": 15}})),
-    );
-    mock.on("POST /v1/volumes", answer(201, json!({"volume": {}})));
-    mock.on("DELETE /v1/firewalls/15", empty(204));
-    let error = hetzner
-        .create(&with_volume)
-        .await
-        .expect_err("no volume id");
-    assert_eq!(error.refusal, Refusal::Transient);
-
-    // The volume left after a failed undo carries the lease labels for the reaper.
-    mock.on(
-        "POST /v1/firewalls",
-        answer(201, json!({"firewall": {"id": 16}})),
-    );
-    mock.on(
-        "POST /v1/volumes",
-        answer(201, json!({"volume": {"id": 47}})),
-    );
-    mock.on(
-        "POST /v1/servers",
-        answer(500, json!({"error": {"code": "server_error"}})),
-    );
-    mock.on(
-        "DELETE /v1/volumes/47",
-        answer(
-            423,
-            json!({"error": {"code": "locked", "message": "locked"}}),
-        ),
-    );
-    mock.on("DELETE /v1/firewalls/16", empty(204));
-    let error = hetzner
-        .create(&with_volume)
-        .await
-        .expect_err("server error");
-    assert!(
-        error.message.contains("volume 47 left for cleanup"),
-        "{}",
-        error.message
-    );
-
-    mock.on("DELETE /v1/volumes/44", empty(204));
-    assert_eq!(
-        hetzner
-            .destroy(&resource(ResourceKind::Volume, 44))
-            .await
-            .expect("deleted"),
-        None
-    );
-    assert_eq!(mock.seen().last().expect("call").uri, "/v1/volumes/44");
 }

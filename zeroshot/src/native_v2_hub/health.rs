@@ -7,15 +7,25 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::clock::rfc3339;
-use super::data::{BOOT_STATUS, DataMode};
+use super::data::BOOT_STATUS;
 use super::error::HubError;
+
+/// The only data mode pool servers have had since Volumes were removed.
+pub(crate) const FILE_MODE: &str = "file";
+
+fn file_mode() -> String {
+    FILE_MODE.to_owned()
+}
 
 /// The data folder a pool member last passed the health check with.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct DataHealth {
     pub fs: String,
-    pub mode: DataMode,
+    /// How the data folder is backed. New checks record [`FILE_MODE`]; legacy `volume`
+    /// observations still load so old state stays readable.
+    #[serde(default = "file_mode")]
+    pub mode: String,
     pub size_bytes: u64,
     pub checked_at_ms: u64,
 }

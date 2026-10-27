@@ -646,16 +646,14 @@ fn job_attribution_helpers() {
 #[test]
 fn placement_errors_have_distinct_exit_codes_and_json_codes() {
     let no_capacity = HubError::NoCapacity("any member".to_owned());
-    let timeout = HubError::WaitTimeout("any member".to_owned());
     let ineligible = HubError::no_eligible("tags [gpu]".to_owned(), Vec::new());
     assert_eq!(no_capacity.exit_code(), EXIT_NO_CAPACITY);
-    assert_eq!(timeout.exit_code(), EXIT_NO_CAPACITY);
     assert_eq!(ineligible.exit_code(), EXIT_NO_ELIGIBLE_TARGET);
     assert_eq!(HubError::JobNotFound("j".to_owned()).exit_code(), 1);
     let diagnostic = ineligible.diagnostic();
     assert_eq!(diagnostic["schema"], json!("zeroshot.error/v1"));
     assert_eq!(diagnostic["code"], json!("hub.no_eligible_target"));
-    assert_eq!(timeout.diagnostic()["code"], json!("hub.wait_timeout"));
+    assert_eq!(no_capacity.diagnostic()["code"], json!("hub.no_capacity"));
 }
 
 #[test]

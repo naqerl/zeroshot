@@ -312,10 +312,7 @@ async fn resume_pool(State(state): State<Arc<ApiState>>, Path(name): Path<String
 async fn submit(State(state): State<Arc<ApiState>>, bytes: Bytes) -> Response {
     let result = async {
         let request = body::<SubmitJob>(&bytes)?;
-        state
-            .service
-            .submit(request.job, request.queue, request.files)
-            .await
+        state.service.submit(request.job, request.files).await
     }
     .await;
     reply(result)

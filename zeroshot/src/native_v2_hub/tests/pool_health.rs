@@ -1,7 +1,6 @@
 //! The btrfs data health check of pool servers, against the fake provider and fake tunnels,
 //! and the SSH script runner against a fake `ssh`.
 
-use super::super::data::DataMode;
 use super::super::health::{self, Health};
 use super::super::model::MemberState;
 use super::super::pool::{LeasePhase, ResourceKind, TeardownReason};
@@ -109,14 +108,25 @@ async fn a_member_joins_only_after_its_data_folder_passes_the_check() {
     let member = state.member(&lease.name).expect("member");
     let data = member.data.as_ref().expect("data health");
     assert_eq!(
-        (data.fs.as_str(), data.mode, data.size_bytes),
-        ("btrfs", DataMode::File, 1_073_741_824)
+        (data.fs.as_str(), data.mode.as_str(), data.size_bytes),
+        ("btrfs", "file", 1_073_741_824)
     );
     let view = member.view();
     assert_eq!(view["data"]["fs"], "btrfs");
     assert_eq!(view["data"]["mode"], "file");
     assert_eq!(view["data"]["sizeBytes"], 1_073_741_824_u64);
     assert!(view["data"]["checkedAt"].is_string());
+    let listed = rig.service.list_pools().await;
+    assert_eq!(listed["pools"][0]["data"]["fs"], "btrfs", "{listed}");
+    assert_eq!(listed["pools"][0]["data"]["mode"], "file", "{listed}");
+    assert_eq!(
+        listed["pools"][0]["data"]["sizeBytes"], 1_073_741_824_u64,
+        "{listed}"
+    );
+    assert!(
+        listed["pools"][0]["data"]["checkedAt"].is_string(),
+        "{listed}"
+    );
     assert!(rig.service.registry().get(&lease.name).is_ok());
 }
 

@@ -104,6 +104,9 @@ removes it. For example:
 `logs`, and `hub_logs` do the same and hold the MCP session until that stream ends. For live run
 events, use the events extension instead of those tools.
 
+`hub_submit` has no `wait` or `queue` option: it places the job now, parks it when a serving pool
+will start a server for it, and fails when nothing can take it. Use `hub_enqueue` to queue a run.
+
 Read-only tools are `status`, `logs`, `watch`, `list`, `report`, `hub_list`, `hub_ps`,
 `hub_stats`, `hub_logs`, and `hub_daemon_status`. `run`, `resume`, `hub_submit`, and `hub_enqueue`
 submit work. `force-stop` stops a run.

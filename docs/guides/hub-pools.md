@@ -46,13 +46,6 @@ the login account's password expired, so PAM refuses the key session with "Passw
 but no TTY available". The boot configuration also marks the password as non-expiring so the key
 session works.
 
-- `--data-fs` is the data folder's filesystem. Only `btrfs` (the default) is supported; see
-  [The btrfs data folder](#the-btrfs-data-folder).
-- `--data-size GB` sizes the btrfs data file on the server's local disk. Without it the file takes
-  the free disk after the target image, less 8 GB of headroom.
-- `--data-volume GB` puts the data folder on a Hetzner Volume of that size (10 to 10240 GB)
-  instead, created and deleted with the server. It excludes `--data-size`.
-
 The daemon needs an API token, from `hub daemon run --hetzner-token-file FILE` or `HCLOUD_TOKEN`
 in the daemon's environment. The token is sent only to the Hetzner API. It is never stored in hub
 state, labels, user data, or logs.
@@ -157,10 +150,10 @@ job waits until its own expiry.
 5. **Teardown.** When a server has been idle for `--idle`, the hub drains it. It
    waits until each run is terminal and its postmortem has finished, then archives the run. Next it
    removes the member and the target, closes the tunnel, deletes the server, waits for the delete
-   action, and finally deletes the Volume, if any, and the firewall.
+   action, and finally deletes the firewall.
 6. **Reaper.** On start and every five minutes, the hub lists resources labelled
-   `zeroshot/hub=<hub id>`. It deletes servers, Volumes, primary IPs, and firewalls that state does not
-   know about. It never deletes a resource whose lease state still holds.
+   `zeroshot/hub=<hub id>`. It deletes servers, legacy Volumes, primary IPs, and firewalls that state
+   does not know about. It never deletes a resource whose lease state still holds.
 
 A server whose boot fails or times out is deleted. Its pool then pauses for 5 minutes, and the
 pause doubles on each further failure up to an hour, so a broken image does not keep creating
@@ -170,8 +163,7 @@ billed servers.
 job. When no free member can take it but a pool can serve its placement, submit parks the job as
 queued and returns it without an error, because that pool starts a server for it; exit 3 with
 `hub.no_capacity` remains for a placement that neither a free member nor a pool can serve now.
-`--wait` is how you block: it follows the parked job until the hub actually places it, and
-`--wait=DURATION` bounds that wait and ends in `hub.wait_timeout` when the job is still unplaced.
+Use `zeroshot hub enqueue` when no free member can take the job now and no pool serves it.
 
 ## The btrfs data folder
 
@@ -183,12 +175,9 @@ subvolumes, no `btrfs` command, and no extra container privileges.
 The boot script is written by the hub into cloud-init user data, so any server image with
 Docker or apt/dnf works. No custom image is needed. The script runs with `set -eu`:
 
-- **File mode** (the default) allocates `/var/lib/zeroshot-data.btrfs` (mode 0600) with
-  `fallocate`. It formats the file with `mkfs.btrfs` and loop-mounts it at `/mnt/zs`.
-- **Volume mode** (`--data-volume`) waits for the attached Volume under
-  `/dev/disk/by-id/scsi-0HC_Volume_*`. It formats the Volume only if it holds no filesystem, and
-  fails if it holds a filesystem other than btrfs.
-- Both mount with `noatime,compress=zstd:1` and add a `nofail` line to `/etc/fstab`, so a reboot
+- It allocates `/var/lib/zeroshot-data.btrfs` (mode 0600) with `fallocate`. It formats the file
+  with `mkfs.btrfs` and loop-mounts it at `/mnt/zs`.
+- It mounts with `noatime,compress=zstd:1` and adds a `nofail` line to `/etc/fstab`, so a reboot
   remounts the folder. `/mnt/zs` is made immutable before the mount, so nothing can write to the
   ext4 underneath.
 - The script then checks that `/mnt/zs` is btrfs. It creates a subvolume, takes a read-only
@@ -204,14 +193,11 @@ Before the hub registers a server, it runs a health check as root over SSH:
 - a subvolume snapshot works;
 - the running target can make a reflink copy inside its own `/var/lib/zeroshot`.
 
-The member then shows the checked filesystem, mode and size under `data` in `zeroshot hub list`.
+The member then shows the checked filesystem, mode `file` and size under
+`data: {fs: "btrfs", mode: "file", sizeBytes: N}` in `zeroshot hub list`, and
+`zeroshot hub pool list` reports the same observed data for the pool's servers.
 While the boot script still runs, or SSH fails, the check is retried until the boot deadline. A
 failed boot script or check counts as a failed boot: the server is deleted and the pool pauses.
-
-A Volume is created unformatted, in the server's location, with the same labels. It is attached
-when the server is created and deleted after the server, and the reaper deletes it if the hub no
-longer holds it. A Volume makes boots slower and is billed separately; see the provider's
-prices. The file mode needs no extra resource.
 
 ## Archives
 

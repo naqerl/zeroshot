@@ -863,14 +863,13 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   transport and per-node lanes need their discovery markers) against capability kinds cached from
   `/.well-known/zeroshot-native-v2`. Cron schedules use `croner` with an explicit IANA zone (`jiff`
   bundled tzdb). Member capacity is hub-declared `slots`; load is the observed nonterminal runs.
-  Dispatch submission keys are `hub-JOB_ID-ATTEMPT`. Exit code 3 means no capacity or an expired
-  wait, and 4 means that no active member matches or supports the job.
+  Dispatch submission keys are `hub-JOB_ID-ATTEMPT`. Exit code 3 means no capacity, and 4 means
+  that no active member matches or supports the job.
 - Hub pools (`native_v2_hub/pool.rs` model and scaling, `lease.rs` per-pass lease steps,
   `provision.rs` `Provisioner` trait plus cloud-init, `hetzner.rs` reqwest client, `tunnel.rs`
   `ssh -N -L`, `archive.rs`) create Hetzner servers for queued jobs only a pool matches. An empty
   pool is eligible, so such jobs queue rather than exit 4, and `hub submit` parks a job a pool
-  serves instead of failing as no-capacity; `--wait` follows that parked job until placement. A
-  lease steps one phase per pass:
+  serves instead of failing as no-capacity. A lease steps one phase per pass:
   Creating, Booting, Connecting, Active, Draining, Deleting, Done. A server is deleted only after
   each of its runs is terminal, has its postmortem, and is archived to `hub/archive/JOB_ID/`. The
   reaper (start, then every 5 min) deletes resources labelled `zeroshot/hub=ID` that state does not
@@ -880,11 +879,11 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   reuses an existing key by public key or MD5 fingerprint, attaches it to the server by key ID,
   and also writes it plus a non-expiring login in user data; key-registration failures remain
   distinct from server create/delete errors. No secret enters either. `data.rs` owns the btrfs
-  data folder: pool `--data-fs btrfs` (only),
-  `--data-size` or `--data-volume` (a labelled Hetzner Volume deleted after its server), and the
-  idempotent, strict boot script (file or Volume, mkfs.btrfs, fstab, snapshot and reflink
-  probe, then the target). `health.rs` is the SSH check run in Connecting before registration;
-  its failure is a failed boot. zeroshot itself needs only reflinks (`FICLONE`). Pools take
+  data folder: an automatically sized file on the server's local disk and the idempotent, strict
+  boot script (mkfs.btrfs, fstab, snapshot and reflink probe, then the target). `health.rs` is the
+  SSH check run in Connecting before registration; its failure is a failed boot, and a joined
+  member reports the observed `data: {fs: "btrfs", mode: "file", sizeBytes: N}` in `hub list` and
+  `hub pool list`. zeroshot itself needs only reflinks (`FICLONE`). Pools take
   ordered `--type`/`--location` lists with no default type, checked against the provider catalog
   (`cax*` needs `--multi-arch`). `profile.rs` owns tag profiles and resolves a job's machine
   (`Spec`): job size tags (`server-type=`, `min-vcpu=`, `min-ram-gb=`), else the highest-ranked

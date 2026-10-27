@@ -391,7 +391,6 @@ impl HubService {
     pub(crate) async fn submit(
         &self,
         mut job: Job,
-        queue: bool,
         files: Vec<JobFile>,
     ) -> Result<Value, HubError> {
         let _placing = self.placement.lock().await;
@@ -446,7 +445,7 @@ impl HubService {
                 Err(HubError::no_eligible(describe(&job.placement), rejected))
             }
             Placement::NoEligible { .. } => self.park(job, now).await,
-            Placement::Busy { .. } if pool_serves || queue => self.park(job, now).await,
+            Placement::Busy { .. } if pool_serves => self.park(job, now).await,
             Placement::Busy { .. } => {
                 self.metrics.record_rejection(None);
                 Err(HubError::NoCapacity(describe(&job.placement)))

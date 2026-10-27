@@ -179,8 +179,6 @@ const HUB_SUBMIT_KEYS: &[&str] = &[
     "tag",
     "strategy",
     "label",
-    "wait",
-    "queue",
     "title",
     "input",
     "graph",
@@ -615,24 +613,6 @@ fn hub_prefix(map: &Map<String, Value>, subcommand: &[&str]) -> Result<Vec<Strin
     Ok(argv)
 }
 
-fn push_wait(argv: &mut Vec<String>, map: &Map<String, Value>) -> Result<(), McpFailure> {
-    match map.get("wait") {
-        None | Some(Value::Null) | Some(Value::Bool(false)) => Ok(()),
-        Some(Value::Bool(true)) => {
-            argv.push("--wait".to_owned());
-            Ok(())
-        }
-        Some(Value::String(duration)) => {
-            argv.push("--wait".to_owned());
-            argv.push(duration.clone());
-            Ok(())
-        }
-        Some(_) => Err(McpFailure::invalid(
-            "wait must be a boolean or a duration string",
-        )),
-    }
-}
-
 fn push_probe(argv: &mut Vec<String>, map: &Map<String, Value>) -> Result<(), McpFailure> {
     match map.get("probe") {
         None | Some(Value::Null) | Some(Value::Bool(true)) => Ok(()),
@@ -736,8 +716,6 @@ fn hub_status_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFailure> 
 fn hub_submit_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFailure> {
     let mut argv = hub_prefix(map, &["submit"])?;
     push_placement(&mut argv, map)?;
-    push_wait(&mut argv, map)?;
-    push_flag(&mut argv, map, "queue", "--queue")?;
     push_run_flags(
         &mut argv,
         map,
@@ -1045,18 +1023,6 @@ fn hub_logs_schema() -> Value {
 
 fn hub_submit_schema() -> Value {
     let mut properties = placement_properties();
-    properties.push((
-        "wait",
-        json!({
-            "description": "Wait for a free member. true waits without a limit; \
-                a string is a duration such as 10m.",
-            "oneOf": [{"type": "boolean"}, {"type": "string"}]
-        }),
-    ));
-    properties.push((
-        "queue",
-        bool_prop("Queue the job when every matching member is busy."),
-    ));
     properties.extend(
         run_properties()
             .into_iter()

@@ -140,12 +140,6 @@ pub struct HubPoolAdd {
     pub tags: Vec<String>,
     pub ssh_key: PathBuf,
     pub ssh_from: Vec<String>,
-    /// Filesystem of the servers' data folder; only `btrfs`.
-    pub data_fs: String,
-    /// Size of the btrfs data file on the local disk, in GB; `None` sizes it to the free disk.
-    pub data_size_gb: Option<u32>,
-    /// Keep the data on an attached Volume of this many GB instead of the local disk.
-    pub data_volume_gb: Option<u32>,
 }
 
 /// `hub daemon run` options.
@@ -297,8 +291,6 @@ pub struct HubJobSpec {
 pub struct HubSubmit {
     pub job: HubJobSpec,
     pub detach: bool,
-    pub wait: Option<Option<String>>,
-    pub queue: bool,
 }
 
 /// Deferred placement: once (`at`) or recurring (`cron`).

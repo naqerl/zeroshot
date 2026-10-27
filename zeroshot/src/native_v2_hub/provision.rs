@@ -31,8 +31,6 @@ pub(crate) struct ServerRequest {
     pub labels: BTreeMap<String, String>,
     /// Source CIDRs admitted on SSH; every other inbound port is closed.
     pub ssh_from: Vec<String>,
-    /// Size of an unformatted Volume to create and attach for the btrfs data folder, in GB.
-    pub volume_gb: Option<u32>,
 }
 
 /// A created server; `action_id` is its creation action.
@@ -40,7 +38,6 @@ pub(crate) struct ServerRequest {
 pub(crate) struct Created {
     pub server_id: u64,
     pub firewall_id: Option<u64>,
-    pub volume_id: Option<u64>,
     pub action_id: Option<u64>,
 }
 
@@ -158,8 +155,7 @@ impl Catalog {
 
 #[async_trait]
 pub(crate) trait Provisioner: Send + Sync {
-    /// Create a firewall admitting only SSH from `ssh_from`, the unformatted Volume of
-    /// `volume_gb` when asked, then the server behind the firewall with the Volume attached. A
+    /// Create a firewall admitting only SSH from `ssh_from`, then the server behind it. A
     /// failure leaves nothing behind that the provider confirmed; anything it could not remove
     /// carries the lease's labels for the caller's cleanup and the reaper.
     async fn create(&self, request: &ServerRequest) -> Result<Created, Failure>;
@@ -194,7 +190,6 @@ pub(crate) fn user_data(pool: &Pool, lease: &Lease, public_key: &str) -> Result<
     }
     let origin = format!("http://127.0.0.1:{}", lease.local_port);
     let script = data::boot_script(&data::Boot {
-        data: &pool.data,
         target_image: &pool.target_image,
         public_origin: &origin,
         data_folder: DATA_FOLDER,

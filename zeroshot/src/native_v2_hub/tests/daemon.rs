@@ -502,7 +502,7 @@ fn one_daemon_owns_a_hub_folder() {
 
 #[tokio::test]
 async fn the_daemon_serves_the_api_dispatches_and_stops_on_shutdown() {
-    use zeroshot_engine::native_v2_cli::hub::{HubDaemonRun, HubSubmit};
+    use zeroshot_engine::native_v2_cli::hub::{HubDaemonRun, HubEnqueue, HubSubmit};
     let directory = tempfile::tempdir().expect("tempdir");
     let store = HubStore::new(directory.path().join("hub"));
     let token_file = directory.path().join("secrets").join("token");
@@ -554,21 +554,32 @@ async fn the_daemon_serves_the_api_dispatches_and_stops_on_shutdown() {
         )
         .await
         .expect("add");
-        // Queue more work than fits; the daemon's next pass places the queued job.
-        for title in ["first", "second"] {
-            super::super::client::execute(
-                &client,
-                zeroshot_engine::native_v2_cli::hub::HubCommand::Submit(Box::new(HubSubmit {
-                    job: super::flows::spec(&folder, title, None),
-                    detach: true,
-                    wait: None,
-                    queue: true,
-                })),
-                &mut output,
-            )
-            .await
-            .expect("submit");
-        }
+        // The first job takes the only slot; `enqueue` queues the second, which the
+        // daemon's next pass places.
+        super::super::client::execute(
+            &client,
+            zeroshot_engine::native_v2_cli::hub::HubCommand::Submit(Box::new(HubSubmit {
+                job: super::flows::spec(&folder, "first", None),
+                detach: true,
+            })),
+            &mut output,
+        )
+        .await
+        .expect("submit");
+        super::super::client::execute(
+            &client,
+            zeroshot_engine::native_v2_cli::hub::HubCommand::Enqueue(Box::new(HubEnqueue {
+                job: super::flows::spec(&folder, "second", None),
+                at: None,
+                cron: None,
+                cron_timezone: None,
+                priority: 0,
+                expires: None,
+            })),
+            &mut output,
+        )
+        .await
+        .expect("enqueue");
         let metrics = heartbeat["metricsListen"].as_str().expect("metrics listen");
         let scraped = reqwest::get(format!("http://{metrics}/metrics"))
             .await
