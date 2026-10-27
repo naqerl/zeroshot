@@ -9,7 +9,7 @@ use super::capacity::Machine;
 use super::clock::rfc3339;
 use super::eval::EvalState;
 use super::health::DataHealth;
-use super::pool::{Lease, Pool};
+use super::pool::{Lease, POOL_EVENT_LIMIT, Pool, PoolEventRecord};
 use super::profile::Spec;
 use super::usage::JobUsage;
 
@@ -39,6 +39,15 @@ pub(crate) struct HubState {
     /// Pool servers from creation until their deletion is confirmed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub leases: Vec<Lease>,
+    /// Observed pool and lease transitions, oldest first and bounded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pool_events: Vec<PoolEventRecord>,
+    /// Last sequence assigned to a pool event; monotonic for the life of the hub state.
+    #[serde(default)]
+    pub next_pool_event: u64,
+    /// Pools removed through `hub pool remove` whose leases are still being deleted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_pools: Vec<String>,
 }
 
 impl Default for HubState {
@@ -52,6 +61,9 @@ impl Default for HubState {
             hub_id: None,
             pools: Vec::new(),
             leases: Vec::new(),
+            pool_events: Vec::new(),
+            next_pool_event: 0,
+            removed_pools: Vec::new(),
         }
     }
 }
@@ -59,6 +71,17 @@ impl Default for HubState {
 impl HubState {
     pub(crate) fn member(&self, name: &str) -> Option<&Member> {
         self.members.iter().find(|member| member.name == name)
+    }
+
+    /// Append one transition, assigning its hub-local sequence and dropping the oldest once
+    /// the bounded log is full.
+    pub(crate) fn push_pool_event(&mut self, mut event: PoolEventRecord) {
+        self.next_pool_event = self.next_pool_event.saturating_add(1);
+        event.sequence = self.next_pool_event;
+        self.pool_events.push(event);
+        while self.pool_events.len() > POOL_EVENT_LIMIT {
+            self.pool_events.remove(0);
+        }
     }
 }
 
@@ -298,7 +321,7 @@ pub(crate) enum JobErrorKind {
     DequeuedWhilePlacing,
     /// Waited longer than its pool's `--wait-max` for a server; the job expired.
     PoolWaitTimeout,
-        /// The run stopped making progress and is stopped by `hub daemon run --max-stall`; while a
+    /// The run stopped making progress and is stopped by `hub daemon run --max-stall`; while a
     /// stop keeps failing the job stays running with this error.
     Stalled,
     /// The job's member left the hub or stayed unreachable for too many consecutive probes, so

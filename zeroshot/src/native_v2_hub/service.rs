@@ -459,6 +459,7 @@ impl HubService {
                 })
                 .await?;
                 let (job, dispatched) = self.dispatch(&job.job_id, &member, now).await?;
+                self.note_placed(&job, &dispatched).await?;
                 if let Dispatched::Rejected(error) = dispatched {
                     return Err(error);
                 }
@@ -511,6 +512,23 @@ impl HubService {
         })
         .await?;
         Ok(job_document(&job, now))
+    }
+
+    /// Mark a pool member as busy once a target confirmed the run, so the lease reports
+    /// `in_use` only for a job that actually started.
+    async fn note_placed(&self, job: &Job, dispatched: &Dispatched) -> Result<(), HubError> {
+        if !matches!(dispatched, Dispatched::Placed) {
+            return Ok(());
+        }
+        let Some(member) = job.target.clone() else {
+            return Ok(());
+        };
+        let at = now_ms();
+        self.mutate(|state| {
+            pool::record_member_phase(state, &member, pool::PoolPhase::InUse, at);
+            Ok(())
+        })
+        .await
     }
 
     /// Submit a job already marked as placing on `member`, outside the state lock, and record
@@ -943,6 +961,7 @@ impl HubService {
         let placing = schedule::placing(&self.snapshot().await);
         for (job_id, member) in placing {
             let (job, dispatched) = self.dispatch(&job_id, &member, now).await?;
+            self.note_placed(&job, &dispatched).await?;
             schedule::record_dispatch(&mut report, &job, &dispatched);
         }
         let due = !schedule::due_jobs(&self.snapshot().await.jobs, now_ms()).is_empty();
@@ -966,6 +985,7 @@ impl HubService {
                 .await?;
             for (job_id, member) in chosen {
                 let (job, dispatched) = self.dispatch(&job_id, &member, now).await?;
+                self.note_placed(&job, &dispatched).await?;
                 schedule::record_dispatch(&mut report, &job, &dispatched);
             }
             report.loads = Some(loads);

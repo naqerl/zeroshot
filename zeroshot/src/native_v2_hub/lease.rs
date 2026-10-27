@@ -21,7 +21,7 @@ use super::health::{self, DataHealth, Health};
 use super::model::{HubState, Member, MemberState};
 use super::pool::{
     self, LABEL_HUB, LABEL_LEASE, LABEL_LOCATION, LABEL_SERVER_TYPE, Lease, LeasePhase, Pool,
-    Resource, ResourceKind, TeardownReason,
+    PoolPhase, Resource, ResourceKind, TeardownReason,
 };
 use super::provision::{self, Catalog, Progress, Provisioner, Refusal, ServerRequest};
 use super::service::HubService;
@@ -155,6 +155,9 @@ impl HubService {
     /// lease. Runs outside the placement lock except where it changes what placement may use.
     pub(crate) async fn pool_pass(&self) -> Result<PoolReport, HubError> {
         let mut report = PoolReport::default();
+        // A removed pool is reported once its last lease is gone, even when that pass finds
+        // nothing left to do.
+        self.publish_pool_removals(now_ms()).await?;
         let state = self.snapshot().await;
         if state.pools.is_empty() && state.leases.is_empty() {
             return Ok(report);
@@ -177,6 +180,7 @@ impl HubService {
             }
             let name = lease.name.clone();
             let phase = lease.phase;
+            let lease_server_id = lease.server_id;
             let failed_boot = matches!(
                 lease.reason,
                 Some(TeardownReason::BootFailed | TeardownReason::BootTimeout)
@@ -186,7 +190,20 @@ impl HubService {
                 Ok(Step::Update(next)) => self.store_lease(*next).await?,
                 Ok(Step::Done(lease)) => {
                     self.sweep(runtime, &lease, &mut report).await;
+                    let mut finished = *lease;
+                    if finished.server_id.is_none() {
+                        finished.server_id = lease_server_id;
+                    }
                     self.mutate(|state| {
+                        pool::record_lease_phase(
+                            state,
+                            &mut finished,
+                            pool::PoolPhaseChange {
+                                phase: PoolPhase::Deleted,
+                                reason: None,
+                                at: now_ms(),
+                            },
+                        );
                         state.leases.retain(|lease| lease.name != name);
                         if failed_boot {
                             pool::record_boot(state, &pool_name, true, now_ms());
@@ -198,7 +215,21 @@ impl HubService {
                 }
                 Ok(Step::Abandoned(lease)) => {
                     self.sweep(runtime, &lease, &mut report).await;
+                    let mut failed = *lease;
+                    let reason = failed
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "creating: the provider refused the server".to_owned());
                     self.mutate(|state| {
+                        pool::record_lease_phase(
+                            state,
+                            &mut failed,
+                            pool::PoolPhaseChange {
+                                phase: PoolPhase::Failed,
+                                reason: Some(reason),
+                                at: now_ms(),
+                            },
+                        );
                         state.leases.retain(|slot| slot.name != name);
                         Ok(())
                     })
@@ -213,10 +244,61 @@ impl HubService {
         Ok(report)
     }
 
-    async fn store_lease(&self, next: Lease) -> Result<(), HubError> {
+    async fn store_lease(&self, mut next: Lease) -> Result<(), HubError> {
+        let at = now_ms();
         self.mutate(|state| {
+            let previous = state
+                .leases
+                .iter()
+                .find(|slot| slot.name == next.name)
+                .and_then(|slot| slot.event_phase);
+            match next.event_phase {
+                Some(phase) => {
+                    next.event_phase = previous;
+                    let reason = (phase == PoolPhase::Failed)
+                        .then(|| failed_reason(previous, next.error.clone()))
+                        .flatten();
+                    pool::record_lease_phase(
+                        state,
+                        &mut next,
+                        pool::PoolPhaseChange { phase, reason, at },
+                    );
+                }
+                None => next.event_phase = previous,
+            }
             if let Some(slot) = state.leases.iter_mut().find(|slot| slot.name == next.name) {
                 *slot = next;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Emit `removed` for pools whose last lease is gone. A pool is never reported removed
+    /// while one of its servers could still be billing, and a lease that failed before it had a
+    /// server keeps the pool from ever claiming every lease was deleted.
+    async fn publish_pool_removals(&self, now: u64) -> Result<(), HubError> {
+        self.mutate(|state| {
+            let done = state
+                .removed_pools
+                .iter()
+                .filter(|name| !state.leases.iter().any(|lease| lease.pool == **name))
+                .cloned()
+                .collect::<Vec<_>>();
+            for name in done {
+                state.removed_pools.retain(|pending| pending != &name);
+                if !pool::every_lease_deleted(state, &name) {
+                    continue;
+                }
+                pool::record_pool_phase(
+                    state,
+                    &name,
+                    pool::PoolPhaseChange {
+                        phase: PoolPhase::Removed,
+                        reason: None,
+                        at: now,
+                    },
+                );
             }
             Ok(())
         })
@@ -266,7 +348,18 @@ impl HubService {
                     spec,
                     ..Lease::new(pool, &job_id, port, now)
                 };
-                started.push(lease.name.clone());
+                let mut lease = lease;
+                let name = lease.name.clone();
+                pool::record_lease_phase(
+                    state,
+                    &mut lease,
+                    pool::PoolPhaseChange {
+                        phase: PoolPhase::Requested,
+                        reason: None,
+                        at: now,
+                    },
+                );
+                started.push(name);
                 state.leases.push(lease);
             }
             Ok((started, expired))
@@ -309,12 +402,14 @@ impl HubService {
                         let reason = self
                             .hold(&lease.pool, Hold::Short(&lease.spec, &tried))
                             .await?;
-                        report.shortages.push((lease.name.clone(), reason));
+                        report.shortages.push((lease.name.clone(), reason.clone()));
+                        lease.error = Some(format!("creating: {reason}"));
                         return Ok(Step::Abandoned(Box::new(lease)));
                     }
                     Creation::Blocked(error) => {
                         self.hold(&lease.pool, Hold::Blocked(&error)).await?;
-                        report.blocked.push((lease.pool.clone(), error));
+                        report.blocked.push((lease.pool.clone(), error.clone()));
+                        lease.error = Some(format!("creating: {error}"));
                         return Ok(Step::Abandoned(Box::new(lease)));
                     }
                 }
@@ -378,6 +473,7 @@ impl HubService {
             lease.firewall_id = held(ResourceKind::Firewall);
             lease.volume_id = held(ResourceKind::Volume);
             lease.machine = adopted_machine(pool, server);
+            lease.event_phase = Some(PoolPhase::Creating);
             lease.advance(LeasePhase::Booting);
             return Ok(Creation::Created(false));
         }
@@ -411,6 +507,7 @@ impl HubService {
                     lease.volume_id = created.volume_id;
                     lease.action_id = created.action_id;
                     lease.machine = Some(machine(server_type, location));
+                    lease.event_phase = Some(PoolPhase::Creating);
                     lease.advance(LeasePhase::Booting);
                     self.hold(&pool.name, Hold::Clear(&lease.spec, &tried))
                         .await?;
@@ -447,27 +544,57 @@ impl HubService {
     async fn hold(&self, pool_name: &str, hold: Hold<'_>) -> Result<String, HubError> {
         let now = now_ms();
         self.mutate(|state| {
-            let Some(pool) = state.pools.iter_mut().find(|pool| pool.name == pool_name) else {
+            let Some(index) = state.pools.iter().position(|pool| pool.name == pool_name) else {
                 return Ok(String::new());
             };
-            match hold {
-                Hold::Clear(spec, tried) => {
-                    capacity::count_unavailable(pool, tried);
-                    pool.shortages.remove(&spec.key());
+            let mut change: Option<(PoolPhase, Option<String>)> = None;
+            let reason = {
+                let pool = &mut state.pools[index];
+                match hold {
+                    Hold::Clear(spec, tried) => {
+                        capacity::count_unavailable(pool, tried);
+                        pool.shortages.remove(&spec.key());
+                        String::new()
+                    }
+                    Hold::Count(tried) => {
+                        capacity::count_unavailable(pool, tried);
+                        String::new()
+                    }
+                    Hold::Short(spec, tried) => {
+                        capacity::count_unavailable(pool, tried);
+                        let existed = pool.shortages.contains_key(&spec.key());
+                        capacity::record_shortage(pool, spec, tried, now);
+                        let reason = pool
+                            .shortages
+                            .get(&spec.key())
+                            .map(|shortage| shortage.reason.clone())
+                            .unwrap_or_default();
+                        if !existed {
+                            change = Some((PoolPhase::Shortage, Some(reason.clone())));
+                        }
+                        reason
+                    }
+                    Hold::Blocked(error) => {
+                        if pool.blocked.as_deref() != Some(error) {
+                            change = Some((PoolPhase::Blocked, Some(error.to_owned())));
+                        }
+                        pool.blocked = Some(error.to_owned());
+                        String::new()
+                    }
                 }
-                Hold::Count(tried) => capacity::count_unavailable(pool, tried),
-                Hold::Short(spec, tried) => {
-                    capacity::count_unavailable(pool, tried);
-                    capacity::record_shortage(pool, spec, tried, now);
-                    return Ok(pool
-                        .shortages
-                        .get(&spec.key())
-                        .map(|shortage| shortage.reason.clone())
-                        .unwrap_or_default());
-                }
-                Hold::Blocked(error) => pool.blocked = Some(error.to_owned()),
+            };
+            if let Some((phase, why)) = change {
+                pool::record_pool_phase(
+                    state,
+                    pool_name,
+                    pool::PoolPhaseChange {
+                        phase,
+                        reason: why,
+                        at: now,
+                    },
+                );
             }
-            Ok(String::new())
+            Ok(reason)
         })
         .await
     }
@@ -521,6 +648,10 @@ impl HubService {
         lease: &mut Lease,
     ) -> Result<(), HubError> {
         let spec = self.tunnel_spec(pool, lease)?;
+        // Persist the transition before the first effect, so a failed SSH or health check
+        // still leaves the lease in `preparing` and reports the step that failed.
+        lease.event_phase = Some(PoolPhase::Preparing);
+        self.store_lease(lease.clone()).await?;
         runtime.tunnels.open(&spec)?;
         let Some(data) = check_data(runtime, spec, pool, lease).await? else {
             return Ok(());
@@ -541,7 +672,18 @@ impl HubService {
                 .add_direct(&lease.name, &origin)
                 .map_err(target_registry)?,
         }
-        let capabilities = self.driver().capabilities(&lease.name).await?;
+        let capabilities = match self.driver().capabilities(&lease.name).await {
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                lease.retry(
+                    now_ms(),
+                    Some(format!(
+                        "preparing: target did not answer discovery: {error}"
+                    )),
+                );
+                return Ok(());
+            }
+        };
         let now = now_ms();
         let member = Member {
             tags: profile::member_tags(pool),
@@ -565,6 +707,7 @@ impl HubService {
             Ok(())
         })
         .await?;
+        lease.event_phase = Some(PoolPhase::Ready);
         lease.advance(LeasePhase::Active);
         Ok(())
     }
@@ -669,10 +812,56 @@ impl HubService {
     }
 }
 
+/// Name the lease step a failure happened in, without repeating an error that already does.
+fn failed_reason(previous: Option<PoolPhase>, error: Option<String>) -> Option<String> {
+    let error = error?;
+    let step = match previous {
+        Some(PoolPhase::Requested | PoolPhase::Creating) => Some("creating"),
+        Some(PoolPhase::Booting) => Some("booting"),
+        Some(PoolPhase::Preparing) => Some("preparing"),
+        _ => None,
+    };
+    Some(match step {
+        Some(step) if !error.starts_with(&format!("{step}: ")) => format!("{step}: {error}"),
+        _ => error,
+    })
+}
+
 fn begin_teardown(state: &mut HubState, name: &str, reason: TeardownReason) {
-    if let Some(lease) = state.leases.iter_mut().find(|lease| lease.name == name) {
+    let at = now_ms();
+    if let Some(index) = state.leases.iter().position(|lease| lease.name == name) {
+        let mut lease = state.leases[index].clone();
+        let failed_step = match lease.phase {
+            LeasePhase::Creating => Some("creating"),
+            LeasePhase::Booting => Some("booting"),
+            LeasePhase::Connecting => Some("preparing"),
+            _ => None,
+        };
+        if reason == TeardownReason::BootTimeout {
+            if let Some(step) = failed_step {
+                pool::record_lease_phase(
+                    state,
+                    &mut lease,
+                    pool::PoolPhaseChange {
+                        phase: PoolPhase::Failed,
+                        reason: Some(format!("{step}: the machine did not become ready in time")),
+                        at,
+                    },
+                );
+            }
+        }
         lease.reason = Some(reason);
         lease.advance(LeasePhase::Draining);
+        pool::record_lease_phase(
+            state,
+            &mut lease,
+            pool::PoolPhaseChange {
+                phase: PoolPhase::Draining,
+                reason: None,
+                at,
+            },
+        );
+        state.leases[index] = lease;
     }
     if let Some(member) = state.members.iter_mut().find(|member| member.name == name) {
         member.state = MemberState::Drain;
@@ -704,6 +893,7 @@ async fn check_data(
         }
         Health::Failed(reason) => {
             lease.reason = Some(TeardownReason::BootFailed);
+            lease.event_phase = Some(PoolPhase::Failed);
             lease.advance(LeasePhase::Draining);
             lease.error = Some(format!("data health check: {reason}"));
             Ok(None)
@@ -729,13 +919,15 @@ async fn boot(runtime: &PoolRuntime, lease: &mut Lease) -> Result<(), HubError> 
         Progress::Done(Some(ipv4)) => {
             lease.ipv4 = Some(ipv4);
             lease.action_id = None;
+            lease.event_phase = Some(PoolPhase::Booting);
             lease.advance(LeasePhase::Connecting);
         }
         Progress::Done(None) | Progress::Pending => lease.retry(now_ms(), None),
         Progress::Failed(error) => {
             lease.reason = Some(TeardownReason::BootFailed);
+            lease.event_phase = Some(PoolPhase::Failed);
             lease.advance(LeasePhase::Draining);
-            lease.error = Some(error);
+            lease.error = Some(format!("booting: {error}"));
         }
     }
     Ok(())
@@ -909,7 +1101,17 @@ impl HubService {
                 state.hub_id = Some(uuid::Uuid::now_v7().simple().to_string());
             }
             let document = pool_document(&pool, &state.leases);
+            let name = pool.name.clone();
             state.pools.push(pool);
+            pool::record_pool_phase(
+                state,
+                &name,
+                pool::PoolPhaseChange {
+                    phase: PoolPhase::Added,
+                    reason: None,
+                    at: now_ms(),
+                },
+            );
             Ok(document)
         })
         .await
@@ -926,6 +1128,7 @@ impl HubService {
                 .iter()
                 .map(|pool| pool.view(&state.leases, now))
                 .collect::<Vec<_>>(),
+            "events": state.pool_events,
         })
     }
 
@@ -964,15 +1167,30 @@ impl HubService {
     pub(crate) async fn remove_pool(&self, name: &str) -> Result<Value, HubError> {
         self.mutate(|state| {
             let before = state.pools.len();
-            state.pools.retain(|pool| pool.name != name);
-            if state.pools.len() == before {
-                return Err(HubError::Usage(format!("pool {name} does not exist")));
-            }
             let leases = state
                 .leases
                 .iter()
                 .filter(|lease| lease.pool == name)
                 .count();
+            state.pools.retain(|pool| pool.name != name);
+            if state.pools.len() == before {
+                return Err(HubError::Usage(format!("pool {name} does not exist")));
+            }
+            if leases == 0 {
+                if pool::every_lease_deleted(state, name) {
+                    pool::record_pool_phase(
+                        state,
+                        name,
+                        pool::PoolPhaseChange {
+                            phase: PoolPhase::Removed,
+                            reason: None,
+                            at: now_ms(),
+                        },
+                    );
+                }
+            } else if !state.removed_pools.iter().any(|pending| pending == name) {
+                state.removed_pools.push(name.to_owned());
+            }
             Ok(json!({
                 "schema": "zeroshot.hub.pool/v1",
                 "removed": name,

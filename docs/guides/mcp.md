@@ -122,16 +122,22 @@ members; `hub_dequeue` cancels queued jobs or schedules; `hub_dispatch` requests
 ## Hub events
 
 The server advertises `io.modelcontextprotocol/events` (SEP-3415). One subscription covers the
-whole hub. `events/list` reports four event types, each with `delivery` `poll` and `push`:
+whole hub. `events/list` reports one event type, `hub`, described as everything in the hub, with
+`delivery` `poll` and `push`. It also lists the four `name` values a notification may carry:
 
-| Event         | Data                                                                                             |
+| Name          | Data                                                                                             |
 | ------------- | ------------------------------------------------------------------------------------------------ |
 | `hub.job`     | `jobId`, `title`, `state`, `target`, `project`, `reason`, `at`, `cursor`, `summary`, `replayed`  |
 | `hub.run`     | the durable run watch record: `runId`, `cursor`, `runCursor`, `status`, `summary`, `replayed`    |
-| `hub.pool`    | `pool`, `leaseId`, `serverId`, `machine`, `phase`, `reason`, `at`, `cursor`, `summary`, `replayed` |
+| `hub.pool`    | `kind`, `pool`, `leaseId`, `serverId`, `memberId`, `machine`, `phase`, `previousPhase`, `reason`, `at`, `cursor`, `summary`, `replayed` |
 | `hub.warning` | `jobId`, `runId`, `message`, `at`, `cursor`, `summary`, `replayed`                              |
 
-Every occurrence has exactly the flattened five-field envelope:
+A client that does not care about the kind reads the stream as it is; a client that cares
+branches on `name`. The normal way to watch the hub is a request with no `name` field at all:
+
+```
+events/subscribe {}
+```
 
 ```json
 {"eventId": "hub:42", "name": "hub.run", "timestamp": "RFC3339", "data": {}, "_meta": {}}
@@ -144,11 +150,12 @@ original durable `v2:<sequence>` watch cursor as `data.runCursor`.
 
 Subscription arguments are all optional filters:
 
-- No `runId` or `jobId`, and no `name`, subscribes to the whole hub.
+- Omit `name` to subscribe to the whole hub. This is the normal form and needs no other field.
 - `runId` narrows to that run, its job, and its warnings. `jobId` narrows to that job, its run,
   and that run's warnings. Supplying both is invalid params (`-32602`).
-- `name` selects one event type: `hub.job`, `hub.run`, `hub.pool`, or `hub.warning`. `hub.event`
-  and `run.event` are aliases for every hub event and for `hub.run` respectively.
+- `name` still selects one carried type: `hub.job`, `hub.run`, `hub.pool`, or `hub.warning`.
+  `hub` and `hub.event` are aliases for every hub event; `run.event` is the legacy run-watch
+  form. An unknown name is invalid request (`-32600`). There is no wildcard syntax.
 - `target`, `kinds` (`hub.job`, `hub.run`, `hub.pool`, `hub.warning`), `phases`, `nodes`,
   `terminalOnly`, and `verbose` further filter occurrences. `phases` accepts `admitted`,
   `running`, `stopping`, and `finished`; `nodes` applies only to run records.
@@ -167,8 +174,8 @@ Subscription arguments are all optional filters:
 }
 ```
 
-- `cursor: null` starts from the current state: the latest live event for each job, run, and pool
-  lease, with no backfill of history.
+- `cursor: null` starts from the current state: the latest event for each job and run, plus the
+  pool transitions the hub has retained. There is no backfill of run history.
 - A cursor is exclusive. The response cursor advances to the last delivered event and never moves
   backwards.
 - `truncated` is `false` when nothing was lost. It is `{ "from": "hub:N", "to": "hub:M" }` only
@@ -194,16 +201,20 @@ open for later jobs, later runs, pool changes, warnings, and idle heartbeats. On
 `events/unsubscribe`, MCP session shutdown, or request cancellation stops it. Streams do not
 accept `maxEvents`.
 
-`events/list` reports `resultType` `complete`. Signed webhooks are not offered.
-`events/subscribe` opens the same long-lived stream as `events/stream`; with no arguments it
-subscribes to the whole hub.
+`events/list` reports `resultType` `complete` with the single `hub` type. Signed webhooks are not
+offered. `events/subscribe` opens the same long-lived stream as `events/stream`; with no arguments
+it subscribes to the whole hub and is the ordinary way to watch jobs, runs, pool machines, and
+warnings on one stream.
 
 `hub.job` follows the same hub record as `hub_status`, including `submitted`, `queued`,
 `scheduled`, `placing`, `running`, `succeeded`, `failed`, `dequeued`, and `cancelled`. A job that
 fails or is cancelled before it runs still produces a terminal `hub.job` event. `hub.pool`
-reports member leases as `provisioning`, `active`, `draining`, `deleted`, or `failed`. A running
-job receives one `hub.warning` per hour; a run-watch or stream failure also produces
-`hub.warning`, and the subscription continues.
+reports each lease as `requested`, `creating`, `booting`, `preparing`, `ready`, `in_use`, `idle`,
+`draining`, `deleted`, or `failed`, with `previousPhase` chaining its transitions. Pool-level
+records use `kind: "pool"` and the phases `added`, `removed`, `blocked`, and `shortage`. See
+[Watching a machine come up](hub-pools.md#watching-a-machine-come-up). A running job receives one
+`hub.warning` per hour; a run-watch or stream failure also produces `hub.warning`, and the
+subscription continues.
 
 ## Resume and stop
 
