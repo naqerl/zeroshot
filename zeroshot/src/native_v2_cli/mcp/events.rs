@@ -1834,7 +1834,7 @@ fn payload_schema(name: &str) -> Value {
             },
             "phase": {
                 "type": "string",
-                "enum": ["requested", "creating", "booting", "preparing", "ready", "in_use", "idle", "draining", "deleted", "failed", "added", "removed", "blocked", "shortage"]
+                "enum": ["requested", "creating", "booting", "preparing", "ready", "in_use", "idle", "draining", "deleted", "failed", "added", "removed", "paused", "resumed", "blocked", "shortage"]
             },
             "previousPhase": {"type": ["string", "null"]},
             "reason": {"type": ["string", "null"]},

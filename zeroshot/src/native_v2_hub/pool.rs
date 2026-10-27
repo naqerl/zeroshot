@@ -50,6 +50,8 @@ pub(crate) enum PoolPhase {
     Failed,
     Added,
     Removed,
+    Paused,
+    Resumed,
     Blocked,
     Shortage,
 }
@@ -147,21 +149,46 @@ pub(crate) const FIRST_PAUSE_MS: u64 = 5 * 60_000;
 pub(crate) const MAX_PAUSE_MS: u64 = 60 * 60_000;
 
 /// Record how a pool's boot ended: a failure pauses the pool's scale-up, with doubling pauses;
-/// a server that joined resets it.
+/// a server that joined resets it. Both are recorded as pool events, so a caller sees why no
+/// server started instead of polling `hub pool ls`.
 pub(crate) fn record_boot(state: &mut HubState, pool: &str, failed: bool, now: u64) {
-    let Some(pool) = state.pools.iter_mut().find(|slot| slot.name == pool) else {
+    let Some(index) = state.pools.iter().position(|slot| slot.name == pool) else {
         return;
     };
-    if failed {
-        pool.boot_failures = pool.boot_failures.saturating_add(1);
-        let doublings = pool.boot_failures.saturating_sub(1).min(8);
-        let pause = FIRST_PAUSE_MS
-            .saturating_mul(1 << doublings)
-            .min(MAX_PAUSE_MS);
-        pool.paused_until_ms = Some(now.saturating_add(pause));
-    } else {
-        pool.boot_failures = 0;
-        pool.paused_until_ms = None;
+    let change = {
+        let slot = &mut state.pools[index];
+        let held = slot.paused_until_ms.is_some() || slot.blocked.is_some();
+        if failed {
+            slot.boot_failures = slot.boot_failures.saturating_add(1);
+            let doublings = slot.boot_failures.saturating_sub(1).min(8);
+            let pause = FIRST_PAUSE_MS
+                .saturating_mul(1 << doublings)
+                .min(MAX_PAUSE_MS);
+            slot.paused_until_ms = Some(now.saturating_add(pause));
+            Some((
+                PoolPhase::Paused,
+                format!(
+                    "{} failed boot(s) in a row; no server starts for {}s",
+                    slot.boot_failures,
+                    pause / 1000
+                ),
+            ))
+        } else {
+            slot.boot_failures = 0;
+            slot.paused_until_ms = None;
+            held.then(|| (PoolPhase::Resumed, "a server joined the hub".to_owned()))
+        }
+    };
+    if let Some((phase, reason)) = change {
+        record_pool_phase(
+            state,
+            pool,
+            PoolPhaseChange {
+                phase,
+                reason: Some(reason),
+                at: now,
+            },
+        );
     }
 }
 
@@ -334,7 +361,8 @@ pub(crate) struct PoolPhaseChange {
     pub at: u64,
 }
 
-/// Record one pool-level change: `added`, `removed`, `blocked`, or `shortage`.
+/// Record one pool-level change: `added`, `removed`, `paused`, `resumed`, `blocked`, or
+/// `shortage`.
 pub(crate) fn record_pool_phase(state: &mut HubState, pool: &str, change: PoolPhaseChange) {
     state.push_pool_event(PoolEventRecord {
         sequence: 0,

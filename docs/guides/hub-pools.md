@@ -194,8 +194,11 @@ health check, image pull, and target startup; there are no probe-by-probe events
 lease that failed before it had a machine never records `deleted`, so its pool does not report
 `removed`.
 
-Pool-wide changes use `kind: "pool"` and the phases `added`, `removed`, `blocked`, and
-`shortage`. They carry the pool name and, for `blocked` and `shortage`, a `reason`. `removed`
+Pool-wide changes use `kind: "pool"` and the phases `added`, `removed`, `paused`, `resumed`,
+`blocked`, and `shortage`. They carry the pool name and no lease, and a `reason` for every phase
+except `added` and `removed`. `paused` follows a failed boot and says how many failures in a row
+stopped new servers and for how long; `resumed` follows a server that joined or a
+`hub pool resume` that cleared the pause, the block, and the shortages. `removed`
 is recorded only after every lease of the pool has recorded `deleted`.
 
 An example notification for a lease that just became ready:

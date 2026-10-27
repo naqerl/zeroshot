@@ -214,7 +214,8 @@ warnings on one stream.
 fails or is cancelled before it runs still produces a terminal `hub.job` event. `hub.pool`
 reports each lease as `requested`, `creating`, `booting`, `preparing`, `ready`, `in_use`, `idle`,
 `draining`, `deleted`, or `failed`, with `previousPhase` chaining its transitions. Pool-level
-records use `kind: "pool"` and the phases `added`, `removed`, `blocked`, and `shortage`. See
+records use `kind: "pool"` and the phases `added`, `removed`, `paused`, `resumed`, `blocked`,
+and `shortage`. See
 [Watching a machine come up](hub-pools.md#watching-a-machine-come-up). A running job receives one
 `hub.warning` per hour; a run-watch or stream failure also produces `hub.warning`, and the
 subscription continues.

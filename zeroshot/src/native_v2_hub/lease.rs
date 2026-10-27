@@ -1132,17 +1132,33 @@ impl HubService {
     /// Let a pool start servers again: clear an account or request block, a capacity
     /// shortage and a failed-boot pause.
     pub(crate) async fn resume_pool(&self, name: &str) -> Result<Value, HubError> {
+        let now = now_ms();
         self.mutate(|state| {
-            let pool = state
+            let index = state
                 .pools
-                .iter_mut()
-                .find(|pool| pool.name == name)
+                .iter()
+                .position(|pool| pool.name == name)
                 .ok_or_else(|| HubError::Usage(format!("pool {name} does not exist")))?;
-            pool.blocked = None;
+            let pool = &mut state.pools[index];
+            let held = pool.blocked.take();
+            let paused = pool.paused_until_ms.take();
             pool.shortages.clear();
             pool.boot_failures = 0;
-            pool.paused_until_ms = None;
-            let pool = pool.clone();
+            if held.is_some() || paused.is_some() {
+                let reason = held
+                    .map(|blocked| format!("block cleared: {blocked}"))
+                    .or_else(|| paused.map(|_| "boot pause cleared".to_owned()));
+                pool::record_pool_phase(
+                    state,
+                    name,
+                    pool::PoolPhaseChange {
+                        phase: PoolPhase::Resumed,
+                        reason,
+                        at: now,
+                    },
+                );
+            }
+            let pool = state.pools[index].clone();
             Ok(pool_document(&pool, &state.leases, &state.members))
         })
         .await

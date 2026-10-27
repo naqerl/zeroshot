@@ -853,6 +853,95 @@ async fn an_unchanged_lease_sweep_records_no_event() {
     assert_eq!(rig.state().await.pool_events.len(), before);
 }
 
+#[test]
+fn a_failed_boot_pauses_the_pool_and_a_joining_server_resumes_it() {
+    let mut state = HubState {
+        pools: vec![pool_fixture()],
+        ..HubState::default()
+    };
+    pool::record_boot(&mut state, "burst", true, 1_000);
+    let paused = state.pool_events.last().expect("paused event");
+    assert_eq!(paused.kind, PoolEventKind::Pool);
+    assert_eq!(paused.phase, PoolPhase::Paused);
+    assert_eq!(paused.pool, "burst");
+    assert_eq!(paused.lease_id, None);
+    assert!(
+        paused
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("failed boot")),
+        "{paused:?}"
+    );
+
+    pool::record_boot(&mut state, "burst", false, 2_000);
+    let resumed = state.pool_events.last().expect("resumed event");
+    assert_eq!(resumed.kind, PoolEventKind::Pool);
+    assert_eq!(resumed.phase, PoolPhase::Resumed);
+    assert!(resumed.reason.is_some(), "{resumed:?}");
+
+    let before = state.pool_events.len();
+    pool::record_boot(&mut state, "burst", false, 3_000);
+    assert_eq!(
+        state.pool_events.len(),
+        before,
+        "a boot that ends while the pool runs records nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_create_blocks_the_pool_and_resume_reports_it() {
+    let rig = rig();
+    rig.add_pool(1).await;
+    rig.cloud
+        .with(|cloud| cloud.refuse_all = Some(Refusal::Quota));
+    rig.enqueue("hj_one").await;
+    rig.pass().await;
+    let state = rig.state().await;
+    let blocked = state
+        .pool_events
+        .iter()
+        .find(|event| event.kind == PoolEventKind::Pool && event.phase == PoolPhase::Blocked)
+        .expect("blocked pool");
+    assert!(
+        blocked
+            .reason
+            .as_deref()
+            .is_some_and(|reason| !reason.is_empty()),
+        "{blocked:?}"
+    );
+    assert!(
+        state
+            .pool_events
+            .iter()
+            .all(|event| event.phase != PoolPhase::Resumed),
+        "a block is not resumed before the operator resumes it"
+    );
+
+    rig.service.resume_pool("burst").await.expect("resume");
+    let state = rig.state().await;
+    let resumed = state
+        .pool_events
+        .iter()
+        .find(|event| event.kind == PoolEventKind::Pool && event.phase == PoolPhase::Resumed)
+        .expect("resumed pool");
+    assert!(
+        resumed
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("block cleared")),
+        "{resumed:?}"
+    );
+    assert_eq!(state.pools[0].blocked, None);
+
+    let before = state.pool_events.len();
+    rig.service.resume_pool("burst").await.expect("resume");
+    assert_eq!(
+        rig.state().await.pool_events.len(),
+        before,
+        "resuming a running pool records nothing"
+    );
+}
+
 #[tokio::test]
 async fn an_idle_server_is_archived_removed_and_deleted() {
     let rig = rig();

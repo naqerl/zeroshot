@@ -900,7 +900,12 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   Creating, Booting, Connecting, Active, Draining, Deleting, Done. A server is deleted only after
   each of its runs is terminal, has its postmortem, and is archived to `hub/archive/JOB_ID/`. The
   reaper (start, then every 5 min) deletes resources labelled `zeroshot/hub=ID` that state does not
-  own or that are past `zeroshot/expires`. Failed boots pause the pool (5 min doubling to 1 h). The
+  own or that are past `zeroshot/expires`. Failed boots pause the pool (5 min doubling to 1 h).
+  `pool_events` records every lease and pool transition from the code that performs it: leases
+  report `requested`, `creating`, `booting`, `preparing`, `ready`, `in_use`, `idle`, `draining`,
+  `deleted`, or `failed` with `previousPhase`, and pools report `added`, `removed`, `paused`,
+  `resumed`, `blocked`, `shortage`; `removed` waits for every lease of the pool to be deleted.
+  MCP publishes them as `hub.pool` events from `hub pool list`, so no caller polls for readiness. The
   API token comes from `--hetzner-token-file` or `HCLOUD_TOKEN` and is never stored. Labels carry
   IDs, server type and location only. The hub registers the pool's public key with the provider,
   reuses an existing key by public key or MD5 fingerprint, attaches it to the server by key ID,
