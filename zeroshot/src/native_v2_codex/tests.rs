@@ -97,7 +97,11 @@ if [ "${GATEWAY_API_KEY-unset}" != unset ]; then
     '{"type":"item.completed","item":{"type":"agent_message",' \
     '"text":"visible fake-gateway-key"}}'
 fi
-if [ "${ALWAYS_MALFORMED-false}" = true ]; then
+if [ "${FORMAT_SECRET-false}" = true ] && [ "$resumed" = false ]; then
+  /usr/bin/printf '%s%s\n' \
+    '{"type":"item.completed","item":{"type":"agent_message",' \
+    '"text":"{\"response\":{\"answer\":42},\"fake-openai-key\":true}"}}'
+elif [ "${ALWAYS_MALFORMED-false}" = true ]; then
   /usr/bin/printf '%s%s\n' \
     '{"type":"item.completed","item":{"type":"agent_message",' \
     '"text":"{\"response\":{\"answer\":\"wrong\"}}"}}'

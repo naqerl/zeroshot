@@ -473,17 +473,19 @@ async fn resolve_pi_response(
     result: PiResult,
     state: &PiRunState,
 ) -> Result<PiTurnAdvance, NodeRunnerError> {
-    let response = resolve_agent_response_with_schema(
-        &turn.invocation.response,
-        &result.message,
-        state.dialect,
-    )?;
+    let response = state
+        .retry
+        .redact_response(resolve_agent_response_with_schema(
+            &turn.invocation.response,
+            &result.message,
+            state.dialect,
+        )?);
     state
         .retry
         .report_correction(
             turn.control,
             &response,
-            state.response.corrections_exhausted(),
+            state.response.corrections_exhausted(&response),
         )
         .await?;
     if matches!(response, AgentResponse::Correction { .. }) {

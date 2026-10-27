@@ -902,14 +902,19 @@ async fn validation_errors_keep_the_explanation_and_redact_credentials() {
         let (events, outcome) = complete(fixture.start(1).await).await;
         assert_eq!(outcome.assert_value(), WorkerOutcome::malformed());
         let errors = error_output(&events);
-        assert_eq!(errors.len(), 3);
+        assert_eq!(errors.len(), 4);
         for error in errors {
             assert!(error.contains("final output rejected:"));
-            assert!(error.contains("unknown field"));
+            assert!(error.contains("top-level keys"));
             assert!(error.contains("[REDACTED]"));
             assert!(!error.contains("gho_fak"));
             assert!(!error.contains("Response contract:"));
             assert!(error.len() <= 8 * 1024);
+        }
+        for event in &events {
+            if let DurableNodeEvent::Output { output, .. } = event {
+                assert!(!output.text.contains("gho_fak"), "{}", output.text);
+            }
         }
     }
 }

@@ -522,3 +522,287 @@ fn contract_signals(contract: &NodeResponseContract) -> BTreeMap<FieldName, NonE
     };
     signals.clone()
 }
+
+fn verifier_contract(output: PayloadType, diagnostic: PayloadType) -> NodeResponseContract {
+    NodeResponseContract::Verifier {
+        output,
+        signals: BTreeMap::from([(
+            FieldName::new("verdict").assert_value(),
+            NonEmptyEnumSet::new(vec![
+                EnumLabel::new("accepted").assert_value(),
+                EnumLabel::new("rejected").assert_value(),
+            ])
+            .assert_value(),
+        )]),
+        diagnostic,
+    }
+}
+
+#[test]
+fn fenced_json_is_accepted_before_contract_validation() {
+    let contract = worker_contract();
+    for response in [
+        "```json\n{\"response\":{\"answer\":42}}\n```",
+        "```\n{\"response\":{\"answer\":42}}\n```",
+        "  ```json\r\n{\"response\":{\"answer\":42}}\r\n```  ",
+    ] {
+        assert!(matches!(
+            resolve_agent_response(&contract, response).assert_value(),
+            AgentResponse::Complete(WorkerOutcome::Verified { output, .. })
+                if output == json!({"answer": 42})
+        ));
+    }
+}
+
+#[test]
+fn prose_wrapped_json_is_accepted_before_contract_validation() {
+    let contract = worker_contract();
+    let response = "Here is the result:\n{\"response\":{\"answer\":42}}\nThat is all.";
+    assert!(matches!(
+        resolve_agent_response(&contract, response).assert_value(),
+        AgentResponse::Complete(WorkerOutcome::Verified { output, .. })
+            if output == json!({"answer": 42})
+    ));
+}
+
+#[test]
+fn a_verifier_may_return_its_channel_without_the_response_envelope() {
+    let contract = verifier_contract(PayloadType::Null, PayloadType::String);
+    let response = resolve_agent_response(
+        &contract,
+        r#"{"output":null,"signals":{"verdict":"accepted"},"diagnostic":"looks good","artifacts":[]}"#,
+    )
+    .assert_value();
+    let AgentResponse::Complete(WorkerOutcome::Verifier {
+        output,
+        signals,
+        diagnostic,
+        ..
+    }) = response
+    else {
+        panic!("a verifier channel object must be accepted without the envelope");
+    };
+    assert_eq!(output, Value::Null);
+    assert_eq!(
+        signals
+            .get(&FieldName::new("verdict").assert_value())
+            .assert_value()
+            .as_str(),
+        "accepted"
+    );
+    assert_eq!(diagnostic, json!("looks good"));
+}
+
+#[test]
+fn a_verifier_channel_fills_absent_output_and_signals_with_contract_defaults() {
+    let contract = NodeResponseContract::Verifier {
+        output: PayloadType::Null,
+        signals: BTreeMap::new(),
+        diagnostic: PayloadType::String,
+    };
+    let response =
+        resolve_agent_response(&contract, r#"{"diagnostic":"looks good"}"#).assert_value();
+    assert!(matches!(
+        response,
+        AgentResponse::Complete(WorkerOutcome::Verifier {
+            output,
+            signals,
+            diagnostic,
+            ..
+        }) if output == Value::Null && signals.is_empty() && diagnostic == json!("looks good")
+    ));
+}
+
+#[test]
+fn an_absent_verifier_diagnostic_stays_absent_and_fails_the_inner_contract() {
+    let contract = verifier_contract(PayloadType::Null, PayloadType::Null);
+    let response =
+        resolve_agent_response(&contract, r#"{"signals":{"verdict":"rejected"}}"#).assert_value();
+    let AgentResponse::Correction {
+        kind, diagnostic, ..
+    } = response
+    else {
+        panic!("an absent verifier diagnostic must remain absent");
+    };
+    assert_eq!(kind, AgentCorrectionKind::Contract);
+    assert!(
+        diagnostic.to_string().contains("diagnostic"),
+        "{diagnostic}"
+    );
+}
+
+#[test]
+fn duplicate_response_keys_are_rejected_as_a_format_fault() {
+    let response = resolve_agent_response(
+        &worker_contract(),
+        r#"{"response":{"answer":42},"response":{"answer":43}}"#,
+    )
+    .assert_value();
+    let AgentResponse::Correction {
+        kind, diagnostic, ..
+    } = response
+    else {
+        panic!("a duplicate response field must not be collapsed");
+    };
+    assert_eq!(kind, AgentCorrectionKind::Format);
+    assert!(
+        diagnostic
+            .to_string()
+            .contains("duplicate field `response`"),
+        "{diagnostic}"
+    );
+}
+
+#[test]
+fn a_worker_top_level_output_channel_is_not_unwrapped() {
+    let response =
+        resolve_agent_response(&worker_contract(), r#"{"output":{"answer":42}}"#).assert_value();
+    let AgentResponse::Correction {
+        kind, diagnostic, ..
+    } = response
+    else {
+        panic!("a worker top-level output object must not be unwrapped");
+    };
+    assert_eq!(kind, AgentCorrectionKind::Format);
+    assert!(diagnostic.to_string().contains("output"));
+}
+
+#[test]
+fn an_unknown_top_level_shape_names_the_keys_it_found() {
+    let response = resolve_agent_response(
+        &verifier_contract(PayloadType::Null, PayloadType::Null),
+        r#"{"verdict":"accepted"}"#,
+    )
+    .assert_value();
+    let AgentResponse::Correction {
+        kind, diagnostic, ..
+    } = response
+    else {
+        panic!("an unknown verifier channel must request a correction");
+    };
+    assert_eq!(kind, AgentCorrectionKind::Format);
+    let diagnostic = diagnostic.to_string();
+    assert!(
+        diagnostic.contains("must be exactly an object containing response"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("top-level keys [verdict]"),
+        "{diagnostic}"
+    );
+}
+
+#[test]
+fn an_envelope_with_extra_top_level_keys_still_fails_as_a_format_fault() {
+    let response = resolve_agent_response(
+        &worker_contract(),
+        r#"{"response":{"answer":42},"extra":1}"#,
+    )
+    .assert_value();
+    let AgentResponse::Correction {
+        kind, diagnostic, ..
+    } = response
+    else {
+        panic!("an envelope with extra top-level keys must be rejected");
+    };
+    assert_eq!(kind, AgentCorrectionKind::Format);
+    assert!(diagnostic.to_string().contains("extra"));
+}
+
+#[tokio::test]
+async fn three_format_corrections_do_not_consume_the_contract_budget() {
+    let (_cancel, control, mut durable) = crate::native_v2_runner::test_support::control();
+    let mut state = AgentResponseState::new("initial prompt".to_owned());
+    for index in 1..=3 {
+        let response = resolve_agent_response(&worker_contract(), "not json").assert_value();
+        assert!(matches!(
+            response,
+            AgentResponse::Correction {
+                kind: AgentCorrectionKind::Format,
+                ..
+            }
+        ));
+        assert!(
+            state
+                .accept("test", &control, response)
+                .await
+                .assert_value()
+                .is_none()
+        );
+        let record = durable.recv_output().await.assert_value();
+        assert_eq!(record.stream, LiveOutputStream::System);
+        assert!(
+            record
+                .text
+                .contains(&format!("format correction {index}/3")),
+            "{}",
+            record.text
+        );
+        assert!(record.text.contains("provider response"), "{}", record.text);
+    }
+
+    let response =
+        resolve_agent_response(&worker_contract(), r#"{"response":{"answer":42}}"#).assert_value();
+    let outcome = state
+        .accept("test", &control, response)
+        .await
+        .assert_value()
+        .assert_value();
+    assert!(matches!(
+        outcome,
+        WorkerOutcome::Verified { output, .. } if output == json!({"answer": 42})
+    ));
+    assert_eq!(state.format_corrections, 3);
+    assert_eq!(state.contract_corrections, 0);
+}
+
+#[tokio::test]
+async fn a_contract_correction_does_not_reset_the_format_budget() {
+    let (_cancel, control, mut durable) = crate::native_v2_runner::test_support::control();
+    let mut state = AgentResponseState::new("initial prompt".to_owned());
+    let format = resolve_agent_response(&worker_contract(), "not json").assert_value();
+    state.accept("test", &control, format).await.assert_value();
+    let _ = durable.recv_output().await.assert_value();
+
+    let contract = resolve_agent_response(&worker_contract(), r#"{"response":{"answer":"wrong"}}"#)
+        .assert_value();
+    state
+        .accept("test", &control, contract)
+        .await
+        .assert_value();
+    assert_eq!(state.format_corrections, 1);
+    assert_eq!(state.contract_corrections, 1);
+}
+
+#[tokio::test]
+async fn a_fourth_format_fault_fails_the_node_without_consuming_contract_corrections() {
+    let (_cancel, control, mut durable) = crate::native_v2_runner::test_support::control();
+    let mut state = AgentResponseState::new("initial prompt".to_owned());
+    for _ in 0..3 {
+        let response = resolve_agent_response(&worker_contract(), "not json").assert_value();
+        assert!(
+            state
+                .accept("test", &control, response)
+                .await
+                .assert_value()
+                .is_none()
+        );
+        let _ = durable.recv_output().await.assert_value();
+    }
+
+    let response = resolve_agent_response(&worker_contract(), "not json").assert_value();
+    let outcome = state
+        .accept("test", &control, response)
+        .await
+        .assert_value()
+        .assert_value();
+    assert_eq!(outcome, WorkerOutcome::malformed());
+    let failure = durable.recv_output().await.assert_value();
+    assert!(
+        failure.text.contains("after 3 format corrections"),
+        "{}",
+        failure.text
+    );
+    assert_eq!(state.format_corrections, 3);
+    assert_eq!(state.contract_corrections, 0);
+}
