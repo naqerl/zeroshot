@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use super::super::{CliTestBackend, CliTestCall, NeverDetach, RunWatchCommand};
 use super::{McpFailure, McpHost, McpServer, WatchStream, serve_http_listener};
-use crate::native_v2_cli::hub::{HubCommand, HubRequest};
+use crate::native_v2_cli::hub::{HubCommand, HubPoolCommand, HubRequest};
 use crate::native_v2_cli::{NativeV2CliCommand, execute_native_v2_cli};
 
 struct ToolHost {
@@ -134,10 +134,12 @@ impl McpHost for EventHost {
     }
 }
 
-/// A hub host that serves one running job, one member, and the job's run watch.
+/// A hub host that serves one running job, one recorded pool transition, and the job's run
+/// watch.
 struct HubFeedHost {
     jobs: Vec<Value>,
     members: Vec<Value>,
+    pool_events: Vec<Value>,
     events: Vec<Value>,
 }
 
@@ -155,8 +157,15 @@ impl McpHost for HubFeedHost {
             }) => Ok(
                 json!({"schema": "zeroshot.hub.targets/v1", "targets": self.members}).to_string(),
             ),
+            NativeV2CliCommand::Hub(HubRequest {
+                command: HubCommand::Pool(HubPoolCommand::List),
+                ..
+            }) => Ok(
+                json!({"schema": "zeroshot.hub.pools/v1", "pools": [], "events": self.pool_events})
+                    .to_string(),
+            ),
             _ => Err(McpFailure::invalid(
-                "hub feed host only lists jobs and members",
+                "hub feed host only lists jobs, members and pools",
             )),
         }
     }
@@ -192,6 +201,23 @@ fn hub_feed_host() -> HubFeedHost {
             "name": "local",
             "state": "active",
             "addedAt": "2026-01-01T00:00:00Z"
+        })],
+        pool_events: vec![json!({
+            "sequence": 1,
+            "kind": "lease",
+            "pool": "burst",
+            "leaseId": "zs-feed",
+            "serverId": 11,
+            "memberId": "builder",
+            "machine": {
+                "cores": 2,
+                "memoryMb": 4096,
+                "location": "fsn1",
+                "serverType": "cx23"
+            },
+            "phase": "ready",
+            "previousPhase": "preparing",
+            "at": "2026-01-01T00:00:02Z"
         })],
         events: vec![watch_event("run-public", "v2:1", running_status("worker"))],
     }
@@ -252,8 +278,14 @@ impl McpHost for HubLifecycleHost {
             }) => Ok(
                 json!({"schema": "zeroshot.hub.targets/v1", "targets": self.members}).to_string(),
             ),
+            NativeV2CliCommand::Hub(HubRequest {
+                command: HubCommand::Pool(HubPoolCommand::List),
+                ..
+            }) => Ok(
+                json!({"schema": "zeroshot.hub.pools/v1", "pools": [], "events": []}).to_string(),
+            ),
             _ => Err(McpFailure::invalid(
-                "lifecycle host only lists jobs and members",
+                "lifecycle host only lists jobs, members and pools",
             )),
         }
     }
@@ -837,20 +869,32 @@ async fn failing_status_is_a_tool_error_with_the_cli_code() {
 }
 
 #[tokio::test]
-async fn events_list_describes_poll_and_push_only() {
+async fn events_list_describes_one_hub_type_and_poll_and_push() {
     let mut session = Session::spawn(ScriptHost);
     initialize(&mut session).await;
     let listed = session.request(2, "events/list", json!({})).await;
     assert_eq!(listed["result"]["resultType"], json!("complete"));
-    let event = &listed["result"]["events"][0];
-    assert_eq!(event["name"], json!("hub.job"));
+    let events = listed["result"]["events"]
+        .as_array()
+        .expect("event descriptions");
+    assert_eq!(events.len(), 1, "one subscription covers the whole hub");
+    let event = &events[0];
+    assert_eq!(event["name"], json!("hub"));
     assert_eq!(event["delivery"], json!(["poll", "push"]));
+    let description = event["description"].as_str().unwrap_or_default();
     assert!(
-        event["description"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("hub job")
+        description.contains("everything in the hub"),
+        "{description}"
     );
+    for name in ["hub.job", "hub.run", "hub.pool", "hub.warning"] {
+        assert!(description.contains(name), "{name} is described");
+        assert!(
+            event["names"]
+                .as_array()
+                .is_some_and(|names| names.contains(&json!(name))),
+            "{name} is listed as a carried name"
+        );
+    }
     assert!(event["inputSchema"].get("oneOf").is_none());
     for property in ["runId", "jobId", "target"] {
         assert!(
@@ -861,6 +905,10 @@ async fn events_list_describes_poll_and_push_only() {
     assert_eq!(
         event["payloadSchema"]["required"],
         json!(["eventId", "name", "timestamp", "data", "_meta"])
+    );
+    assert_eq!(
+        event["payloadSchema"]["properties"]["name"]["enum"],
+        json!(["hub.job", "hub.run", "hub.pool", "hub.warning"])
     );
     assert!(
         event["payloadSchema"]["properties"]["data"].is_object(),
@@ -892,10 +940,21 @@ async fn events_list_describes_poll_and_push_only() {
         .request(3, "events/list", json!({"cursor": "1"}))
         .await;
     assert_eq!(next["result"]["events"], json!([]));
+
+    let unknown = session
+        .request(
+            4,
+            "events/poll",
+            json!({"name": "hub.unknown", "arguments": {}}),
+        )
+        .await;
+    assert_eq!(unknown["error"]["code"], json!(-32600), "{unknown}");
+    assert_eq!(unknown["error"]["data"]["kind"], json!("event"));
+
     let subscribe = session
         .start_stream(&json!({
             "jsonrpc": "2.0",
-            "id": 4,
+            "id": 5,
             "method": "events/subscribe",
             "params": {}
         }))
@@ -1435,51 +1494,76 @@ async fn hub_poll_resumes_from_a_cursor_captured_before_a_terminal_event() {
 }
 
 #[tokio::test]
-async fn hub_pool_reports_provisioning_then_active() {
-    let host = HubLifecycleHost::new(
-        vec![Vec::new(), Vec::new()],
-        vec![hub_member("builder")],
-        HashMap::new(),
-    );
+async fn a_nameless_subscription_streams_jobs_runs_and_pool_phases() {
+    let host = hub_feed_host();
     let mut session = Session::spawn(host);
     initialize(&mut session).await;
-    let mut phases = Vec::new();
-    for _ in 0..40 {
-        let response = session
-            .request(
-                2,
-                "events/poll",
-                json!({"arguments": {}, "cursor": "hub:0", "maxEvents": 100}),
-            )
-            .await;
-        if let Some(events) = response["result"]["events"].as_array() {
-            for event in events {
-                if event["name"] == json!("hub.pool") {
-                    phases.push(
-                        event["data"]["phase"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_owned(),
-                    );
-                    assert_eq!(event["data"]["pool"], json!("builder"));
-                    assert_eq!(event["data"]["leaseId"], json!("builder"));
-                    assert_eq!(event["data"]["machine"], json!("builder"));
-                    assert!(event["data"]["at"].is_string());
-                }
-            }
-        }
-        if phases.iter().any(|phase| phase == "provisioning")
-            && phases.iter().any(|phase| phase == "active")
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    let listed = session.request(2, "events/list", json!({})).await;
+    assert_eq!(listed["result"]["events"][0]["name"], json!("hub"));
+
+    let response = session
+        .start_stream(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "events/subscribe",
+            "params": {}
+        }))
+        .await;
+    let frames = collect_stream(response, Duration::from_secs(5), |frames| {
+        let names = stream_notifications(frames)
+            .into_iter()
+            .filter_map(|frame| frame["params"]["name"].as_str())
+            .collect::<std::collections::HashSet<_>>();
+        ["hub.job", "hub.run", "hub.pool"]
+            .iter()
+            .all(|name| names.contains(name))
+    })
+    .await;
+    let notifications = stream_notifications(&frames);
+    let names = notifications
+        .iter()
+        .filter_map(|frame| frame["params"]["name"].as_str())
+        .collect::<Vec<_>>();
+    for name in ["hub.job", "hub.run", "hub.pool"] {
+        assert!(
+            names.contains(&name),
+            "{name} arrives on one stream: {names:?}"
+        );
     }
     assert!(
-        phases.iter().any(|phase| phase == "provisioning"),
-        "{phases:?}"
+        names.iter().collect::<std::collections::HashSet<_>>().len() >= 3,
+        "the subscription carries distinct names: {names:?}"
     );
-    assert!(phases.iter().any(|phase| phase == "active"), "{phases:?}");
+    let pool = notifications
+        .iter()
+        .find(|frame| frame["params"]["name"] == json!("hub.pool"))
+        .expect("pool phase");
+    assert_eq!(pool["params"]["data"]["phase"], json!("ready"));
+    assert_eq!(pool["params"]["data"]["pool"], json!("burst"));
+    assert_eq!(pool["params"]["data"]["leaseId"], json!("zs-feed"));
+    assert_eq!(
+        pool["params"]["data"]["machine"]["serverType"],
+        json!("cx23")
+    );
+    assert_eq!(pool["params"]["data"]["previousPhase"], json!("preparing"));
+
+    let mut sequences = Vec::new();
+    for frame in notifications
+        .iter()
+        .filter(|frame| frame["params"]["eventId"].is_string())
+    {
+        let event_id = frame["params"]["eventId"].as_str().expect("hub event id");
+        sequences.push(
+            event_id
+                .strip_prefix("hub:")
+                .and_then(|value| value.parse::<u64>().ok())
+                .expect("hub cursor shape"),
+        );
+    }
+    assert!(
+        sequences.windows(2).all(|pair| pair[0] < pair[1]),
+        "cursors strictly increase on one stream: {sequences:?}"
+    );
 }
 
 #[tokio::test]

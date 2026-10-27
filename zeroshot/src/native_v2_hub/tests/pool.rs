@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::json;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use super::super::archive::{self, FILES};
 use super::super::capacity;
@@ -17,7 +19,8 @@ use super::super::lease::{PoolRuntime, REAP_INTERVAL_MS, production_runtime};
 use super::super::model::{HubState, Job, JobState, MemberState, STATE_VERSION, Strategy};
 use super::super::pool::{
     self, BOOT_DEADLINE_MS, FIRST_PAUSE_MS, MAX_PAUSE_MS, LABEL_HUB, LABEL_LEASE, LABEL_LOCATION,
-    LABEL_SERVER_TYPE, Lease, LeasePhase, Pool, Provider, Resource, ResourceKind, TeardownReason,
+    LABEL_SERVER_TYPE, Lease, LeasePhase, Pool, PoolEventKind, PoolPhase, Provider, Resource,
+    ResourceKind, TeardownReason,
 };
 use super::super::provision::{
     self, Architecture, Catalog, Created, Failure, Location, Progress, Provisioner, Refusal,
@@ -664,6 +667,197 @@ async fn scale_up_stops_at_the_pool_maximum() {
     rig.pass().await;
     assert_eq!(rig.state().await.leases.len(), 2);
     assert_eq!(rig.cloud.servers(), 2);
+}
+
+/// The lease's recorded phases, in the order the hub emitted them.
+fn lease_phases(state: &HubState, lease: &Lease) -> Vec<(PoolPhase, Option<PoolPhase>)> {
+    state
+        .pool_events
+        .iter()
+        .filter(|event| {
+            event.kind == PoolEventKind::Lease
+                && event.lease_id.as_deref() == Some(lease.id.as_str())
+        })
+        .map(|event| (event.phase, event.previous_phase))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_lease_reports_every_phase_once_and_pool_removal_waits_for_deleted() {
+    let rig = rig();
+    let lease = rig.finished_job_on_server().await;
+    rig.service.remove_pool("burst").await.expect("remove pool");
+    for _ in 0..8 {
+        rig.pass().await;
+    }
+    let state = rig.state().await;
+    assert!(state.leases.is_empty(), "{:?}", state.leases);
+
+    let phases = lease_phases(&state, &lease);
+    assert_eq!(
+        phases.iter().map(|(phase, _)| *phase).collect::<Vec<_>>(),
+        vec![
+            PoolPhase::Requested,
+            PoolPhase::Creating,
+            PoolPhase::Booting,
+            PoolPhase::Preparing,
+            PoolPhase::Ready,
+            PoolPhase::InUse,
+            PoolPhase::Idle,
+            PoolPhase::Draining,
+            PoolPhase::Deleted,
+        ],
+        "{phases:?}"
+    );
+    let mut previous = None;
+    for (phase, recorded_previous) in &phases {
+        assert_eq!(*recorded_previous, previous, "{phase:?} chains");
+        previous = Some(*phase);
+    }
+    let lease_events = state
+        .pool_events
+        .iter()
+        .filter(|event| {
+            event.kind == PoolEventKind::Lease
+                && event.lease_id.as_deref() == Some(lease.id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let stamps = lease_events
+        .iter()
+        .map(|event| {
+            OffsetDateTime::parse(&event.at, &Rfc3339)
+                .unwrap_or_else(|error| panic!("{}: {error}", event.at))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        stamps.windows(2).all(|pair| pair[0] <= pair[1]),
+        "timestamps never go backwards: {:?}",
+        lease_events
+            .iter()
+            .map(|event| (event.phase, event.at.as_str()))
+            .collect::<Vec<_>>()
+    );
+    let creating = lease_events
+        .iter()
+        .find(|event| event.phase == PoolPhase::Creating)
+        .expect("creating");
+    assert_eq!(creating.server_id, lease.server_id);
+    let machine = creating.machine.as_ref().expect("machine accepted");
+    assert!(!machine.server_type.is_empty());
+    assert!(machine.cores > 0);
+    assert!(machine.memory_mb > 0);
+    assert!(!machine.location.is_empty());
+    for event in &lease_events {
+        if matches!(
+            event.phase,
+            PoolPhase::Ready
+                | PoolPhase::InUse
+                | PoolPhase::Idle
+                | PoolPhase::Draining
+                | PoolPhase::Deleted
+        ) {
+            assert_eq!(event.member_id.as_deref(), Some(lease.name.as_str()));
+        }
+    }
+
+    let removed = state
+        .pool_events
+        .iter()
+        .find(|event| event.kind == PoolEventKind::Pool && event.phase == PoolPhase::Removed)
+        .expect("pool removed");
+    let deleted = lease_events
+        .iter()
+        .find(|event| event.phase == PoolPhase::Deleted)
+        .expect("lease deleted");
+    assert!(
+        removed.sequence > deleted.sequence,
+        "removed follows every deleted lease"
+    );
+    assert_eq!(removed.pool, "burst");
+}
+
+#[tokio::test]
+async fn a_provider_refusal_fails_the_lease_without_ready_or_deleted() {
+    let rig = rig();
+    rig.add_pool(1).await;
+    rig.cloud
+        .with(|cloud| cloud.refuse_all = Some(Refusal::Quota));
+    rig.enqueue("hj_one").await;
+    rig.pass().await;
+    let state = rig.state().await;
+    assert!(state.leases.is_empty(), "{:?}", state.leases);
+    let failed = state
+        .pool_events
+        .iter()
+        .find(|event| event.kind == PoolEventKind::Lease && event.phase == PoolPhase::Failed)
+        .expect("failed lease");
+    assert!(
+        failed
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("creating: ")),
+        "{failed:?}"
+    );
+    assert!(
+        state
+            .pool_events
+            .iter()
+            .all(|event| !matches!(event.phase, PoolPhase::Ready | PoolPhase::Deleted)),
+        "a refused create never becomes ready or deleted"
+    );
+    rig.service
+        .remove_pool("burst")
+        .await
+        .expect("remove refused pool");
+    let state = rig.state().await;
+    assert!(
+        state
+            .pool_events
+            .iter()
+            .all(|event| !(event.kind == PoolEventKind::Pool && event.phase == PoolPhase::Removed)),
+        "a failed lease without deleted keeps the pool from reporting removed"
+    );
+}
+
+#[tokio::test]
+async fn a_server_that_never_answers_fails_naming_the_boot_step() {
+    let rig = rig();
+    rig.add_pool(1).await;
+    rig.cloud
+        .with(|cloud| cloud.ready = Some(Progress::Pending));
+    rig.enqueue("hj_one").await;
+    rig.pass().await;
+    rig.set(|state| state.leases[0].created_at_ms = 0).await;
+    rig.pass().await;
+    let state = rig.state().await;
+    let failed = state
+        .pool_events
+        .iter()
+        .find(|event| event.kind == PoolEventKind::Lease && event.phase == PoolPhase::Failed)
+        .expect("failed lease");
+    assert!(
+        failed
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("booting: ")),
+        "{failed:?}"
+    );
+    assert!(
+        state
+            .pool_events
+            .iter()
+            .all(|event| event.phase != PoolPhase::Ready)
+    );
+}
+
+#[tokio::test]
+async fn an_unchanged_lease_sweep_records_no_event() {
+    let rig = rig();
+    let _lease = rig.running_job_on_server().await;
+    let before = rig.state().await.pool_events.len();
+    rig.pass().await;
+    rig.pass().await;
+    assert_eq!(rig.state().await.pool_events.len(), before);
 }
 
 #[tokio::test]

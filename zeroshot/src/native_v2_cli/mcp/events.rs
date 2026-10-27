@@ -15,7 +15,7 @@ use super::args::{
     bool_prop, object_schema, optional_string, reject_unknown, string_array_prop, string_prop,
 };
 use super::host::{parse_cli, McpFailure, McpHost, WatchStream};
-use super::super::hub::{HubCommand, HubRequest};
+use super::super::hub::{HubCommand, HubPoolCommand, HubRequest};
 use super::super::{NativeV2CliCommand, RunWatchCommand};
 
 pub(super) const EXTENSION_ID: &str = "io.modelcontextprotocol/events";
@@ -289,7 +289,18 @@ fn snapshot_key(event: &HubEvent) -> Option<(&'static str, String)> {
     match event.name {
         HUB_JOB => event.job_id.clone().map(|key| ("job", key)),
         HUB_RUN => event.run_id.clone().map(|key| ("run", key)),
-        HUB_POOL => event.target.clone().map(|key| ("pool", key)),
+        HUB_POOL => event
+            .data
+            .get("leaseId")
+            .and_then(Value::as_str)
+            .map(|key| ("lease", key.to_owned()))
+            .or_else(|| {
+                event
+                    .data
+                    .get("pool")
+                    .and_then(Value::as_str)
+                    .map(|key| ("pool", key.to_owned()))
+            }),
         _ => None,
     }
 }
@@ -365,32 +376,19 @@ pub(super) fn list(params: &Value) -> Result<Value, EventError> {
     if paged {
         return Ok(json!({"resultType": "complete", "events": []}));
     }
-    let descriptions = [
-        (
-            HUB_JOB,
-            "A hub job lifecycle event for every submitted, queued, scheduled, placing, running, \
-             succeeded, failed, dequeued, or cancelled job.",
-        ),
-        (
-            HUB_RUN,
-            "A durable run event from the same record `zeroshot watch` reads. The hub stream \
-             carries the records of every run on one long-lived subscription.",
-        ),
-        (
-            HUB_POOL,
-            "A pool lease lifecycle event: provisioning, active, draining, deleted, or failed.",
-        ),
-        (
-            HUB_WARNING,
-            "An hourly warning for a running job, or a run-watch and stream failure.",
-        ),
-    ];
+    let descriptions = [(
+        "hub",
+        "everything in the hub: jobs, runs, pool leases, and warnings. Each notification keeps \
+         its own name, one of hub.job, hub.run, hub.pool, or hub.warning, so a client can branch \
+         on the kind or ignore it and read the stream.",
+    )];
     let events = descriptions
         .into_iter()
         .map(|(name, description)| {
             json!({
                 "name": name,
                 "description": description,
+                "names": HUB_EVENTS,
                 "delivery": ["poll", "push"],
                 "inputSchema": input_schema(name),
                 "payloadSchema": payload_schema(name),
@@ -770,7 +768,7 @@ fn truncation_bounds(value: &Value) -> (Option<u64>, Option<u64>) {
 pub(super) fn rpc_error(error: EventError) -> (i64, &'static str, Value) {
     match error {
         EventError::Invalid(failure) => (-32602, "Invalid params", failure_data(failure)),
-        EventError::NotFound => (-32023, "NotFound", json!({"kind": "event"})),
+        EventError::NotFound => (-32600, "Invalid Request", json!({"kind": "event"})),
         EventError::Failed(failure) if failure.code == "run.not_found" => (
             -32023,
             "NotFound",
@@ -817,7 +815,7 @@ fn parse_subscription(params: &Value, capped: bool) -> Result<PollRequest, Event
         None => None,
         Some(EVENT_NAME) => None,
         Some(name) if HUB_EVENTS.contains(&name) => Some(vec![name.to_owned()]),
-        Some("hub.event") => None,
+        Some("hub") | Some("hub.event") => None,
         Some(_) => return Err(EventError::NotFound),
     };
     // Watch records have no occurrence time, so maxAgeMs is accepted and not applied.
@@ -868,7 +866,7 @@ fn parse_subscription(params: &Value, capped: bool) -> Result<PollRequest, Event
         || name.is_none()
         || selector.is_hub()
         || name_kinds.is_some()
-        || matches!(name.as_deref(), Some("hub.event"));
+        || matches!(name.as_deref(), Some("hub") | Some("hub.event"));
     let target = optional_string(arguments, "target").map_err(EventError::Invalid)?;
     let mut filters = parse_filters(arguments)?;
     if filters.kinds.is_none() {
@@ -1226,7 +1224,7 @@ where
     H: McpHost + 'static,
 {
     let mut jobs: HashMap<String, String> = HashMap::new();
-    let mut members: HashMap<String, String> = HashMap::new();
+    let mut pool_sequence: u64 = 0;
     let mut watched: HashSet<String> = HashSet::new();
     let mut poll = tokio::time::interval(HUB_POLL_INTERVAL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1237,7 +1235,7 @@ where
         tokio::select! {
             _ = poll.tick() => {
                 poll_jobs(host.as_ref(), &feed, &mut jobs, &mut watched).await;
-                poll_members(host.as_ref(), &feed, &mut members).await;
+                poll_pools(host.as_ref(), &feed, &mut pool_sequence).await;
             }
             _ = warning.tick() => {
                 publish_warnings(host.as_ref(), &feed).await;
@@ -1397,17 +1395,16 @@ fn publish_job(feed: &HubFeed, job_id: &str, view: &Value, state: &str) {
     });
 }
 
-async fn poll_members<H>(host: &H, feed: &HubFeed, members: &mut HashMap<String, String>)
+/// Poll the hub's recorded pool transitions. The daemon performs every transition and keeps
+/// the bounded log, so this reader publishes each record once, in sequence order.
+async fn poll_pools<H>(host: &H, feed: &HubFeed, sequence: &mut u64)
 where
     H: McpHost + 'static,
 {
     let output = match host
         .execute(NativeV2CliCommand::Hub(HubRequest {
             context: None,
-            command: HubCommand::List {
-                tags: Vec::new(),
-                probe: false,
-            },
+            command: HubCommand::Pool(HubPoolCommand::List),
         }))
         .await
     {
@@ -1417,85 +1414,71 @@ where
     let Ok(document) = serde_json::from_str::<Value>(output.trim()) else {
         return;
     };
-    let mut current = HashMap::new();
-    for member in document
-        .get("targets")
+    let records = document
+        .get("events")
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let Some(name) = member
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-        else {
+        .cloned()
+        .unwrap_or_default();
+    let newest = records
+        .iter()
+        .filter_map(|record| record.get("sequence").and_then(Value::as_u64))
+        .max();
+    if let Some(newest) = newest {
+        if newest < *sequence {
+            // A restarted hub numbers its log from the start again.
+            *sequence = 0;
+        }
+    }
+    for record in records {
+        let Some(record_sequence) = record.get("sequence").and_then(Value::as_u64) else {
             continue;
         };
-        let phase = member_phase(member);
-        current.insert(name.clone(), phase.to_owned());
-        let first = members.get(&name).is_none();
-        if first && phase != "provisioning" {
-            publish_member(feed, &name, member, "provisioning");
+        if record_sequence <= *sequence {
+            continue;
         }
-        if first || members.get(&name) != Some(&phase.to_owned()) {
-            publish_member(feed, &name, member, phase);
-        }
-    }
-    for (name, phase) in members.iter() {
-        if !current.contains_key(name) && phase != "deleted" {
-            publish_member(
-                feed,
-                name,
-                &json!({"name": name, "state": "deleted"}),
-                "deleted",
-            );
-        }
-    }
-    *members = current;
-}
-
-fn member_phase(member: &Value) -> &'static str {
-    match member.get("state").and_then(Value::as_str) {
-        Some("active") => "active",
-        Some("drain") => "draining",
-        Some("disabled") => "failed",
-        Some("deleted") => "deleted",
-        _ => "provisioning",
+        publish_pool(feed, &record);
+        *sequence = record_sequence;
     }
 }
 
-fn publish_member(feed: &HubFeed, name: &str, member: &Value, phase: &str) {
-    let reason = member
-        .get("probeError")
-        .or_else(|| member.get("error"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    let at = member
-        .get("probedAt")
-        .cloned()
-        .unwrap_or_else(|| json!(now_rfc3339()));
+fn publish_pool(feed: &HubFeed, record: &Value) {
+    let phase = record
+        .get("phase")
+        .and_then(Value::as_str)
+        .unwrap_or("failed")
+        .to_owned();
+    let at = record
+        .get("at")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(now_rfc3339);
+    let pool = record.get("pool").and_then(Value::as_str);
+    let lease = record.get("leaseId").and_then(Value::as_str);
+    let member = record.get("memberId").and_then(Value::as_str);
+    let terminal = matches!(phase.as_str(), "deleted" | "failed" | "removed");
+    let target = member.or(lease).or(pool).map(str::to_owned);
     let data = json!({
-        "pool": member
-            .get("pool")
-            .cloned()
-            .unwrap_or_else(|| json!(name)),
-        "leaseId": member.get("leaseId").cloned().unwrap_or_else(|| json!(name)),
-        "serverId": member.get("serverId").cloned().unwrap_or(Value::Null),
-        "machine": member.get("machine").cloned().unwrap_or_else(|| json!(name)),
+        "kind": record.get("kind").cloned().unwrap_or_else(|| json!("lease")),
+        "pool": pool,
+        "leaseId": record.get("leaseId").cloned().unwrap_or(Value::Null),
+        "serverId": record.get("serverId").cloned().unwrap_or(Value::Null),
+        "memberId": record.get("memberId").cloned().unwrap_or(Value::Null),
+        "machine": record.get("machine").cloned().unwrap_or(Value::Null),
         "phase": phase,
-        "reason": reason,
+        "previousPhase": record.get("previousPhase").cloned().unwrap_or(Value::Null),
         "at": at,
+        "reason": record.get("reason").cloned().unwrap_or(Value::Null),
     });
     feed.publish(HubEvent {
         sequence: 0,
         name: HUB_POOL,
-        timestamp: now_rfc3339(),
+        timestamp: at,
         data,
         run_id: None,
         job_id: None,
-        target: Some(name.to_owned()),
-        phase: Some(phase.to_owned()),
-        terminal: matches!(phase, "deleted" | "failed"),
+        target,
+        phase: Some(phase),
+        terminal,
     });
 }
 
@@ -1831,14 +1814,29 @@ fn payload_schema(name: &str) -> Value {
     let pool_data = json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["pool", "leaseId", "serverId", "machine", "phase", "reason", "at", "cursor", "summary", "replayed"],
+        "required": ["kind", "pool", "leaseId", "serverId", "memberId", "machine", "phase", "previousPhase", "at", "reason", "cursor", "summary", "replayed"],
         "properties": {
+            "kind": {"type": "string", "enum": ["lease", "pool"]},
             "pool": {"type": "string"},
             "cursor": {"type": "string", "pattern": "^hub:[0-9]+$"},
-            "leaseId": {"type": "string"},
+            "leaseId": {"type": ["string", "null"]},
             "serverId": {"type": ["integer", "string", "null"]},
-            "machine": {"type": ["string", "null"]},
-            "phase": {"type": "string", "enum": ["provisioning", "active", "draining", "deleted", "failed"]},
+            "memberId": {"type": ["string", "null"]},
+            "machine": {
+                "type": ["object", "null"],
+                "additionalProperties": true,
+                "properties": {
+                    "cores": {"type": "integer"},
+                    "memoryMb": {"type": "integer"},
+                    "location": {"type": "string"},
+                    "serverType": {"type": "string"}
+                }
+            },
+            "phase": {
+                "type": "string",
+                "enum": ["requested", "creating", "booting", "preparing", "ready", "in_use", "idle", "draining", "deleted", "failed", "added", "removed", "blocked", "shortage"]
+            },
+            "previousPhase": {"type": ["string", "null"]},
             "reason": {"type": ["string", "null"]},
             "at": {"type": "string"},
             "summary": {"type": "object"},

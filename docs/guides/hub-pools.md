@@ -173,6 +173,65 @@ queued and returns it without an error, because that pool starts a server for it
 `--wait` is how you block: it follows the parked job until the hub actually places it, and
 `--wait=DURATION` bounds that wait and ends in `hub.wait_timeout` when the job is still unplaced.
 
+## Watching a machine come up
+
+Every pool transition is recorded by the code that performs it and exposed as a `hub.pool`
+event. One subscription receives those events together with jobs, runs, and warnings; see
+[the MCP guide](mcp.md#hub-events). The lease fields are `leaseId`, `pool`, `serverId`,
+`memberId`, `machine` (`cores`, `memoryMb`, `location`, `serverType`), `phase`, `previousPhase`,
+`at`, and `reason`. A lease never records the same phase twice, and `previousPhase` chains the
+transitions in the order the hub made them.
+
+| Phase       | What the hub did                                                                 | `memberId` |
+| ----------- | -------------------------------------------------------------------------------- | ---------- |
+| `requested` | Created the lease for a queued job.                                               | no         |
+| `creating`  | The provider accepted the request; `serverId` is known.                           | no         |
+| `booting`   | The provider reports the server running.                                          | no         |
+| `preparing` | Opened the tunnel and is checking the data folder, image, and target startup.     | no         |
+| `ready`     | The target answered discovery and the server joined the hub as a member.          | yes        |
+| `in_use`    | The hub placed a job on this member.                                              | yes        |
+| `idle`      | The job finished; the idle timer is running.                                      | yes        |
+| `draining`  | Teardown started: archive the runs, remove the member, close the tunnel.          | yes        |
+| `deleted`   | The provider confirmed deletion; billing stopped.                                 | yes        |
+| `failed`    | The lease stopped early; `reason` names `creating`, `booting`, or `preparing`.     | no         |
+
+The provider API has no boot-progress signal before it reports the server running, so
+`creating` covers that wait. `booting` is recorded at the provider's running report. The hub then
+records `preparing` before it opens the tunnel, and that phase covers SSH readiness, the data
+health check, image pull, and target startup; there are no probe-by-probe events inside it. A
+lease that failed before it had a machine never records `deleted`, so its pool does not report
+`removed`.
+
+Pool-wide changes use `kind: "pool"` and the phases `added`, `removed`, `blocked`, and
+`shortage`. They carry the pool name and, for `blocked` and `shortage`, a `reason`. `removed`
+is recorded only after every lease of the pool has recorded `deleted`.
+
+An example notification for a lease that just became ready:
+
+```json
+{
+  "eventId": "hub:57",
+  "name": "hub.pool",
+  "timestamp": "2026-02-11T09:41:12.481Z",
+  "data": {
+    "kind": "lease",
+    "pool": "burst",
+    "leaseId": "zs-hj-42",
+    "serverId": 41892345,
+    "memberId": "zs-hj-42",
+    "machine": {"cores": 4, "memoryMb": 8192, "location": "fsn1", "serverType": "cpx31"},
+    "phase": "ready",
+    "previousPhase": "preparing",
+    "reason": null,
+    "at": "2026-02-11T09:41:12.481Z",
+    "cursor": "hub:57",
+    "summary": {"phase": "ready", "node": null, "terminal": false, "reason": null},
+    "replayed": false
+  },
+  "_meta": {}
+}
+```
+
 ## The btrfs data folder
 
 The target keeps run workspaces, checkpoint staging and its Restic repository under its storage

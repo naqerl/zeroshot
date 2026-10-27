@@ -9,6 +9,8 @@ use super::error::HubError;
 use super::model::{HubState, Job, JobError, JobErrorKind, JobState, LOCAL_MEMBER, Member, MemberState};
 use super::usage::JobUsage;
 use super::placement::{Load, Placement, place};
+#[cfg(test)]
+use super::pool::{self, PoolPhase};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Consecutive failed member probes, one per dispatcher interval, after which a job placed on
@@ -730,8 +732,14 @@ pub(crate) async fn tick(state: &mut HubState, driver: &dyn HubDriver, now_ms: u
         if let Some(job) = state.jobs.iter_mut().find(|job| job.job_id == job_id) {
             let dispatched =
                 dispatch(job, &member, driver, (now_ms, DEFAULT_UNCONFIRMED_LIMIT)).await;
+            let placed = matches!(dispatched, Dispatched::Placed);
             let job = job.clone();
             record_dispatch(&mut report, &job, &dispatched);
+            if placed {
+                if let Some(member) = job.target.as_deref() {
+                    pool::record_member_phase(state, member, PoolPhase::InUse, now_ms);
+                }
+            }
         }
     }
     if due_jobs(&state.jobs, now_ms).is_empty() {
@@ -743,8 +751,14 @@ pub(crate) async fn tick(state: &mut HubState, driver: &dyn HubDriver, now_ms: u
             continue;
         };
         let dispatched = dispatch(job, &member, driver, (now_ms, DEFAULT_UNCONFIRMED_LIMIT)).await;
+        let placed = matches!(dispatched, Dispatched::Placed);
         let job = job.clone();
         record_dispatch(&mut report, &job, &dispatched);
+        if placed {
+            if let Some(member) = job.target.as_deref() {
+                pool::record_member_phase(state, member, PoolPhase::InUse, now_ms);
+            }
+        }
     }
     report.loads = Some(loads);
     report

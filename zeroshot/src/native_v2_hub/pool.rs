@@ -30,6 +30,59 @@ pub(crate) const LABEL_LOCATION: &str = "zeroshot/location";
 pub(crate) const BOOT_DEADLINE_MS: u64 = 15 * 60_000;
 /// Longest wait between two provider polls of one lease.
 const MAX_BACKOFF_MS: u64 = 60_000;
+/// Pool lifecycle records kept for the `events/list` stream and `hub pool list`.
+pub(crate) const POOL_EVENT_LIMIT: usize = 1024;
+
+/// One observed pool or lease transition. Lease phases chain through `previous_phase`; a
+/// pool-level change such as `added` or `removed` carries no lease.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PoolPhase {
+    Requested,
+    Creating,
+    Booting,
+    Preparing,
+    Ready,
+    InUse,
+    Idle,
+    Draining,
+    Deleted,
+    Failed,
+    Added,
+    Removed,
+    Blocked,
+    Shortage,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PoolEventKind {
+    Lease,
+    Pool,
+}
+
+/// One recorded transition, in the order the hub performed it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PoolEventRecord {
+    pub sequence: u64,
+    pub kind: PoolEventKind,
+    pub pool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<Machine>,
+    pub phase: PoolPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_phase: Option<PoolPhase>,
+    pub at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -240,11 +293,163 @@ pub(crate) struct Lease {
     /// The server type and location the provider accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<Machine>,
+    /// Furthest pool phase already recorded for this lease; kept so a repeated observation
+    /// never becomes a second event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_phase: Option<PoolPhase>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
 const fn is_zero(value: &u32) -> bool {
     *value == 0
+}
+
+/// The setup chain a lease follows before it can take jobs. Later phases (`in_use`, `idle`)
+/// depend on placement and are recorded by the callers that perform them.
+const SETUP_PHASES: &[PoolPhase] = &[
+    PoolPhase::Requested,
+    PoolPhase::Creating,
+    PoolPhase::Booting,
+    PoolPhase::Preparing,
+    PoolPhase::Ready,
+];
+
+fn setup_index(phase: PoolPhase) -> Option<usize> {
+    SETUP_PHASES
+        .iter()
+        .position(|candidate| *candidate == phase)
+}
+
+/// One transition to record, with the time the hub performed it.
+pub(crate) struct PoolPhaseChange {
+    pub phase: PoolPhase,
+    pub reason: Option<String>,
+    pub at: u64,
+}
+
+/// Record one pool-level change: `added`, `removed`, `blocked`, or `shortage`.
+pub(crate) fn record_pool_phase(state: &mut HubState, pool: &str, change: PoolPhaseChange) {
+    state.push_pool_event(PoolEventRecord {
+        sequence: 0,
+        kind: PoolEventKind::Pool,
+        pool: pool.to_owned(),
+        lease_id: None,
+        server_id: None,
+        member_id: None,
+        machine: None,
+        phase: change.phase,
+        previous_phase: None,
+        at: rfc3339(change.at),
+        reason: change.reason,
+    });
+}
+
+/// Record one lease change once, chaining every setup phase it passed through so a fast boot
+/// still reports `creating`, `booting`, and `preparing` in order. Returns whether this call
+/// emitted anything.
+pub(crate) fn record_lease_phase(
+    state: &mut HubState,
+    lease: &mut Lease,
+    change: PoolPhaseChange,
+) -> bool {
+    if lease.event_phase == Some(change.phase) {
+        return false;
+    }
+    let previous = lease.event_phase;
+    let chain = match (previous.and_then(setup_index), setup_index(change.phase)) {
+        (Some(from), Some(to)) if to > from => SETUP_PHASES[from + 1..=to].to_vec(),
+        _ => vec![change.phase],
+    };
+    let member = matches!(
+        change.phase,
+        PoolPhase::Ready
+            | PoolPhase::InUse
+            | PoolPhase::Idle
+            | PoolPhase::Draining
+            | PoolPhase::Deleted
+            | PoolPhase::Failed
+    )
+    .then(|| lease.name.clone());
+    let mut prior = previous;
+    for (index, step) in chain.iter().copied().enumerate() {
+        let last = index + 1 == chain.len();
+        let step_member = if matches!(
+            step,
+            PoolPhase::Ready
+                | PoolPhase::InUse
+                | PoolPhase::Idle
+                | PoolPhase::Draining
+                | PoolPhase::Deleted
+        ) {
+            member.clone()
+        } else {
+            None
+        };
+        state.push_pool_event(PoolEventRecord {
+            sequence: 0,
+            kind: PoolEventKind::Lease,
+            pool: lease.pool.clone(),
+            lease_id: Some(lease.id.clone()),
+            server_id: lease.server_id,
+            member_id: step_member,
+            machine: lease.machine.clone(),
+            phase: step,
+            previous_phase: prior,
+            at: rfc3339(change.at),
+            reason: last.then(|| change.reason.clone()).flatten(),
+        });
+        prior = Some(step);
+    }
+    lease.event_phase = Some(change.phase);
+    true
+}
+
+/// Whether every lease that ever recorded an event for `pool` also recorded `deleted`.
+/// A lease that failed before it had a machine never records `deleted`, so its pool is not
+/// reported removed even though no server remains.
+pub(crate) fn every_lease_deleted(state: &HubState, pool: &str) -> bool {
+    let mut leases: Vec<&str> = Vec::new();
+    let mut deleted: Vec<&str> = Vec::new();
+    for event in &state.pool_events {
+        if event.kind != PoolEventKind::Lease || event.pool != pool {
+            continue;
+        }
+        let Some(id) = event.lease_id.as_deref() else {
+            continue;
+        };
+        if !leases.contains(&id) {
+            leases.push(id);
+        }
+        if event.phase == PoolPhase::Deleted && !deleted.contains(&id) {
+            deleted.push(id);
+        }
+    }
+    leases.iter().all(|id| deleted.contains(id))
+}
+
+/// Record `phase` for the lease that owns `member`, if any: placement (`in_use`) and
+/// idleness (`idle`) happen outside a lease step.
+pub(crate) fn record_member_phase(
+    state: &mut HubState,
+    member: &str,
+    phase: PoolPhase,
+    at: u64,
+) -> bool {
+    let Some(index) = state.leases.iter().position(|lease| lease.name == member) else {
+        return false;
+    };
+    let mut lease = state.leases[index].clone();
+    let changed = record_lease_phase(
+        state,
+        &mut lease,
+        PoolPhaseChange {
+            phase,
+            reason: None,
+            at,
+        },
+    );
+    state.leases[index] = lease;
+    changed
 }
 
 impl Lease {
@@ -269,6 +474,7 @@ impl Lease {
             error: None,
             spec: Spec::default(),
             machine: None,
+            event_phase: None,
         }
     }
 
@@ -309,6 +515,7 @@ impl Lease {
             "id": self.id,
             "name": self.name,
             "phase": self.phase,
+            "eventPhase": self.event_phase,
             "serverId": self.server_id,
             "localPort": self.local_port,
             "createdAt": rfc3339(self.created_at_ms),
@@ -413,19 +620,34 @@ pub(crate) fn scale_up(state: &HubState, now: u64) -> Vec<Decision> {
 /// Track idleness of pool members: idle since the first pass that saw no hub job running or
 /// placing on them.
 pub(crate) fn update_idle(state: &mut HubState, now: u64) {
-    let jobs = &state.jobs;
-    for member in state
-        .members
-        .iter_mut()
-        .filter(|member| member.pool.is_some())
+    let mut became_idle = Vec::new();
     {
-        let busy = jobs.iter().any(|job| {
-            job.state == JobState::Running && job.target.as_deref() == Some(member.name.as_str())
-        });
-        if busy {
-            member.idle_since_ms = None;
-        } else if member.idle_since_ms.is_none() {
-            member.idle_since_ms = Some(now);
+        let jobs = &state.jobs;
+        for member in state
+            .members
+            .iter_mut()
+            .filter(|member| member.pool.is_some())
+        {
+            let busy = jobs.iter().any(|job| {
+                job.state == JobState::Running
+                    && job.target.as_deref() == Some(member.name.as_str())
+            });
+            if busy {
+                member.idle_since_ms = None;
+            } else if member.idle_since_ms.is_none() {
+                member.idle_since_ms = Some(now);
+                became_idle.push(member.name.clone());
+            }
+        }
+    }
+    for name in became_idle {
+        let was_in_use = state
+            .leases
+            .iter()
+            .find(|lease| lease.name == name)
+            .is_some_and(|lease| lease.event_phase == Some(PoolPhase::InUse));
+        if was_in_use {
+            record_member_phase(state, &name, PoolPhase::Idle, now);
         }
     }
 }
