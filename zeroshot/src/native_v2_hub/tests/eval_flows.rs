@@ -124,8 +124,6 @@ async fn suites_and_cases_are_created_listed_and_shown() {
         HubCommand::Submit(Box::new(HubSubmit {
             job: spec(&folder, "captured", None),
             detach: true,
-            wait: None,
-            queue: true,
         })),
         &mut output,
     )

@@ -104,8 +104,8 @@ sum by (reason) (rate(zeroshot_hub_placement_rejections_total[15m]))
 member can but a pool serves the job's placement, submit parks the job exactly as `hub enqueue`
 accepts it: the job is persisted as queued and returned without an error, because the pool
 provisions a machine for it. `hub.no_capacity` (exit 3) is reserved for a placement that neither a
-free member nor a pool can serve now. Pass `--wait` (optionally `--wait=DURATION`) to block until
-the hub actually places the job; without it, submit returns as soon as the job is placed or parked.
+free member nor a pool can serve now. Use `hub enqueue` when no free member can take the job now
+and no pool serves it.
 
 ## Unconfirmed submissions
 

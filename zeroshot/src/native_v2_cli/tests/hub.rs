@@ -5,7 +5,7 @@ use crate::native_v2_cli::hub::{
     HubDaemonRun, HubInstall, HubManager, HubMemberState, HubPoolCommand, HubPoolTag, HubRequest,
     HubStrategy, HubTokenSource, HubUninstall,
 };
-use crate::native_v2_cli::{NativeV2CliCommand, NativeV2CliError, parse_native_v2_args};
+use crate::native_v2_cli::{Cli, NativeV2CliCommand, NativeV2CliError, parse_native_v2_args};
 
 fn request(values: &[&str]) -> Result<HubRequest, NativeV2CliError> {
     match parse_native_v2_args(values.iter().map(OsString::from))? {
@@ -35,8 +35,6 @@ fn submit_keeps_run_arguments_and_separates_placement() {
         "least-loaded",
         "--label",
         "task=parser",
-        "--wait",
-        "10m",
         "--title",
         "Fix parser",
         "--template",
@@ -57,8 +55,6 @@ fn submit_keeps_run_arguments_and_separates_placement() {
         panic!("expected submit");
     };
     assert!(submit.detach);
-    assert!(!submit.queue);
-    assert_eq!(submit.wait, Some(Some("10m".to_owned())));
     let job = &submit.job;
     assert_eq!(job.target.as_deref(), Some("box-1"));
     assert_eq!(job.tags, ["eu", "gpu"]);
@@ -117,49 +113,42 @@ fn hub_jobs_preserve_task_from_and_reject_review_source_conflicts() {
 }
 
 #[test]
-fn bare_wait_means_wait_without_deadline() {
-    let command = parse(&[
-        "hub",
-        "submit",
-        "--wait",
-        "--title",
-        "T",
-        "--profile",
-        "p",
-        "--input",
-        "in.json",
-    ])
-    .expect("hub submit parses");
-    let HubCommand::Submit(submit) = command else {
-        panic!("expected submit");
+fn submit_rejects_removed_wait_and_queue_flags() {
+    for flag in [["--wait", "1m"], ["--wait", ""], ["--queue", ""]] {
+        let mut arguments = vec![
+            "hub", "submit", flag[0], "--title", "T", "--input", "in.json",
+        ];
+        if !flag[1].is_empty() {
+            arguments.insert(3, flag[1]);
+        }
+        parse(&arguments).expect_err("removed flags are rejected");
+    }
+}
+
+#[test]
+fn removed_hub_flags_are_absent_from_help() {
+    let help = |values: &[&str]| match parse_native_v2_args(values.iter().map(OsString::from))
+        .expect("help parses")
+    {
+        NativeV2CliCommand::Help(text) => text,
+        other => panic!("expected help, got {other:?}"),
     };
-    assert_eq!(submit.wait, Some(None));
-    assert!(!submit.detach);
-}
-
-#[test]
-fn submit_parses_queue_and_wait() {
-    let command = parse(&[
-        "hub",
-        "submit",
-        "--title",
-        "T",
-        "--profile",
-        "p",
-        "--input",
-        "in.json",
-    ])
-    .expect("hub submit parses");
-    assert!(matches!(command, HubCommand::Submit(_)));
-}
-
-#[test]
-fn wait_and_queue_conflict() {
-    let error = parse(&[
-        "hub", "submit", "--wait", "1m", "--queue", "--title", "T", "--input", "in.json",
-    ])
-    .expect_err("conflicting flags are rejected");
-    assert!(matches!(error, NativeV2CliError::Usage(_)));
+    let submit = help(&["hub", "submit", "--help"]);
+    for flag in ["--wait", "--queue"] {
+        assert!(
+            !submit.contains(flag),
+            "{flag} is still documented:
+{submit}"
+        );
+    }
+    let pool = help(&["hub", "pool", "add", "--help"]);
+    for flag in ["--data-fs", "--data-size", "--data-volume"] {
+        assert!(
+            !pool.contains(flag),
+            "{flag} is still documented:
+{pool}"
+        );
+    }
 }
 
 #[test]
@@ -838,6 +827,39 @@ fn eval_names_cases_and_variants_are_validated() {
         message(&["hub", "eval", "run", "--suite", "s", "--variant", "a=model"])
             .contains("KEY=VALUE")
     );
+}
+
+#[test]
+fn pool_add_rejects_removed_data_flags() {
+    use clap::Parser;
+    for flag in ["--data-fs", "--data-size", "--data-volume"] {
+        let arguments = [
+            "zeroshot",
+            "hub",
+            "pool",
+            "add",
+            "burst",
+            "--type",
+            "cpx31",
+            "--image",
+            "docker-ce",
+            "--target-image",
+            "img:1",
+            "--max",
+            "1",
+            "--ssh-key",
+            "/k",
+            "--ssh-from",
+            "198.51.100.7/32",
+            flag,
+            "btrfs",
+        ];
+        let error = Cli::try_parse_from(arguments).expect_err("removed data flags are rejected");
+        // Clap reports a usage error as exit 2; the CLI wraps it in its own diagnostic and
+        // process exit code, so only this direct clap result observes the conventional value.
+        assert_eq!(error.exit_code(), 2, "{flag}: {error}");
+        parse(&arguments[1..]).expect_err("removed data flags are rejected");
+    }
 }
 
 #[test]

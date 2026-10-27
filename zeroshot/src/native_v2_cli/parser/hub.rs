@@ -45,7 +45,7 @@ ranked by --strategy. Hub documents carry a `schema` field.
 EXIT CODES
   0  success
   1  error (ZEROSHOT_ERROR_FORMAT=json writes a zeroshot.error/v1 diagnostic)
-  3  no capacity: matching members are busy or unreachable, or --wait timed out (retryable)
+  3  no capacity: matching members are busy or unreachable (retryable)
   4  no eligible target: no active member matches the placement, or none supports the run
      (not retryable; details.rejected lists each member's reason)
   5  hub.unreachable: the selected hub context's daemon does not answer
@@ -83,8 +83,9 @@ pub(super) enum HubCliCommand {
     /// Place a run on a free member now.
     ///
     /// A job a pool serves is parked as queued, as `hub enqueue` does, because the pool starts a
-    /// server for it. It fails with exit code 3 only when no free member and no pool can take the
-    /// job now. --wait blocks until the job is placed; --queue returns as soon as it is queued.
+    /// server for it. It fails with exit code 3 and the `hub.no_capacity` diagnostic only when no
+    /// free member and no pool can take the job now. Use `hub enqueue` to queue a job when no
+    /// pool serves it.
     Submit(Box<HubSubmitArgs>),
 
     /// Accept a run into the hub queue for later placement, once or on a cron schedule.
@@ -354,22 +355,6 @@ pub(super) struct HubPoolAddArgs {
     /// CIDR allowed to reach servers over SSH (the hub's public address). Repeat for several.
     #[arg(long, value_name = "CIDR", required = true, action = clap::ArgAction::Append)]
     ssh_from: Vec<String>,
-
-    /// Filesystem of the servers' data folder. Zeroshot copies workspaces with reflinks, so
-    /// it must be copy-on-write: btrfs, formatted at boot.
-    #[arg(long, value_name = "FS", default_value = "btrfs", value_parser = ["btrfs"])]
-    data_fs: String,
-
-    /// Size of the btrfs data file on the server's local disk, in GB. Default: the free disk
-    /// after the target image, less 8 GB for Docker.
-    #[arg(long, value_name = "GB", conflicts_with = "data_volume",
-          value_parser = clap::value_parser!(u32).range(5..))]
-    data_size: Option<u32>,
-
-    /// Keep the data on a btrfs Hetzner Volume of this many GB, created with each server and
-    /// deleted with it, instead of a file on the local disk.
-    #[arg(long, value_name = "GB", value_parser = clap::value_parser!(u32).range(10..=10240))]
-    data_volume: Option<u32>,
 }
 
 impl HubPoolCliCommand {
@@ -392,9 +377,6 @@ impl HubPoolCliCommand {
                     tags: tags(args.tags)?,
                     ssh_key: args.ssh_key,
                     ssh_from: args.ssh_from,
-                    data_fs: args.data_fs,
-                    data_size_gb: args.data_size,
-                    data_volume_gb: args.data_volume,
                 }))
             }
             Self::List => HubPoolCommand::List,
@@ -744,14 +726,6 @@ pub(super) struct HubSubmitArgs {
     #[command(flatten)]
     placement: HubPlacementArgs,
 
-    /// Wait for a free member, optionally up to DURATION such as 10m.
-    #[arg(long, value_name = "DURATION", num_args = 0..=1, conflicts_with = "queue")]
-    wait: Option<Option<String>>,
-
-    /// Queue the job when every matching member is busy instead of failing.
-    #[arg(long)]
-    queue: bool,
-
     #[command(flatten)]
     run: RunArgs,
 }
@@ -1045,8 +1019,6 @@ impl HubSubmitArgs {
         Ok(HubSubmit {
             job: job_spec(self.run, self.placement)?,
             detach,
-            wait: self.wait,
-            queue: self.queue,
         })
     }
 }

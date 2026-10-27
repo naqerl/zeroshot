@@ -121,13 +121,8 @@ pub(super) fn spec(folder: &Path, title: &str, target: Option<&str>) -> HubJobSp
     }
 }
 
-fn submit(job: HubJobSpec, queue: bool, wait: Option<Option<String>>) -> HubCommand {
-    HubCommand::Submit(Box::new(HubSubmit {
-        job,
-        detach: true,
-        wait,
-        queue,
-    }))
+fn submit(job: HubJobSpec) -> HubCommand {
+    HubCommand::Submit(Box::new(HubSubmit { job, detach: true }))
 }
 
 fn add(name: &str, slots: u32) -> HubCommand {
@@ -320,7 +315,7 @@ async fn unreachable_members_probe_as_unreachable() {
 }
 
 #[tokio::test]
-async fn submissions_place_queue_wait_and_refuse_through_the_api() {
+async fn submissions_place_and_refuse_through_the_api() {
     let hub = hub_with(FakeDriver::default(), None).await;
     let client = &hub.client;
     let folder = hub.directory.path();
@@ -328,15 +323,11 @@ async fn submissions_place_queue_wait_and_refuse_through_the_api() {
 
     let mut keyed = spec(folder, "first", None);
     keyed.submission_key = Some("first-key".to_owned());
-    let placed = run(client, submit(keyed.clone(), false, None))
-        .await
-        .expect("submit");
+    let placed = run(client, submit(keyed.clone())).await.expect("submit");
     assert_eq!(placed["job"]["state"], json!("running"));
     assert_eq!(placed["job"]["target"], json!("local"));
     let job_id = placed["job"]["jobId"].as_str().expect("job id").to_owned();
-    let again = run(client, submit(keyed, false, None))
-        .await
-        .expect("same key");
+    let again = run(client, submit(keyed)).await.expect("same key");
     assert_eq!(
         again["job"]["jobId"],
         json!(job_id),
@@ -344,32 +335,17 @@ async fn submissions_place_queue_wait_and_refuse_through_the_api() {
     );
     assert_eq!(hub.driver.submissions.lock().expect("lock").len(), 1);
 
-    // The only slot is taken: no capacity, queue it, or wait for one.
+    // The only slot is taken: submit cannot place it now.
     let busy = expect_code(
         client,
-        submit(spec(folder, "second", None), false, None),
+        submit(spec(folder, "second", None)),
         "hub.no_capacity",
     )
     .await;
     assert_eq!(busy.exit_code(), super::super::error::EXIT_NO_CAPACITY);
-    let queued = run(client, submit(spec(folder, "third", None), true, None))
-        .await
-        .expect("queue");
-    assert_eq!(queued["job"]["state"], json!("queued"));
-    let waited = run(
-        client,
-        submit(
-            spec(folder, "fourth", None),
-            false,
-            Some(Some("1s".to_owned())),
-        ),
-    )
-    .await
-    .expect_err("no slot frees up");
-    assert!(matches!(waited, HubError::WaitTimeout(_)), "{waited:?}");
     expect_code(
         client,
-        submit(spec(folder, "elsewhere", Some("box")), false, None),
+        submit(spec(folder, "elsewhere", Some("box"))),
         "hub.no_eligible_target",
     )
     .await;
@@ -403,20 +379,10 @@ async fn submissions_place_queue_wait_and_refuse_through_the_api() {
     .await
     .expect("finished");
     assert_eq!(finished["job"]["state"], json!("succeeded"), "{finished}");
-    let queued_status = run(
-        client,
-        HubCommand::Status {
-            job: queued["job"]["jobId"].as_str().expect("id").to_owned(),
-        },
-    )
-    .await
-    .expect("queued status");
-    assert_eq!(queued_status["run"], Value::Null);
-
     let dispatched = run(client, HubCommand::Dispatch).await.expect("dispatch");
     assert!(dispatched.is_object(), "{dispatched}");
     let all = run(client, ps("all")).await.expect("ps all");
-    assert!(all["jobs"].as_array().expect("jobs").len() >= 2, "{all}");
+    assert!(!all["jobs"].as_array().expect("jobs").is_empty(), "{all}");
     let limited = run(
         client,
         HubCommand::Ps(HubPs {
@@ -659,7 +625,6 @@ async fn uploads_must_name_a_file_argument_of_the_run() {
     job.cwd = hub.directory.path().to_path_buf();
     let body = json!({
         "job": job,
-        "queue": true,
         "files": [{"argument": "elsewhere.json", "content": "{}"}],
     });
     let response = reqwest::Client::new()
@@ -743,12 +708,9 @@ async fn observations_stream_the_target_command_and_its_exit_code() {
     let hub = hub_with(FakeDriver::default(), Some(echo_executable(folder.path()))).await;
     let client = &hub.client;
     run(client, add("local", 2)).await.expect("add");
-    let placed = run(
-        client,
-        submit(spec(hub.directory.path(), "observed", None), false, None),
-    )
-    .await
-    .expect("submit");
+    let placed = run(client, submit(spec(hub.directory.path(), "observed", None)))
+        .await
+        .expect("submit");
     let job = placed["job"]["jobId"].as_str().expect("job").to_owned();
     for command in [
         HubCommand::Watch {
@@ -781,8 +743,6 @@ async fn observations_stream_the_target_command_and_its_exit_code() {
         HubCommand::Submit(Box::new(HubSubmit {
             job: follow,
             detach: false,
-            wait: Some(None),
-            queue: false,
         })),
         &mut output,
     )
@@ -812,7 +772,7 @@ async fn an_unstartable_observer_reports_exit_1() {
     run(&hub.client, add("local", 1)).await.expect("add");
     let placed = run(
         &hub.client,
-        submit(spec(hub.directory.path(), "lost", None), false, None),
+        submit(spec(hub.directory.path(), "lost", None)),
     )
     .await
     .expect("submit");
@@ -892,7 +852,7 @@ async fn placing_jobs_can_be_dequeued_through_the_api_and_are_never_adopted() {
     run(client, add("local", 1)).await.expect("add");
     let placing = run(
         client,
-        submit(spec(hub.directory.path(), "unanswered", None), false, None),
+        submit(spec(hub.directory.path(), "unanswered", None)),
     )
     .await
     .expect("an unconfirmed submission is not an error");
