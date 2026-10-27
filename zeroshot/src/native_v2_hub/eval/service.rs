@@ -600,6 +600,7 @@ impl HubService {
             schedule_id: None,
             output: None,
             archive: None,
+            archive_skipped: None,
             graph_hash: None,
             pool_wait: None,
         })

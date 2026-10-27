@@ -100,6 +100,7 @@ pub(super) fn job(id: &str, submitted_at_ms: u64) -> Job {
         schedule_id: None,
         output: None,
         archive: None,
+        archive_skipped: None,
         graph_hash: None,
         pool_wait: None,
     }
@@ -822,6 +823,8 @@ pub(super) struct FakeDriver {
     pub captures: Mutex<Vec<(String, Vec<String>)>>,
     /// Makes archive captures fail, like a target that went away.
     pub capture_fails: std::sync::atomic::AtomicBool,
+    /// Makes archive captures report the target unreachable, like a deleted pool server.
+    pub capture_unreachable: std::sync::atomic::AtomicBool,
     /// Discovery answer for members absent from `capabilities`, such as pool servers whose
     /// names the hub chooses.
     pub discover_any: Option<Vec<String>>,
@@ -961,6 +964,17 @@ impl HubDriver for FakeDriver {
     }
 
     async fn capture(&self, member: &str, arguments: Vec<String>) -> Result<String, HubError> {
+        if self
+            .capture_unreachable
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(HubError::Target {
+                message: format!(
+                    "zeroshot status: cannot communicate with target {member}: connection refused"
+                ),
+                diagnostic: None,
+            });
+        }
         if self.capture_fails.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(HubError::Unanswered("capture failed".to_owned()));
         }

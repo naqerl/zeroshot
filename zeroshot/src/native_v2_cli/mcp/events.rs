@@ -183,6 +183,61 @@ pub(super) struct HubFeed {
     snapshot: RefCell<Vec<Arc<HubEvent>>>,
     sender: broadcast::Sender<Arc<HubEvent>>,
     started: Cell<bool>,
+    warnings: RefCell<WarningBook>,
+}
+
+/// Facts the warning publisher keeps between intervals for each running job: the execution it
+/// last observed and when that execution first appeared, plus the cursor the previous warning
+/// announced. It lives beside the feed rather than on `Job`, so no hub state schema moves.
+#[derive(Default)]
+struct WarningBook {
+    jobs: HashMap<String, WarningEntry>,
+}
+
+#[derive(Default)]
+struct WarningEntry {
+    node: Option<String>,
+    execution: Option<String>,
+    execution_since_ms: Option<u64>,
+    announced_cursor: Option<String>,
+}
+
+impl WarningBook {
+    /// Learn the current execution from a run event. An empty `activeExecutions` means the run
+    /// is between executions, so the next one starts its own clock.
+    fn observe(&mut self, job_id: &str, event: &Value, now: u64) {
+        if event.pointer("/status/phase").and_then(Value::as_str) == Some("finished") {
+            self.jobs.remove(job_id);
+            return;
+        }
+        let Some(executions) = event
+            .pointer("/status/activeExecutions")
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        let current = executions.first();
+        let execution = current
+            .and_then(|execution| execution.get("execution"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let node = current
+            .and_then(|execution| execution.get("node"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let entry = self.jobs.entry(job_id.to_owned()).or_default();
+        if entry.execution != execution {
+            entry.execution_since_ms = execution.as_ref().map(|_| now);
+            entry.execution = execution;
+            entry.node = node;
+        } else if node.is_some() {
+            entry.node = node;
+        }
+    }
+
+    fn retain_running(&mut self, running: &HashSet<String>) {
+        self.jobs.retain(|job_id, _| running.contains(job_id));
+    }
 }
 
 impl HubFeed {
@@ -196,6 +251,7 @@ impl HubFeed {
             snapshot: RefCell::new(Vec::new()),
             sender,
             started: Cell::new(false),
+            warnings: RefCell::new(WarningBook::default()),
         }
     }
 
@@ -1312,14 +1368,14 @@ async fn poll_jobs<H>(
         let command = match watch_command(&run_id, target.as_deref(), None) {
             Ok(command) => command,
             Err(failure) => {
-                feed.publish_warning(&job_id, &run_id, rpc_error(failure).1);
+                feed.publish_warning(&job_id, &run_id, json!({"message": rpc_error(failure).1}));
                 continue;
             }
         };
         let mut stream = match host.open_watch(&command).await {
             Ok(stream) => stream,
             Err(failure) => {
-                feed.publish_warning(&job_id, &run_id, &failure.message);
+                feed.publish_warning(&job_id, &run_id, json!({"message": failure.message}));
                 continue;
             }
         };
@@ -1337,7 +1393,11 @@ async fn poll_jobs<H>(
                         event,
                     ),
                     Err(failure) => {
-                        feed.publish_warning(&job_id, &watched_run, &failure.message);
+                        feed.publish_warning(
+                            &job_id,
+                            &watched_run,
+                            json!({"message": failure.message}),
+                        );
                         break;
                     }
                 }
@@ -1489,8 +1549,10 @@ where
     let Ok(views) = hub_job_views(host).await else {
         return;
     };
-    for view in views {
-        if hub_job_state(&view) != "running" {
+    let now = now_ms();
+    let mut running = HashSet::new();
+    for view in &views {
+        if hub_job_state(view) != "running" {
             continue;
         }
         let Some(job_id) = view.get("jobId").and_then(Value::as_str) else {
@@ -1499,13 +1561,11 @@ where
         let Some(run_id) = view.get("runId").and_then(Value::as_str) else {
             continue;
         };
-        let mut message = "run has been in progress for an hour".to_owned();
-        if let Some(reason) = view.get("reaper").and_then(Value::as_str) {
-            message.push_str("; reaper withheld action: ");
-            message.push_str(reason);
-        }
-        feed.publish_warning(job_id, run_id, &message);
+        running.insert(job_id.to_owned());
+        let data = feed.warning_data(view, now);
+        feed.publish_warning(job_id, run_id, data);
     }
+    feed.warnings.borrow_mut().retain_running(&running);
 }
 
 struct RunOrigin<'a> {
@@ -1521,6 +1581,9 @@ impl HubFeed {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let terminal = phase.as_deref() == Some("finished");
+        self.warnings
+            .borrow_mut()
+            .observe(origin.job_id, &event, now_ms());
         if let Some(map) = event.as_object_mut() {
             map.entry("runId").or_insert_with(|| json!(origin.run_id));
         }
@@ -1537,17 +1600,109 @@ impl HubFeed {
         });
     }
 
-    fn publish_warning(&self, job_id: &str, run_id: &str, message: &str) {
+    /// Facts the hub already knows about one running job, keeping the payload additive: every
+    /// earlier `jobId`/`runId`/`message`/`at` field keeps its meaning.
+    fn warning_data(&self, view: &Value, now: u64) -> Value {
+        let job_id = view
+            .get("jobId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let run_id = view
+            .get("runId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let cursor = view
+            .get("lastCursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let (previous_cursor, node, execution, execution_since_ms) = {
+            let mut book = self.warnings.borrow_mut();
+            let entry = book.jobs.entry(job_id.to_owned()).or_default();
+            let previous = std::mem::replace(&mut entry.announced_cursor, cursor.clone());
+            (
+                previous,
+                entry.node.clone(),
+                entry.execution.clone(),
+                entry.execution_since_ms,
+            )
+        };
+        let dispatched_at_ms = view
+            .get("dispatchedAt")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_ms);
+        let elapsed_ms = dispatched_at_ms.map(|at| now.saturating_sub(at));
+        let unchanged_ms = execution_since_ms.map(|at| now.saturating_sub(at));
+        let cursor_delta = match (&previous_cursor, &cursor) {
+            (Some(previous), Some(current)) => cursor_sequence(current)
+                .zip(cursor_sequence(previous))
+                .and_then(|(current, previous)| current.checked_sub(previous)),
+            _ => None,
+        };
+
+        let mut message = format!(
+            "job {job_id} run {run_id} has been running for {}",
+            elapsed_ms.map_or_else(|| "an unknown time".to_owned(), human_duration)
+        );
+        match (&node, &execution) {
+            (Some(node), Some(execution)) => {
+                message.push_str(&format!(" at node {node}"));
+                message.push_str(&format!(" (execution {execution} unchanged for "));
+                message.push_str(
+                    &unchanged_ms.map_or_else(|| "an unknown time".to_owned(), human_duration),
+                );
+                message.push(')');
+            }
+            _ => message.push_str("; no active execution was reported"),
+        }
+        match (&previous_cursor, cursor_delta) {
+            (Some(_), Some(delta)) => message.push_str(&format!(
+                "; {delta} cursor event{} since the previous warning",
+                if delta == 1 { "" } else { "s" }
+            )),
+            (Some(_), None) => {
+                message.push_str("; the cursor did not advance since the previous warning")
+            }
+            (None, _) => {
+                let at = cursor.as_deref().unwrap_or("unknown");
+                message.push_str(&format!("; first warning, cursor {at}"));
+            }
+        }
+        if let Some(reason) = view.get("reaper").and_then(Value::as_str) {
+            message.push_str("; reaper withheld action: ");
+            message.push_str(reason);
+        }
+
+        json!({
+            "message": message,
+            "at": now_rfc3339(),
+            "elapsedMs": elapsed_ms,
+            "elapsed": elapsed_ms.map(human_duration),
+            "dispatchedAt": view.get("dispatchedAt").cloned().unwrap_or(Value::Null),
+            "node": node,
+            "execution": execution,
+            "executionUnchangedMs": unchanged_ms,
+            "executionUnchanged": unchanged_ms.map(human_duration),
+            "runCursor": cursor,
+            "previousRunCursor": previous_cursor,
+            "cursorDelta": cursor_delta,
+        })
+    }
+
+    fn publish_warning(&self, job_id: &str, run_id: &str, facts: Value) {
+        let mut data = Map::new();
+        data.insert("jobId".to_owned(), json!(job_id));
+        data.insert("runId".to_owned(), json!(run_id));
+        // Every warning the hub already emitted carried `at`, including watch failures that
+        // supply only a message.
+        data.insert("at".to_owned(), json!(now_rfc3339()));
+        if let Value::Object(facts) = facts {
+            data.extend(facts);
+        }
         self.publish(HubEvent {
             sequence: 0,
             name: HUB_WARNING,
             timestamp: now_rfc3339(),
-            data: json!({
-                "jobId": job_id,
-                "runId": run_id,
-                "message": message,
-                "at": now_rfc3339(),
-            }),
+            data: Value::Object(data),
             run_id: Some(run_id.to_owned()),
             job_id: Some(job_id.to_owned()),
             target: None,
@@ -1555,6 +1710,33 @@ impl HubFeed {
             terminal: false,
         });
     }
+}
+
+/// Human-readable duration for warnings: `6h 12m`, `3m`, `45s`.
+fn human_duration(ms: u64) -> String {
+    let total = ms / 1000;
+    let days = total / 86_400;
+    let hours = (total % 86_400) / 3_600;
+    let minutes = (total % 3_600) / 60;
+    let seconds = total % 60;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn parse_rfc3339_ms(text: &str) -> Option<u64> {
+    let instant = OffsetDateTime::parse(text, &Rfc3339).ok()?;
+    u64::try_from(instant.unix_timestamp_nanos() / 1_000_000).ok()
+}
+
+fn now_ms() -> u64 {
+    u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).unwrap_or(0)
 }
 
 fn watch_command(
@@ -1954,4 +2136,65 @@ where
         &json!({"jsonrpc": "2.0", "method": method, "params": params}),
     )
     .await
+}
+
+#[cfg(test)]
+mod warning_tests {
+    use super::*;
+
+    #[test]
+    fn hub_warnings_name_the_execution_and_cursor_delta() {
+        let feed = HubFeed::new();
+        let now = parse_rfc3339_ms("2024-01-01T06:12:00Z").expect("time");
+        let observed_at = now - 12 * 60_000;
+        feed.warnings.borrow_mut().observe(
+            "hj_1",
+            &json!({
+                "status": {
+                    "phase": "running",
+                    "activeExecutions": [{"node": "worker", "execution": "exec-7"}],
+                },
+            }),
+            observed_at,
+        );
+        let mut view = json!({
+            "jobId": "hj_1",
+            "runId": "run-1",
+            "dispatchedAt": "2024-01-01T00:00:00Z",
+            "lastCursor": "v2:15",
+        });
+
+        let first = feed.warning_data(&view, now);
+        assert_eq!(first["elapsed"], json!("6h 12m"));
+        assert_eq!(first["node"], json!("worker"));
+        assert_eq!(first["execution"], json!("exec-7"));
+        assert_eq!(first["executionUnchanged"], json!("12m"));
+        assert_eq!(first["cursorDelta"], Value::Null);
+        assert!(
+            first["message"]
+                .as_str()
+                .expect("message")
+                .contains("first warning")
+        );
+
+        view["lastCursor"] = json!("v2:20");
+        let second = feed.warning_data(&view, now + 60_000);
+        assert_eq!(second["previousRunCursor"], json!("v2:15"));
+        assert_eq!(second["cursorDelta"], json!(5));
+        assert!(
+            second["message"]
+                .as_str()
+                .expect("message")
+                .contains("5 cursor events")
+        );
+    }
+
+    #[test]
+    fn hub_warning_durations_stay_readable() {
+        assert_eq!(human_duration(0), "0s");
+        assert_eq!(human_duration(45_000), "45s");
+        assert_eq!(human_duration(3 * 60_000), "3m");
+        assert_eq!(human_duration((6 * 60 + 12) * 60_000), "6h 12m");
+        assert_eq!(human_duration((2 * 24 + 3) * 3_600_000), "2d 3h");
+    }
 }

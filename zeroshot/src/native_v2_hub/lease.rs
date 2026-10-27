@@ -5,7 +5,8 @@
 //! provider resources that the state does not hold.
 //!
 //! Every provider failure is retried with backoff; an unconfirmed step never counts as done.
-//! Nothing is deleted while a run on it is unarchived.
+//! Nothing is deleted while a run on it is unarchived, unless the target never answers: drains
+//! are bounded, and an unreachable target's archives are recorded as skipped instead.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -33,6 +34,11 @@ use crate::native_v2_target::TargetRegistry;
 /// Least time between reaper passes after the first: three list calls each, well inside the
 /// provider's hourly request budget.
 pub(crate) const REAP_INTERVAL_MS: u64 = 5 * 60_000;
+
+/// How long a draining lease may keep retrying archives before its server is deleted anyway.
+const DRAIN_TIMEOUT_MS: u64 = 10 * 60_000;
+/// Retry count reaching the same bound when passes run without waiting for wall-clock time.
+const DRAIN_MAX_ATTEMPTS: u32 = 12;
 
 /// Provider and tunnel effects of a hub's pools.
 pub(crate) struct PoolRuntime {
@@ -196,6 +202,12 @@ enum Step {
     Done(Box<Lease>),
     /// The lease never got a server; it is removed after cleaning up what its attempts left.
     Abandoned(Box<Lease>),
+}
+
+/// Whether draining finished, and why any archive was skipped if it did.
+enum Drain {
+    Pending,
+    Done(Option<String>),
 }
 
 /// How creating a lease's server ended.
@@ -485,13 +497,16 @@ impl HubService {
                 }
             }
             LeasePhase::Draining => {
-                if !self.drain(runtime, &lease, report).await? {
-                    return Ok(Step::Update(Box::new(lease)));
-                }
+                lease.drain_started_ms.get_or_insert(now_ms());
+                let skipped = match self.drain(runtime, &lease, report).await? {
+                    Drain::Pending => return Ok(Step::Update(Box::new(lease))),
+                    Drain::Done(skipped) => skipped,
+                };
                 // A boot that failed or timed out may still hold its creation action; only a
                 // deletion action may confirm the server gone.
                 lease.action_id = None;
                 lease.advance(LeasePhase::Deleting);
+                lease.error = skipped;
             }
             LeasePhase::Deleting => {
                 if delete(runtime, &mut lease).await? {
@@ -765,35 +780,63 @@ impl HubService {
     }
 
     /// Once nothing runs on the lease's member, archive every run it held, then remove the
-    /// member, its target and its tunnel. Returns whether the lease may be deleted.
+    /// member, its target and its tunnel. An unreachable target, or an archive that outlives
+    /// the drain bound, is recorded as skipped so the lease can still be deleted.
     async fn drain(
         &self,
         runtime: &PoolRuntime,
         lease: &Lease,
         report: &mut PoolReport,
-    ) -> Result<bool, HubError> {
+    ) -> Result<Drain, HubError> {
         let state = self.snapshot().await;
         if !pool::drained(&state.jobs, &lease.name) {
-            return Ok(false);
+            return Ok(Drain::Pending);
         }
+        let timed_out = lease.attempts >= DRAIN_MAX_ATTEMPTS
+            || lease
+                .drain_started_ms
+                .is_some_and(|started| now_ms().saturating_sub(started) >= DRAIN_TIMEOUT_MS);
         let root = self.store().directory().join("archive");
+        let mut skipped: Option<String> = None;
         for job in pool::unarchived(&state.jobs, &lease.name) {
+            if let Some(reason) = &skipped {
+                // The target already proved unreachable: every other run on it is unreadable.
+                self.skip_archive(&job.job_id, reason).await?;
+                continue;
+            }
+            if timed_out {
+                let reason =
+                    skipped_reason(lease, "the target did not answer before the drain deadline");
+                self.skip_archive(&job.job_id, &reason).await?;
+                skipped = Some(reason);
+                continue;
+            }
             if !runtime.tunnels.is_open(&lease.name)
                 && let Some(pool) = state.pools.iter().find(|pool| pool.name == lease.pool)
             {
                 runtime.tunnels.open(&self.tunnel_spec(pool, lease)?)?;
             }
-            let archived = archive::archive(self.driver(), &root, &lease.name, job).await?;
-            let job_id = job.job_id.clone();
-            self.mutate(|state| {
-                if let Some(slot) = state.jobs.iter_mut().find(|slot| slot.job_id == job_id) {
-                    slot.archive = Some(archived.folder.clone());
-                    slot.graph_hash.clone_from(&archived.graph_hash);
+            match archive::archive(self.driver(), &root, &lease.name, job).await {
+                Ok(archived) => {
+                    let job_id = job.job_id.clone();
+                    self.mutate(|state| {
+                        if let Some(slot) = state.jobs.iter_mut().find(|slot| slot.job_id == job_id)
+                        {
+                            slot.archive = Some(archived.folder.clone());
+                            slot.graph_hash.clone_from(&archived.graph_hash);
+                        }
+                        Ok(())
+                    })
+                    .await?;
+                    report.archived.push(job.job_id.clone());
                 }
-                Ok(())
-            })
-            .await?;
-            report.archived.push(job.job_id.clone());
+                Err(error) if target_unreachable(&error) => {
+                    let reason = skipped_reason(lease, &format!("target unreachable: {error}"));
+                    self.skip_archive(&job.job_id, &reason).await?;
+                    skipped = Some(reason);
+                }
+                Err(error) => return Err(error),
+            }
         }
         let _placing = self.placement_lock().await;
         let removed = self
@@ -813,7 +856,24 @@ impl HubService {
                 .map_err(target_registry)?;
             runtime.tunnels.close(&lease.name);
         }
-        Ok(removed)
+        Ok(if removed {
+            Drain::Done(skipped)
+        } else {
+            Drain::Pending
+        })
+    }
+
+    /// Remember that a job's archive could not be read, without changing its outcome.
+    async fn skip_archive(&self, job_id: &str, reason: &str) -> Result<(), HubError> {
+        let job_id = job_id.to_owned();
+        let reason = reason.to_owned();
+        self.mutate(move |state| {
+            if let Some(job) = state.jobs.iter_mut().find(|job| job.job_id == job_id) {
+                job.archive_skipped = Some(reason);
+            }
+            Ok(())
+        })
+        .await
     }
 
     fn tunnel_spec(&self, pool: &Pool, lease: &Lease) -> Result<TunnelSpec, HubError> {
@@ -903,6 +963,7 @@ fn begin_teardown(state: &mut HubState, name: &str, reason: TeardownReason) {
             }
         }
         lease.reason = Some(reason);
+        lease.drain_started_ms = Some(at);
         lease.advance(LeasePhase::Draining);
         pool::record_lease_phase(
             state,
@@ -945,6 +1006,7 @@ async fn check_data(
         Health::Failed(reason) => {
             lease.reason = Some(TeardownReason::BootFailed);
             lease.event_phase = Some(PoolPhase::Failed);
+            lease.drain_started_ms = Some(now_ms());
             lease.advance(LeasePhase::Draining);
             lease.error = Some(format!("data health check: {reason}"));
             Ok(None)
@@ -977,6 +1039,7 @@ async fn boot(runtime: &PoolRuntime, lease: &mut Lease) -> Result<(), HubError> 
         Progress::Failed(error) => {
             lease.reason = Some(TeardownReason::BootFailed);
             lease.event_phase = Some(PoolPhase::Failed);
+            lease.drain_started_ms = Some(now_ms());
             lease.advance(LeasePhase::Draining);
             lease.error = Some(format!("booting: {error}"));
         }
@@ -999,26 +1062,37 @@ async fn delete(runtime: &PoolRuntime, lease: &mut Lease) -> Result<bool, HubErr
             }
             Progress::Failed(error) => {
                 lease.action_id = None;
-                lease.retry(now_ms(), Some(format!("deletion failed: {error}")));
-                return Ok(false);
+                if !already_gone(&error) {
+                    lease.retry(now_ms(), Some(format!("deletion failed: {error}")));
+                    return Ok(false);
+                }
+                // A 404 for the action means the provider forgot an already-gone target;
+                // confirm the resources themselves below instead of retrying a dead action.
             }
         }
     }
     if let Some(server_id) = lease.server_id {
         let resource = resource(ResourceKind::Server, server_id, lease);
-        match runtime.provisioner.destroy(&resource).await? {
-            Some(action_id) => {
+        match runtime.provisioner.destroy(&resource).await {
+            Ok(Some(action_id)) => {
                 lease.action_id = Some(action_id);
                 lease.retry(now_ms(), None);
                 return Ok(false);
             }
-            None => lease.server_id = None,
+            Ok(None) => lease.server_id = None,
+            Err(HubError::Provider(message)) if already_gone(&message) => lease.server_id = None,
+            Err(error) => return Err(error),
         }
     }
     if let Some(firewall_id) = lease.firewall_id {
         let resource = resource(ResourceKind::Firewall, firewall_id, lease);
-        runtime.provisioner.destroy(&resource).await?;
-        lease.firewall_id = None;
+        match runtime.provisioner.destroy(&resource).await {
+            Ok(_) => lease.firewall_id = None,
+            Err(HubError::Provider(message)) if already_gone(&message) => {
+                lease.firewall_id = None;
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(true)
 }
@@ -1033,6 +1107,48 @@ enum Hold<'a> {
     Short(&'a Spec, &'a [(String, String)]),
     /// The provider refused for a reason only the operator can fix.
     Blocked(&'a str),
+}
+
+/// Whether an archive error means the target itself cannot be reached, so retrying it cannot
+/// produce a run log.
+fn target_unreachable(error: &HubError) -> bool {
+    let message = match error {
+        HubError::Target { message, .. } | HubError::Unanswered(message) => message,
+        _ => return false,
+    };
+    let text = message.to_ascii_lowercase();
+    [
+        "cannot communicate with target",
+        "connection refused",
+        "connection reset",
+        "no route to host",
+        "network is unreachable",
+        "unreachable",
+        "timed out",
+        "broken pipe",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+/// The note a skipped archive leaves on the lease and its job, naming the retry count.
+fn skipped_reason(lease: &Lease, detail: &str) -> String {
+    let attempts = lease.attempts.max(1);
+    let attempts = if attempts == 1 {
+        "1 attempt".to_owned()
+    } else {
+        format!("{attempts} attempts")
+    };
+    format!("draining: archive skipped after {attempts} ({detail})")
+}
+
+/// Whether a provider message says a resource or action is already gone (HTTP 404).
+fn already_gone(message: &str) -> bool {
+    let text = message.to_ascii_lowercase();
+    text.contains("404")
+        || text.contains("not found")
+        || text.contains("is unknown")
+        || text.contains("no longer exists")
 }
 
 fn lease_selector(hub_id: &str, lease: &Lease) -> String {

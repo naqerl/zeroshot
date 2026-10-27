@@ -454,6 +454,10 @@ pub(crate) struct Job {
     /// server that ran it was deleted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive: Option<PathBuf>,
+    /// Why this job's archive was skipped: the pool server that ran it could not be reached
+    /// before it was deleted. The job's own outcome and failure reason are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_skipped: Option<String>,
     /// `authoredGraphHash` from the archived run report, when the target reported one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_hash: Option<String>,
@@ -520,6 +524,7 @@ impl Job {
             "error": self.error.as_ref().map(|error| &error.message),
             "errorKind": self.error.as_ref().map(|error| error.kind),
             "archive": self.archive,
+            "archiveSkipped": self.archive_skipped,
             "graphHash": self.graph_hash,
             "waiting": self.pool_wait,
             "spec": self.requirements.machine,

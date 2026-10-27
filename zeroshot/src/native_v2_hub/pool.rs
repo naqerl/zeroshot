@@ -303,6 +303,10 @@ pub(crate) struct Lease {
     /// Hub-side port of the SSH tunnel to the target.
     pub local_port: u16,
     pub created_at_ms: u64,
+    /// When the lease entered draining, so archive retries are bounded even when a target
+    /// never answers again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_started_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -498,6 +502,7 @@ impl Lease {
             phase: LeasePhase::Creating,
             local_port,
             created_at_ms: now,
+            drain_started_ms: None,
             server_id: None,
             firewall_id: None,
             ipv4: None,
@@ -718,7 +723,9 @@ pub(crate) fn teardown_due(state: &HubState, now: u64) -> Vec<(String, TeardownR
 pub(crate) fn unarchived<'a>(jobs: &'a [Job], member: &str) -> Vec<&'a Job> {
     jobs.iter()
         .filter(|job| job.target.as_deref() == Some(member))
-        .filter(|job| job.run_id.is_some() && job.archive.is_none())
+        .filter(|job| {
+            job.run_id.is_some() && job.archive.is_none() && job.archive_skipped.is_none()
+        })
         .collect()
 }
 

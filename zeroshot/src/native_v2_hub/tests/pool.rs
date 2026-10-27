@@ -68,6 +68,8 @@ pub(super) struct Cloud {
     pub(super) pending_deletes: u32,
     /// Fail every resource listing, like a provider error during confirmation.
     pub(super) list_fails: bool,
+    /// Report a deletion action as unknown (a provider 404 for an already-gone target).
+    pub(super) action_gone: bool,
 }
 
 impl FakeCloud {
@@ -199,6 +201,9 @@ impl Provisioner for FakeCloud {
 
     async fn action(&self, _: u64) -> Result<Progress, HubError> {
         Ok(self.with(|cloud| {
+            if cloud.action_gone {
+                return Progress::Failed("action is unknown (404)".to_owned());
+            }
             if cloud.pending_deletes > 0 {
                 cloud.pending_deletes -= 1;
                 Progress::Pending
@@ -1994,4 +1999,100 @@ fn ssh_tunnels_start_restart_and_stop_their_process() {
         error.to_string().contains("ssh could not be started"),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn an_unreachable_target_skips_its_archive_and_reaches_deleted() {
+    let rig = rig();
+    let lease = rig.finished_job_on_server().await;
+    rig.set(|state| {
+        let member = state
+            .members
+            .iter_mut()
+            .find(|member| member.name == lease.name)
+            .expect("member");
+        member.idle_since_ms = Some(1);
+    })
+    .await;
+    rig.driver.capture_unreachable.store(true, Ordering::SeqCst);
+
+    let view = rig.pass().await;
+    assert_eq!(view["pools"]["archived"], json!([]), "{view}");
+    let state = rig.state().await;
+    assert_eq!(state.leases[0].phase, LeasePhase::Deleting);
+    assert!(state.member(&lease.name).is_none());
+    let job = job_named(&state, "hj_one");
+    assert!(job.archive.is_none());
+    let skipped = job.archive_skipped.as_deref().expect("skip recorded");
+    assert!(
+        skipped.starts_with("draining: archive skipped"),
+        "{skipped}"
+    );
+    assert!(skipped.contains("unreachable"), "{skipped}");
+
+    for _ in 0..4 {
+        rig.pass().await;
+    }
+    let state = rig.state().await;
+    assert!(state.leases.is_empty(), "{:?}", state.leases);
+    assert_eq!(rig.cloud.servers(), 0, "the pool slot is free again");
+}
+
+#[tokio::test]
+async fn a_drain_whose_archive_never_finishes_is_bounded_and_recorded() {
+    let rig = rig();
+    let lease = rig.finished_job_on_server().await;
+    rig.set(|state| {
+        let member = state
+            .members
+            .iter_mut()
+            .find(|member| member.name == lease.name)
+            .expect("member");
+        member.idle_since_ms = Some(1);
+    })
+    .await;
+    rig.driver.capture_fails.store(true, Ordering::SeqCst);
+
+    for _ in 0..13 {
+        rig.pass().await;
+    }
+    let state = rig.state().await;
+    assert_eq!(state.leases[0].phase, LeasePhase::Deleting);
+    assert!(state.member(&lease.name).is_none());
+    let job = job_named(&state, "hj_one");
+    assert!(job.archive.is_none());
+    let skipped = job.archive_skipped.as_deref().expect("skip recorded");
+    assert!(skipped.contains("after 12 attempts"), "{skipped}");
+    assert!(
+        state.leases[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("archive skipped")),
+        "{:?}",
+        state.leases[0]
+    );
+}
+
+#[tokio::test]
+async fn a_provider_404_for_the_delete_action_completes_the_lease() {
+    let rig = rig();
+    let lease = rig.finished_job_on_server().await;
+    rig.set(|state| {
+        let member = state
+            .members
+            .iter_mut()
+            .find(|member| member.name == lease.name)
+            .expect("member");
+        member.idle_since_ms = Some(1);
+    })
+    .await;
+    rig.cloud.with(|cloud| cloud.action_gone = true);
+
+    for _ in 0..4 {
+        rig.pass().await;
+    }
+    let state = rig.state().await;
+    assert!(state.leases.is_empty(), "{:?}", state.leases);
+    assert_eq!(rig.cloud.servers(), 0);
+    assert_eq!(rig.cloud.with(|cloud| cloud.destroyed.len()), 3);
 }
