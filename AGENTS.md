@@ -349,10 +349,18 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   documents use atomic private-file replacement with descriptor-based ownership; Linux pins the
   private home before publication and never follows a worker-created destination link.
 - Structured-output correction runs in the same provider session under the node's existing
-  execution policy; local response validation remains authoritative.
+  execution policy; local response validation remains authoritative. Provider responses are read
+  tolerantly before contract validation: surrounding whitespace, one Markdown JSON fence, and a
+  first-`{`/last-`}` JSON span are accepted, and a verifier may omit the `response` envelope by
+  returning its channel (`output`, `signals`, and/or `diagnostic`; absent members take the contract
+  defaults and an unused `artifacts` member is ignored), while workers still require the envelope. A
+  format fault (unreadable envelope or unknown top-level shape) has its own three-correction budget
+  per node visit, does not consume the contract-correction budget, and publishes a debug record
+  naming its count and reason.
 - Provider continuation is bounded: Claude continues once after `system/api_retry`; Codex continues
   once after a terminal execution error. Both send literal `Continue` in the same session when one
-  exists. Structured output receives at most two correction turns before `malformed`.
+  exists. Structured output that violates a valid envelope receives at most two correction turns
+  before `malformed`.
 - Pi drives one `pi --mode json` process per turn, with the node prompt on stdin so a large input
   payload can never exceed the platform argument limit. Model identifiers stay caller-owned and Pi
   owns their resolution. Its provider lanes are `anthropic`, `openai`, `openrouter`, `bedrock`, and

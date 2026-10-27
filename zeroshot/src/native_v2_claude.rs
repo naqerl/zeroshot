@@ -336,13 +336,16 @@ async fn resolve_claude_attempt(
             });
         }
     };
-    let response = resolve_agent_response(&turn.invocation.response, &result.message)?;
+    let response = state.retry.redact_response(resolve_agent_response(
+        &turn.invocation.response,
+        &result.message,
+    )?);
     state
         .retry
         .report_correction(
             turn.control,
             &response,
-            state.response.corrections_exhausted(),
+            state.response.corrections_exhausted(&response),
         )
         .await?;
     if matches!(response, AgentResponse::Correction { .. }) {

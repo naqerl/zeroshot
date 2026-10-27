@@ -59,7 +59,7 @@ async fn invalid_output_is_corrected_in_the_same_claude_session() {
 }
 
 #[tokio::test]
-async fn malformed_output_stops_after_two_claude_correction_turns() {
+async fn malformed_output_stops_after_three_claude_format_correction_turns() {
     let workspace = TestDirectory::new("claude-malformed-limit");
     let (runner, binding) = correction_runner(
         &workspace,
@@ -91,9 +91,9 @@ printf '%s%s\n' \
             "final output rejected: provider response must be exactly an object containing response"
         )
         .count(),
-        3
+        4
     );
-    assert_eq!(workspace.read("attempts.args").matches("---").count(), 3);
+    assert_eq!(workspace.read("attempts.args").matches("---").count(), 4);
 }
 
 #[tokio::test]
