@@ -307,14 +307,20 @@ impl AgentResponseState {
                 match kind {
                     AgentCorrectionKind::Format => {
                         self.format_corrections += 1;
+                        // The diagnostic quotes provider text, so it may contain NUL or exceed the
+                        // live-output bound. Sanitize and bound it before publication instead of
+                        // turning a reportable correction into `UnsafeOutput`.
+                        let message = format!(
+                            "{provider} format correction {}/{}: {diagnostic}",
+                            self.format_corrections, MAX_FORMAT_CORRECTIONS
+                        );
+                        let text = super::bounded_log_text(message, super::MAX_LIVE_OUTPUT_BYTES);
                         control
-                            .emit(LiveOutput::new(
-                                LiveOutputStream::System,
-                                format!(
-                                    "{provider} format correction {}/{}: {diagnostic}",
-                                    self.format_corrections, MAX_FORMAT_CORRECTIONS
-                                ),
-                            )?)
+                            .emit(LiveOutput {
+                                stream: LiveOutputStream::System,
+                                text,
+                                diagnostic: None,
+                            })
                             .await?;
                     }
                     AgentCorrectionKind::Contract => {
@@ -533,9 +539,12 @@ fn materialize_verifier_channel_response(object: &Map<String, Value>) -> Value {
     response
         .entry("signals")
         .or_insert_with(|| Value::Object(Map::new()));
-    // An absent diagnostic stays absent: the strict `VerifierResponse` shape rejects it rather
-    // than the outer parser inventing a value. Providers that add an artifacts member to the
-    // channel are tolerated, but artifacts are not part of the provider response contract.
+    // Null is the declared default for an omitted diagnostic. Materialize it here so a provider
+    // that omits the member agrees with one that sends `diagnostic: null`; a contract that asks
+    // for another type still rejects the null default during inner validation.
+    response.entry("diagnostic").or_insert(Value::Null);
+    // Providers that add an artifacts member to the channel are tolerated, but artifacts are not
+    // part of the provider response contract.
     response.remove("artifacts");
     Value::Object(response)
 }
