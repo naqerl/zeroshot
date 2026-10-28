@@ -220,6 +220,15 @@ impl DeliveryPollPolicy {
             None => true,
         }
     }
+
+    /// The bounded time this policy permits for one operation, or `None` when it runs until
+    /// cancelled.
+    pub(crate) fn budget(&self) -> Option<Duration> {
+        self.maximum_attempts.map(|attempts| {
+            self.interval
+                .saturating_mul(u32::try_from(attempts).unwrap_or(u32::MAX))
+        })
+    }
 }
 
 impl Default for DeliveryPollPolicy {

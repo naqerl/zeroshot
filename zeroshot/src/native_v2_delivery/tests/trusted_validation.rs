@@ -420,7 +420,7 @@ async fn pending_publication_validation_honors_the_callers_finite_poll_policy() 
     let harness = ValidationHarness::with_poll(
         Script::NoCi,
         r#"printf '{"verdict":"pending"}'"#,
-        DeliveryPollPolicy::new(3, Duration::from_millis(2)).unwrap(),
+        DeliveryPollPolicy::new(3, Duration::from_millis(100)).unwrap(),
     );
     let mut handle = harness.start(DeliveryMode::MergeV3).await;
     let completed = tokio::time::timeout(Duration::from_secs(10), handle.completion()).await;

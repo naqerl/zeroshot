@@ -89,6 +89,12 @@ impl NativeV2DeliveryAdapter {
         self.trusted_github_token = token;
         self
     }
+
+    /// One operation's deadline from its caller-authored poll policy. An until-cancelled policy
+    /// still bounds each individual authority call.
+    fn delivery_deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + self.config.poll.budget().unwrap_or(AUTHORITY_CALL_TIMEOUT)
+    }
 }
 
 struct DeliverySession {

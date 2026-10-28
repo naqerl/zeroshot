@@ -98,7 +98,8 @@ pub(super) async fn review_completion(
 mod tests;
 
 use crate::native_v2_delivery::validation::{
-    DeliveryValidationDecision, DeliveryValidationRequest, DeliveryValidationStage,
+    DeliveryValidationDecision, DeliveryValidationOutcome, DeliveryValidationRequest,
+    DeliveryValidationStage,
 };
 
 struct ValidationCandidate<'a> {
@@ -214,7 +215,22 @@ impl NativeV2DeliveryAdapter {
             description: manifest.1,
             review_id: (!review.review_id.is_empty()).then_some(review.review_id.as_str()),
         };
-        let decision = validator.validate(request, control.cancellation()).await?;
+        let decision = match validator
+            .validate_within(
+                request,
+                control.cancellation(),
+                Some(self.delivery_deadline()),
+            )
+            .await?
+        {
+            DeliveryValidationOutcome::Decision(decision) => decision,
+            DeliveryValidationOutcome::TimedOut => {
+                return Err(DeliveryStop::failure(
+                    WorkerOutcome::declared_failure(WorkerErrorCode::Timeout),
+                    "trusted delivery validation timed out",
+                ));
+            }
+        };
         ensure_active(control)?;
         if matches!(decision, DeliveryValidationDecision::Accepted) {
             let (head, dirty) = self
