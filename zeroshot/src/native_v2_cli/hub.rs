@@ -42,6 +42,8 @@ pub enum HubCommand {
     Submit(Box<HubSubmit>),
     Enqueue(Box<HubEnqueue>),
     Ps(HubPs),
+    /// The same events the MCP subscription carries, as NDJSON.
+    Events(HubEvents),
     Status {
         job: String,
     },
@@ -314,6 +316,18 @@ pub struct HubPs {
     pub target: Option<String>,
     pub labels: Vec<(String, String)>,
     pub limit: Option<usize>,
+}
+
+/// Hub event feed filters. An omitted filter keeps every kind/state/phase.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HubEvents {
+    pub json: bool,
+    pub after: Option<String>,
+    pub job: Option<String>,
+    pub target: Option<String>,
+    pub states: Vec<String>,
+    pub phases: Vec<String>,
+    pub labels: Vec<(String, String)>,
 }
 
 /// Log passthrough for one hub job.

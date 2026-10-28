@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 use zeroshot_engine::native_v2_cli::hub::{
-    HubCommand, HubContextCommand, HubEnqueue, HubJobSpec, HubMemberAdd, HubPs, HubStrategy,
-    HubTokenSource,
+    HubCommand, HubContextCommand, HubEnqueue, HubEvents, HubJobSpec, HubMemberAdd, HubPs,
+    HubStrategy, HubTokenSource,
 };
 
 use super::super::api::{ApiState, EXIT_CODE_HEADER, router, token_matches};
@@ -526,5 +526,128 @@ fn context_files_and_commands_reject_bad_records() {
     assert!(
         unreadable.to_string().contains("could not be read"),
         "{unreadable}"
+    );
+}
+
+#[tokio::test]
+async fn hub_events_resumes_with_a_top_level_cursor_and_surfaces_refusals() {
+    use axum::response::IntoResponse;
+
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&requests);
+    let app = axum::Router::new().route(
+        "/mcp",
+        axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+            let captured = Arc::clone(&captured);
+            async move {
+                captured.lock().expect("requests").push(body.clone());
+                let method = body
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                match method {
+                    "initialize" => {
+                        let mut headers = axum::http::HeaderMap::new();
+                        headers
+                            .insert("mcp-session-id", axum::http::HeaderValue::from_static("s1"));
+                        (
+                            headers,
+                            axum::Json(json!({
+                                "jsonrpc": "2.0",
+                                "id": body.get("id").cloned().unwrap_or(Value::Null),
+                                "result": {}
+                            })),
+                        )
+                            .into_response()
+                    }
+                    "notifications/initialized" => axum::http::StatusCode::ACCEPTED.into_response(),
+                    "events/stream" => {
+                        let cursor = body
+                            .pointer("/params/cursor")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if cursor == "hub:error" {
+                            return axum::Json(json!({
+                                "jsonrpc": "2.0",
+                                "id": 2,
+                                "error": {"code": -32602, "message": "cursor was not accepted"}
+                            }))
+                            .into_response();
+                        }
+                        let frame = json!({
+                            "jsonrpc": "2.0",
+                            "method": "notifications/events/event",
+                            "params": {
+                                "name": "hub.job",
+                                "data": {"jobId": "hj_1", "sequence": 1}
+                            }
+                        });
+                        let mut headers = axum::http::HeaderMap::new();
+                        headers.insert(
+                            axum::http::header::CONTENT_TYPE,
+                            axum::http::HeaderValue::from_static("text/event-stream"),
+                        );
+                        (headers, format!("data: {frame}\n\n")).into_response()
+                    }
+                    _ => axum::http::StatusCode::OK.into_response(),
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let token = directory.path().join("token");
+    std::fs::write(&token, TOKEN).expect("token");
+    let client = HubClient::new(&Resolved {
+        name: "lab".to_owned(),
+        url,
+        token: TokenRef::File(token),
+        source: "flag",
+    })
+    .expect("client");
+    let events = |after: Option<&str>| {
+        HubCommand::Events(HubEvents {
+            json: true,
+            after: after.map(str::to_owned),
+            job: Some("hj_1".to_owned()),
+            target: None,
+            states: vec!["running".to_owned()],
+            phases: Vec::new(),
+            labels: Vec::new(),
+        })
+    };
+
+    let mut output = Vec::new();
+    let code = execute(&client, events(Some("hub:7")), &mut output)
+        .await
+        .expect("events");
+    assert_eq!(code, 0);
+    let output = String::from_utf8(output).expect("utf8");
+    assert!(output.contains("hj_1"), "{output}");
+    let stream = requests
+        .lock()
+        .expect("requests")
+        .iter()
+        .find(|request| request["method"] == json!("events/stream"))
+        .cloned()
+        .expect("stream request");
+    assert_eq!(stream["params"]["cursor"], json!("hub:7"), "{stream}");
+    assert_eq!(stream["params"]["arguments"]["jobId"], json!("hj_1"));
+    assert!(
+        stream["params"]["arguments"].get("cursor").is_none(),
+        "cursor is a subscription parameter, not a worker argument: {stream}"
+    );
+
+    let error = execute(&client, events(Some("hub:error")), &mut Vec::new())
+        .await
+        .expect_err("a refused subscription is not a clean end of stream");
+    assert!(
+        error.to_string().contains("cursor was not accepted"),
+        "{error}"
     );
 }

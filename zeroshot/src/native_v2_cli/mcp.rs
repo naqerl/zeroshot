@@ -6,7 +6,7 @@
 #[path = "mcp/args.rs"]
 mod args;
 #[path = "mcp/events.rs"]
-mod events;
+pub(crate) mod events;
 #[path = "mcp/host.rs"]
 mod host;
 #[path = "mcp/http.rs"]

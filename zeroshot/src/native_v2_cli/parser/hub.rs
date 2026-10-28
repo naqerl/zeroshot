@@ -7,9 +7,10 @@ use super::convert::validate_review_source;
 mod eval;
 use crate::native_v2_cli::NativeV2CliError;
 use crate::native_v2_cli::hub::{
-    HubApiOptions, HubCommand, HubContextCommand, HubDaemonRun, HubEnqueue, HubInstall, HubJobSpec,
-    HubLogs, HubManager, HubMemberAdd, HubMemberState, HubMemberUpdate, HubPs, HubStats,
-    HubPoolAdd, HubPoolCommand, HubPoolTag, HubStrategy, HubSubmit, HubTokenSource, HubUninstall,
+    HubApiOptions, HubCommand, HubContextCommand, HubDaemonRun, HubEnqueue, HubEvents, HubInstall,
+    HubJobSpec, HubLogs, HubManager, HubMemberAdd, HubMemberState, HubMemberUpdate, HubPs,
+    HubStats, HubPoolAdd, HubPoolCommand, HubPoolTag, HubStrategy, HubSubmit, HubTokenSource,
+    HubUninstall,
 };
 
 #[derive(Debug, Subcommand)]
@@ -99,6 +100,13 @@ pub(super) enum HubCliCommand {
     /// List hub jobs as JSON.
     #[command(name = "ps")]
     Ps(HubPsArgs),
+
+    /// Print the hub event feed as NDJSON.
+    ///
+    /// These are the same events the MCP subscription carries: a bootstrap `hub.job` per
+    /// known job when no cursor is given, every later status/phase transition, and exactly one
+    /// terminal `hub.job` per job. Each event carries a monotone per-subscription `sequence`.
+    Events(HubEventsArgs),
 
     /// Read one hub job with its run status as JSON.
     Status(HubJobArgs),
@@ -788,6 +796,37 @@ pub(super) struct HubPsArgs {
 }
 
 #[derive(Debug, Args)]
+pub(super) struct HubEventsArgs {
+    /// Print JSON NDJSON (the only format; accepted for symmetry with other commands).
+    #[arg(long)]
+    json: bool,
+
+    /// Resume strictly after this durable hub cursor.
+    #[arg(long, value_name = "CURSOR")]
+    after: Option<String>,
+
+    /// Only this hub job ID.
+    #[arg(long, value_name = "JOB_ID")]
+    job: Option<String>,
+
+    /// Only jobs placed on this member.
+    #[arg(long, value_name = "NAME")]
+    target: Option<String>,
+
+    /// Only these job states. Repeat or comma-separate.
+    #[arg(long, value_name = "STATE", action = clap::ArgAction::Append, value_delimiter = ',')]
+    states: Vec<String>,
+
+    /// Only these run/lease phases. Repeat or comma-separate.
+    #[arg(long, value_name = "PHASE", action = clap::ArgAction::Append, value_delimiter = ',')]
+    phases: Vec<String>,
+
+    /// Only jobs and runs carrying this label. Repeat for several.
+    #[arg(long, value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
+    label: Vec<String>,
+}
+
+#[derive(Debug, Args)]
 pub(super) struct HubJobArgs {
     /// Hub job ID.
     #[arg(value_name = "JOB_ID")]
@@ -866,6 +905,7 @@ impl HubCliCommand {
             Self::Submit(args) => Ok(HubCommand::Submit(Box::new(args.into_submit()?))),
             Self::Enqueue(args) => Ok(HubCommand::Enqueue(Box::new(args.into_enqueue()?))),
             Self::Ps(args) => ps_command(args),
+            Self::Events(args) => events_command(args),
             Self::Status(args) => Ok(HubCommand::Status { job: args.job }),
             Self::Watch(args) => Ok(HubCommand::Watch {
                 job: args.job,
@@ -925,6 +965,54 @@ fn ps_command(args: HubPsArgs) -> Result<HubCommand, NativeV2CliError> {
         labels: labels(args.label)?,
         limit: args.limit,
     }))
+}
+
+fn events_command(args: HubEventsArgs) -> Result<HubCommand, NativeV2CliError> {
+    Ok(HubCommand::Events(HubEvents {
+        json: args.json,
+        after: args.after,
+        job: args.job,
+        target: args.target,
+        states: states(args.states)?,
+        phases: phases(args.phases)?,
+        labels: labels(args.label)?,
+    }))
+}
+
+fn states(values: Vec<String>) -> Result<Vec<String>, NativeV2CliError> {
+    let mut states = Vec::new();
+    for value in values {
+        for state in value.split(',') {
+            let state = state.trim();
+            if state.is_empty() {
+                return Err(usage("--states entries must not be empty"));
+            }
+            if !crate::native_v2_cli::mcp::events::JOB_STATES.contains(&state) {
+                return Err(usage(format!("unknown job state {state}")));
+            }
+            states.push(state.to_owned());
+        }
+    }
+    Ok(states)
+}
+
+fn phases(values: Vec<String>) -> Result<Vec<String>, NativeV2CliError> {
+    let mut phases = Vec::new();
+    for value in values {
+        for phase in value.split(',') {
+            let phase = phase.trim();
+            if phase.is_empty() {
+                return Err(usage("--phases entries must not be empty"));
+            }
+            if !crate::native_v2_cli::mcp::events::PHASES.contains(&phase)
+                && !crate::native_v2_cli::mcp::events::POOL_PHASES.contains(&phase)
+            {
+                return Err(usage(format!("unknown phase {phase}")));
+            }
+            phases.push(phase.to_owned());
+        }
+    }
+    Ok(phases)
 }
 
 fn stats_command(args: HubStatsArgs) -> HubCommand {

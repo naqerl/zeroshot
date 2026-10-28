@@ -1065,6 +1065,7 @@ Commands:
   submit      Place a run on a free member now
   enqueue     Accept a run into the hub queue for later placement, once or on a cron schedule
   ps          List hub jobs as JSON
+  events      Print the hub event feed as NDJSON
   status      Read one hub job with its run status as JSON
   watch       Follow a placed job's run events as NDJSON
   logs        Follow a placed job's run logs as NDJSON
@@ -1701,6 +1702,44 @@ Options:
 
   -h, --help
           Print help
+```
+
+#### `zeroshot hub events`
+
+```text
+Print the hub event feed as NDJSON.
+
+These are the same events the MCP subscription carries: a bootstrap `hub.job` per known job when no cursor is given, every later status/phase transition, and exactly one terminal `hub.job` per job. Each event carries a monotone per-subscription `sequence`.
+
+Usage: zeroshot hub events [OPTIONS]
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+      --json
+          Print JSON NDJSON (the only format; accepted for symmetry with other commands)
+
+      --after <CURSOR>
+          Resume strictly after this durable hub cursor
+
+      --job <JOB_ID>
+          Only this hub job ID
+
+      --target <NAME>
+          Only jobs placed on this member
+
+      --states <STATE>
+          Only these job states. Repeat or comma-separate
+
+      --phases <PHASE>
+          Only these run/lease phases. Repeat or comma-separate
+
+      --label <KEY=VALUE>
+          Only jobs and runs carrying this label. Repeat for several
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 #### `zeroshot hub status`
@@ -3075,6 +3114,7 @@ Commands:
   submit      Place a run on a free member now
   enqueue     Accept a run into the hub queue for later placement, once or on a cron schedule
   ps          List hub jobs as JSON
+  events      Print the hub event feed as NDJSON
   status      Read one hub job with its run status as JSON
   watch       Follow a placed job's run events as NDJSON
   logs        Follow a placed job's run logs as NDJSON

@@ -61,6 +61,9 @@ pub(super) struct SessionState {
     initialized: bool,
     cancellations: HashMap<String, StreamCancel>,
     active_streams: Rc<Cell<usize>>,
+    /// Monotone per-session occurrence counter shared by `events/poll` calls, so a client
+    /// polling the same MCP session sees `sequence: 1, 2, 3...` across responses.
+    event_sequence: Rc<Cell<u64>>,
 }
 
 impl SessionState {
@@ -108,6 +111,10 @@ impl SessionState {
 
     pub(super) fn has_active_streams(&self) -> bool {
         self.active_streams.get() > 0
+    }
+
+    pub(super) fn event_sequence(&self) -> Rc<Cell<u64>> {
+        Rc::clone(&self.event_sequence)
     }
 
     pub(super) fn shutdown(&mut self) {
@@ -227,10 +234,13 @@ where
             Ok(result) => Action::Reply(result),
             Err(error) => event_failure(error),
         },
-        "events/poll" => match events::poll(host, feed, &params).await {
-            Ok(result) => Action::Reply(result),
-            Err(error) => event_failure(error),
-        },
+        "events/poll" => {
+            let sequence = session.borrow().event_sequence();
+            match events::poll(host, feed, &params, sequence.as_ref()).await {
+                Ok(result) => Action::Reply(result),
+                Err(error) => event_failure(error),
+            }
+        }
         "events/stream" => match events::prepare(host, feed, &params).await {
             Ok(prepared) => Action::Stream(Box::new(prepared)),
             Err(error) => event_failure(error),

@@ -130,7 +130,7 @@ whole hub. `events/list` reports one event type, `hub`, described as everything 
 
 | Name          | Data                                                                                             |
 | ------------- | ------------------------------------------------------------------------------------------------ |
-| `hub.job`     | `jobId`, `title`, `state`, `target`, `project`, `reason`, `at`, `cursor`, `summary`, `replayed`  |
+| `hub.job`     | `jobId`, `title`, `state`, `target`, `project`, `runId`, `attempts`, `pinnedRevision`, `labels`, `submittedAt`, `finishedAt`, `failureReason`, `errorKind`, `headBranch`, `headRevision`, `status`, `terminal`, `snapshot`, `reason`, `at`, `cursor`, `summary`, `replayed`, `sequence` |
 | `hub.run`     | the durable run watch record: `runId`, `cursor`, `runCursor`, `status`, `summary`, `replayed`    |
 | `hub.pool`    | `kind`, `pool`, `leaseId`, `serverId`, `memberId`, `machine`, `phase`, `previousPhase`, `reason`, `at`, `cursor`, `summary`, `replayed` |
 | `hub.warning` | `jobId`, `runId`, `message`, `at`, `cursor`, `summary`, `replayed`                              |
@@ -151,6 +151,11 @@ events/subscribe {}
 warnings, so a client can keep one cursor and resume the whole feed. A `hub.run` record keeps its
 original durable `v2:<sequence>` watch cursor as `data.runCursor`.
 
+Every occurrence also carries `data.sequence`, a monotone counter owned by one subscription (or one
+`events/poll` caller). It starts at 1 for the first delivered event, including bootstrap snapshots,
+and increments for every delivered occurrence whether or not earlier occurrences were filtered out.
+Use it to order a stream and to prove no event was skipped; keep `hub:<sequence>` for resume.
+
 Subscription arguments are all optional filters:
 
 - Omit `name` to subscribe to the whole hub. This is the normal form and needs no other field.
@@ -159,9 +164,14 @@ Subscription arguments are all optional filters:
 - `name` still selects one carried type: `hub.job`, `hub.run`, `hub.pool`, or `hub.warning`.
   `hub` and `hub.event` are aliases for every hub event; `run.event` is the legacy run-watch
   form. An unknown name is invalid request (`-32600`). There is no wildcard syntax.
-- `target`, `kinds` (`hub.job`, `hub.run`, `hub.pool`, `hub.warning`), `phases`, `nodes`,
-  `terminalOnly`, and `verbose` further filter occurrences. `phases` accepts `admitted`,
-  `running`, `stopping`, and `finished`; `nodes` applies only to run records.
+- `target`, `kinds` (`hub.job`, `hub.run`, `hub.pool`, `hub.warning`), `states`, `phases`,
+  `labels`, `nodes`, `terminalOnly`, and `verbose` further filter occurrences.
+- `states` accepts `submitted`, `queued`, `scheduled`, `placing`, `running`, `succeeded`, `failed`,
+  `dequeued`, and `cancelled`, and applies to `hub.job` records. Any other value is invalid params.
+- `phases` accepts the run phases `admitted`, `running`, `stopping`, and `finished` plus every
+  lease/pool phase below. Any other value is invalid params. `nodes` applies only to run records.
+- `labels` is an object of string values; a job or run must carry all of them. An unknown state,
+  phase, or non-string label is invalid params (`-32602`).
 - `maxAgeMs` is accepted and not applied because watch records carry no occurrence time.
 
 `events/poll` returns occurrences after an opaque `hub:<sequence>` cursor:
@@ -177,8 +187,16 @@ Subscription arguments are all optional filters:
 }
 ```
 
-- `cursor: null` starts from the current state: the latest event for each job and run, plus the
-  pool transitions the hub has retained. There is no backfill of run history.
+- `cursor: null` starts with a bootstrap snapshot and then the live feed. For every known job
+  (queued, placing, running, or already attempted) the first batch contains one synthesized
+  `hub.job` in `submittedAt` order with `data.snapshot: true` and the current state. It uses
+  `eventId`/`data.cursor` `hub:0`, is never replayed, and is never reported by a later poll. After
+  that, the feed carries each genuine occurrence once; bootstrap records replace remembered job
+  replay so stale job state cannot be repeated. A bootstrap for an already-terminal job is that
+  job's one durable terminal occurrence, so its publication moves the response cursor past itself
+  and a resume cannot replay it. Run and pool replay still follows the retained window. There is
+  no backfill of run history.
+- A subscription opened with a cursor does not bootstrap; it resumes strictly after that cursor.
 - A cursor is exclusive. The response cursor advances to the last delivered event and never moves
   backwards.
 - `truncated` is `false` when nothing was lost. It is `{ "from": "hub:N", "to": "hub:M" }` only
@@ -199,10 +217,14 @@ or from the live broadcast are `false`. A real replay or backpressure shortfall 
 lost events sends another `notifications/events/active` with the `{from,to}` range before
 continuing.
 
-A terminal run or job is an ordinary event. It never completes the stream: the subscription stays
-open for later jobs, later runs, pool changes, warnings, and idle heartbeats. Only
-`events/unsubscribe`, MCP session shutdown, or request cancellation stops it. Streams do not
-accept `maxEvents`.
+A terminal run or job is an ordinary event. Every job produces exactly one terminal `hub.job`
+occurrence, including `succeeded`, `failed`, `force_stopped`, `dequeued`, `target_lost`, and jobs
+found terminal after a daemon restart. It carries `data.terminal: true`, `finishedAt`,
+`failureReason`, `errorKind`, and `headBranch`/`headRevision` when Git delivery landed. A snapshot
+for a job that was already terminal is that terminal occurrence. The stream never completes on a
+terminal event: it stays open for later jobs, later runs, pool changes, warnings, and idle
+heartbeats. Only `events/unsubscribe`, MCP session shutdown, or request cancellation stops it.
+Streams do not accept `maxEvents`.
 
 `events/list` reports `resultType` `complete` with the single `hub` type. Signed webhooks are not
 offered. `events/subscribe` opens the same long-lived stream as `events/stream`; with no arguments
@@ -211,7 +233,11 @@ warnings on one stream.
 
 `hub.job` follows the same hub record as `hub_status`, including `submitted`, `queued`,
 `scheduled`, `placing`, `running`, `succeeded`, `failed`, `dequeued`, and `cancelled`. A job that
-fails or is cancelled before it runs still produces a terminal `hub.job` event. `hub.pool`
+fails or is cancelled before it runs still produces its one terminal `hub.job` event. Phase
+transitions are not sampled away: every new run status transition publishes a `hub.run` with a
+fresh active-execution set. A status is deduplicated only against the job's immediately previous
+occurrence, using its attempt and complete active-execution set, so `{A, B}` to `{A}` still
+publishes A's finish. `hub.pool`
 reports each lease as `requested`, `creating`, `booting`, `preparing`, `ready`, `in_use`, `idle`,
 `draining`, `deleted`, or `failed`, with `previousPhase` chaining its transitions. Pool-level
 records use `kind: "pool"` and the phases `added`, `removed`, `paused`, `resumed`, `blocked`,
@@ -219,6 +245,19 @@ and `shortage`. See
 [Watching a machine come up](hub-pools.md#watching-a-machine-come-up). A running job receives one
 `hub.warning` per hour; a run-watch or stream failure also produces `hub.warning`, and the
 subscription continues.
+
+The same feed is available without MCP:
+
+```bash
+zeroshot hub events --json
+zeroshot hub events --json --after hub:42 --states running,failed --phases running
+```
+
+`zeroshot hub events` prints one NDJSON occurrence per line with the same four names, fields,
+bootstrap snapshots, sequence counter, cursor semantics, and `--job`/`--target`/`--label` filters.
+`--json` is accepted for symmetry with other hub commands; NDJSON is the only format. A request
+without `--after` prints the bootstrap snapshot and then follows live occurrences; a request with
+`--after` resumes instead of bootstrapping.
 
 ## Resume and stop
 

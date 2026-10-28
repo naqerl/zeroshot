@@ -244,6 +244,42 @@ fn tags_and_labels_are_validated() {
 }
 
 #[test]
+fn events_command_mirrors_subscription_filters() {
+    let HubCommand::Events(events) = parse(&[
+        "hub",
+        "events",
+        "--json",
+        "--after",
+        "hub:4",
+        "--job",
+        "hj_1",
+        "--target",
+        "box-1",
+        "--states",
+        "running,failed",
+        "--states",
+        "queued",
+        "--phases",
+        "running",
+        "--label",
+        "team=alpha",
+    ])
+    .expect("events") else {
+        panic!("expected events");
+    };
+    assert!(events.json);
+    assert_eq!(events.after.as_deref(), Some("hub:4"));
+    assert_eq!(events.job.as_deref(), Some("hj_1"));
+    assert_eq!(events.target.as_deref(), Some("box-1"));
+    assert_eq!(events.states, ["running", "failed", "queued"]);
+    assert_eq!(events.phases, ["running"]);
+    assert_eq!(events.labels, [("team".to_owned(), "alpha".to_owned())]);
+    assert!(parse(&["hub", "events", "--states", "not-a-state"]).is_err());
+    assert!(parse(&["hub", "events", "--phases", "not-a-phase"]).is_err());
+    assert!(parse(&["hub", "events", "--label", "novalue"]).is_err());
+}
+
+#[test]
 fn observation_and_dispatch_commands_parse() {
     assert_eq!(
         parse(&["hub", "logs", "hj_1", "--after", "c", "--execution", "e"]).expect("logs"),

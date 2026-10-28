@@ -74,6 +74,7 @@ section { margin-block: 2.5rem; }
 <li><a href="#zeroshot-hub-submit"><code>zeroshot hub submit</code></a></li>
 <li><a href="#zeroshot-hub-enqueue"><code>zeroshot hub enqueue</code></a></li>
 <li><a href="#zeroshot-hub-ps"><code>zeroshot hub ps</code></a></li>
+<li><a href="#zeroshot-hub-events"><code>zeroshot hub events</code></a></li>
 <li><a href="#zeroshot-hub-status"><code>zeroshot hub status</code></a></li>
 <li><a href="#zeroshot-hub-watch"><code>zeroshot hub watch</code></a></li>
 <li><a href="#zeroshot-hub-logs"><code>zeroshot hub logs</code></a></li>
@@ -1016,6 +1017,7 @@ Commands:
   submit      Place a run on a free member now
   enqueue     Accept a run into the hub queue for later placement, once or on a cron schedule
   ps          List hub jobs as JSON
+  events      Print the hub event feed as NDJSON
   status      Read one hub job with its run status as JSON
   watch       Follow a placed job&#39;s run events as NDJSON
   logs        Follow a placed job&#39;s run logs as NDJSON
@@ -1624,6 +1626,40 @@ Options:
 
   -h, --help
           Print help</code></pre></section>
+<section id="zeroshot-hub-events"><h4><code>zeroshot hub events</code></h4>
+<pre><code>Print the hub event feed as NDJSON.
+
+These are the same events the MCP subscription carries: a bootstrap `hub.job` per known job when no cursor is given, every later status/phase transition, and exactly one terminal `hub.job` per job. Each event carries a monotone per-subscription `sequence`.
+
+Usage: zeroshot hub events [OPTIONS]
+
+Options:
+      --hub &lt;CONTEXT&gt;
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+      --json
+          Print JSON NDJSON (the only format; accepted for symmetry with other commands)
+
+      --after &lt;CURSOR&gt;
+          Resume strictly after this durable hub cursor
+
+      --job &lt;JOB_ID&gt;
+          Only this hub job ID
+
+      --target &lt;NAME&gt;
+          Only jobs placed on this member
+
+      --states &lt;STATE&gt;
+          Only these job states. Repeat or comma-separate
+
+      --phases &lt;PHASE&gt;
+          Only these run/lease phases. Repeat or comma-separate
+
+      --label &lt;KEY=VALUE&gt;
+          Only jobs and runs carrying this label. Repeat for several
+
+  -h, --help
+          Print help (see a summary with &#39;-h&#39;)</code></pre></section>
 <section id="zeroshot-hub-status"><h4><code>zeroshot hub status</code></h4>
 <pre><code>Read one hub job with its run status as JSON
 
@@ -2806,6 +2842,7 @@ Commands:
   submit      Place a run on a free member now
   enqueue     Accept a run into the hub queue for later placement, once or on a cron schedule
   ps          List hub jobs as JSON
+  events      Print the hub event feed as NDJSON
   status      Read one hub job with its run status as JSON
   watch       Follow a placed job&#39;s run events as NDJSON
   logs        Follow a placed job&#39;s run logs as NDJSON

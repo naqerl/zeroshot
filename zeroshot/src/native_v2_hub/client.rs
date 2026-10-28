@@ -7,9 +7,9 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use reqwest::{Method, StatusCode};
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use zeroshot_engine::native_v2_cli::hub::{
-    HubCommand, HubEnqueue, HubPoolAdd, HubPoolCommand, HubPs, HubStats, HubSubmit,
+    HubCommand, HubEnqueue, HubEvents, HubPoolAdd, HubPoolCommand, HubPs, HubStats, HubSubmit,
 };
 
 use super::api::EXIT_CODE_HEADER;
@@ -242,6 +242,7 @@ pub(crate) async fn execute(
 ) -> Result<i32, HubError> {
     match command {
         HubCommand::Submit(request) => submit(client, *request, output).await,
+        HubCommand::Events(events) => events_command(client, events, output).await,
         HubCommand::Eval(command) => super::eval::client::execute(client, command, output).await,
         HubCommand::Watch { .. }
         | HubCommand::Logs(_)
@@ -324,6 +325,177 @@ async fn request_document(client: &HubClient, command: HubCommand) -> Result<Val
         HubCommand::Pool(command) => pool_document(client, command).await,
         _ => Err(local_only()),
     }
+}
+
+/// Print the same occurrences the MCP `events/stream` subscription carries. The daemon owns
+/// that feed, so this command speaks its MCP endpoint instead of rebuilding a second event log.
+async fn events_command(
+    client: &HubClient,
+    events: HubEvents,
+    output: &mut impl Write,
+) -> Result<i32, HubError> {
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "zeroshot-hub-events", "version": env!("CARGO_PKG_VERSION")}
+        }
+    });
+    let response = mcp_post(client, None, &initialize).await?;
+    if !response.status().is_success() {
+        return Err(client.failure(response).await);
+    }
+    let session = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let reply = response
+        .json::<Value>()
+        .await
+        .map_err(|error| HubError::Unreachable {
+            context: client.context.clone(),
+            url: client.url.clone(),
+            cause: format!("the hub MCP endpoint answered with invalid JSON: {error}"),
+        })?;
+    if reply.get("error").is_some() {
+        return Err(HubError::Usage(format!(
+            "the hub MCP endpoint refused initialization: {reply}"
+        )));
+    }
+    let initialized = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+    let response = mcp_post(client, session.as_deref(), &initialized).await?;
+    if !response.status().is_success() {
+        return Err(client.failure(response).await);
+    }
+    let mut arguments = Map::new();
+    if let Some(job) = &events.job {
+        arguments.insert("jobId".to_owned(), json!(job));
+    }
+    if let Some(target) = &events.target {
+        arguments.insert("target".to_owned(), json!(target));
+    }
+    if !events.states.is_empty() {
+        arguments.insert("states".to_owned(), json!(events.states));
+    }
+    if !events.phases.is_empty() {
+        arguments.insert("phases".to_owned(), json!(events.phases));
+    }
+    if !events.labels.is_empty() {
+        let labels = events
+            .labels
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        arguments.insert("labels".to_owned(), json!(labels));
+    }
+    // `cursor` is a subscription parameter, not one of the worker-binding arguments. Putting
+    // it under `arguments` makes the subscription reject it as unknown and drops the resume.
+    let stream = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "events/stream",
+        "params": {
+            "cursor": events.after,
+            "arguments": Value::Object(arguments)
+        }
+    });
+    let response = mcp_post(client, session.as_deref(), &stream).await?;
+    if !response.status().is_success() {
+        return Err(client.failure(response).await);
+    }
+    // A refused subscription is an ordinary JSON-RPC reply, not an event stream. Surface it
+    // instead of treating an empty body as a clean end of stream.
+    let streaming = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|content| content.starts_with("text/event-stream"));
+    if !streaming {
+        let reply = response
+            .json::<Value>()
+            .await
+            .map_err(|error| HubError::Unreachable {
+                context: client.context.clone(),
+                url: client.url.clone(),
+                cause: format!("the hub MCP endpoint answered with invalid JSON: {error}"),
+            })?;
+        return Err(HubError::Usage(mcp_reply_error(&reply).unwrap_or_else(
+            || "the hub MCP endpoint did not open an event stream".to_owned(),
+        )));
+    }
+    let mut body = response.bytes_stream();
+    let mut buffer = Vec::new();
+    let interrupted = tokio::signal::ctrl_c();
+    tokio::pin!(interrupted);
+    loop {
+        let chunk = tokio::select! {
+            chunk = body.next() => chunk,
+            _ = &mut interrupted => return Ok(130),
+        };
+        let Some(chunk) = chunk else {
+            return Ok(0);
+        };
+        let chunk = chunk.map_err(|error| client.unreachable(&error))?;
+        buffer.extend_from_slice(&chunk);
+        while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
+            let line = buffer.drain(..=end).collect::<Vec<_>>();
+            let line = String::from_utf8_lossy(&line);
+            let Some(data) = line.trim_end().strip_prefix("data:") else {
+                continue;
+            };
+            let Ok(message) = serde_json::from_str::<Value>(data.trim()) else {
+                continue;
+            };
+            if let Some(error) = mcp_reply_error(&message) {
+                return Err(HubError::Usage(error));
+            }
+            if message.get("method").and_then(Value::as_str) != Some("notifications/events/event") {
+                continue;
+            }
+            if let Some(event) = message.get("params") {
+                write_json(output, event)?;
+            }
+        }
+    }
+}
+
+fn mcp_reply_error(reply: &Value) -> Option<String> {
+    let error = reply.get("error")?;
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("the hub MCP endpoint refused the event subscription");
+    Some(match error.get("code").and_then(Value::as_i64) {
+        Some(code) => format!("{message} (code {code})"),
+        None => message.to_owned(),
+    })
+}
+
+async fn mcp_post(
+    client: &HubClient,
+    session: Option<&str>,
+    body: &Value,
+) -> Result<reqwest::Response, HubError> {
+    let mut request = client
+        .http
+        .post(client.endpoint(&["mcp"])?)
+        .bearer_auth(&client.token)
+        .header(
+            reqwest::header::ACCEPT,
+            "application/json, text/event-stream",
+        )
+        .json(body);
+    if let Some(session) = session {
+        request = request.header("mcp-session-id", session);
+    }
+    request
+        .send()
+        .await
+        .map_err(|error| client.unreachable(&error))
 }
 
 /// Add, update, remove, or list hub members.
