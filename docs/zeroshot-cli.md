@@ -2861,6 +2861,9 @@ List pools and their servers as JSON
 Usage: zeroshot hub pool list [OPTIONS]
 
 Options:
+      --event <N>
+          Include the newest N pool and lease transitions, oldest first. N is 1 to 1024; without it the document has no events key
+
       --hub <CONTEXT>
           Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
 

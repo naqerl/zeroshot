@@ -677,6 +677,50 @@ async fn a_queued_job_creates_a_server_that_joins_as_a_member_and_runs_it() {
 }
 
 #[tokio::test]
+async fn pool_list_reports_history_only_when_asked() {
+    let rig = rig();
+    rig.add_pool(1).await;
+    rig.enqueue("hj_one").await;
+    rig.pass().await;
+    let state = rig.state().await;
+    let total = state.pool_events.len();
+    assert!(total >= 2, "the pool and lease recorded transitions");
+
+    let listed = rig.service.list_pools(None).await.expect("pools");
+    assert_eq!(listed["schema"], json!("zeroshot.hub.pools/v1"));
+    assert!(
+        listed.get("events").is_none(),
+        "history is not state: {listed}"
+    );
+
+    let listed = rig.service.list_pools(Some(2)).await.expect("events");
+    let events = listed["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events[0]["sequence"],
+        json!(state.pool_events[total - 2].sequence)
+    );
+    assert_eq!(
+        events[1]["sequence"],
+        json!(state.pool_events[total - 1].sequence)
+    );
+
+    let zero = rig.service.list_pools(Some(0)).await.expect_err("zero");
+    assert!(matches!(zero, HubError::Usage(_)), "{zero}");
+    assert!(zero.to_string().contains("between 1 and 1024"), "{zero}");
+    let too_many = rig
+        .service
+        .list_pools(Some(pool::POOL_EVENT_LIMIT + 1))
+        .await
+        .expect_err("above the cap");
+    assert!(matches!(too_many, HubError::Usage(_)), "{too_many}");
+    assert!(
+        too_many.to_string().contains("between 1 and 1024"),
+        "{too_many}"
+    );
+}
+
+#[tokio::test]
 async fn scale_up_stops_at_the_pool_maximum() {
     let rig = rig();
     rig.add_pool(2).await;
@@ -1624,7 +1668,7 @@ async fn pool_config_is_validated_listed_and_unique() {
         .await
         .expect_err("duplicate");
     assert!(error.to_string().contains("already exists"), "{error}");
-    let listed = rig.service.list_pools().await;
+    let listed = rig.service.list_pools(None).await.expect("pools");
     assert_eq!(listed["schema"], json!("zeroshot.hub.pools/v1"));
     assert_eq!(listed["pools"][0]["name"], json!("burst"));
     assert_eq!(listed["pools"][0]["targetImage"], json!(IMAGE));

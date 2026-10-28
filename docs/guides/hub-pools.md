@@ -19,8 +19,14 @@ zeroshot hub pool add burst \
   --max 3 --idle 10m --tag linux,burst \
   --ssh-key ~/.ssh/zeroshot-pool --ssh-from 203.0.113.7/32
 zeroshot hub pool list
+zeroshot hub pool list --event 20   # also the newest 20 pool and lease transitions
 zeroshot hub pool remove burst   # only once the pool has no servers left
 ```
+
+`hub pool list` prints current state as JSON: `schema`, `hubId`, and `pools`, with each pool's
+live servers. It has no `events` key. History is not state, so pass `--event N` to add the newest
+`N` recorded transitions (1 to 1024, oldest first) under `events`; the newest transition comes
+last.
 
 The type names above are only an example. There is no default type.
 
@@ -169,7 +175,9 @@ Use `zeroshot hub enqueue` when no free member can take the job now and no pool 
 
 Every pool transition is recorded by the code that performs it and exposed as a `hub.pool`
 event. One subscription receives those events together with jobs, runs, and warnings; see
-[the MCP guide](mcp.md#hub-events). The lease fields are `leaseId`, `pool`, `serverId`,
+[the MCP guide](mcp.md#hub-events). `zeroshot hub pool list --event 20` shows the newest 20
+recorded transitions; plain `zeroshot hub pool list` reports only the current pools and servers.
+The lease fields are `leaseId`, `pool`, `serverId`,
 `memberId`, `machine` (`cores`, `memoryMb`, `location`, `serverType`), `phase`, `previousPhase`,
 `at`, and `reason`. A lease never records the same phase twice, and `previousPhase` chains the
 transitions in the order the hub made them.

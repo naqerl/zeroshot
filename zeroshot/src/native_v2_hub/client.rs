@@ -67,6 +67,16 @@ impl HubClient {
         Ok(url)
     }
 
+    fn endpoint_query(
+        &self,
+        segments: &[&str],
+        query: &[(&str, String)],
+    ) -> Result<url::Url, HubError> {
+        let mut url = self.endpoint(segments)?;
+        url.query_pairs_mut().extend_pairs(query);
+        Ok(url)
+    }
+
     fn unreachable(&self, error: &reqwest::Error) -> HubError {
         let cause = if error.is_timeout() {
             "the request timed out".to_owned()
@@ -94,10 +104,16 @@ impl HubClient {
         segments: &[&str],
         body: Option<&(impl Serialize + Sync)>,
     ) -> Result<reqwest::Response, HubError> {
-        let mut request = self
-            .http
-            .request(method, self.endpoint(segments)?)
-            .bearer_auth(&self.token);
+        self.send_url(method, self.endpoint(segments)?, body).await
+    }
+
+    async fn send_url(
+        &self,
+        method: Method,
+        url: url::Url,
+        body: Option<&(impl Serialize + Sync)>,
+    ) -> Result<reqwest::Response, HubError> {
+        let mut request = self.http.request(method, url).bearer_auth(&self.token);
         if let Some(body) = body {
             request = request.json(body);
         }
@@ -155,8 +171,17 @@ impl HubClient {
         segments: &[&str],
         body: Option<&(impl Serialize + Sync)>,
     ) -> Result<Value, HubError> {
+        self.call_url(method, self.endpoint(segments)?, body).await
+    }
+
+    async fn call_url(
+        &self,
+        method: Method,
+        url: url::Url,
+        body: Option<&(impl Serialize + Sync)>,
+    ) -> Result<Value, HubError> {
         let request = async {
-            let response = self.send(method, segments, body).await?;
+            let response = self.send_url(method, url, body).await?;
             response
                 .json::<Value>()
                 .await
@@ -179,6 +204,15 @@ impl HubClient {
 
     pub(crate) async fn get(&self, segments: &[&str]) -> Result<Value, HubError> {
         self.call(Method::GET, segments, None::<&Value>).await
+    }
+
+    pub(crate) async fn get_query(
+        &self,
+        segments: &[&str],
+        query: &[(&str, String)],
+    ) -> Result<Value, HubError> {
+        let url = self.endpoint_query(segments, query)?;
+        self.call_url(Method::GET, url, None::<&Value>).await
     }
 
     pub(crate) async fn post(
@@ -550,7 +584,14 @@ async fn pool_document(client: &HubClient, command: HubPoolCommand) -> Result<Va
             let body = add_pool(*request)?;
             client.post(&["v1", "hub", "pools"], &body).await
         }
-        HubPoolCommand::List => client.get(&["v1", "hub", "pools"]).await,
+        HubPoolCommand::List { event } => match event {
+            Some(event) => {
+                let event = super::pool::event_count(event)?;
+                let query = [("event", event.to_string())];
+                client.get_query(&["v1", "hub", "pools"], &query).await
+            }
+            None => client.get(&["v1", "hub", "pools"]).await,
+        },
         HubPoolCommand::Types => client.get(&["v1", "hub", "pools", "types"]).await,
         HubPoolCommand::Resume { name } => {
             client

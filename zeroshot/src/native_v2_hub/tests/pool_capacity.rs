@@ -143,7 +143,7 @@ async fn no_capacity_anywhere_keeps_the_job_queued_with_a_reason_and_backs_off()
     assert!(waiting.starts_with(reason), "{waiting}");
     assert_eq!(job.view(now_ms())["waiting"], json!(waiting));
     assert_eq!(attempts(&rig).len(), 4, "no create while backing off");
-    let listed = rig.service.list_pools().await;
+    let listed = rig.service.list_pools(None).await.expect("pools");
     assert!(
         listed["pools"][0]["waiting"]
             .as_str()

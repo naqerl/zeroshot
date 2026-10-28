@@ -116,7 +116,7 @@ async fn a_member_joins_only_after_its_data_folder_passes_the_check() {
     assert_eq!(view["data"]["mode"], "file");
     assert_eq!(view["data"]["sizeBytes"], 1_073_741_824_u64);
     assert!(view["data"]["checkedAt"].is_string());
-    let listed = rig.service.list_pools().await;
+    let listed = rig.service.list_pools(None).await.expect("pools");
     assert_eq!(listed["pools"][0]["data"]["fs"], "btrfs", "{listed}");
     assert_eq!(listed["pools"][0]["data"]["mode"], "file", "{listed}");
     assert_eq!(

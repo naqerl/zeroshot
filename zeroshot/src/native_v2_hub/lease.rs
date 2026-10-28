@@ -1277,10 +1277,14 @@ impl HubService {
         .await
     }
 
-    pub(crate) async fn list_pools(&self) -> Value {
+    /// List pools, optionally with the newest `event` recorded transitions.
+    ///
+    /// Without a count the document has no `events` key: history is not state.
+    pub(crate) async fn list_pools(&self, event: Option<usize>) -> Result<Value, HubError> {
+        let event = event.map(pool::event_count).transpose()?;
         let state = self.snapshot().await;
         let now = now_ms();
-        json!({
+        let mut document = json!({
             "schema": "zeroshot.hub.pools/v1",
             "hubId": state.hub_id,
             "pools": state
@@ -1288,8 +1292,12 @@ impl HubService {
                 .iter()
                 .map(|pool| pool.view(&state.leases, &state.members, now))
                 .collect::<Vec<_>>(),
-            "events": state.pool_events,
-        })
+        });
+        if let Some(event) = event {
+            let start = state.pool_events.len().saturating_sub(event);
+            document["events"] = json!(&state.pool_events[start..]);
+        }
+        Ok(document)
     }
 
     /// The provider's server types, prices and locations.

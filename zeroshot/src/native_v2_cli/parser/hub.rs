@@ -10,6 +10,7 @@ use crate::native_v2_cli::hub::{
     HubApiOptions, HubCommand, HubContextCommand, HubDaemonRun, HubEnqueue, HubInstall, HubJobSpec,
     HubLogs, HubManager, HubMemberAdd, HubMemberState, HubMemberUpdate, HubPs, HubStats,
     HubPoolAdd, HubPoolCommand, HubPoolTag, HubStrategy, HubSubmit, HubTokenSource, HubUninstall,
+    parse_pool_event,
 };
 
 #[derive(Debug, Subcommand)]
@@ -174,7 +175,7 @@ pub(super) enum HubPoolCliCommand {
 
     /// List pools and their servers as JSON.
     #[command(visible_alias = "ls")]
-    List,
+    List(HubPoolListArgs),
 
     /// Remove a pool that has no servers left.
     #[command(visible_alias = "rm")]
@@ -282,6 +283,14 @@ fn memory_gb(value: &str) -> Result<u32, String> {
 }
 
 #[derive(Debug, Args)]
+pub(super) struct HubPoolListArgs {
+    /// Include the newest N pool and lease transitions, oldest first. N is 1 to 1024;
+    /// without it the document has no events key.
+    #[arg(long, value_name = "N", allow_hyphen_values = true)]
+    event: Option<String>,
+}
+
+#[derive(Debug, Args)]
 pub(super) struct HubPoolNameArgs {
     /// Pool name.
     #[arg(value_name = "NAME")]
@@ -379,7 +388,14 @@ impl HubPoolCliCommand {
                     ssh_from: args.ssh_from,
                 }))
             }
-            Self::List => HubPoolCommand::List,
+            Self::List(args) => HubPoolCommand::List {
+                event: args
+                    .event
+                    .as_deref()
+                    .map(parse_pool_event)
+                    .transpose()
+                    .map_err(NativeV2CliError::Usage)?,
+            },
             Self::Remove(args) => HubPoolCommand::Remove {
                 name: member_name(args.name)?,
             },

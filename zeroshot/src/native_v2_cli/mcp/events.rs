@@ -15,7 +15,7 @@ use super::args::{
     bool_prop, object_schema, optional_string, reject_unknown, string_array_prop, string_prop,
 };
 use super::host::{parse_cli, McpFailure, McpHost, WatchStream};
-use super::super::hub::{HubCommand, HubPoolCommand, HubRequest};
+use super::super::hub::{HubCommand, HubPoolCommand, HubRequest, POOL_EVENT_LIMIT};
 use super::super::{NativeV2CliCommand, RunWatchCommand};
 
 pub(super) const EXTENSION_ID: &str = "io.modelcontextprotocol/events";
@@ -1464,7 +1464,9 @@ where
     let output = match host
         .execute(NativeV2CliCommand::Hub(HubRequest {
             context: None,
-            command: HubCommand::Pool(HubPoolCommand::List),
+            command: HubCommand::Pool(HubPoolCommand::List {
+                event: Some(POOL_EVENT_LIMIT),
+            }),
         }))
         .await
     {

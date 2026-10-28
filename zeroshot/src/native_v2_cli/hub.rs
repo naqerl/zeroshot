@@ -19,6 +19,30 @@ pub fn valid_eval_name(name: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
 }
 
+/// Most pool lifecycle records a hub keeps for `hub pool list --event` and the `hub.pool`
+/// stream.
+pub const POOL_EVENT_LIMIT: usize = 1024;
+
+/// Validate a `hub pool list --event` count: at least one and at most [`POOL_EVENT_LIMIT`].
+/// The parser and the hub daemon share this rule so the accepted range is reported once.
+pub fn pool_event_count(event: i64) -> Result<usize, String> {
+    match usize::try_from(event) {
+        Ok(count) if (1..=POOL_EVENT_LIMIT).contains(&count) => Ok(count),
+        _ => Err(format!(
+            "--event must be between 1 and {POOL_EVENT_LIMIT}, got {event}"
+        )),
+    }
+}
+
+/// Parse and validate a textual `hub pool list --event` count, so every invalid spelling
+/// reports the same accepted range.
+pub fn parse_pool_event(raw: &str) -> Result<usize, String> {
+    let event = raw.parse::<i64>().map_err(|_| {
+        format!("--event must be an integer between 1 and {POOL_EVENT_LIMIT}, got {raw}")
+    })?;
+    pool_event_count(event)
+}
+
 /// A hub subcommand plus the hub context it addresses.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HubRequest {
@@ -83,7 +107,10 @@ pub enum HubCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HubPoolCommand {
     Add(Box<HubPoolAdd>),
-    List,
+    /// List pools, optionally including the newest `event` pool and lease transitions.
+    List {
+        event: Option<usize>,
+    },
     Remove {
         name: String,
     },

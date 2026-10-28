@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 use zeroshot_engine::native_v2_cli::hub::{
-    HubCommand, HubContextCommand, HubEnqueue, HubJobSpec, HubMemberAdd, HubPs, HubStrategy,
-    HubTokenSource,
+    HubCommand, HubContextCommand, HubEnqueue, HubJobSpec, HubMemberAdd, HubPoolCommand, HubPs,
+    HubStrategy, HubTokenSource,
 };
 
 use super::super::api::{ApiState, EXIT_CODE_HEADER, router, token_matches};
@@ -259,6 +259,49 @@ async fn api_rejects_missing_and_wrong_bearer_tokens() {
     assert!(
         !error.to_string().contains("wrong"),
         "the token is never echoed: {error}"
+    );
+}
+
+#[tokio::test]
+async fn pool_list_adds_history_only_for_an_accepted_event_count() {
+    let hub = hub().await;
+    let client = client(&hub, TOKEN);
+    let listed = run(
+        &client,
+        HubCommand::Pool(HubPoolCommand::List { event: None }),
+    )
+    .await
+    .expect("pools");
+    assert!(
+        listed.get("events").is_none(),
+        "history is not state: {listed}"
+    );
+
+    let listed = run(
+        &client,
+        HubCommand::Pool(HubPoolCommand::List { event: Some(1) }),
+    )
+    .await
+    .expect("events");
+    assert_eq!(listed["events"], json!([]));
+
+    let error = run(
+        &client,
+        HubCommand::Pool(HubPoolCommand::List { event: Some(0) }),
+    )
+    .await
+    .expect_err("zero");
+    assert_eq!(error.diagnostic()["code"], json!("hub.invalid_request"));
+    assert!(error.to_string().contains("between 1 and 1024"), "{error}");
+
+    let error = client
+        .get_query(&["v1", "hub", "pools"], &[("event", "many".to_owned())])
+        .await
+        .expect_err("not an integer");
+    assert_eq!(error.diagnostic()["code"], json!("hub.invalid_request"));
+    assert!(
+        error.to_string().contains("integer between 1 and 1024"),
+        "{error}"
     );
 }
 

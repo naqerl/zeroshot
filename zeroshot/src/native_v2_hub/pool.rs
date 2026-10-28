@@ -13,10 +13,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::capacity::{self, Machine, PoolType, Shortage};
+use super::error::HubError;
 use super::health::{DataHealth, FILE_MODE};
 use super::profile::{self, Spec, TagProfile};
 use super::clock::rfc3339;
 use super::model::{HubState, Job, JobState, Member, PlacementSpec, Requirements};
+
+pub(crate) use zeroshot_engine::native_v2_cli::hub::POOL_EVENT_LIMIT;
 
 /// Label naming the hub that owns a provider resource.
 pub(crate) const LABEL_HUB: &str = "zeroshot/hub";
@@ -30,8 +33,12 @@ pub(crate) const LABEL_LOCATION: &str = "zeroshot/location";
 pub(crate) const BOOT_DEADLINE_MS: u64 = 15 * 60_000;
 /// Longest wait between two provider polls of one lease.
 const MAX_BACKOFF_MS: u64 = 60_000;
-/// Pool lifecycle records kept for the `events/list` stream and `hub pool list`.
-pub(crate) const POOL_EVENT_LIMIT: usize = 1024;
+
+/// Validate a requested `hub pool list --event` count against [`POOL_EVENT_LIMIT`].
+pub(crate) fn event_count(event: usize) -> Result<usize, HubError> {
+    zeroshot_engine::native_v2_cli::hub::pool_event_count(i64::try_from(event).unwrap_or(i64::MAX))
+        .map_err(HubError::Usage)
+}
 
 /// One observed pool or lease transition. Lease phases chain through `previous_phase`; a
 /// pool-level change such as `added` or `removed` carries no lease.

@@ -10,11 +10,13 @@ use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::{MatchedPath, Path, Request, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{MatchedPath, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -29,11 +31,29 @@ use super::wire::{
     AddMember, AddPool, CreateSchedule, EnqueueJob, JobQuery, MemberQuery, StatsRequest,
     SetTagProfile, StreamFrame, StreamRequest, SubmitJob, UpdateMember,
 };
+use zeroshot_engine::native_v2_cli::hub::parse_pool_event;
 
 /// Response header carrying the CLI exit code of an error.
 pub(crate) const EXIT_CODE_HEADER: &str = "x-zeroshot-exit-code";
 /// Largest accepted request body: a job with its uploaded files.
 const BODY_LIMIT: usize = 16 * 1024 * 1024;
+
+/// Optional `GET /v1/hub/pools` history: the newest `event` transitions.
+#[derive(Debug, Deserialize)]
+struct PoolListQuery {
+    #[serde(default)]
+    event: Option<String>,
+}
+
+impl PoolListQuery {
+    fn event(self) -> Result<Option<usize>, HubError> {
+        self.event
+            .as_deref()
+            .map(parse_pool_event)
+            .transpose()
+            .map_err(HubError::Usage)
+    }
+}
 
 pub(crate) struct ApiState {
     pub service: Arc<HubService>,
@@ -266,8 +286,18 @@ async fn add_pool(State(state): State<Arc<ApiState>>, bytes: Bytes) -> Response 
     reply(result)
 }
 
-async fn list_pools(State(state): State<Arc<ApiState>>) -> Response {
-    reply(Ok(state.service.list_pools().await))
+async fn list_pools(
+    State(state): State<Arc<ApiState>>,
+    query: Result<Query<PoolListQuery>, QueryRejection>,
+) -> Response {
+    let result = async {
+        let Query(query) =
+            query.map_err(|error| HubError::Usage(format!("invalid hub API request: {error}")))?;
+        let event = query.event()?;
+        state.service.list_pools(event).await
+    }
+    .await;
+    reply(result)
 }
 
 async fn remove_pool(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Response {

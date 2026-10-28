@@ -158,7 +158,7 @@ impl McpHost for HubFeedHost {
                 json!({"schema": "zeroshot.hub.targets/v1", "targets": self.members}).to_string(),
             ),
             NativeV2CliCommand::Hub(HubRequest {
-                command: HubCommand::Pool(HubPoolCommand::List),
+                command: HubCommand::Pool(HubPoolCommand::List { .. }),
                 ..
             }) => Ok(
                 json!({"schema": "zeroshot.hub.pools/v1", "pools": [], "events": self.pool_events})
@@ -279,7 +279,7 @@ impl McpHost for HubLifecycleHost {
                 json!({"schema": "zeroshot.hub.targets/v1", "targets": self.members}).to_string(),
             ),
             NativeV2CliCommand::Hub(HubRequest {
-                command: HubCommand::Pool(HubPoolCommand::List),
+                command: HubCommand::Pool(HubPoolCommand::List { .. }),
                 ..
             }) => Ok(
                 json!({"schema": "zeroshot.hub.pools/v1", "pools": [], "events": []}).to_string(),
