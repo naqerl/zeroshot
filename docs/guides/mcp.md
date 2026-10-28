@@ -196,10 +196,10 @@ Subscription arguments are all optional filters:
 }
 ```
 
-- `cursor: null` starts with a bootstrap snapshot and then the live feed. For every known job
-  (queued, placing, running, or already attempted) the first batch contains one synthesized
-  `hub.job` in `submittedAt` order with `data.snapshot: true` and the current state. Each record
-  has a distinct `eventId`/`data.cursor` of
+- `cursor: null` starts with a bootstrap snapshot and then the live feed. For every recent known
+  job (queued, placing, running, or already attempted, bounded to the newest 512 job views) the
+  first batch contains one synthesized `hub.job` in `submittedAt` order with `data.snapshot: true`
+  and the current state. Each record has a distinct `eventId`/`data.cursor` of
   `hub:snapshot:<delivered>:<start>`, where `<delivered>` counts the synthesized records already
   sent and `<start>` is the durable boundary the batch began from. It is never replayed, and is
   never reported by a later poll. After that, the feed carries each genuine occurrence once;

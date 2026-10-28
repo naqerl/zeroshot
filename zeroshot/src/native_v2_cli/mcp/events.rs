@@ -41,6 +41,9 @@ const HUB_WARNING_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// A watch that failed is retried after this cooldown instead of being tombstoned forever.
 const WATCH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const HUB_LOG_LIMIT: usize = 4096;
+/// Bootstrap and every per-job book retain only the newest job views. This keeps those maps
+/// bounded independently of how much terminal history the daemon has accumulated.
+const HUB_RECENT_JOBS: usize = 512;
 const HUB_BROADCAST_LIMIT: usize = 1024;
 pub(crate) const PHASES: &[&str] = &["admitted", "running", "stopping", "finished"];
 /// Phases a pool lease or pool record can carry; `phases` also filters these.
@@ -1742,7 +1745,7 @@ where
                 state: "all".to_owned(),
                 target: None,
                 labels: Vec::new(),
-                limit: None,
+                limit: Some(HUB_RECENT_JOBS),
             }),
         }))
         .await

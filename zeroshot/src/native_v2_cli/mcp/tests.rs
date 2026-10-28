@@ -2412,10 +2412,17 @@ async fn hub_poll_clipping_is_has_more_without_reporting_truncation() {
 
 #[tokio::test]
 async fn hub_replay_reports_the_exact_evicted_range_and_starts_at_the_front() {
-    let jobs = (0..4100)
-        .map(|index| hub_lifecycle_job(&format!("hj_{index}"), "running", None))
+    // Each wave exposes more jobs than the bounded per-job window, so successive hub reads
+    // keep producing durable occurrences until the resident feed evicts its front. Full daemon
+    // history no longer needs to be replayed to reach that bound.
+    let jobs = (0..9)
+        .map(|wave| {
+            (0..512)
+                .map(|index| hub_lifecycle_job(&format!("hj_{wave}_{index}"), "running", None))
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
-    let host = HubLifecycleHost::new(vec![jobs], Vec::new(), HashMap::new());
+    let host = HubLifecycleHost::new(jobs, Vec::new(), HashMap::new());
     let mut session = Session::spawn(host);
     initialize(&mut session).await;
     let mut first = Value::Null;
