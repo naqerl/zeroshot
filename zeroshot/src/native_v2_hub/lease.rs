@@ -26,6 +26,7 @@ use super::pool::{
     PoolPhase, Resource, ResourceKind, TeardownReason,
 };
 use super::provision::{self, Catalog, Progress, Provisioner, Refusal, ServerRequest};
+use super::schedule;
 use super::service::HubService;
 use super::tunnel::{self, TunnelSpec, Tunnels};
 use super::wire::AddPool;
@@ -155,6 +156,8 @@ pub(crate) struct PoolReport {
     pub teardowns: Vec<(String, TeardownReason)>,
     pub archived: Vec<String>,
     pub deleted: Vec<String>,
+    /// Leases given up after the provider confirmed their server gone: `(lease, reason)`.
+    pub reconciled: Vec<(String, String)>,
     pub reaped: Vec<(ResourceKind, u64)>,
     /// Leases given up because no candidate had capacity: `(lease, reason)`.
     pub shortages: Vec<(String, String)>,
@@ -175,6 +178,10 @@ impl PoolReport {
             })).collect::<Vec<_>>(),
             "archived": self.archived,
             "deleted": self.deleted,
+            "reconciled": self.reconciled.iter().map(|(lease, reason)| json!({
+                "lease": lease,
+                "reason": reason,
+            })).collect::<Vec<_>>(),
             "reaped": self.reaped.iter().map(|(kind, id)| json!({
                 "kind": format!("{kind:?}"),
                 "id": id,
@@ -245,6 +252,7 @@ impl HubService {
         report.started = started;
         report.expired = expired;
         report.teardowns = self.begin_teardowns(now).await?;
+        self.reconcile(runtime, &mut report).await?;
         for lease in self.snapshot().await.leases {
             if !lease.due(now_ms()) {
                 continue;
@@ -704,6 +712,84 @@ impl HubService {
                 )),
             }
         }
+    }
+
+    /// Give up leases whose server the provider no longer has and whose pool was removed: with
+    /// no pool there is no drain, tunnel or archive left to wait for, and with no server there is
+    /// nothing to delete, so the ordinary `deleted` phase is recorded instead. Recording it also
+    /// lets the removed pool complete.
+    ///
+    /// A lease is left alone while its pool still exists (that pool may still run or drain it),
+    /// while the provider still lists its server (nothing outside an authored drain deletes a
+    /// live server), and while the provider cannot confirm the loss: an inconclusive answer is
+    /// never read as a deleted server, so it changes nothing. A run still placing on such a lease
+    /// is failed first, with the provider's answer as its recorded classification.
+    async fn reconcile(
+        &self,
+        runtime: &PoolRuntime,
+        report: &mut PoolReport,
+    ) -> Result<(), HubError> {
+        let state = self.snapshot().await;
+        let Some(hub_id) = state.hub_id.clone() else {
+            return Ok(());
+        };
+        for lease in state.leases.clone() {
+            // A deleting lease confirms its own deletion, an active pool owns its leases, and a
+            // lease that has not been given a server yet has lost nothing to reconcile.
+            if lease.phase == LeasePhase::Deleting
+                || lease.server_id.is_none()
+                || state.pools.iter().any(|pool| pool.name == lease.pool)
+            {
+                continue;
+            }
+            let reason = match runtime.server_exists(&hub_id, &lease).await {
+                Ok(true) => continue,
+                Ok(false) => format!(
+                    "pool {} was removed and the provider no longer lists its server",
+                    lease.pool
+                ),
+                Err(error) => {
+                    report.errors.push(format!(
+                        "{}: reconcile: the provider could not confirm its server: {error}",
+                        lease.name
+                    ));
+                    continue;
+                }
+            };
+            let name = lease.name.clone();
+            let mut finished = lease;
+            self.mutate(|state| {
+                pool::record_lease_phase(
+                    state,
+                    &mut finished,
+                    pool::PoolPhaseChange {
+                        phase: PoolPhase::Deleted,
+                        reason: Some(reason.clone()),
+                        at: now_ms(),
+                    },
+                );
+                schedule::settle_orphaned_lease(&mut state.jobs, now_ms(), &name, &reason);
+                state.members.retain(|member| member.name != name);
+                state.leases.retain(|slot| slot.name != name);
+                for job in state.jobs.iter_mut() {
+                    if job.target.as_deref() == Some(name.as_str())
+                        && job.run_id.is_some()
+                        && job.archive.is_none()
+                        && job.archive_skipped.is_none()
+                    {
+                        job.archive_skipped = Some(reason.clone());
+                    }
+                }
+                Ok(())
+            })
+            .await?;
+            runtime.tunnels.close(&name);
+            if let Err(error) = self.registry().remove(&name) {
+                report.errors.push(format!("{name}: reconcile: {error}"));
+            }
+            report.reconciled.push((name, reason));
+        }
+        Ok(())
     }
 
     /// Tunnel to a booted server, check its btrfs data folder, register it as a direct target,

@@ -1065,6 +1065,7 @@ Commands:
   submit      Place a run on a free member now
   enqueue     Accept a run into the hub queue for later placement, once or on a cron schedule
   ps          List hub jobs as JSON
+  jobs        Print one newest-first page of job history as JSON
   events      Print the hub event feed as NDJSON
   status      Read one hub job with its run status as JSON
   watch       Follow a placed job's run events as NDJSON
@@ -1702,6 +1703,37 @@ Options:
 
   -h, --help
           Print help
+```
+
+#### `zeroshot hub jobs`
+
+```text
+Print one newest-first page of job history as JSON.
+
+Each job carries its ID, state, labels, pinned revision, attempts, last durable cursor, creation and update times, and, once terminal, its failure reason. Jobs are never dropped: history of finished and in-flight jobs is the same durable state `hub ps` reads.
+
+Usage: zeroshot hub jobs [OPTIONS]
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+      --state <STATE>
+          Job state filter: active (queued, scheduled, running), queued, scheduled, running, succeeded, failed, dequeued, or all
+
+          [default: all]
+
+      --label <KEY=VALUE>
+          Only jobs carrying this label. Repeat for several, or combine with --since
+
+      --since <WHEN>
+          Only jobs created at or after this time: a duration such as 24h or 7d, or a timestamp
+
+      --limit <N>
+          Return at most this many of the newest matching jobs [default: 20]
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 #### `zeroshot hub events`
@@ -3114,6 +3146,7 @@ Commands:
   submit      Place a run on a free member now
   enqueue     Accept a run into the hub queue for later placement, once or on a cron schedule
   ps          List hub jobs as JSON
+  jobs        Print one newest-first page of job history as JSON
   events      Print the hub event feed as NDJSON
   status      Read one hub job with its run status as JSON
   watch       Follow a placed job's run events as NDJSON

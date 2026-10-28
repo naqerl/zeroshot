@@ -75,6 +75,7 @@ pub(crate) fn router_with_mcp(state: Arc<ApiState>, mcp: Option<Router>) -> Rout
         )
         .route("/v1/hub/jobs", post(submit))
         .route("/v1/hub/jobs/query", post(ps))
+        .route("/v1/hub/jobs/history", post(history))
         .route("/v1/hub/jobs/{id}", get(status).delete(dequeue))
         .route("/v1/hub/jobs/{id}/stream", post(stream))
         .route("/v1/hub/queue", post(enqueue))
@@ -341,6 +342,11 @@ async fn create_schedule(State(state): State<Arc<ApiState>>, bytes: Bytes) -> Re
 
 async fn ps(State(state): State<Arc<ApiState>>, bytes: Bytes) -> Response {
     let result = async { state.service.ps(body::<JobQuery>(&bytes)?).await }.await;
+    reply(result)
+}
+
+async fn history(State(state): State<Arc<ApiState>>, bytes: Bytes) -> Response {
+    let result = async { state.service.job_history(body::<JobQuery>(&bytes)?).await }.await;
     reply(result)
 }
 

@@ -98,6 +98,7 @@ pull-request URL into the run input. It conflicts with `input`, `repository`, an
 | `hub_update`        | `zeroshot hub update`        | Change member tags, slots, priority, or state.      |
 | `hub_remove`        | `zeroshot hub remove`        | Remove a member from the hub.                       |
 | `hub_ps`            | `zeroshot hub ps`            | List hub jobs.                                      |
+| `hub_jobs`          | `zeroshot hub jobs`          | List job history, newest first.                     |
 | `hub_status`        | `zeroshot hub status`        | Read one hub job.                                   |
 | `hub_submit`        | `zeroshot hub submit`        | Place a run on a free member.                       |
 | `hub_enqueue`       | `zeroshot hub enqueue`       | Queue a run for later placement.                    |
@@ -117,10 +118,17 @@ For live run events, use the events extension instead of those tools.
 will start a server for it, and fails when nothing can take it. Use `hub_enqueue` to queue a run.
 
 Read-only tools are `status`, `logs`, `watch`, `list`, `report`, `hub_list`, `hub_ps`,
-`hub_status`, `hub_watch`, `hub_stats`, `hub_logs`, and `hub_daemon_status`. `run`, `resume`,
-`hub_submit`, and `hub_enqueue` submit work. `hub_add`, `hub_update`, and `hub_remove` manage
-members; `hub_dequeue` cancels queued jobs or schedules; `hub_dispatch` requests a dispatcher pass;
-`force-stop` and `hub_force_stop` stop runs.
+`hub_jobs`, `hub_status`, `hub_watch`, `hub_stats`, `hub_logs`, and `hub_daemon_status`. `run`,
+`resume`, `hub_submit`, and `hub_enqueue` submit work. `hub_add`, `hub_update`, and `hub_remove`
+manage members; `hub_dequeue` cancels queued jobs or schedules; `hub_dispatch` requests a
+dispatcher pass; `force-stop` and `hub_force_stop` stop runs.
+
+`hub_jobs` lists job history instead of live load: `state` (`all` by default), `label` (one or
+more `key=value` pairs), `since` (`10m`, `2h`, `3d`), and `limit`. It returns at most a page of
+the newest jobs, with `jobId`, `state`, `labels`, `pinnedRevision`, `attempts`, `lastCursor`,
+`createdAt`, `updatedAt`, and `failureReason` only on a terminal failure. The page is
+`{"schema": "zeroshot.hub.job-history/v1", "filters": …, "limit": …, "returned": …, "jobs": […]}`.
+A filter that matches nothing is an empty `jobs` array, not an error.
 
 ## Hub events
 
@@ -130,7 +138,7 @@ whole hub. `events/list` reports one event type, `hub`, described as everything 
 
 | Name          | Data                                                                                             |
 | ------------- | ------------------------------------------------------------------------------------------------ |
-| `hub.job`     | `jobId`, `title`, `state`, `target`, `project`, `runId`, `attempts`, `pinnedRevision`, `labels`, `submittedAt`, `finishedAt`, `failureReason`, `errorKind`, `headBranch`, `headRevision`, `status`, `terminal`, `snapshot`, `reason`, `at`, `cursor`, `summary`, `replayed`, `sequence` |
+| `hub.job`     | `jobId`, `title`, `state`, `target`, `project`, `runId`, `attempts`, `pinnedRevision`, `labels`, `submittedAt`, `finishedAt`, `failureReason`, `failureClassification`, `errorKind`, `headBranch`, `headRevision`, `status`, `terminal`, `snapshot`, `reason`, `at`, `cursor`, `summary`, `replayed`, `sequence` |
 | `hub.run`     | the durable run watch record: `runId`, `cursor`, `runCursor`, `status`, `summary`, `replayed`    |
 | `hub.pool`    | `kind`, `pool`, `leaseId`, `serverId`, `memberId`, `machine`, `phase`, `previousPhase`, `reason`, `at`, `cursor`, `summary`, `replayed` |
 | `hub.warning` | `jobId`, `runId`, `message`, `at`, `cursor`, `summary`, `replayed`                              |

@@ -257,6 +257,7 @@ impl Metrics {
                 ("teardown", report.teardowns.len()),
                 ("archived", report.archived.len()),
                 ("deleted", report.deleted.len()),
+                ("reconciled", report.reconciled.len()),
                 ("reaped", report.reaped.len()),
                 ("shortage", report.shortages.len()),
                 ("blocked", report.blocked.len()),
@@ -380,7 +381,8 @@ impl Metrics {
         out.family(
             "zeroshot_hub_pool_events_total",
             "counter",
-            "Pool lease events (started, teardown, archived, deleted, reaped, error).",
+            "Pool pass events (started, teardown, archived, deleted, reconciled, reaped, \
+             shortage, blocked, error).",
         );
         for (event, count) in &counters.pool_events {
             out.sample(

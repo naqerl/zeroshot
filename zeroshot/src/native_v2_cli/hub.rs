@@ -42,6 +42,9 @@ pub enum HubCommand {
     Submit(Box<HubSubmit>),
     Enqueue(Box<HubEnqueue>),
     Ps(HubPs),
+    /// Job history: a newest-first page with each job's state, labels, pinned revision,
+    /// attempts, last durable cursor, timestamps, and terminal failure reason.
+    Jobs(HubJobHistory),
     /// The same events the MCP subscription carries, as NDJSON.
     Events(HubEvents),
     Status {
@@ -315,6 +318,19 @@ pub struct HubPs {
     pub state: String,
     pub target: Option<String>,
     pub labels: Vec<(String, String)>,
+    pub limit: Option<usize>,
+}
+
+/// One newest-first page of hub job history: the terminal outcome and progress facts of jobs,
+/// without the run arguments a job was submitted with.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HubJobHistory {
+    /// State filter; `all` (the default) keeps every state.
+    pub state: String,
+    pub labels: Vec<(String, String)>,
+    /// Only jobs submitted at or after this instant: a duration such as `24h`, or a timestamp.
+    /// Kept as text so the client resolves it against its own clock.
+    pub since: Option<String>,
     pub limit: Option<usize>,
 }
 

@@ -14,7 +14,7 @@ use super::model::{
 };
 use super::pool::{Lease, LeasePhase};
 use super::usage::{JobUsage, Tokens, reported};
-use super::placement::{Load, Placement, describe, place};
+use super::placement::{Load, Placement, Reachability, describe, place};
 use super::schedule::{UNREACHABLE_REAP_THRESHOLD, active_runs, apply_status, due_jobs, tick};
 use super::stats::{Dimension, ModelPrice, StatsQuery, aggregate, percentiles};
 use crate::native_v2_target::{FileTargetRegistry, TargetAccess, TargetRecord, TargetRegistry};
@@ -95,6 +95,7 @@ pub(super) fn job(id: &str, submitted_at_ms: u64) -> Job {
         reaper: None,
         finished_at_ms: None,
         failure_reason: None,
+        failure_classification: None,
         token_usage: None,
         error: None,
         schedule_id: None,
@@ -702,6 +703,97 @@ async fn a_member_unreachable_once_keeps_its_job_until_the_reap_threshold() {
             "an IPv6 target endpoint must be checked without a host lookup: {note}"
         );
     }
+}
+
+/// A timeout, a rate limit or an empty answer is not proof that a member is gone: the streak
+/// stays where it was, and only a decisive negative extends it. The job failed by a decisive
+/// observation records which observation it was.
+#[test]
+fn only_decisive_probes_extend_the_unreachable_streak() {
+    let mut state = HubState {
+        members: vec![member("box", &[], 1, 0)],
+        jobs: vec![job("hj_probed", 0)],
+        ..HubState::default()
+    };
+    state.jobs[0].state = JobState::Running;
+    state.jobs[0].target = Some("box".to_owned());
+    state.jobs[0].run_id = Some("run-probed".to_owned());
+    let probe = |reachability| {
+        BTreeMap::from([(
+            "box".to_owned(),
+            Load {
+                reachability,
+                active: 1,
+                error: Some("probe failed".to_owned()),
+            },
+        )])
+    };
+
+    let mut at = 1;
+    for _ in 0..UNREACHABLE_REAP_THRESHOLD as u64 + 2 {
+        super::schedule::record_health(
+            &mut state.members,
+            &mut state.jobs,
+            &probe(Reachability::Inconclusive),
+            at,
+        );
+        at += 1;
+    }
+    let boxed = state.member("box").expect("member");
+    assert_eq!(
+        boxed.unreachable_probes, 0,
+        "an inconclusive probe never extends the streak"
+    );
+    assert_eq!(
+        boxed.last_probe_ok_at_ms, None,
+        "an inconclusive probe is not a success either"
+    );
+    assert!(
+        super::schedule::lost_targets(&state).is_empty(),
+        "a member with no decisive failure keeps its job running"
+    );
+
+    for _ in 0..UNREACHABLE_REAP_THRESHOLD as u64 + 1 {
+        super::schedule::record_health(
+            &mut state.members,
+            &mut state.jobs,
+            &probe(Reachability::Unreachable),
+            at,
+        );
+        at += 1;
+    }
+    let boxed = state.member("box").expect("member");
+    assert_eq!(boxed.unreachable_probes, UNREACHABLE_REAP_THRESHOLD + 1);
+    let lost = super::schedule::lost_targets(&state);
+    assert_eq!(lost.len(), 1, "{lost:?}");
+    assert_eq!(
+        lost[0].classification, None,
+        "the streak alone is not the proof"
+    );
+    let (confirmed, _) =
+        super::schedule::confirm_lost_by_probe(lost, &probe(Reachability::Unreachable));
+    assert_eq!(confirmed.len(), 1, "{confirmed:?}");
+    assert_eq!(
+        confirmed[0].classification,
+        Some("probe_unreachable"),
+        "the deciding probe classifies the loss"
+    );
+    let failed = super::schedule::settle_lost_targets(&mut state.jobs, at, &confirmed);
+    assert_eq!(failed[0]["classification"], json!("probe_unreachable"));
+    let job = &state.jobs[0];
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(job.failure_reason.as_deref(), Some("target_lost"));
+    assert_eq!(
+        job.failure_classification.as_deref(),
+        Some("probe_unreachable"),
+        "the job record names the observation that failed it"
+    );
+    let message = job.error.as_ref().expect("error").message.clone();
+    assert!(message.contains("(probe_unreachable)"), "{message}");
+    assert!(
+        message.contains("could not connect to the member"),
+        "{message}"
+    );
 }
 
 #[tokio::test]

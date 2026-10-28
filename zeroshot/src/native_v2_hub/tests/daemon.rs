@@ -278,6 +278,7 @@ async fn reads_do_not_wait_for_a_pass_blocked_on_a_slow_target() {
         target: None,
         labels: Vec::new(),
         limit: None,
+        since_ms: None,
     };
     let listed = tokio::time::timeout(std::time::Duration::from_secs(2), service.ps(query))
         .await

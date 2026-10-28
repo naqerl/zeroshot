@@ -500,6 +500,14 @@ pub(super) fn job_named<'a>(state: &'a HubState, id: &str) -> &'a Job {
         .expect("job present")
 }
 
+/// The leases a pass reconciled as deleted, empty when the pass did no pool work at all.
+pub(super) fn reconciled(view: &serde_json::Value) -> Vec<serde_json::Value> {
+    view["pools"]["reconciled"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
 pub(super) fn first_error(view: &serde_json::Value) -> String {
     view["pools"]["errors"][0]
         .as_str()
@@ -797,6 +805,175 @@ async fn a_lease_reports_every_phase_once_and_pool_removal_waits_for_deleted() {
     assert_eq!(removed.pool, "burst");
 }
 
+/// A lease whose cloud server the provider no longer has, in a pool that was removed, can never
+/// drain, tunnel, archive or delete anything again. The hub records the ordinary `deleted` phase
+/// with the evidence, fails the runs it cannot observe, and lets the removed pool complete.
+#[tokio::test]
+async fn a_vanished_server_in_a_removed_pool_is_reconciled_as_deleted() {
+    let rig = rig();
+    let lease = rig.running_job_on_server().await;
+    rig.service.remove_pool("burst").await.expect("remove pool");
+    let server_id = lease.server_id.expect("server id");
+    rig.cloud.with(|cloud| {
+        cloud.resources.remove(&(ResourceKind::Server, server_id));
+    });
+    let view = rig.pass().await;
+    assert_eq!(
+        reconciled(&view),
+        vec![json!({
+            "lease": lease.name,
+            "reason": "pool burst was removed and the provider no longer lists its server",
+        })],
+        "{view}"
+    );
+    let state = rig.state().await;
+    assert!(state.leases.is_empty(), "{:?}", state.leases);
+    assert!(
+        state.members.iter().all(|member| member.name != lease.name),
+        "a reconciled lease leaves no ghost member"
+    );
+
+    let phases = lease_phases(&state, &lease);
+    assert_eq!(
+        phases.last().map(|(phase, _)| *phase),
+        Some(PoolPhase::Deleted)
+    );
+    assert_eq!(
+        phases.iter().rev().nth(1).map(|(phase, _)| *phase),
+        Some(PoolPhase::Draining),
+        "{phases:?}"
+    );
+    let deleted = state
+        .pool_events
+        .iter()
+        .find(|event| {
+            event.lease_id.as_deref() == Some(lease.id.as_str())
+                && event.phase == PoolPhase::Deleted
+        })
+        .expect("reconciled deletion");
+    assert_eq!(deleted.previous_phase, Some(PoolPhase::Draining));
+    assert_eq!(
+        deleted.reason.as_deref(),
+        Some("pool burst was removed and the provider no longer lists its server")
+    );
+
+    let job = job_named(&state, "hj_one");
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(job.failure_reason.as_deref(), Some("target_lost"));
+    assert_eq!(
+        job.failure_classification.as_deref(),
+        Some("provider_confirmed_absent"),
+        "the job record says which observation failed it"
+    );
+    let error = job.error.as_ref().expect("error");
+    assert!(
+        error.message.contains("pool burst was removed"),
+        "{error:?}"
+    );
+    assert!(
+        error.message.contains("(provider_confirmed_absent)"),
+        "{error:?}"
+    );
+    assert_eq!(
+        job.archive_skipped.as_deref(),
+        Some("pool burst was removed and the provider no longer lists its server"),
+        "a run that can never be archived says why"
+    );
+
+    // Nothing was deleted by the hub: the server it would have deleted is already gone.
+    assert!(
+        rig.cloud.with(|cloud| !cloud
+            .destroyed
+            .iter()
+            .any(|(kind, id)| { *kind == ResourceKind::Server && *id == server_id })),
+        "reconciliation never issues a delete"
+    );
+
+    rig.pass().await;
+    let state = rig.state().await;
+    assert!(state.removed_pools.is_empty(), "{:?}", state.removed_pools);
+    assert!(
+        state.pool_events.iter().any(|event| {
+            event.kind == PoolEventKind::Pool
+                && event.pool == "burst"
+                && event.phase == PoolPhase::Removed
+        }),
+        "the removed pool completes once its last lease is deleted"
+    );
+}
+
+/// The same lease while the provider still lists its server is left alone, even after its pool
+/// was removed: only an authored drain may delete a live server.
+#[tokio::test]
+async fn a_removed_pool_never_deletes_a_server_the_provider_still_lists() {
+    let rig = rig();
+    let lease = rig.running_job_on_server().await;
+    rig.service.remove_pool("burst").await.expect("remove pool");
+    for _ in 0..4 {
+        let view = rig.pass().await;
+        assert_eq!(reconciled(&view), Vec::<serde_json::Value>::new(), "{view}");
+        let state = rig.state().await;
+        assert_eq!(state.leases.len(), 1, "{:?}", state.leases);
+        assert_eq!(state.leases[0].phase, LeasePhase::Draining);
+        assert_eq!(
+            job_named(&state, "hj_one").state,
+            JobState::Running,
+            "a drained member keeps running its run"
+        );
+    }
+    assert_eq!(rig.cloud.servers(), 1, "the live server stays");
+
+    rig.driver.finish_all();
+    for _ in 0..4 {
+        rig.pass().await;
+    }
+    assert!(
+        rig.cloud.with(|cloud| cloud
+            .destroyed
+            .contains(&(ResourceKind::Server, lease.server_id.expect("id")))),
+        "the authored drain deletes the server it drained"
+    );
+    assert_eq!(
+        lease_phases(&rig.state().await, &lease)
+            .last()
+            .map(|(phase, _)| *phase),
+        Some(PoolPhase::Deleted)
+    );
+}
+
+/// An inconclusive provider answer is not an absent server: the lease keeps draining and the
+/// pass reports the failed confirmation.
+#[tokio::test]
+async fn an_unconfirmed_server_check_leaves_the_orphaned_lease_draining() {
+    let rig = rig();
+    let lease = rig.running_job_on_server().await;
+    rig.service.remove_pool("burst").await.expect("remove pool");
+    rig.cloud.with(|cloud| cloud.list_fails = true);
+    let view = rig.pass().await;
+    assert_eq!(reconciled(&view), Vec::<serde_json::Value>::new(), "{view}");
+    let errors = view["pools"]["errors"]
+        .as_array()
+        .expect("errors")
+        .iter()
+        .filter_map(|error| error.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("reconcile: the provider could not confirm")),
+        "{errors:?}"
+    );
+    let state = rig.state().await;
+    assert_eq!(state.leases.len(), 1, "{:?}", state.leases);
+    assert_eq!(state.leases[0].phase, LeasePhase::Draining);
+    assert_eq!(job_named(&state, "hj_one").state, JobState::Running);
+    assert!(
+        lease_phases(&state, &lease)
+            .iter()
+            .all(|(phase, _)| *phase != PoolPhase::Deleted)
+    );
+}
+
 #[tokio::test]
 async fn a_provider_refusal_fails_the_lease_without_ready_or_deleted() {
     let rig = rig();
@@ -837,6 +1014,26 @@ async fn a_provider_refusal_fails_the_lease_without_ready_or_deleted() {
             .iter()
             .all(|event| !(event.kind == PoolEventKind::Pool && event.phase == PoolPhase::Removed)),
         "a failed lease without deleted keeps the pool from reporting removed"
+    );
+
+    // Later passes reconcile orphaned leases, but a lease that never had a server has no lost
+    // resource to report: it stays recorded as failed instead of becoming a deletion.
+    let view = rig.pass().await;
+    assert!(reconciled(&view).is_empty(), "{view}");
+    let state = rig.state().await;
+    assert!(
+        state
+            .pool_events
+            .iter()
+            .all(|event| !(event.kind == PoolEventKind::Lease && event.phase == PoolPhase::Deleted)),
+        "a lease without a server is never reconciled as deleted"
+    );
+    assert!(
+        state
+            .pool_events
+            .iter()
+            .all(|event| !(event.kind == PoolEventKind::Pool && event.phase == PoolPhase::Removed)),
+        "its pool still waits for the deletion it never records"
     );
 }
 

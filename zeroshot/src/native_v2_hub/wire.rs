@@ -126,10 +126,11 @@ pub(crate) struct CreateSchedule {
     pub files: Vec<JobFile>,
 }
 
-/// `POST /v1/hub/jobs/query`.
+/// `POST /v1/hub/jobs/query` and `POST /v1/hub/jobs/history`.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct JobQuery {
+    /// A state filter (`active`, `queued`, ..., `all`), shared by `hub ps` and job history.
     pub state: String,
     #[serde(default)]
     pub target: Option<String>,
@@ -137,6 +138,10 @@ pub(crate) struct JobQuery {
     pub labels: Vec<(String, String)>,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Only jobs submitted at or after this instant; resolved by the client from `--since`.
+    /// Kept outside the listing shape so `ps` reads the same records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<u64>,
 }
 
 /// `POST /v1/hub/stats`. Times are already resolved by the client.

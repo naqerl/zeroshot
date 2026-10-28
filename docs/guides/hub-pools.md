@@ -194,6 +194,17 @@ health check, image pull, and target startup; there are no probe-by-probe events
 lease that failed before it had a machine never records `deleted`, so its pool does not report
 `removed`.
 
+Every pass also reconciles leases the hub can no longer act on. A lease whose pool was removed
+and whose server the provider no longer lists records `deleted` with a `reason` naming both
+facts, even when a drain never finished: with no pool and no server there is nothing left to
+archive, tunnel, or delete. A run still placing on that lease fails with `target_lost` and
+`failureClassification: "provider_confirmed_absent"`, and the pool's `removed` event follows on
+the next pass. Reconciliation never deletes a server the provider still lists, never touches a
+lease whose pool still exists, and leaves a lease alone when the provider cannot confirm the
+loss — an inconclusive answer is not a deleted server, so the lease keeps draining and the pass
+reports the failed confirmation. A lease that never received a server is not reconciled either:
+there is no lost resource to report, so it keeps its pool from claiming removal.
+
 Pool-wide changes use `kind: "pool"` and the phases `added`, `removed`, `paused`, `resumed`,
 `blocked`, and `shortage`. They carry the pool name and no lease, and a `reason` for every phase
 except `added` and `removed`. `paused` follows a failed boot and says how many failures in a row
@@ -278,6 +289,10 @@ so it does not depend on the data folder's filesystem. Object Storage upload is 
 - `zeroshot_hub_member_machine_info{member,server_type,location,source,profile}` gives each pool
   member's machine and why it was chosen.
 - `zeroshot_hub_pool_queued_jobs{pool,source,profile}` counts queued jobs by machine choice.
+- `zeroshot_hub_pool_events_total{event}` counts pool pass outcomes by event: `started`,
+  `teardown`, `archived`, `deleted`, `reconciled`, `reaped`, `shortage`, `blocked`, `wait_timeout`,
+  or `error`. `reconciled` counts leases recorded as deleted because their server was gone and
+  their pool removed.
 
 ## Cost
 

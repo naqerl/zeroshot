@@ -9,7 +9,8 @@ use reqwest::{Method, StatusCode};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use zeroshot_engine::native_v2_cli::hub::{
-    HubCommand, HubEnqueue, HubEvents, HubPoolAdd, HubPoolCommand, HubPs, HubStats, HubSubmit,
+    HubCommand, HubEnqueue, HubEvents, HubJobHistory, HubPoolAdd, HubPoolCommand, HubPs, HubStats,
+    HubSubmit,
 };
 
 use super::api::EXIT_CODE_HEADER;
@@ -311,8 +312,27 @@ async fn request_document(client: &HubClient, command: HubCommand) -> Result<Val
                 target,
                 labels,
                 limit,
+                since_ms: None,
             };
             client.post(&["v1", "hub", "jobs", "query"], &query).await
+        }
+        HubCommand::Jobs(HubJobHistory {
+            state,
+            labels,
+            since,
+            limit,
+        }) => {
+            let query = JobQuery {
+                state,
+                target: None,
+                labels,
+                limit,
+                since_ms: since
+                    .as_deref()
+                    .map(|since| parse_past_ms(since, now_ms()))
+                    .transpose()?,
+            };
+            client.post(&["v1", "hub", "jobs", "history"], &query).await
         }
         HubCommand::Status { job } => client.get(&["v1", "hub", "jobs", &job]).await,
         HubCommand::Dequeue { job } => {

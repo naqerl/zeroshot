@@ -439,6 +439,11 @@ pub(crate) struct Job {
     pub finished_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
+    /// Which decisive observation failed this job, when the hub's own reaper did: `member_absent`,
+    /// `provider_confirmed_absent`, `endpoint_refused`, or `probe_unreachable`. Kept apart from
+    /// the run's `failure_reason` so a lost target is never mistaken for a run failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_classification: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<JobUsage>,
     /// The hub's own problem with this job, apart from its run's `failure_reason`.
@@ -485,6 +490,41 @@ impl Job {
         }
     }
 
+    /// When the job record last changed: dispatch, a cursor advance, or its finish.
+    pub(crate) fn updated_at_ms(&self) -> u64 {
+        [
+            Some(self.submitted_at_ms),
+            self.dispatched_at_ms,
+            self.last_cursor_at_ms,
+            self.finished_at_ms,
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+        .unwrap_or(self.submitted_at_ms)
+    }
+
+    /// One row of the job-history page the `hub jobs` CLI and the MCP `hub_jobs` tool return.
+    pub(crate) fn history_view(&self, now_ms: u64) -> Value {
+        let mut view = json!({
+            "jobId": self.job_id,
+            "state": self.display_state(now_ms),
+            "labels": self.labels,
+            "pinnedRevision": self.pinned_revision,
+            "attempts": self.attempts,
+            "lastCursor": self.last_cursor,
+            "createdAt": rfc3339(self.submitted_at_ms),
+            "updatedAt": rfc3339(self.updated_at_ms()),
+        });
+        // A terminal job names why it stopped; a queued or running one has no verdict yet.
+        if self.state.is_terminal()
+            && let (Some(fields), Some(reason)) = (view.as_object_mut(), &self.failure_reason)
+        {
+            fields.insert("failureReason".to_owned(), json!(reason));
+        }
+        view
+    }
+
     /// Model attribution for stats: one named model, `mixed`, or `unknown`.
     pub(crate) fn model_key(&self) -> String {
         match self.models.as_slice() {
@@ -520,6 +560,7 @@ impl Job {
             "reaper": self.reaper,
             "finishedAt": time(self.finished_at_ms),
             "failureReason": self.failure_reason,
+            "failureClassification": self.failure_classification,
             "tokenUsage": self.token_usage,
             "error": self.error.as_ref().map(|error| &error.message),
             "errorKind": self.error.as_ref().map(|error| error.kind),

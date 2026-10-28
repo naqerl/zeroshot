@@ -644,24 +644,7 @@ impl HubService {
     }
 
     pub(crate) async fn ps(&self, query: JobQuery) -> Result<Value, HubError> {
-        const STATES: [&str; 9] = [
-            "active",
-            "all",
-            "recurring",
-            "queued",
-            "scheduled",
-            "running",
-            "succeeded",
-            "failed",
-            "dequeued",
-        ];
-        if !STATES.contains(&query.state.as_str()) {
-            return Err(HubError::Usage(format!(
-                "invalid --state {:?}: use one of {}",
-                query.state,
-                STATES.join(", ")
-            )));
-        }
+        validate_job_state(&query.state)?;
         let state = self.snapshot().await;
         let now = now_ms();
         let mut selected = state
@@ -704,6 +687,60 @@ impl HubService {
             .map(Schedule::view)
             .collect::<Vec<_>>();
         Ok(json!({ "schema": "zeroshot.hub.jobs/v1", "jobs": views, "schedules": schedules }))
+    }
+
+    /// One newest-first page of job history: the progress and terminal facts of matching jobs,
+    /// without their run arguments. An empty page is a page, not an error.
+    pub(crate) async fn job_history(&self, query: JobQuery) -> Result<Value, HubError> {
+        validate_job_state(&query.state)?;
+        if query.state == "recurring" {
+            return Err(HubError::Usage(
+                "invalid --state \"recurring\": job history lists jobs; recurring schedules are \
+                 listed by --state all or active on `hub ps`"
+                    .to_owned(),
+            ));
+        }
+        let limit = query.limit.unwrap_or(JOB_HISTORY_PAGE);
+        let state = self.snapshot().await;
+        let now = now_ms();
+        let mut matching = state
+            .jobs
+            .iter()
+            .filter(|job| state_matches(job, &query.state, now))
+            .filter(|job| {
+                query
+                    .since_ms
+                    .is_none_or(|since| job.submitted_at_ms >= since)
+            })
+            .filter(|job| {
+                query
+                    .labels
+                    .iter()
+                    .all(|(key, value)| job.labels.get(key) == Some(value))
+            })
+            .collect::<Vec<_>>();
+        matching.sort_by(|left, right| {
+            right
+                .submitted_at_ms
+                .cmp(&left.submitted_at_ms)
+                .then_with(|| right.job_id.cmp(&left.job_id))
+        });
+        matching.truncate(limit);
+        let jobs = matching
+            .iter()
+            .map(|job| job.history_view(now))
+            .collect::<Vec<_>>();
+        let mut filters = json!({"state": query.state, "labels": query.labels});
+        if let Some(since) = query.since_ms {
+            filters["since"] = json!(clock::rfc3339(since));
+        }
+        Ok(json!({
+            "schema": "zeroshot.hub.job-history/v1",
+            "filters": filters,
+            "limit": limit,
+            "returned": jobs.len(),
+            "jobs": jobs,
+        }))
     }
 
     /// One job with its live run status, read from the target outside the state lock.
@@ -1080,6 +1117,7 @@ impl HubService {
                         target.evidence = Some(format!(
                             "pool lease {label} no longer exists (provider confirmed)"
                         ));
+                        target.classification = Some(schedule::CLASSIFIED_PROVIDER_ABSENT);
                         confirmed.push(target);
                     }
                     Ok(true) => withheld.push(withhold(
@@ -1115,6 +1153,7 @@ impl HubService {
                         "target endpoint {} is not reachable: {why}",
                         target.member
                     ));
+                    target.classification = Some(schedule::CLASSIFIED_ENDPOINT_REFUSED);
                     confirmed.push(target);
                 }
                 EndpointCheck::Unknown(why) => withheld.push(withhold(
@@ -1251,6 +1290,32 @@ fn dequeue_placing(job: &mut Job, now: u64) -> Value {
         ),
     ));
     job_document(job, now)
+}
+
+/// The state filters `hub ps` and `hub jobs` accept.
+const JOB_STATES: [&str; 9] = [
+    "active",
+    "all",
+    "recurring",
+    "queued",
+    "scheduled",
+    "running",
+    "succeeded",
+    "failed",
+    "dequeued",
+];
+
+/// Jobs one history page returns when the caller sets no `--limit`.
+pub(crate) const JOB_HISTORY_PAGE: usize = 20;
+
+fn validate_job_state(filter: &str) -> Result<(), HubError> {
+    if JOB_STATES.contains(&filter) {
+        return Ok(());
+    }
+    Err(HubError::Usage(format!(
+        "invalid --state {filter:?}: use one of {}",
+        JOB_STATES.join(", ")
+    )))
 }
 
 fn state_matches(job: &Job, filter: &str, now: u64) -> bool {

@@ -905,6 +905,10 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   report `requested`, `creating`, `booting`, `preparing`, `ready`, `in_use`, `idle`, `draining`,
   `deleted`, or `failed` with `previousPhase`, and pools report `added`, `removed`, `paused`,
   `resumed`, `blocked`, `shortage`; `removed` waits for every lease of the pool to be deleted.
+  Each pass reconciles a lease whose pool was removed and whose server the provider no longer lists
+  into `deleted` with its reason, failing any run still placing there with
+  `failureClassification: provider_confirmed_absent`; a live server, a lease in an existing pool, and
+  an inconclusive provider answer all leave the lease alone.
   MCP publishes them as `hub.pool` events from `hub pool list`, so no caller polls for readiness. The
   API token comes from `--hetzner-token-file` or `HCLOUD_TOKEN` and is never stored. Labels carry
   IDs, server type and location only. The hub registers the pool's public key with the provider,
@@ -970,8 +974,9 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   `zeroshot hub install` and `zeroshot hub uninstall` change system services and need explicit
   user intent; prefer `--dry-run` first.
   The hub daemon also serves MCP on `POST /mcp`; it does not itself start a run. Its read-only tools
-  are `status`, `logs`, `watch`, `list`, `report`, `hub_list`, `hub_ps`, `hub_stats`, `hub_logs`,
-  and `hub_daemon_status`. `watch`, `logs`, and `hub_logs` follow until the stream ends; live run
+  are `status`, `logs`, `watch`, `list`, `report`, `hub_list`, `hub_ps`, `hub_jobs`, `hub_stats`,
+  `hub_logs`, and `hub_daemon_status`; `hub_jobs` pages job history newest first by state, label,
+  and `since`. `watch`, `logs`, and `hub_logs` follow until the stream ends; live run
   events use the events extension. `run`, `resume`, `hub_submit`, and `hub_enqueue` submit work.
 - Destructive commands such as `zeroshot force-stop` require explicit user intent. The MCP
   `force-stop` tool is that command.

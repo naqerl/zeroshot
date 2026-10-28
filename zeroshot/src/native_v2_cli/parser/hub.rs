@@ -8,9 +8,9 @@ mod eval;
 use crate::native_v2_cli::NativeV2CliError;
 use crate::native_v2_cli::hub::{
     HubApiOptions, HubCommand, HubContextCommand, HubDaemonRun, HubEnqueue, HubEvents, HubInstall,
-    HubJobSpec, HubLogs, HubManager, HubMemberAdd, HubMemberState, HubMemberUpdate, HubPs,
-    HubStats, HubPoolAdd, HubPoolCommand, HubPoolTag, HubStrategy, HubSubmit, HubTokenSource,
-    HubUninstall,
+    HubJobHistory, HubJobSpec, HubLogs, HubManager, HubMemberAdd, HubMemberState, HubMemberUpdate,
+    HubPs, HubPoolAdd, HubPoolCommand, HubPoolTag, HubStats, HubStrategy, HubSubmit,
+    HubTokenSource, HubUninstall,
 };
 
 #[derive(Debug, Subcommand)]
@@ -100,6 +100,13 @@ pub(super) enum HubCliCommand {
     /// List hub jobs as JSON.
     #[command(name = "ps")]
     Ps(HubPsArgs),
+
+    /// Print one newest-first page of job history as JSON.
+    ///
+    /// Each job carries its ID, state, labels, pinned revision, attempts, last durable cursor,
+    /// creation and update times, and, once terminal, its failure reason. Jobs are never
+    /// dropped: history of finished and in-flight jobs is the same durable state `hub ps` reads.
+    Jobs(HubJobsArgs),
 
     /// Print the hub event feed as NDJSON.
     ///
@@ -796,6 +803,26 @@ pub(super) struct HubPsArgs {
 }
 
 #[derive(Debug, Args)]
+pub(super) struct HubJobsArgs {
+    /// Job state filter: active (queued, scheduled, running), queued, scheduled, running,
+    /// succeeded, failed, dequeued, or all.
+    #[arg(long, value_name = "STATE", default_value = "all")]
+    state: String,
+
+    /// Only jobs carrying this label. Repeat for several, or combine with --since.
+    #[arg(long, value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
+    label: Vec<String>,
+
+    /// Only jobs created at or after this time: a duration such as 24h or 7d, or a timestamp.
+    #[arg(long, value_name = "WHEN")]
+    since: Option<String>,
+
+    /// Return at most this many of the newest matching jobs [default: 20].
+    #[arg(long, value_name = "N")]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Args)]
 pub(super) struct HubEventsArgs {
     /// Print JSON NDJSON (the only format; accepted for symmetry with other commands).
     #[arg(long)]
@@ -905,6 +932,12 @@ impl HubCliCommand {
             Self::Submit(args) => Ok(HubCommand::Submit(Box::new(args.into_submit()?))),
             Self::Enqueue(args) => Ok(HubCommand::Enqueue(Box::new(args.into_enqueue()?))),
             Self::Ps(args) => ps_command(args),
+            Self::Jobs(args) => Ok(HubCommand::Jobs(HubJobHistory {
+                state: args.state,
+                labels: labels(args.label)?,
+                since: args.since,
+                limit: args.limit,
+            })),
             Self::Events(args) => events_command(args),
             Self::Status(args) => Ok(HubCommand::Status { job: args.job }),
             Self::Watch(args) => Ok(HubCommand::Watch {

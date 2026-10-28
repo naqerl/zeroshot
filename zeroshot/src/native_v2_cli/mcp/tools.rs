@@ -132,6 +132,13 @@ const TOOLS: &[Tool] = &[
         argv: hub_ps_argv,
     },
     Tool {
+        name: "hub_jobs",
+        cli: &["hub", "jobs"],
+        allowed: &["hub", "state", "label", "since", "limit"],
+        schema: hub_jobs_schema,
+        argv: hub_jobs_argv,
+    },
+    Tool {
         name: "hub_status",
         cli: &["hub", "status"],
         allowed: &["hub", "job"],
@@ -430,6 +437,9 @@ fn tool_matches(name: &str, command: &NativeV2CliCommand) -> bool {
         }
         ("hub_ps", NativeV2CliCommand::Hub(request)) => {
             matches!(request.command, HubCommand::Ps(_))
+        }
+        ("hub_jobs", NativeV2CliCommand::Hub(request)) => {
+            matches!(request.command, HubCommand::Jobs(_))
         }
         ("hub_status", NativeV2CliCommand::Hub(request)) => {
             matches!(request.command, HubCommand::Status { .. })
@@ -782,6 +792,15 @@ fn hub_ps_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFailure> {
     push_opt(&mut argv, map, "state", "--state")?;
     push_opt(&mut argv, map, "target", "--target")?;
     push_repeat(&mut argv, map, "label", "--label")?;
+    push_u64(&mut argv, map, "limit", "--limit")?;
+    Ok(argv)
+}
+
+fn hub_jobs_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFailure> {
+    let mut argv = hub_prefix(map, &["jobs"])?;
+    push_opt(&mut argv, map, "state", "--state")?;
+    push_repeat(&mut argv, map, "label", "--label")?;
+    push_opt(&mut argv, map, "since", "--since")?;
     push_u64(&mut argv, map, "limit", "--limit")?;
     Ok(argv)
 }
@@ -1149,6 +1168,39 @@ fn hub_ps_schema() -> Value {
             (
                 "limit",
                 integer_prop("Maximum number of newest matching jobs."),
+            ),
+        ],
+    )
+}
+
+fn hub_jobs_schema() -> Value {
+    object_schema(
+        &[],
+        vec![
+            (
+                "hub",
+                string_prop("Hub context. Omit for ZEROSHOT_HUB, then the current context."),
+            ),
+            (
+                "state",
+                string_prop(
+                    "Job state filter: active, queued, scheduled, running, succeeded, failed, \
+                     dequeued, or all. Defaults to all.",
+                ),
+            ),
+            (
+                "label",
+                string_array_prop("Only jobs carrying every listed KEY=VALUE label."),
+            ),
+            (
+                "since",
+                string_prop(
+                    "Only jobs created at or after this time: a duration such as 24h, or a timestamp.",
+                ),
+            ),
+            (
+                "limit",
+                integer_prop("Page size, newest first. Defaults to 20."),
             ),
         ],
     )

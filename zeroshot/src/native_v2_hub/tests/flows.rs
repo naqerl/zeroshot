@@ -7,9 +7,9 @@ use serde_json::{Value, json};
 #[cfg(unix)]
 use zeroshot_engine::native_v2_cli::hub::HubLogs;
 use zeroshot_engine::native_v2_cli::hub::{
-    HubApiOptions, HubCommand, HubContextCommand, HubDaemonRun, HubEnqueue, HubInstall, HubJobSpec,
-    HubManager, HubMemberAdd, HubMemberState, HubMemberUpdate, HubPs, HubStats, HubStrategy,
-    HubSubmit, HubUninstall,
+    HubApiOptions, HubCommand, HubContextCommand, HubDaemonRun, HubEnqueue, HubInstall,
+    HubJobHistory, HubJobSpec, HubManager, HubMemberAdd, HubMemberState, HubMemberUpdate, HubPs,
+    HubStats, HubStrategy, HubSubmit, HubUninstall,
 };
 
 use super::super::api::{ApiState, metrics_router, router};
@@ -134,6 +134,21 @@ fn add(name: &str, slots: u32) -> HubCommand {
     })
 }
 
+fn jobs(state: &str, labels: &[&str], since: Option<&str>, limit: Option<usize>) -> HubCommand {
+    HubCommand::Jobs(HubJobHistory {
+        state: state.to_owned(),
+        labels: labels
+            .iter()
+            .map(|label| {
+                let (key, value) = label.split_once('=').expect("key=value label");
+                (key.to_owned(), value.to_owned())
+            })
+            .collect(),
+        since: since.map(str::to_owned),
+        limit,
+    })
+}
+
 fn ps(state: &str) -> HubCommand {
     HubCommand::Ps(HubPs {
         state: state.to_owned(),
@@ -141,6 +156,145 @@ fn ps(state: &str) -> HubCommand {
         labels: Vec::new(),
         limit: None,
     })
+}
+
+/// Job history is the durable progress and terminal record of every job: newest first, filtered
+/// by state, label and creation time, and an empty page for a filter that matches nothing.
+#[tokio::test]
+async fn job_history_pages_newest_first_and_filters() {
+    let hub = hub_with(FakeDriver::default(), None).await;
+    let client = &hub.client;
+    let empty = run(client, jobs("all", &[], None, None))
+        .await
+        .expect("empty history");
+    assert_eq!(empty["schema"], json!("zeroshot.hub.job-history/v1"));
+    assert_eq!(empty["jobs"], json!([]), "no jobs is an empty page");
+    assert_eq!(empty["returned"], json!(0));
+    assert_eq!(empty["limit"], json!(20));
+    let unmatched = run(client, jobs("all", &["eval.role=judge"], None, None))
+        .await
+        .expect("unmatched filter");
+    assert_eq!(
+        unmatched["jobs"],
+        json!([]),
+        "a filter with no match is no error"
+    );
+
+    let now = super::super::clock::now_ms();
+    let day = 86_400_000_u64;
+    hub.service
+        .mutate(|state| {
+            let mut failed = super::job("hj_failed", now.saturating_sub(2 * day));
+            failed.state = JobState::Failed;
+            failed
+                .labels
+                .insert("eval.role".to_owned(), "judge".to_owned());
+            failed.pinned_revision = Some("b".repeat(40));
+            failed.attempts = 2;
+            failed.last_cursor = Some("v2:42".to_owned());
+            failed.last_cursor_at_ms = Some(now.saturating_sub(day));
+            failed.finished_at_ms = Some(now.saturating_sub(day));
+            failed.failure_reason = Some("target_lost".to_owned());
+            failed.failure_classification = Some("provider_confirmed_absent".to_owned());
+            let mut running = super::job("hj_running", now.saturating_sub(3_600_000));
+            running.state = JobState::Running;
+            running.attempts = 1;
+            running.last_cursor = Some("v2:7".to_owned());
+            running.last_cursor_at_ms = Some(now.saturating_sub(60_000));
+            let mut queued = super::job("hj_queued", now.saturating_sub(60_000));
+            queued.state = JobState::Queued;
+            state.jobs.push(failed);
+            state.jobs.push(running);
+            state.jobs.push(queued);
+            Ok(())
+        })
+        .await
+        .expect("seed jobs");
+
+    let page = run(client, jobs("all", &[], None, None))
+        .await
+        .expect("history page");
+    let order = page["jobs"]
+        .as_array()
+        .expect("jobs")
+        .iter()
+        .map(|job| job["jobId"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(order, ["hj_queued", "hj_running", "hj_failed"], "{page}");
+    for job in page["jobs"].as_array().expect("jobs") {
+        assert!(job.get("runArgs").is_none(), "history omits run arguments");
+        assert!(job["createdAt"].is_string(), "{job}");
+        assert!(job["updatedAt"].is_string(), "{job}");
+        assert!(job["labels"].is_object(), "{job}");
+    }
+    let failed = &page["jobs"][2];
+    assert_eq!(failed["state"], json!("failed"));
+    assert_eq!(failed["failureReason"], json!("target_lost"), "{failed}");
+    assert_eq!(failed["pinnedRevision"], json!("b".repeat(40)));
+    assert_eq!(failed["attempts"], json!(2));
+    assert_eq!(failed["lastCursor"], json!("v2:42"));
+    assert!(
+        failed.get("failureClassification").is_none(),
+        "history names the failed observation through its reason and state"
+    );
+    assert!(
+        page["jobs"][0].get("failureReason").is_none(),
+        "a live job has no failure reason"
+    );
+    let running = &page["jobs"][1];
+    assert_eq!(running["lastCursor"], json!("v2:7"));
+    assert_eq!(
+        running["updatedAt"],
+        json!(super::super::clock::rfc3339(now.saturating_sub(60_000))),
+        "a running job is updated by its newest cursor"
+    );
+
+    let succeeded = run(client, jobs("succeeded", &[], None, None))
+        .await
+        .expect("state filter");
+    assert_eq!(succeeded["jobs"], json!([]));
+    let failing = run(client, jobs("failed", &[], None, None))
+        .await
+        .expect("failed filter");
+    assert_eq!(failing["returned"], json!(1));
+    assert_eq!(failing["jobs"][0]["jobId"], json!("hj_failed"));
+
+    let labelled = run(client, jobs("all", &["eval.role=judge"], None, None))
+        .await
+        .expect("label filter");
+    assert_eq!(labelled["returned"], json!(1));
+    assert_eq!(labelled["jobs"][0]["jobId"], json!("hj_failed"));
+    assert_eq!(
+        labelled["filters"]["labels"],
+        json!([["eval.role", "judge"]])
+    );
+
+    let recent = run(client, jobs("all", &[], Some("24h"), None))
+        .await
+        .expect("since filter");
+    let recent_ids = recent["jobs"]
+        .as_array()
+        .expect("jobs")
+        .iter()
+        .map(|job| job["jobId"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(recent_ids, ["hj_queued", "hj_running"], "{recent}");
+    assert!(recent["filters"]["since"].is_string(), "{recent}");
+
+    let newest = run(client, jobs("all", &[], None, Some(1)))
+        .await
+        .expect("limited page");
+    assert_eq!(newest["limit"], json!(1));
+    assert_eq!(newest["returned"], json!(1));
+    assert_eq!(newest["jobs"][0]["jobId"], json!("hj_queued"));
+
+    let invalid = expect_code(
+        client,
+        jobs("nonsense", &[], None, None),
+        "hub.invalid_request",
+    )
+    .await;
+    assert!(invalid.to_string().contains("--state"), "{invalid:?}");
 }
 
 #[tokio::test]

@@ -734,6 +734,7 @@ async fn handshake_lists_cli_tools() {
             "report",
             "hub_list",
             "hub_ps",
+            "hub_jobs",
             "hub_status",
             "hub_submit",
             "hub_enqueue",
@@ -792,6 +793,31 @@ fn hub_tools_are_listed_and_map_arguments() {
     assert_eq!(
         super::tools::argv_for_test("hub_dequeue", &arguments).expect("hub_dequeue argv"),
         ["hub", "dequeue", "hj_1"]
+    );
+
+    let arguments = json!({
+        "state": "failed",
+        "label": ["eval.role=judge"],
+        "since": "24h",
+        "limit": 5,
+    })
+    .as_object()
+    .expect("arguments object")
+    .clone();
+    assert_eq!(
+        super::tools::argv_for_test("hub_jobs", &arguments).expect("hub_jobs argv"),
+        [
+            "hub",
+            "jobs",
+            "--state",
+            "failed",
+            "--label",
+            "eval.role=judge",
+            "--since",
+            "24h",
+            "--limit",
+            "5",
+        ]
     );
 
     let arguments = json!({"title": "Review", "taskFrom": "https://github.com/acme/repo/pull/1"})

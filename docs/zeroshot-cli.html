@@ -74,6 +74,7 @@ section { margin-block: 2.5rem; }
 <li><a href="#zeroshot-hub-submit"><code>zeroshot hub submit</code></a></li>
 <li><a href="#zeroshot-hub-enqueue"><code>zeroshot hub enqueue</code></a></li>
 <li><a href="#zeroshot-hub-ps"><code>zeroshot hub ps</code></a></li>
+<li><a href="#zeroshot-hub-jobs"><code>zeroshot hub jobs</code></a></li>
 <li><a href="#zeroshot-hub-events"><code>zeroshot hub events</code></a></li>
 <li><a href="#zeroshot-hub-status"><code>zeroshot hub status</code></a></li>
 <li><a href="#zeroshot-hub-watch"><code>zeroshot hub watch</code></a></li>
@@ -1017,6 +1018,7 @@ Commands:
   submit      Place a run on a free member now
   enqueue     Accept a run into the hub queue for later placement, once or on a cron schedule
   ps          List hub jobs as JSON
+  jobs        Print one newest-first page of job history as JSON
   events      Print the hub event feed as NDJSON
   status      Read one hub job with its run status as JSON
   watch       Follow a placed job&#39;s run events as NDJSON
@@ -1626,6 +1628,33 @@ Options:
 
   -h, --help
           Print help</code></pre></section>
+<section id="zeroshot-hub-jobs"><h4><code>zeroshot hub jobs</code></h4>
+<pre><code>Print one newest-first page of job history as JSON.
+
+Each job carries its ID, state, labels, pinned revision, attempts, last durable cursor, creation and update times, and, once terminal, its failure reason. Jobs are never dropped: history of finished and in-flight jobs is the same durable state `hub ps` reads.
+
+Usage: zeroshot hub jobs [OPTIONS]
+
+Options:
+      --hub &lt;CONTEXT&gt;
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+      --state &lt;STATE&gt;
+          Job state filter: active (queued, scheduled, running), queued, scheduled, running, succeeded, failed, dequeued, or all
+
+          [default: all]
+
+      --label &lt;KEY=VALUE&gt;
+          Only jobs carrying this label. Repeat for several, or combine with --since
+
+      --since &lt;WHEN&gt;
+          Only jobs created at or after this time: a duration such as 24h or 7d, or a timestamp
+
+      --limit &lt;N&gt;
+          Return at most this many of the newest matching jobs [default: 20]
+
+  -h, --help
+          Print help (see a summary with &#39;-h&#39;)</code></pre></section>
 <section id="zeroshot-hub-events"><h4><code>zeroshot hub events</code></h4>
 <pre><code>Print the hub event feed as NDJSON.
 
@@ -2842,6 +2871,7 @@ Commands:
   submit      Place a run on a free member now
   enqueue     Accept a run into the hub queue for later placement, once or on a cron schedule
   ps          List hub jobs as JSON
+  jobs        Print one newest-first page of job history as JSON
   events      Print the hub event feed as NDJSON
   status      Read one hub job with its run status as JSON
   watch       Follow a placed job&#39;s run events as NDJSON

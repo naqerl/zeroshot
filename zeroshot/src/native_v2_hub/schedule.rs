@@ -224,7 +224,16 @@ pub(crate) struct LostTarget {
     pub last_probe_ok_at_ms: Option<u64>,
     /// The deciding confirmation, such as a provider saying the pool server is gone.
     pub evidence: Option<String>,
+    /// Which observation failed the job: `member_absent`, `provider_confirmed_absent`,
+    /// `endpoint_refused`, or `probe_unreachable`. Set with `evidence`, and recorded on the job
+    /// so its terminal record says what the hub actually saw.
+    pub classification: Option<&'static str>,
 }
+
+/// The decisive observations that fail a lost-target job by themselves.
+pub(crate) const CLASSIFIED_MEMBER_ABSENT: &str = "member_absent";
+pub(crate) const CLASSIFIED_PROVIDER_ABSENT: &str = "provider_confirmed_absent";
+pub(crate) const CLASSIFIED_ENDPOINT_REFUSED: &str = "endpoint_refused";
 
 /// A lost-target candidate the reaper kept running, with the reason it withheld action.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -249,6 +258,7 @@ pub(crate) fn lost_targets(state: &HubState) -> Vec<LostTarget> {
                     unreachable_probes: None,
                     last_probe_ok_at_ms: job.target_last_ok_at_ms,
                     evidence: None,
+                    classification: Some(CLASSIFIED_MEMBER_ABSENT),
                 }),
                 Some(member) if member.unreachable_probes >= UNREACHABLE_REAP_THRESHOLD => {
                     Some(LostTarget {
@@ -259,6 +269,7 @@ pub(crate) fn lost_targets(state: &HubState) -> Vec<LostTarget> {
                             .last_probe_ok_at_ms
                             .or(job.target_last_ok_at_ms),
                         evidence: None,
+                        classification: None,
                     })
                 }
                 Some(_) => None,
@@ -296,24 +307,64 @@ pub(crate) fn settle_lost_targets(
             Some(evidence) => format!("{detail}; {evidence}"),
             None => detail,
         };
-        job.reaper = None;
-        job.state = JobState::Failed;
-        job.finished_at_ms = Some(now_ms);
-        job.failure_reason = Some("target_lost".to_owned());
-        job.error = Some(JobError::new(
-            JobErrorKind::TargetLost,
-            format!("{detail}; the hub cannot observe or stop its run"),
+        failed.push(fail_job(
+            job,
+            now_ms,
+            target.classification.unwrap_or("unclassified"),
+            detail,
         ));
-        failed.push(json!({
-            "jobId": job.job_id,
-            "state": job.display_state(now_ms),
-            "target": job.target,
-            "runId": job.run_id,
-            "reason": "target_lost",
-        }));
     }
     failed
 }
+
+/// Fail the runs still placing on a lease that the hub gave up: its pool was removed and the
+/// provider confirmed its server is gone, so nothing can observe, stop or archive them any more.
+pub(crate) fn settle_orphaned_lease(
+    jobs: &mut [Job],
+    now_ms: u64,
+    member: &str,
+    evidence: &str,
+) -> Vec<Value> {
+    let mut failed = Vec::new();
+    for job in jobs.iter_mut() {
+        if job.state != JobState::Running || job.target.as_deref() != Some(member) {
+            continue;
+        }
+        failed.push(fail_job(
+            job,
+            now_ms,
+            CLASSIFIED_PROVIDER_ABSENT,
+            format!("{evidence}; {member} is retired"),
+        ));
+    }
+    failed
+}
+
+/// Record one target-lost failure, naming the observation that decided it. `detail` explains
+/// what the hub saw; `classification` says which observation it was.
+fn fail_job(job: &mut Job, now_ms: u64, classification: &str, detail: String) -> Value {
+    job.reaper = None;
+    job.state = JobState::Failed;
+    job.finished_at_ms = Some(now_ms);
+    job.failure_reason = Some("target_lost".to_owned());
+    job.failure_classification = Some(classification.to_owned());
+    job.error = Some(JobError::new(
+        JobErrorKind::TargetLost,
+        format!("{detail}; the hub cannot observe or stop its run ({classification})"),
+    ));
+    json!({
+        "jobId": job.job_id,
+        "state": job.display_state(now_ms),
+        "target": job.target,
+        "runId": job.run_id,
+        "reason": "target_lost",
+        "classification": job.failure_classification,
+    })
+}
+
+/// The deciding observation when only a failed load probe proves a member is gone.
+#[cfg(test)]
+pub(crate) const CLASSIFIED_PROBE_UNREACHABLE: &str = "probe_unreachable";
 
 /// Keep only candidates whose current probe is decisive, or whose member already left. All
 /// others stay running with a reaper note naming why no action was taken.
@@ -338,6 +389,7 @@ pub(crate) fn confirm_lost_by_probe(
                     "the load probe could not connect to the member: {}",
                     load.error.as_deref().unwrap_or("connection failed")
                 ));
+                target.classification = Some(CLASSIFIED_PROBE_UNREACHABLE);
                 confirmed.push(target);
             }
             Some(load) => withheld.push(WithheldTarget {

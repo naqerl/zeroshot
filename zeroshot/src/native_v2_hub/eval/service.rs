@@ -595,6 +595,7 @@ impl HubService {
             reaper: None,
             finished_at_ms: None,
             failure_reason: None,
+            failure_classification: None,
             token_usage: None,
             error: None,
             schedule_id: None,
