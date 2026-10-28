@@ -44,6 +44,11 @@ const HUB_LOG_LIMIT: usize = 4096;
 /// Bootstrap and every per-job book retain only the newest job views. This keeps those maps
 /// bounded independently of how much terminal history the daemon has accumulated.
 const HUB_RECENT_JOBS: usize = 512;
+/// Every delivered cursor is either a durable `hub:<sequence>` position or the resumable
+/// bootstrap progress identity `hub:snapshot:<delivered>:<start>` synthesized before the first
+/// occurrence. Advertised schemas must accept both, because bootstrap records carry the latter
+/// as their `eventId` and `data.cursor`.
+const HUB_CURSOR_PATTERN: &str = "^hub:(snapshot:[0-9]+:[0-9]+|[0-9]+)$";
 const HUB_BROADCAST_LIMIT: usize = 1024;
 pub(crate) const PHASES: &[&str] = &["admitted", "running", "stopping", "finished"];
 /// Phases a pool lease or pool record can carry; `phases` also filters these.
@@ -2916,7 +2921,7 @@ fn payload_schema(name: &str) -> Value {
         "required": ["jobId", "title", "state", "target", "project", "runId", "attempts", "pinnedRevision", "labels", "submittedAt", "finishedAt", "failureReason", "errorKind", "reason", "at", "cursor", "summary", "replayed", "sequence"],
         "properties": {
             "jobId": {"type": "string"},
-            "cursor": {"type": "string", "pattern": "^hub:[0-9]+$"},
+            "cursor": {"type": "string", "pattern": HUB_CURSOR_PATTERN, "description": "Durable hub:<sequence> cursor, or hub:snapshot:<delivered>:<start> for a bootstrap record."},
             "sequence": {"type": "integer", "minimum": 1},
             "snapshot": {"type": "boolean", "description": "Bootstrap state, not replayed history."},
             "terminal": {"type": "boolean", "description": "The one terminal occurrence for this job."},
@@ -3006,8 +3011,8 @@ fn payload_schema(name: &str) -> Value {
         "properties": {
             "eventId": {
                 "type": "string",
-                "pattern": "^hub:[0-9]+$",
-                "description": "The durable hub:<sequence> cursor. Bootstrap snapshot events use hub:0."
+                "pattern": HUB_CURSOR_PATTERN,
+                "description": "The record's resume cursor: durable hub:<sequence>, or hub:snapshot:<delivered>:<start> for a bootstrap snapshot record."
             },
             "name": {
                 "type": "string",
