@@ -210,6 +210,14 @@ struct Batch {
     has_more: bool,
 }
 
+/// Where a hub poll record came from. Bootstrap progress needs its own resumable cursor because
+/// synthesized snapshots do not occupy durable feed sequences.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HubPosition {
+    Snapshot(usize),
+    Durable(u64),
+}
+
 /// One event published on the hub-wide stream. The sequence is the hub cursor; it is
 /// deliberately independent from the sparse per-run `v2:` watch cursors.
 pub(super) struct HubEvent {
@@ -517,6 +525,15 @@ impl HubLog {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HubCursor {
+    /// A durable feed occurrence.
+    Durable(u64),
+    /// Bootstrap progress: `delivered` synthesized records have been sent from a batch whose
+    /// original durable boundary is `start`.
+    Snapshot { delivered: usize, start: u64 },
+}
+
 fn hub_cursor(sequence: u64) -> String {
     format!("hub:{sequence}")
 }
@@ -525,7 +542,18 @@ fn snapshot_cursor(delivered: usize, start: u64) -> String {
     format!("hub:snapshot:{delivered}:{start}")
 }
 
+/// The durable feed sequence carried by a plain `hub:<n>` cursor. A bootstrap-progress cursor
+/// is not a durable position and never advances a resumed feed by itself.
 fn cursor_sequence(cursor: &str) -> Option<u64> {
+    let rest = cursor.strip_prefix("hub:")?;
+    if rest.is_empty() || !rest.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok()
+}
+
+/// A per-run watch cursor (`v2:<n>`) used for warning progress, not a hub feed position.
+fn watch_cursor_sequence(cursor: &str) -> Option<u64> {
     cursor.rsplit_once(':')?.1.parse().ok()
 }
 
@@ -720,22 +748,18 @@ where
     H: McpHost + 'static,
 {
     feed.ensure_started(Rc::clone(host));
-    let after = match request.cursor.as_deref() {
-        Some(cursor) => Some(parse_hub_cursor(cursor)?),
-        None => None,
+    let (after, snapshot_skip, bootstrap) = match request.cursor.as_deref() {
+        Some(cursor) => match parse_hub_cursor(cursor)? {
+            HubCursor::Durable(sequence) => (Some(sequence), 0, false),
+            HubCursor::Snapshot { delivered, start } => (Some(start), delivered, true),
+        },
+        None => (None, 0, true),
     };
     let (after, stale) = clamp_resume(feed, after);
     let start = after.unwrap_or_else(|| feed.head());
-    let (receiver, mut replay, truncated, mut cursor) = feed.snapshot(after);
+    let (receiver, mut replay, truncated, cursor) = feed.snapshot(after);
     let mut truncated = merge_truncated(truncated, stale);
-    // The active view is written before replay. A bootstrap starts before every retained event
-    // so the advertised cursor never skips the batch that follows; replay advances it event by
-    // event, and a reconnect before the stream drains replays rather than loses the prefix.
-    if after.is_none() {
-        cursor = Some(hub_cursor(0));
-    }
-    if after.is_none()
-        && let Some(snapshots) = snapshot_events(host.as_ref(), feed, request, start).await
+    if bootstrap && let Some(snapshots) = snapshot_events(host.as_ref(), feed, request, start).await
     {
         // Bootstrap records lead the batch. Everything published while this snapshot was
         // built still follows, so neither the bootstrap terminal's own publication nor an
@@ -744,7 +768,10 @@ where
         replay.retain(|event| event.sequence <= start);
         replay.extend(live);
         truncated = merge_truncated(truncated, lost);
-        let mut combined = snapshots;
+        let mut combined = snapshots
+            .into_iter()
+            .skip(snapshot_skip)
+            .collect::<Vec<_>>();
         combined.extend(replay);
         replay = combined;
     }
@@ -1507,9 +1534,12 @@ where
 {
     feed.ensure_started(Rc::clone(host));
     tokio::task::yield_now().await;
-    let after = match request.cursor.as_deref() {
-        Some(cursor) => Some(parse_hub_cursor(cursor)?),
-        None => None,
+    let (after, snapshot_skip, bootstrap) = match request.cursor.as_deref() {
+        Some(cursor) => match parse_hub_cursor(cursor)? {
+            HubCursor::Durable(sequence) => (Some(sequence), 0, false),
+            HubCursor::Snapshot { delivered, start } => (Some(start), delivered, true),
+        },
+        None => (None, 0, true),
     };
     let (after, stale) = clamp_resume(feed, after);
     let start = after.unwrap_or_else(|| feed.head());
@@ -1523,12 +1553,12 @@ where
         filters: &request.filters,
     };
     let mut job_states = HashMap::new();
-    let snapshots = if after.is_none() {
+    let snapshots = if bootstrap {
         snapshot_events(host.as_ref(), feed, request, start).await
     } else {
         None
     };
-    if after.is_none() {
+    if bootstrap {
         // Bootstrap may publish an already-terminal job's durable occurrence while it awaits
         // host reads. Replay everything published since the initial head so that publication
         // advances the cursor without skipping unrelated live events.
@@ -1539,8 +1569,9 @@ where
     }
     let mut selected = Vec::new();
     if let Some(snapshots) = snapshots.as_ref() {
-        for event in snapshots {
-            if repeated_job_state(event, &job_states) {
+        for (index, event) in snapshots.iter().enumerate() {
+            let position = index.saturating_add(1);
+            if position <= snapshot_skip || repeated_job_state(event, &job_states) {
                 continue;
             }
             if let Some(value) = hub_event_value(
@@ -1552,7 +1583,7 @@ where
                     id: None,
                 },
             ) {
-                selected.push((event.sequence, value));
+                selected.push((HubPosition::Snapshot(position), value));
                 remember_job_state(event, &mut job_states);
             }
         }
@@ -1570,7 +1601,7 @@ where
                 id: None,
             },
         ) {
-            selected.push((event.sequence, value));
+            selected.push((HubPosition::Durable(event.sequence), value));
             remember_job_state(event, &mut job_states);
         }
     }
@@ -1578,27 +1609,30 @@ where
     // A fresh poll starts at the head after any bootstrap terminal publication, so the
     // caller never replays an occurrence it already received as a snapshot.
     let mut cursor = after.unwrap_or_else(|| feed.head());
+    let mut cursor_position = HubPosition::Durable(cursor);
     if selected.len() > request.max_events {
         selected.truncate(request.max_events);
-        if let Some((selected_sequence, _)) = selected.last() {
-            cursor = *selected_sequence;
+        if let Some((position, _)) = selected.last() {
+            cursor_position = *position;
         }
         // A maxEvents clip is resumable from the returned cursor, so it is hasMore
         // rather than truncation. Bootstrap snapshots share that bound instead of being
         // prepended for free; otherwise a hub that knows thousands of jobs sends them all
         // in one frame and reports hasMore: false.
         has_more = true;
-    } else if snapshots.is_none() {
+    } else {
         // Filters can hide every replay record while the cursor still has to advance past it.
         if let Some(last) = replay.last()
             && last.sequence > cursor
         {
             cursor = last.sequence;
+            cursor_position = HubPosition::Durable(cursor);
         }
-        if let Some((selected_sequence, _)) = selected.last()
-            && *selected_sequence > cursor
+        if let Some((HubPosition::Durable(sequence), _)) = selected.last()
+            && *sequence > cursor
         {
-            cursor = *selected_sequence;
+            cursor = *sequence;
+            cursor_position = HubPosition::Durable(cursor);
         }
     }
 
@@ -1615,28 +1649,59 @@ where
         .into_iter()
         .map(|(_, value)| value)
         .collect::<Vec<_>>();
+    let response_cursor = match cursor_position {
+        HubPosition::Snapshot(delivered) => snapshot_cursor(delivered, start),
+        HubPosition::Durable(sequence) => hub_cursor(sequence),
+    };
     Ok(json!({
         "resultType": "complete",
         "events": events,
-        "cursor": hub_cursor(cursor),
+        "cursor": response_cursor,
         "truncated": truncated,
         "hasMore": has_more,
         "nextPollMs": NEXT_POLL_MS,
     }))
 }
 
-fn parse_hub_cursor(cursor: &str) -> Result<u64, EventError> {
+fn parse_hub_cursor(cursor: &str) -> Result<HubCursor, EventError> {
     let Some(rest) = cursor.strip_prefix("hub:") else {
         return Err(EventError::Invalid(McpFailure::invalid(
             "hub events use a hub:<sequence> cursor",
         )));
     };
+    if let Some(progress) = rest.strip_prefix("snapshot:") {
+        let Some((delivered, start)) = progress.split_once(':') else {
+            return Err(EventError::Invalid(McpFailure::invalid(
+                "hub snapshot cursor must be hub:snapshot:<count>:<sequence>",
+            )));
+        };
+        if delivered.is_empty()
+            || start.is_empty()
+            || !delivered.bytes().all(|byte| byte.is_ascii_digit())
+            || !start.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(EventError::Invalid(McpFailure::invalid(
+                "hub snapshot cursor must be hub:snapshot:<count>:<sequence>",
+            )));
+        }
+        let delivered = delivered.parse::<usize>().map_err(|_| {
+            EventError::Invalid(McpFailure::invalid(
+                "hub snapshot cursor count is out of range",
+            ))
+        })?;
+        let start = start.parse::<u64>().map_err(|_| {
+            EventError::Invalid(McpFailure::invalid(
+                "hub snapshot cursor sequence is out of range",
+            ))
+        })?;
+        return Ok(HubCursor::Snapshot { delivered, start });
+    }
     if rest.is_empty() || !rest.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(EventError::Invalid(McpFailure::invalid(
             "hub cursor must be hub:<sequence>",
         )));
     }
-    rest.parse().map_err(|_| {
+    rest.parse().map(HubCursor::Durable).map_err(|_| {
         EventError::Invalid(McpFailure::invalid("hub cursor sequence is out of range"))
     })
 }
@@ -2479,8 +2544,8 @@ impl HubFeed {
         let elapsed_ms = dispatched_at_ms.map(|at| now.saturating_sub(at));
         let unchanged_ms = execution_since_ms.map(|at| now.saturating_sub(at));
         let cursor_delta = match (&previous_cursor, &cursor) {
-            (Some(previous), Some(current)) => cursor_sequence(current)
-                .zip(cursor_sequence(previous))
+            (Some(previous), Some(current)) => watch_cursor_sequence(current)
+                .zip(watch_cursor_sequence(previous))
                 .and_then(|(current, previous)| current.checked_sub(previous)),
             _ => None,
         };

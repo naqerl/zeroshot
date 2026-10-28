@@ -1471,6 +1471,68 @@ async fn hub_bootstrap_snapshots_every_known_job_in_submission_order() {
 }
 
 #[tokio::test]
+async fn hub_bootstrap_clipping_resumes_after_the_delivered_snapshots() {
+    let jobs = (0..3)
+        .map(|index| {
+            let mut job = hub_lifecycle_job(&format!("hj_clip_{index}"), "running", None);
+            job["submittedAt"] = json!(format!("2026-01-01T00:00:0{index}Z"));
+            job
+        })
+        .collect::<Vec<_>>();
+    let host = HubLifecycleHost::new(vec![jobs], vec![hub_member("builder")], HashMap::new());
+    let mut session = Session::spawn(host);
+    initialize(&mut session).await;
+
+    let first = session
+        .request(
+            2,
+            "events/poll",
+            json!({"name": "hub.job", "arguments": {"kinds": ["hub.job"]}, "maxEvents": 2}),
+        )
+        .await;
+    assert_eq!(first["result"]["hasMore"], json!(true), "{first}");
+    assert_eq!(
+        first["result"]["truncated"],
+        json!(false),
+        "a resumable bootstrap clip is not loss: {first}"
+    );
+    let snapshots = first["result"]["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|event| event["data"]["snapshot"] == json!(true))
+        .collect::<Vec<_>>();
+    assert_eq!(snapshots.len(), 2, "{first}");
+    let cursor = first["result"]["cursor"]
+        .as_str()
+        .expect("bootstrap cursor")
+        .to_owned();
+    assert_eq!(cursor, "hub:snapshot:2:0", "{first}");
+
+    let second = session
+        .request(
+            3,
+            "events/poll",
+            json!({
+                "name": "hub.job",
+                "arguments": {"kinds": ["hub.job"]},
+                "cursor": cursor,
+                "maxEvents": 4
+            }),
+        )
+        .await;
+    let remaining = second["result"]["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|event| event["data"]["snapshot"] == json!(true))
+        .map(|event| event["data"]["jobId"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(remaining, [json!("hj_clip_2")], "{second}");
+    assert_eq!(second["result"]["hasMore"], json!(false), "{second}");
+}
+
+#[tokio::test]
 async fn hub_poll_sequences_are_monotone_across_calls_and_ignore_filtered_events() {
     let host = HubLifecycleHost::new(
         vec![vec![hub_lifecycle_job("hj_seq", "queued", None)]],
