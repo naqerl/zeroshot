@@ -225,6 +225,9 @@ pub(super) struct HubEvent {
     /// A bootstrap state synthesized when a subscription starts without a cursor. It is sent
     /// before live work but is never appended to the durable log or counted as a new cursor.
     snapshot: bool,
+    /// Distinct resumable identity for a synthesized bootstrap record. Durable occurrences leave
+    /// this absent and use their feed sequence.
+    snapshot_cursor: Option<String>,
 }
 
 struct HubLog {
@@ -518,6 +521,10 @@ fn hub_cursor(sequence: u64) -> String {
     format!("hub:{sequence}")
 }
 
+fn snapshot_cursor(delivered: usize, start: u64) -> String {
+    format!("hub:snapshot:{delivered}:{start}")
+}
+
 fn cursor_sequence(cursor: &str) -> Option<u64> {
     cursor.rsplit_once(':')?.1.parse().ok()
 }
@@ -728,7 +735,7 @@ where
         cursor = Some(hub_cursor(0));
     }
     if after.is_none()
-        && let Some(snapshots) = snapshot_events(host.as_ref(), feed, request).await
+        && let Some(snapshots) = snapshot_events(host.as_ref(), feed, request, start).await
     {
         // Bootstrap records lead the batch. Everything published while this snapshot was
         // built still follows, so neither the bootstrap terminal's own publication nor an
@@ -998,6 +1005,10 @@ fn hub_event_value(event: &HubEvent, filter: &HubFilter<'_>, stamp: Stamp<'_>) -
             return None;
         }
     }
+    let event_cursor = event
+        .snapshot_cursor
+        .clone()
+        .unwrap_or_else(|| hub_cursor(event.sequence));
     let mut data = if event.name == HUB_RUN {
         event_data(&event.data, filter.filters.verbose)
     } else {
@@ -1024,7 +1035,7 @@ fn hub_event_value(event: &HubEvent, filter: &HubFilter<'_>, stamp: Stamp<'_>) -
                 map.insert("runCursor".to_owned(), run_cursor);
             }
         }
-        map.insert("cursor".to_owned(), json!(hub_cursor(event.sequence)));
+        map.insert("cursor".to_owned(), json!(&event_cursor));
         map.insert("summary".to_owned(), summary);
         map.insert("replayed".to_owned(), json!(stamp.replayed));
         map.insert("sequence".to_owned(), json!(stamp.sequence));
@@ -1033,7 +1044,7 @@ fn hub_event_value(event: &HubEvent, filter: &HubFilter<'_>, stamp: Stamp<'_>) -
         }
     }
     let value = json!({
-        "eventId": hub_cursor(event.sequence),
+        "eventId": event_cursor,
         "name": event.name,
         "timestamp": event.timestamp,
         "data": data,
@@ -1513,7 +1524,7 @@ where
     };
     let mut job_states = HashMap::new();
     let snapshots = if after.is_none() {
-        snapshot_events(host.as_ref(), feed, request).await
+        snapshot_events(host.as_ref(), feed, request, start).await
     } else {
         None
     };
@@ -1731,6 +1742,7 @@ async fn snapshot_events<H>(
     host: &H,
     feed: &Rc<HubFeed>,
     request: &PollRequest,
+    start: u64,
 ) -> Option<Vec<Arc<HubEvent>>>
 where
     H: McpHost + 'static,
@@ -1791,9 +1803,9 @@ where
                 .borrow_mut()
                 .insert(job_id.clone(), run.clone());
         }
-        let event = HubEvent {
-            // `hub:0` is before every durable occurrence, so a bootstrap record can neither
-            // advance the feed cursor nor be mistaken for replayed history.
+        let mut event = HubEvent {
+            // Synthetic bootstrap records start before every durable occurrence, so they can
+            // neither advance the durable feed cursor nor be mistaken for replayed history.
             sequence: 0,
             name: HUB_JOB,
             timestamp: now_rfc3339(),
@@ -1807,6 +1819,7 @@ where
             phase: Some(state.clone()),
             terminal,
             snapshot: true,
+            snapshot_cursor: None,
         };
         if hub_event_value(
             &event,
@@ -1819,6 +1832,7 @@ where
         )
         .is_some()
         {
+            event.snapshot_cursor = Some(snapshot_cursor(events.len() + 1, start));
             if terminal {
                 // A job discovered already terminal still owes the durable feed its one
                 // terminal occurrence; the poller will then suppress its own copy. The run
@@ -2159,6 +2173,7 @@ where
         phase: Some(state.to_owned()),
         terminal,
         snapshot: false,
+        snapshot_cursor: None,
     });
 }
 
@@ -2314,6 +2329,7 @@ fn publish_pool(feed: &HubFeed, record: &Value) {
         phase: Some(phase),
         terminal,
         snapshot: false,
+        snapshot_cursor: None,
     });
 }
 
@@ -2426,6 +2442,7 @@ impl HubFeed {
             phase,
             terminal,
             snapshot: false,
+            snapshot_cursor: None,
         });
     }
 
@@ -2538,6 +2555,7 @@ impl HubFeed {
             phase: None,
             terminal: false,
             snapshot: false,
+            snapshot_cursor: None,
         });
     }
 }
@@ -3064,6 +3082,7 @@ mod warning_tests {
             phase: None,
             terminal: false,
             snapshot,
+            snapshot_cursor: None,
         }
     }
 

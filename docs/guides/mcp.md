@@ -198,13 +198,15 @@ Subscription arguments are all optional filters:
 
 - `cursor: null` starts with a bootstrap snapshot and then the live feed. For every known job
   (queued, placing, running, or already attempted) the first batch contains one synthesized
-  `hub.job` in `submittedAt` order with `data.snapshot: true` and the current state. It uses
-  `eventId`/`data.cursor` `hub:0`, is never replayed, and is never reported by a later poll. After
-  that, the feed carries each genuine occurrence once; bootstrap records replace remembered job
-  replay so stale job state cannot be repeated. A bootstrap for an already-terminal job is that
-  job's one durable terminal occurrence, so its publication moves the response cursor past itself
-  and a resume cannot replay it. Run and pool replay still follows the retained window. There is
-  no backfill of run history.
+  `hub.job` in `submittedAt` order with `data.snapshot: true` and the current state. Each record
+  has a distinct `eventId`/`data.cursor` of `hub:snapshot:<delivered>:<start>`, where
+  `<delivered>` counts the synthesized records already sent and `<start>` is the durable boundary
+  the batch began from. It is never replayed, and is never reported by a later poll. After that,
+  the feed carries each genuine occurrence once; bootstrap records replace remembered job replay
+  so stale job state cannot be repeated. A bootstrap for an already-terminal job is that job's
+  one durable terminal occurrence, so its publication moves the response cursor past itself and a
+  resume cannot replay it. Run and pool replay still follows the retained window. There is no
+  backfill of run history.
 - A subscription opened with a cursor does not bootstrap; it resumes strictly after that cursor.
 - A cursor is exclusive. The response cursor advances to the last delivered event and never moves
   backwards.

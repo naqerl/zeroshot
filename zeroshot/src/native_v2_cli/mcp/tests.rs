@@ -1076,10 +1076,9 @@ async fn hub_events_multiplex_a_whole_hub_on_one_cursor() {
     let mut sequences = Vec::new();
     for event in &events {
         let event_id = event["eventId"].as_str().expect("hub event id");
-        let sequence = event_id
-            .strip_prefix("hub:")
-            .and_then(|value| value.parse::<u64>().ok())
-            .expect("hub cursor shape");
+        let sequence = event["data"]["sequence"]
+            .as_u64()
+            .expect("hub event sequence");
         sequences.push(sequence);
         let envelope = event.as_object().expect("hub event object");
         assert_eq!(
@@ -1447,9 +1446,10 @@ async fn hub_bootstrap_snapshots_every_known_job_in_submission_order() {
     assert_eq!(snapshots[0]["data"]["jobId"], json!("hj_earlier"));
     assert_eq!(snapshots[1]["data"]["jobId"], json!("hj_later"));
     let mut sequences = Vec::new();
-    for event in &snapshots {
-        assert_eq!(event["eventId"], json!("hub:0"));
-        assert_eq!(event["data"]["cursor"], json!("hub:0"));
+    for (index, event) in snapshots.iter().enumerate() {
+        let identity = format!("hub:snapshot:{}:0", index + 1);
+        assert_eq!(event["eventId"], json!(identity));
+        assert_eq!(event["data"]["cursor"], json!(identity));
         assert_eq!(event["data"]["replayed"], json!(false));
         sequences.push(event["data"]["sequence"].as_u64().expect("sequence"));
         for field in [
@@ -2194,12 +2194,10 @@ async fn a_nameless_subscription_streams_jobs_runs_and_pool_phases() {
         .iter()
         .filter(|frame| frame["params"]["eventId"].is_string())
     {
-        let event_id = frame["params"]["eventId"].as_str().expect("hub event id");
         sequences.push(
-            event_id
-                .strip_prefix("hub:")
-                .and_then(|value| value.parse::<u64>().ok())
-                .expect("hub cursor shape"),
+            frame["params"]["data"]["sequence"]
+                .as_u64()
+                .expect("hub event sequence"),
         );
     }
     assert!(
