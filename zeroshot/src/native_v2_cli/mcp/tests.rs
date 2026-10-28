@@ -2394,10 +2394,16 @@ async fn hub_replay_reports_the_exact_evicted_range_and_starts_at_the_front() {
             "params": {"arguments": {}, "cursor": "hub:0"}
         }))
         .await;
-    let frames = collect_stream(response, Duration::from_secs(2), |frames| {
-        stream_notifications(frames)
+    // The active view now follows the replayed prefix, so a large evicted batch may take a
+    // moment before the completed frame arrives.
+    let frames = collect_stream(response, Duration::from_secs(10), |frames| {
+        let notifications = stream_notifications(frames);
+        notifications
             .iter()
-            .any(|frame| frame["method"] == json!("notifications/events/event"))
+            .any(|frame| frame["method"] == json!("notifications/events/active"))
+            && notifications
+                .iter()
+                .any(|frame| frame["method"] == json!("notifications/events/event"))
     })
     .await;
     let active = stream_notifications(&frames)

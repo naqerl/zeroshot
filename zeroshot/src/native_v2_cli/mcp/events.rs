@@ -809,17 +809,6 @@ where
     if cancelled.load(Ordering::Relaxed) {
         return Ok(());
     }
-    write_active(
-        &writer,
-        &id,
-        &ActiveView {
-            cursor: &cursor,
-            run: None,
-            truncated: truncated.clone(),
-            job: None,
-        },
-    )
-    .await?;
     let filter = HubFilter {
         selector: &selector,
         target: &target,
@@ -857,6 +846,20 @@ where
             cursor = Some(hub_cursor(event.sequence));
         }
     }
+    // Advertise the cursor after the replayed prefix drains. A pre-replay active frame would
+    // leave a reconnect at the subscription start even though this stream already delivered the
+    // whole batch, causing a second bootstrap.
+    write_active(
+        &writer,
+        &id,
+        &ActiveView {
+            cursor: &cursor,
+            run: None,
+            truncated: truncated.clone(),
+            job: None,
+        },
+    )
+    .await?;
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
