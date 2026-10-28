@@ -17,9 +17,11 @@ those effects. Acceptance cannot override forge policy, required checks, reviews
 
 The helper runs under the delivery poll policy's operation budget. A check that reads stdin, blocks
 on a network mount, or deadlocks against the workspace therefore fails the delivery as a declared
-timeout instead of leaving an execution that looks alive forever. Bounded pipes and cancellation use
-the normal process session; its process tree must be confirmed gone before delivery releases the
-workspace, even if the outer operation is cancelled or its turn deadline expires. An accepted helper
+timeout instead of leaving an execution that looks alive forever. Each forge authority call (branch
+push, review observation, and merge request) gets one bounded operation deadline and narrows it to
+the remaining time on retries; poll intervals govern repeated polling, not a single call.
+Bounded pipes and cancellation use the normal process session; its process tree must be confirmed
+gone before delivery releases the workspace, even if the outer operation is cancelled or its turn deadline expires. An accepted helper
 must leave the captured candidate clean and unchanged. GitHub confirmation remains authoritative:
 accepting or queuing a merge is not a merged receipt.
 

@@ -219,7 +219,7 @@ impl NativeV2DeliveryAdapter {
             .validate_within(
                 request,
                 control.cancellation(),
-                Some(self.delivery_deadline()),
+                Some(self.validation_deadline()),
             )
             .await?
         {
