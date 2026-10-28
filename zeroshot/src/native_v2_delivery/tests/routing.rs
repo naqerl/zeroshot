@@ -3,8 +3,8 @@ use openengine_cluster_protocol::GraphSpec;
 use openengine_cluster_testkit::assertions::JsonAt;
 
 #[test]
-fn hosted_delivery_polling_has_no_work_duration_limit() {
-    assert!(DeliveryPollPolicy::default().has_next(usize::MAX));
+fn hosted_delivery_polling_is_bounded_by_default() {
+    assert!(!DeliveryPollPolicy::default().has_next(usize::MAX));
     assert!(
         !DeliveryPollPolicy::new(3, Duration::ZERO)
             .assert_value()

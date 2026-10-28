@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -15,10 +16,14 @@ use crate::execution::process::{
     ProcessSessionOutput, ProcessStdout,
 };
 use crate::native_v2_runner::NodeRunnerError;
+use tokio::time::Instant;
 
 const VALIDATION_KIND: &str = "openengine.delivery-validation/v1";
 const MAX_VALIDATION_BYTES: usize = 1024 * 1024;
 const MAX_REASON_BYTES: usize = 8 * 1024;
+/// The trusted check may run for a while, but never forever; a deadlock or blocked mount must
+/// surface as a failed delivery instead of an execution that looks alive but never emits.
+const VALIDATION_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 /// Controller-owned executable outside the checkout, never supplied to provider children.
 #[derive(Clone)]
@@ -110,7 +115,8 @@ impl TrustedDeliveryValidator {
         &self.path
     }
 
-    /// No turn deadline is imposed. Cancellation and every exchange exit await containment cleanup.
+    /// A bounded turn deadline applies. Cancellation and every exchange exit await containment
+    /// cleanup.
     pub async fn validate(
         &self,
         request: DeliveryValidationRequest<'_>,
@@ -193,7 +199,7 @@ impl TrustedDeliveryValidator {
                 current_dir: self.workspace.clone(),
                 mode: WorkspaceAccessMode::ReadWrite,
             },
-            deadline: None,
+            deadline: Some(Instant::now() + VALIDATION_DEADLINE),
         })
     }
 }

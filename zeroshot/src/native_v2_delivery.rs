@@ -82,6 +82,8 @@ const DELIVERY_MERGE_REVISION_FIELD: &str = "mergeRevision";
 const DELIVERY_PULL_REQUEST_ID_FIELD: &str = "pullRequestId";
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(20);
+/// A finite default so a stuck authority or forge cannot keep a delivery running for hours.
+const DEFAULT_POLL_ATTEMPTS: usize = 90;
 const REVIEW_SYNC_ATTEMPTS: usize = 10;
 const REVIEW_SYNC_DEADLINE: Duration = Duration::from_secs(60);
 const REVIEW_SYNC_INTERVAL: Duration = Duration::from_secs(1);
@@ -204,6 +206,7 @@ impl DeliveryPollPolicy {
         })
     }
 
+    #[cfg(test)]
     const fn until_cancelled(interval: Duration) -> Self {
         Self {
             maximum_attempts: None,
@@ -221,7 +224,10 @@ impl DeliveryPollPolicy {
 
 impl Default for DeliveryPollPolicy {
     fn default() -> Self {
-        Self::until_cancelled(DEFAULT_POLL_INTERVAL)
+        Self {
+            maximum_attempts: Some(DEFAULT_POLL_ATTEMPTS),
+            interval: DEFAULT_POLL_INTERVAL,
+        }
     }
 }
 
