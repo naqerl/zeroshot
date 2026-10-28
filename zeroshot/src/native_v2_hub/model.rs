@@ -103,6 +103,12 @@ pub(crate) struct Member {
     pub capabilities_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_error: Option<String>,
+    /// Consecutive failed discoveries, used only to back off retries.
+    #[serde(default)]
+    pub capability_failures: u32,
+    /// Earliest time a failed discovery may be retried; `None` means retry as soon as stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_retry_at_ms: Option<u64>,
     /// Pool that created this member's server; `None` for registered members.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool: Option<String>,
@@ -142,6 +148,8 @@ impl Member {
             capabilities: None,
             capabilities_at_ms: None,
             capability_error: None,
+            capability_failures: 0,
+            capability_retry_at_ms: None,
             pool: None,
             server_id: None,
             idle_since_ms: None,

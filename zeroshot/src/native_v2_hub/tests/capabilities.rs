@@ -281,11 +281,21 @@ async fn discovery_refreshes_stale_members_and_keeps_known_capabilities_on_error
         Some(&["old".to_owned()][..])
     );
     assert!(members[2].capability_error.is_some());
+    assert_eq!(members[2].capability_failures, 1);
+    assert_eq!(
+        members[2].capability_retry_at_ms,
+        Some(10 + 60_000),
+        "a failed discovery backs off instead of adding its timeout to every pass"
+    );
     members[1].capabilities = None;
     discover(&mut members, &driver, 12, 5).await;
     assert_eq!(
         members[1].capabilities, None,
         "fresh entries are not refetched"
+    );
+    assert_eq!(
+        members[2].capability_failures, 1,
+        "a backed-off member is not rediscovered before its retry time"
     );
 }
 

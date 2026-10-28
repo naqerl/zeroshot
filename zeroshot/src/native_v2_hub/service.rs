@@ -753,6 +753,9 @@ impl HubService {
                 let run_id = run_id.clone();
                 let job = self
                     .mutate(|state| {
+                        if result.is_ok() {
+                            schedule::record_target_health(state, target, now);
+                        }
                         let job = state
                             .jobs
                             .iter_mut()

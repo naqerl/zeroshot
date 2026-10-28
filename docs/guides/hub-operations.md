@@ -150,10 +150,12 @@ reports the configured duration in milliseconds as `maxStallMs`; it is `null` wh
 The dispatcher probes every member on every pass, not only when a queued job needs placement.
 The hub has no in-tree anonymous rate limiter: its API is bearer-only, and probes go through the
 same target-credential path as `zeroshot list` rather than a separate anonymous visitor bucket. A
-rate-limit, timeout, busy or `status_unavailable` answer from a target is therefore inconclusive
-rather than evidence that the target is gone. A failed status read never fails the job: it is
-recorded as `errorKind` `status_unavailable`, the job keeps running, and the retryable warning
-stays visible through `hub.warning` until a later status read succeeds.
+rate-limit, timeout, busy, rejected credential or `status_unavailable` answer from a target is
+therefore inconclusive rather than evidence that the target is gone. A failed status read never
+fails the job: it is recorded as `errorKind` `status_unavailable`, the job keeps running, and the
+retryable warning stays visible through `hub.warning` until a later status read succeeds. A
+completed status read is direct proof that the member is alive, so it clears the member's load
+failure streak even when its `list` route fails.
 
 A running job is failed with `failureReason` `target_lost` and `errorKind` `target_lost` only after
 decisive confirmation: its member is gone from the hub, or it failed three consecutive decisive

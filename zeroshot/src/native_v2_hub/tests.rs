@@ -279,6 +279,11 @@ async fn a_stalled_run_is_stopped_and_failed_with_its_cursor_and_still_time() {
     let settled = service.snapshot().await.jobs.remove(0);
     assert_eq!(settled.state, JobState::Failed);
     assert_eq!(settled.failure_reason.as_deref(), Some("stalled"));
+    assert_eq!(
+        settled.failure_classification.as_deref(),
+        Some(super::schedule::CLASSIFIED_STALLED),
+        "a hub-initiated kill names its own classification"
+    );
     let error = settled.error.expect("stall error");
     assert_eq!(error.kind, JobErrorKind::Stalled);
     assert!(
@@ -291,6 +296,24 @@ async fn a_stalled_run_is_stopped_and_failed_with_its_cursor_and_still_time() {
         driver.stops.lock().expect("fake lock").as_slice(),
         [("box".to_owned(), "run-stalled".to_owned())]
     );
+}
+
+#[test]
+fn a_stalled_run_without_a_cursor_falls_back_to_its_dispatch_time() {
+    let mut running = job("hj_silent", 0);
+    running.state = JobState::Running;
+    running.target = Some("box".to_owned());
+    running.run_id = Some("run-silent".to_owned());
+    running.dispatched_at_ms = Some(10);
+    let stalled = super::schedule::stalled_runs(&[running], 100, 50);
+    assert_eq!(
+        stalled.len(),
+        1,
+        "a status without a cursor must not disable --max-stall"
+    );
+    assert_eq!(stalled[0].job_id, "hj_silent");
+    assert_eq!(stalled[0].cursor, "");
+    assert_eq!(stalled[0].still_ms, 90);
 }
 
 #[tokio::test]
@@ -592,6 +615,45 @@ async fn a_missing_members_job_is_reaped_while_a_placed_job_without_a_deadline_r
 }
 
 #[tokio::test]
+async fn a_status_success_clears_a_stale_probe_streak() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let driver = std::sync::Arc::new(FakeDriver {
+        unreachable: vec!["box".to_owned()],
+        status_ok: vec!["box".to_owned()],
+        ..FakeDriver::default()
+    });
+    let service = super::service::HubService::open(
+        super::store::HubStore::new(directory.path().join("hub")),
+        driver,
+        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
+    )
+    .expect("service");
+    let mut running = job("hj_observed", 0);
+    running.state = JobState::Running;
+    running.target = Some("box".to_owned());
+    running.run_id = Some("run-observed".to_owned());
+    let mut boxed = member("box", &[], 1, 0);
+    boxed.last_probe_ok_at_ms = Some(1);
+    boxed.unreachable_probes = UNREACHABLE_REAP_THRESHOLD - 1;
+    service
+        .mutate(|state| {
+            state.members.push(boxed);
+            state.jobs.push(running);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+    // The status read is direct proof the member still serves this run, so the `list` failure in
+    // the same pass starts a fresh streak instead of completing the stale one.
+    let (report, _) = service.pass().await.expect("observed pass");
+    assert!(report.target_lost.is_empty(), "{report:?}");
+    let state = service.snapshot().await;
+    assert_eq!(state.member("box").expect("member").unreachable_probes, 1);
+    assert_eq!(state.jobs[0].state, JobState::Running);
+    assert!(state.jobs[0].reaper.is_none());
+}
+
+#[tokio::test]
 async fn a_member_unreachable_once_keeps_its_job_until_the_reap_threshold() {
     let directory = tempfile::tempdir().expect("tempdir");
     let driver = std::sync::Arc::new(FakeDriver {
@@ -703,6 +765,35 @@ async fn a_member_unreachable_once_keeps_its_job_until_the_reap_threshold() {
             "an IPv6 target endpoint must be checked without a host lookup: {note}"
         );
     }
+}
+
+#[test]
+fn rejected_credentials_and_timeouts_are_not_proof_that_a_member_is_gone() {
+    for message in [
+        "zeroshot list: 401 Unauthorized",
+        "authentication failed for target",
+        "request timed out",
+        "permission denied",
+        "too many requests: 429",
+    ] {
+        let error = HubError::Target {
+            message: message.to_owned(),
+            diagnostic: None,
+        };
+        assert_eq!(
+            super::schedule::classify_probe_error(&error),
+            Reachability::Inconclusive,
+            "{message} describes our access, not the member's presence"
+        );
+    }
+    let refused = HubError::Target {
+        message: "unreachable: connection refused".to_owned(),
+        diagnostic: None,
+    };
+    assert_eq!(
+        super::schedule::classify_probe_error(&refused),
+        Reachability::Unreachable
+    );
 }
 
 /// A timeout, a rate limit or an empty answer is not proof that a member is gone: the streak
@@ -894,6 +985,9 @@ fn active_runs_count_nonterminal_phases() {
 pub(super) struct FakeDriver {
     pub runs: Mutex<BTreeMap<String, Vec<(String, &'static str)>>>,
     pub unreachable: Vec<String>,
+    /// Members whose `list` probe fails but whose `status` reads still answer, like a target
+    /// with a broken list route.
+    pub status_ok: Vec<String>,
     /// Members whose status probe times out without proving the target is gone.
     pub inconclusive: Vec<String>,
     pub rejecting: Vec<String>,
@@ -998,6 +1092,20 @@ impl HubDriver for FakeDriver {
     }
 
     async fn status(&self, member: &str, run_id: &str) -> Result<Value, HubError> {
+        if !self.status_ok.iter().any(|name| name == member) {
+            if self.inconclusive.iter().any(|name| name == member) {
+                return Err(HubError::Target {
+                    message: format!("zeroshot status {member} timed out: status_unavailable"),
+                    diagnostic: None,
+                });
+            }
+            if self.unreachable.iter().any(|name| name == member) {
+                return Err(HubError::Target {
+                    message: "unreachable: connection refused".to_owned(),
+                    diagnostic: None,
+                });
+            }
+        }
         if let Some(delay) = self.status_delay {
             tokio::time::sleep(delay).await;
         }

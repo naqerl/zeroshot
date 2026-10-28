@@ -19,6 +19,10 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const UNREACHABLE_REAP_THRESHOLD: u32 = 3;
 /// Discovered capabilities are refreshed after this age by placement passes.
 pub(crate) const CAPABILITY_TTL_MS: u64 = 5 * 60 * 1000;
+/// A failed discovery backs off from one minute, doubling to half an hour, so a dead member is
+/// not probed on every pass while it stays registered.
+const CAPABILITY_RETRY_BASE_MS: u64 = 60 * 1000;
+const CAPABILITY_RETRY_MAX_MS: u64 = 30 * 60 * 1000;
 
 /// Outcome of one dispatcher pass.
 #[derive(Debug, Default)]
@@ -126,9 +130,9 @@ pub(crate) async fn probe(
     loads
 }
 
-/// Classify a failed probe. Only decisive transport or authentication evidence may count
-/// toward a member's failure streak; a timeout, rate limit or busy target is inconclusive, since
-/// it says nothing about whether the member is still there.
+/// Classify a failed probe. Only decisive transport evidence may count toward a member's
+/// failure streak; a timeout, rate limit, busy target, or rejected credential is inconclusive,
+/// since it says nothing about whether the member is still there.
 pub(crate) fn classify_probe_error(error: &HubError) -> Reachability {
     let text = error.to_string().to_ascii_lowercase();
     if [
@@ -144,6 +148,10 @@ pub(crate) fn classify_probe_error(error: &HubError) -> Reachability {
         "connection aborted",
         "temporarily unavailable",
         "status_unavailable",
+        "authentication",
+        "unauthorized",
+        "forbidden",
+        "permission denied",
     ]
     .iter()
     .any(|needle| text.contains(needle))
@@ -156,10 +164,6 @@ pub(crate) fn classify_probe_error(error: &HubError) -> Reachability {
         "unknown host",
         "name or service not known",
         "nodename nor servname",
-        "authentication",
-        "unauthorized",
-        "forbidden",
-        "permission denied",
     ]
     .iter()
     .any(|needle| text.contains(needle))
@@ -214,6 +218,34 @@ pub(crate) fn record_health(
     }
 }
 
+/// A completed `status` read is direct proof that the member is alive and still serving this
+/// job, so it must clear the same failure streak a successful load probe clears. Without this,
+/// a member that answers status but not `list` is reaped while the hub is actively observing it.
+pub(crate) fn record_target_health(state: &mut HubState, target: &str, now_ms: u64) {
+    if let Some(member) = state
+        .members
+        .iter_mut()
+        .find(|member| member.name == target)
+    {
+        member.unreachable_probes = 0;
+        member.last_probe_ok_at_ms = Some(now_ms);
+    }
+    for job in state
+        .jobs
+        .iter_mut()
+        .filter(|job| job.state == JobState::Running && job.target.as_deref() == Some(target))
+    {
+        job.target_last_ok_at_ms = Some(now_ms);
+        if !job
+            .error
+            .as_ref()
+            .is_some_and(|error| error.kind == JobErrorKind::StatusUnavailable)
+        {
+            job.reaper = None;
+        }
+    }
+}
+
 /// A running job whose member left the hub or failed too many decisive probes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LostTarget {
@@ -234,6 +266,7 @@ pub(crate) struct LostTarget {
 pub(crate) const CLASSIFIED_MEMBER_ABSENT: &str = "member_absent";
 pub(crate) const CLASSIFIED_PROVIDER_ABSENT: &str = "provider_confirmed_absent";
 pub(crate) const CLASSIFIED_ENDPOINT_REFUSED: &str = "endpoint_refused";
+pub(crate) const CLASSIFIED_STALLED: &str = "stalled";
 
 /// A lost-target candidate the reaper kept running, with the reason it withheld action.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -442,9 +475,11 @@ pub(crate) async fn discover(
         .enumerate()
         .filter(|(_, member)| member.name != LOCAL_MEMBER && member.state != MemberState::Disabled)
         .filter(|(_, member)| {
-            member
-                .capabilities_at_ms
-                .is_none_or(|at| now_ms.saturating_sub(at) >= max_age_ms)
+            let retry_ready = member.capability_retry_at_ms.is_none_or(|at| now_ms >= at);
+            retry_ready
+                && member
+                    .capabilities_at_ms
+                    .is_none_or(|at| now_ms.saturating_sub(at) >= max_age_ms)
         })
         .map(|(index, member)| (index, member.name.clone()))
         .collect::<Vec<_>>();
@@ -460,11 +495,23 @@ pub(crate) async fn discover(
                 member.capabilities = Some(capabilities);
                 member.capabilities_at_ms = Some(now_ms);
                 member.capability_error = None;
+                member.capability_failures = 0;
+                member.capability_retry_at_ms = None;
             }
-            Ok(Err(error)) => member.capability_error = Some(error.to_string()),
-            Err(_) => member.capability_error = Some("discovery timed out".to_owned()),
+            Ok(Err(error)) => back_off_discovery(member, now_ms, error.to_string()),
+            Err(_) => back_off_discovery(member, now_ms, "discovery timed out".to_owned()),
         }
     }
+}
+
+fn back_off_discovery(member: &mut Member, now_ms: u64, error: String) {
+    member.capability_error = Some(error);
+    member.capability_failures = member.capability_failures.saturating_add(1);
+    let shift = member.capability_failures.saturating_sub(1).min(5);
+    let delay = CAPABILITY_RETRY_BASE_MS
+        .saturating_mul(1u64 << shift)
+        .min(CAPABILITY_RETRY_MAX_MS);
+    member.capability_retry_at_ms = Some(now_ms.saturating_add(delay));
 }
 
 /// Unconfirmed submissions a job may have before it fails, unless the daemon sets another
@@ -692,6 +739,9 @@ pub(crate) fn apply_polls(
 ) -> Vec<Value> {
     let mut finished = Vec::new();
     for (poll, result) in results {
+        if result.is_ok() {
+            record_target_health(state, &poll.target, now_ms);
+        }
         let Some(job) = state.jobs.iter_mut().find(|job| {
             job.job_id == poll.job_id
                 && job.state == JobState::Running
@@ -719,6 +769,8 @@ pub(crate) fn merge_capabilities(members: &mut [Member], discovered: &[Member]) 
             member.capabilities.clone_from(&found.capabilities);
             member.capabilities_at_ms = found.capabilities_at_ms;
             member.capability_error.clone_from(&found.capability_error);
+            member.capability_failures = found.capability_failures;
+            member.capability_retry_at_ms = found.capability_retry_at_ms;
         }
     }
 }
@@ -810,20 +862,21 @@ pub(crate) struct StalledRun {
 }
 
 /// Running jobs whose cursor has stayed unchanged for at least `max_stall_ms`.
+///
+/// A run that has not produced a cursor yet is still stalled once it has sat at dispatch for the
+/// same budget; otherwise `--max-stall` silently does nothing for a run that never starts
+/// watching. Missing identity fields stay empty rather than excluding the job from the check.
 pub(crate) fn stalled_runs(jobs: &[Job], now_ms: u64, max_stall_ms: u64) -> Vec<StalledRun> {
     jobs.iter()
         .filter(|job| job.state == JobState::Running)
         .filter_map(|job| {
-            let target = job.target.clone()?;
-            let run_id = job.run_id.clone()?;
-            let cursor = job.last_cursor.clone()?;
-            let at = job.last_cursor_at_ms?;
+            let at = job.last_cursor_at_ms.or(job.dispatched_at_ms)?;
             let still_ms = now_ms.saturating_sub(at);
             (still_ms >= max_stall_ms).then_some(StalledRun {
                 job_id: job.job_id.clone(),
-                target,
-                run_id,
-                cursor,
+                target: job.target.clone().unwrap_or_default(),
+                run_id: job.run_id.clone().unwrap_or_default(),
+                cursor: job.last_cursor.clone().unwrap_or_default(),
                 still_ms,
             })
         })
@@ -852,8 +905,8 @@ pub(crate) fn settle_stalled(jobs: &mut [Job], settlement: StallSettlement<'_>) 
             continue;
         };
         if job.state != JobState::Running
-            || job.run_id.as_deref() != Some(run.run_id.as_str())
-            || job.last_cursor.as_deref() != Some(run.cursor.as_str())
+            || job.run_id.as_deref().unwrap_or_default() != run.run_id
+            || job.last_cursor.as_deref().unwrap_or_default() != run.cursor
         {
             continue;
         }
@@ -871,11 +924,22 @@ pub(crate) fn settle_stalled(jobs: &mut [Job], settlement: StallSettlement<'_>) 
         job.state = JobState::Failed;
         job.finished_at_ms = Some(now_ms);
         job.failure_reason = Some("stalled".to_owned());
+        job.failure_classification = Some(CLASSIFIED_STALLED.to_owned());
+        let run_label = if run.run_id.is_empty() {
+            "the run".to_owned()
+        } else {
+            format!("run {}", run.run_id)
+        };
+        let cursor_label = if run.cursor.is_empty() {
+            "no cursor".to_owned()
+        } else {
+            format!("cursor {}", run.cursor)
+        };
         job.error = Some(JobError::new(
             JobErrorKind::Stalled,
             format!(
-                "run {} on {} stayed at cursor {} for {}ms (max stall {}ms); the hub stopped it",
-                run.run_id, run.target, run.cursor, run.still_ms, max_stall_ms
+                "{run_label} on {} stayed at {cursor_label} for {}ms (max stall {}ms); the hub stopped it",
+                run.target, run.still_ms, max_stall_ms
             ),
         ));
         failed.push(json!({
