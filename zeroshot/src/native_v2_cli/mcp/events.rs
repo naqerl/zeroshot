@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
@@ -38,6 +38,8 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HUB_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const HUB_WARNING_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// A watch that failed is retried after this cooldown instead of being tombstoned forever.
+const WATCH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const HUB_LOG_LIMIT: usize = 4096;
 const HUB_BROADCAST_LIMIT: usize = 1024;
 pub(crate) const PHASES: &[&str] = &["admitted", "running", "stopping", "finished"];
@@ -268,6 +270,42 @@ struct WarningEntry {
     announced_cursor: Option<String>,
 }
 
+/// Which runs currently have a live watch, and when a failed one may be retried.
+#[derive(Default)]
+struct WatchBook {
+    active: HashSet<String>,
+    retry_at: HashMap<String, Instant>,
+}
+
+impl WatchBook {
+    fn blocked(&self, run_id: &str, now: Instant) -> bool {
+        self.active.contains(run_id)
+            || self
+                .retry_at
+                .get(run_id)
+                .is_some_and(|retry_at| *retry_at > now)
+    }
+
+    fn started(&mut self, run_id: String) {
+        self.retry_at.remove(&run_id);
+        self.active.insert(run_id);
+    }
+
+    fn retry(&mut self, run_id: &str, now: Instant) {
+        self.active.remove(run_id);
+        self.retry_at
+            .insert(run_id.to_owned(), now + WATCH_RETRY_INTERVAL);
+    }
+
+    fn finished(&mut self, run_id: &str) {
+        self.active.remove(run_id);
+    }
+
+    fn retain_live(&mut self, live: &HashSet<String>) {
+        self.retry_at.retain(|run_id, _| live.contains(run_id));
+    }
+}
+
 impl WarningBook {
     /// Learn the current execution from a run event. An empty `activeExecutions` means the run
     /// is between executions, so the next one starts its own clock.
@@ -307,6 +345,23 @@ impl WarningBook {
 }
 
 impl HubFeed {
+    /// Drop per-job books whose job is no longer visible, so a long-lived daemon does not grow
+    /// with every job it has ever seen.
+    fn retain_jobs(&self, live: &HashSet<String>) {
+        self.run_facts
+            .borrow_mut()
+            .retain(|job_id, _| live.contains(job_id));
+        self.job_labels
+            .borrow_mut()
+            .retain(|job_id, _| live.contains(job_id));
+        self.terminal_jobs
+            .borrow_mut()
+            .retain(|job_id| live.contains(job_id));
+        self.run_seen
+            .borrow_mut()
+            .retain(|job_id, _| live.contains(job_id));
+    }
+
     pub(super) fn new() -> Self {
         let (sender, _) = broadcast::channel(HUB_BROADCAST_LIMIT);
         Self {
@@ -666,6 +721,12 @@ where
     let start = after.unwrap_or_else(|| feed.head());
     let (receiver, mut replay, truncated, mut cursor) = feed.snapshot(after);
     let mut truncated = merge_truncated(truncated, stale);
+    // The active view is written before replay. A bootstrap starts before every retained event
+    // so the advertised cursor never skips the batch that follows; replay advances it event by
+    // event, and a reconnect before the stream drains replays rather than loses the prefix.
+    if after.is_none() {
+        cursor = Some(hub_cursor(0));
+    }
     if after.is_none()
         && let Some(snapshots) = snapshot_events(host.as_ref(), feed, request).await
     {
@@ -679,9 +740,6 @@ where
         let mut combined = snapshots;
         combined.extend(replay);
         replay = combined;
-        // A bootstrap for an already-terminal job publishes that job's one durable terminal
-        // occurrence. Start the active cursor after it so a resume cannot replay it.
-        cursor = Some(hub_cursor(feed.head()));
     }
     Ok(Prepared {
         subscription: HubSubscription {
@@ -995,7 +1053,9 @@ fn truncation_bounds(value: &Value) -> (Option<u64>, Option<u64>) {
 pub(super) fn rpc_error(error: EventError) -> (i64, &'static str, Value) {
     match error {
         EventError::Invalid(failure) => (-32602, "Invalid params", failure_data(failure)),
-        EventError::NotFound => (-32600, "Invalid Request", json!({"kind": "event"})),
+        // An unknown event name is a bad subscription parameter, not a missing session: a
+        // client can correct the typo without restarting the MCP session.
+        EventError::NotFound => (-32602, "Invalid params", json!({"kind": "event"})),
         EventError::Failed(failure) if failure.code == "run.not_found" => (
             -32023,
             "NotFound",
@@ -1483,7 +1543,6 @@ where
             }
         }
     }
-    let bootstrap_len = selected.len();
     for event in &replay {
         if repeated_job_state(event, &job_states) {
             continue;
@@ -1505,13 +1564,15 @@ where
     // A fresh poll starts at the head after any bootstrap terminal publication, so the
     // caller never replays an occurrence it already received as a snapshot.
     let mut cursor = after.unwrap_or_else(|| feed.head());
-    if selected.len() > bootstrap_len.saturating_add(request.max_events) {
-        selected.truncate(bootstrap_len.saturating_add(request.max_events));
+    if selected.len() > request.max_events {
+        selected.truncate(request.max_events);
         if let Some((selected_sequence, _)) = selected.last() {
             cursor = *selected_sequence;
         }
         // A maxEvents clip is resumable from the returned cursor, so it is hasMore
-        // rather than truncation. Only replay or backpressure can permanently lose events.
+        // rather than truncation. Bootstrap snapshots share that bound instead of being
+        // prepended for free; otherwise a hub that knows thousands of jobs sends them all
+        // in one frame and reports hasMore: false.
         has_more = true;
     } else if snapshots.is_none() {
         // Filters can hide every replay record while the cursor still has to advance past it.
@@ -1572,7 +1633,7 @@ where
 {
     let mut jobs: HashMap<String, String> = HashMap::new();
     let mut pool_sequence: u64 = 0;
-    let mut watched: HashSet<String> = HashSet::new();
+    let watched = Rc::new(RefCell::new(WatchBook::default()));
     let mut poll = tokio::time::interval(HUB_POLL_INTERVAL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut warning = tokio::time::interval(HUB_WARNING_INTERVAL);
@@ -1581,7 +1642,7 @@ where
     loop {
         tokio::select! {
             _ = poll.tick() => {
-                poll_jobs(host.as_ref(), &feed, &mut jobs, &mut watched).await;
+                poll_jobs(host.as_ref(), &feed, &mut jobs, &watched).await;
                 poll_pools(host.as_ref(), &feed, &mut pool_sequence).await;
             }
             _ = warning.tick() => {
@@ -1862,17 +1923,27 @@ async fn poll_jobs<H>(
     host: &H,
     feed: &Rc<HubFeed>,
     jobs: &mut HashMap<String, String>,
-    watched: &mut HashSet<String>,
+    watched: &Rc<RefCell<WatchBook>>,
 ) where
     H: McpHost + 'static,
 {
     let Ok(views) = hub_job_views(host).await else {
         return;
     };
+    let mut live_jobs = HashSet::new();
+    let mut running_jobs = HashSet::new();
+    let mut live_runs = HashSet::new();
     for view in views {
         let Some(job_id) = view.get("jobId").and_then(Value::as_str).map(str::to_owned) else {
             continue;
         };
+        live_jobs.insert(job_id.clone());
+        if !matches!(
+            hub_job_state(&view).as_str(),
+            "succeeded" | "failed" | "dequeued" | "cancelled"
+        ) {
+            running_jobs.insert(job_id.clone());
+        }
         let state = hub_job_state(&view);
         if let Some(labels) = view.get("labels") {
             feed.job_labels
@@ -1917,7 +1988,13 @@ async fn poll_jobs<H>(
         else {
             continue;
         };
-        if !watched.insert(run_id.clone()) {
+        if !running_jobs.contains(&job_id) {
+            watched.borrow_mut().finished(&run_id);
+            continue;
+        }
+        live_runs.insert(run_id.clone());
+        let now = Instant::now();
+        if watched.borrow().blocked(&run_id, now) {
             continue;
         }
         let target = view
@@ -1929,6 +2006,7 @@ async fn poll_jobs<H>(
             Ok(command) => command,
             Err(failure) => {
                 feed.publish_warning(&job_id, &run_id, json!({"message": rpc_error(failure).1}));
+                watched.borrow_mut().retry(&run_id, now);
                 continue;
             }
         };
@@ -1936,11 +2014,14 @@ async fn poll_jobs<H>(
             Ok(stream) => stream,
             Err(failure) => {
                 feed.publish_warning(&job_id, &run_id, json!({"message": failure.message}));
+                watched.borrow_mut().retry(&run_id, Instant::now());
                 continue;
             }
         };
         let feed = Rc::clone(feed);
+        let watched_book = Rc::clone(watched);
         let watched_run = run_id.clone();
+        watched.borrow_mut().started(run_id);
         tokio::task::spawn_local(async move {
             while let Some(item) = stream.recv().await {
                 match item {
@@ -1962,8 +2043,15 @@ async fn poll_jobs<H>(
                     }
                 }
             }
+            watched_book
+                .borrow_mut()
+                .retry(&watched_run, Instant::now());
         });
     }
+    jobs.retain(|job_id, _| live_jobs.contains(job_id));
+    feed.retain_jobs(&live_jobs);
+    feed.warnings.borrow_mut().retain_running(&running_jobs);
+    watched.borrow_mut().retain_live(&live_runs);
 }
 
 fn hub_job_state(view: &Value) -> String {

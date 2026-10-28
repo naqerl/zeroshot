@@ -1017,7 +1017,7 @@ async fn events_list_describes_one_hub_type_and_poll_and_push() {
             json!({"name": "hub.unknown", "arguments": {}}),
         )
         .await;
-    assert_eq!(unknown["error"]["code"], json!(-32600), "{unknown}");
+    assert_eq!(unknown["error"]["code"], json!(-32602), "{unknown}");
     assert_eq!(unknown["error"]["data"]["kind"], json!("event"));
 
     let subscribe = session

@@ -171,7 +171,8 @@ Subscription arguments are all optional filters:
   and that run's warnings. Supplying both is invalid params (`-32602`).
 - `name` still selects one carried type: `hub.job`, `hub.run`, `hub.pool`, or `hub.warning`.
   `hub` and `hub.event` are aliases for every hub event; `run.event` is the legacy run-watch
-  form. An unknown name is invalid request (`-32600`). There is no wildcard syntax.
+  form. An unknown name is invalid params (`-32602`), like any other bad subscription field.
+  There is no wildcard syntax.
 - `target`, `kinds` (`hub.job`, `hub.run`, `hub.pool`, `hub.warning`), `states`, `phases`,
   `labels`, `nodes`, `terminalOnly`, and `verbose` further filter occurrences.
 - `states` accepts `submitted`, `queued`, `scheduled`, `placing`, `running`, `succeeded`, `failed`,
@@ -210,9 +211,10 @@ Subscription arguments are all optional filters:
 - `truncated` is `false` when nothing was lost. It is `{ "from": "hub:N", "to": "hub:M" }` only
   when replay shortfall or backpressure permanently lost events. Sparse `v2:` watch cursors are
   not evidence of loss, so a normal jump in a run's cursor never sets `truncated`.
-- `hasMore: true` means the batch reached `maxEvents` (default 50, maximum 1000); the returned
-  cursor resumes at the first event not in the batch. A `maxEvents` clip is resumable and never
-  reports `truncated`.
+- `hasMore: true` means the batch reached `maxEvents` (default 50, maximum 1000). Bootstrap
+  snapshots count against that bound, so a hub that knows thousands of jobs cannot return them
+  all in one frame; the returned cursor resumes after the last delivered record. A `maxEvents`
+  clip is resumable and never reports `truncated`.
 - `nextPollMs` is `1000`.
 
 `events/stream` is the same subscription as a long-lived request. It sends
