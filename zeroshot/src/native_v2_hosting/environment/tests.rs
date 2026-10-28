@@ -9,6 +9,24 @@ use crate::native_v2_platform::PreparationProgress;
 
 static NEXT_UID: AtomicU32 = AtomicU32::new(50_000_000);
 
+/// Returns the effective identity for tests that need an unprivileged hosted process pool.
+///
+/// `HostedProcessPool::new` rejects zero UIDs and GIDs, so a process with a root UID *or* a
+/// root GID cannot reach the behavior under test. Such a run prints the privileged identity and
+/// skips instead of failing inside identity validation.
+fn unprivileged_process_identity() -> Option<(u32, u32)> {
+    // SAFETY: geteuid and getegid only observe this test process's effective identity.
+    let identity = unsafe { (libc::geteuid(), libc::getegid()) };
+    let privileged = match identity {
+        (0, 0) => "root UID and root GID",
+        (0, _) => "root UID",
+        (_, 0) => "root GID",
+        _ => return Some(identity),
+    };
+    eprintln!("skipping unprivileged hook test: hosted identities reject a {privileged}");
+    None
+}
+
 #[derive(Default)]
 struct CapturedProgress(Mutex<Vec<String>>);
 #[async_trait]
@@ -332,8 +350,9 @@ async fn unprivileged_setup_hooks_install_tools_and_fail_closed_on_startup_ident
     let runtime = root.child("runtime");
     std::fs::create_dir(&runtime).assert_value();
     std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o711)).assert_value();
-    let uid = unsafe { libc::geteuid() };
-    let gid = unsafe { libc::getegid() };
+    let Some((uid, gid)) = unprivileged_process_identity() else {
+        return;
+    };
     let pool =
         HostedProcessPool::new(uid, gid, uid.checked_add(10_000).assert_value()).assert_value();
     let identity = pool
@@ -434,8 +453,9 @@ async fn setup_hooks_run_for_an_unprivileged_supervisor_and_redact_output() {
     let root = TestDirectory::new("runtime-hooks-unprivileged");
     let workspace = root.child("workspace");
     std::fs::create_dir(&workspace).assert_value();
-    let uid = unsafe { libc::geteuid() };
-    let gid = unsafe { libc::getegid() };
+    let Some((uid, gid)) = unprivileged_process_identity() else {
+        return;
+    };
     let pool = HostedProcessPool::new(uid, gid, uid.saturating_add(10)).assert_value();
     let identity = pool
         .identity(HostedProcessScope::Environment)
