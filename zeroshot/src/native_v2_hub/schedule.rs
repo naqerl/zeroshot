@@ -612,6 +612,9 @@ pub(crate) fn record_cursor(job: &mut Job, status: &Value, now_ms: u64) {
         .or_else(|| status.pointer("/status/atCursor"))
         .and_then(Value::as_str);
     let Some(cursor) = cursor else {
+        // A successful status read without a cursor still proves the run was observed, so it
+        // resets the stall clock without inventing a cursor value.
+        job.last_cursor_at_ms = Some(now_ms);
         return;
     };
     if job.last_cursor.as_deref() == Some(cursor) {
@@ -870,7 +873,13 @@ pub(crate) fn stalled_runs(jobs: &[Job], now_ms: u64, max_stall_ms: u64) -> Vec<
     jobs.iter()
         .filter(|job| job.state == JobState::Running)
         .filter_map(|job| {
-            let at = job.last_cursor_at_ms.or(job.dispatched_at_ms)?;
+            // Prefer the cursor clock, then the last successful contact (a status read without
+            // `atCursor` or a load probe), and only then placement. A reachable member whose
+            // status omits its cursor is observed work, not a silent run.
+            let at = job
+                .last_cursor_at_ms
+                .or(job.target_last_ok_at_ms)
+                .or(job.dispatched_at_ms)?;
             let still_ms = now_ms.saturating_sub(at);
             (still_ms >= max_stall_ms).then_some(StalledRun {
                 job_id: job.job_id.clone(),

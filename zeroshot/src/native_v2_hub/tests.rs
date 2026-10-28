@@ -931,6 +931,34 @@ async fn a_reachable_drain_member_keeps_its_placed_job_running() {
 }
 
 #[test]
+fn a_stalled_run_without_a_cursor_uses_its_last_successful_contact() {
+    let mut running = job("hj_contacted", 0);
+    running.state = JobState::Running;
+    running.target = Some("box".to_owned());
+    running.run_id = Some("run-contacted".to_owned());
+    running.dispatched_at_ms = Some(10);
+    running.target_last_ok_at_ms = Some(90);
+    assert!(
+        super::schedule::stalled_runs(&[running.clone()], 120, 50).is_empty(),
+        "recent contact is not inactivity"
+    );
+    assert_eq!(
+        super::schedule::stalled_runs(&[running], 150, 50)[0].still_ms,
+        60
+    );
+}
+
+#[test]
+fn a_cursorless_successful_status_read_resets_the_stall_clock() {
+    let mut running = job("hj_cursorless", 0);
+    running.state = JobState::Running;
+    running.last_cursor_at_ms = Some(10);
+    super::schedule::record_cursor(&mut running, &json!({"status": "running"}), 40);
+    assert_eq!(running.last_cursor_at_ms, Some(40));
+    assert!(running.last_cursor.is_none());
+}
+
+#[test]
 fn cursor_recording_keeps_time_until_the_cursor_advances() {
     let mut running = job("j1", 0);
     running.state = JobState::Running;
