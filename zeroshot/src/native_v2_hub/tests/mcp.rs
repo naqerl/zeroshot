@@ -23,13 +23,14 @@ async fn daemon_router_requires_auth_and_serves_mcp() {
         )
         .expect("service"),
     );
+    let (mcp_router, mcp) = crate::mcp_host::spawn_production_mcp().expect("MCP worker");
     let state = Arc::new(ApiState {
         service,
         token: TOKEN.to_owned(),
         heartbeat: Arc::new(Mutex::new(json!({"schema": "zeroshot.hub.daemon/v1"}))),
         executable: None,
+        mcp: Some(mcp.stats()),
     });
-    let (mcp_router, mcp) = crate::mcp_host::spawn_production_mcp().expect("MCP worker");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -85,6 +86,17 @@ async fn daemon_router_requires_auth_and_serves_mcp() {
     );
     let body: Value = authorized.json().await.expect("initialize JSON");
     assert_eq!(body["result"]["serverInfo"]["name"], json!("zeroshot"));
+
+    let health: Value = http
+        .get(format!("http://{address}/v1/hub/health"))
+        .send()
+        .await
+        .expect("health")
+        .json()
+        .await
+        .expect("health JSON");
+    assert_eq!(health["mcp"]["inFlight"], json!(0));
+    assert_eq!(health["mcp"]["oldestAgeMs"], Value::Null);
 
     mcp.shutdown().await;
     server.abort();

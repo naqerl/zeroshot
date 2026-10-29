@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncWrite;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, Notify, broadcast};
 
 use super::args::{
     bool_prop, object_schema, optional_string, reject_unknown, string_array_prop, string_prop,
@@ -258,6 +258,10 @@ pub(super) struct HubFeed {
     snapshot: RefCell<Vec<Arc<HubEvent>>>,
     sender: broadcast::Sender<Arc<HubEvent>>,
     started: Cell<bool>,
+    /// The first poll waits until the subscribing bootstrap has taken its snapshot. That keeps
+    /// synthetic bootstrap records and the poller's first observation from racing, while live
+    /// transitions after the subscription still arrive normally.
+    start: Notify,
     warnings: RefCell<WarningBook>,
     /// Latest durable run record per job, used to carry delivery facts into the one terminal
     /// `hub.job` occurrence.
@@ -391,6 +395,7 @@ impl HubFeed {
             snapshot: RefCell::new(Vec::new()),
             sender,
             started: Cell::new(false),
+            start: Notify::new(),
             warnings: RefCell::new(WarningBook::default()),
             run_facts: RefCell::new(HashMap::new()),
             job_labels: RefCell::new(HashMap::new()),
@@ -408,8 +413,14 @@ impl HubFeed {
         }
         let feed = Rc::clone(self);
         tokio::task::spawn_local(async move {
+            feed.start.notified().await;
             hub_poller(host, feed).await;
         });
+    }
+
+    /// Let the resident poller make its first observation after the bootstrap snapshot.
+    pub(super) fn release_poller(&self) {
+        self.start.notify_one();
     }
 
     fn publish(&self, mut event: HubEvent) {
@@ -783,7 +794,7 @@ where
         combined.extend(replay);
         replay = combined;
     }
-    Ok(Prepared {
+    let prepared = Prepared {
         subscription: HubSubscription {
             feed: Rc::clone(feed),
             receiver,
@@ -795,7 +806,9 @@ where
             kinds: request.filters.kinds.clone(),
         },
         filters: request.filters.clone(),
-    })
+    };
+    feed.release_poller();
+    Ok(prepared)
 }
 
 pub(super) struct StreamOutput<W> {
@@ -1661,6 +1674,7 @@ where
         HubPosition::Snapshot(delivered) => snapshot_cursor(delivered, start),
         HubPosition::Durable(sequence) => hub_cursor(sequence),
     };
+    feed.release_poller();
     Ok(json!({
         "resultType": "complete",
         "events": events,
@@ -2178,15 +2192,18 @@ where
     }
     let terminal = matches!(state, "succeeded" | "failed" | "dequeued" | "cancelled");
     if terminal {
-        // Reserve the one terminal before awaiting the run lookup so the poller, a bootstrap,
-        // and a resumed subscription cannot publish competing copies.
-        feed.terminal_jobs.borrow_mut().insert(job_id.to_owned());
         if !matches!(delivery_facts(feed, job_id, view), Some((Some(_), Some(_))))
             && view.get("runId").and_then(Value::as_str).is_some()
             && let Ok(snapshot) = job_status(host, job_id).await
             && let Some(run) = snapshot.run
         {
             feed.run_facts.borrow_mut().insert(job_id.to_owned(), run);
+        }
+        // Reserve the one terminal only after the last await, so publication is atomic. A
+        // bootstrap or poller that loses this race already sees the winner's durable record:
+        // no subscriber can be left waiting on a reservation whose publisher was cancelled.
+        if !feed.terminal_jobs.borrow_mut().insert(job_id.to_owned()) {
+            return;
         }
     }
     let reason = view

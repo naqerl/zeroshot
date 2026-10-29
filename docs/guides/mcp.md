@@ -36,10 +36,20 @@ Requests without a valid `Authorization: Bearer <api-token>` header fail with `4
 the `Mcp-Session-Id` response header. Later requests must send that id; a missing, unknown, or
 expired id fails with `-32600` and `data.code` `mcp.session_required`. Calling `initialize` again
 with an existing id resets that session so a client can recover after a dropped connection. Idle
-sessions are discarded after 30 minutes. Notifications return `202 Accepted` without a JSON-RPC body.
+sessions are discarded after 30 minutes. `DELETE /mcp` with a session id aborts that session's
+open streams and in-flight jobs, answers `204 No Content`, and makes later requests with that id
+fail as an unknown session. Notifications return `202 Accepted` without a JSON-RPC body.
 `events/stream` returns `text/event-stream`; each SSE `data` line is one JSON-RPC notification or
 the final response. Earlier event polls and ordinary requests return JSON. The MCP worker stops
 with the hub daemon.
+
+Each tool command has a bounded budget, two minutes by default and configurable with
+`ZEROSHOT_MCP_COMMAND_TIMEOUT_MS`. A command that exceeds it answers with a JSON-RPC error whose
+`data.code` is `mcp.timeout`; dropping the HTTP request or sending `notifications/cancelled`
+cancels the command instead. A stuck command therefore costs one request, never the dispatcher.
+`/v1/hub/health` reports `mcp.inFlight` and `mcp.oldestAgeMs` so an external watchdog can identify
+that condition. The `zeroshot-hub-watchdog.timer` installed by `scripts/install-hub-watchdog.sh`
+probes `tools/list` every two minutes and restarts the daemon after two consecutive hangs.
 
 ## Handshake
 

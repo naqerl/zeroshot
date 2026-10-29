@@ -8,7 +8,7 @@ use super::args::{
     bool_prop, inline_json_prop, inline_object_prop, integer_prop, object_schema, optional_string,
     reject_unknown, string_array_prop, string_prop,
 };
-use super::host::{parse_cli, McpFailure, McpHost};
+use super::host::{TIMEOUT_CODE, parse_cli, McpFailure, McpHost};
 use super::super::hub::HubCommand;
 use super::super::{Cli, NativeV2CliCommand};
 
@@ -346,6 +346,9 @@ pub(super) async fn call(host: &impl McpHost, params: &Value) -> Result<Value, M
     drop(materialized);
     match result {
         Ok(stdout) => Ok(tool_success(stdout)),
+        // A command timeout is a server failure rather than a tool verdict, so the caller gets a
+        // JSON-RPC error instead of a normal tool result it might mistake for the command's answer.
+        Err(failure) if failure.code == TIMEOUT_CODE => Err(failure),
         Err(failure) => Ok(tool_error(&failure)),
     }
 }

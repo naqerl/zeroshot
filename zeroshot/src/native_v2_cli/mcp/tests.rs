@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
 use super::super::{CliTestBackend, CliTestCall, NeverDetach, RunWatchCommand};
-use super::{McpFailure, McpHost, McpServer, WatchStream, serve_http_listener};
+use super::{McpFailure, McpHost, McpServer, McpStats, WatchStream, serve_http_listener};
 use crate::native_v2_cli::hub::{HubCommand, HubPoolCommand, HubRequest};
 use crate::native_v2_cli::{NativeV2CliCommand, execute_native_v2_cli};
 
@@ -66,6 +66,57 @@ impl McpHost for ScriptHost {
         drop(sender);
         let task = tokio::spawn(async {});
         Ok(WatchStream::new(receiver, task))
+    }
+}
+
+/// A host whose command execution never finishes on its own, so tests can prove that one
+/// stuck command does not own the MCP dispatcher.
+struct NeverHost;
+
+#[async_trait(?Send)]
+impl McpHost for NeverHost {
+    async fn execute(&self, _command: NativeV2CliCommand) -> Result<String, McpFailure> {
+        std::future::pending().await
+    }
+
+    async fn open_watch(&self, _command: &RunWatchCommand) -> Result<WatchStream, McpFailure> {
+        std::future::pending().await
+    }
+}
+
+/// A host whose command execution blocks the calling thread until the test releases it.
+///
+/// This is the regression shape for the wedged dispatcher: the old single-threaded worker
+/// stopped serving every request while this command ran, while the offloaded worker keeps
+/// dispatching and only this job waits.
+struct BlockingHost {
+    release: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+}
+
+impl BlockingHost {
+    fn new() -> (Self, std::sync::mpsc::Sender<()>) {
+        let (release, blocked) = std::sync::mpsc::channel();
+        (
+            Self {
+                release: Arc::new(Mutex::new(Some(blocked))),
+            },
+            release,
+        )
+    }
+}
+
+#[async_trait(?Send)]
+impl McpHost for BlockingHost {
+    async fn execute(&self, _command: NativeV2CliCommand) -> Result<String, McpFailure> {
+        let blocked = self.release.lock().expect("blocking host gate").take();
+        if let Some(blocked) = blocked {
+            let _ = blocked.recv();
+        }
+        Ok("{}".to_owned())
+    }
+
+    async fn open_watch(&self, _command: &RunWatchCommand) -> Result<WatchStream, McpFailure> {
+        Err(McpFailure::invalid("blocking host does not open watches"))
     }
 }
 
@@ -414,10 +465,15 @@ struct Session {
     url: String,
     frames: std::collections::VecDeque<Value>,
     session: Option<String>,
+    stats: Arc<McpStats>,
 }
 
 impl Session {
     fn spawn(host: impl McpHost + 'static) -> Self {
+        Self::spawn_with_timeout(host, Duration::from_secs(120))
+    }
+
+    fn spawn_with_timeout(host: impl McpHost + 'static, timeout: Duration) -> Self {
         let (address_sender, address_receiver) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("mcp-test-server".to_owned())
@@ -426,26 +482,40 @@ impl Session {
                     .enable_all()
                     .build()
                     .expect("mcp test runtime");
-                let (router, server) = McpServer::spawn(host).expect("start MCP worker");
+                let (router, server) =
+                    McpServer::spawn_with_timeout(host, timeout).expect("start MCP worker");
+                let stats = server.stats();
                 runtime.block_on(async move {
                     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                         .await
                         .expect("bind MCP test listener");
                     let address = listener.local_addr().expect("MCP test address");
                     address_sender
-                        .send(address)
+                        .send((address, stats))
                         .expect("report MCP test address");
                     let _ = axum::serve(listener, router).await;
                     server.shutdown().await;
                 });
             })
             .expect("spawn MCP test server");
-        let address = address_receiver.recv().expect("MCP test address");
+        let (address, stats) = address_receiver.recv().expect("MCP test address");
         Self {
             client: reqwest::Client::new(),
             url: format!("http://{address}/mcp"),
             frames: std::collections::VecDeque::new(),
             session: None,
+            stats,
+        }
+    }
+
+    /// Another client against this same server, with its own MCP session.
+    fn other_client(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            url: self.url.clone(),
+            frames: std::collections::VecDeque::new(),
+            session: None,
+            stats: Arc::clone(&self.stats),
         }
     }
 
@@ -487,6 +557,16 @@ impl Session {
             self.session = Some(session);
         }
         response
+    }
+
+    async fn delete(&self) -> reqwest::Response {
+        let session = self.session.clone().expect("session id");
+        self.client
+            .delete(&self.url)
+            .header("mcp-session-id", session)
+            .send()
+            .await
+            .expect("delete MCP session")
     }
 
     async fn post(&mut self, message: &Value, session: Option<String>) -> Option<String> {
@@ -2833,6 +2913,226 @@ fn inline_tool_data_is_materialized_for_the_command() {
     }
     drop(directory);
     assert!(!root.exists(), "temporary command inputs are removed");
+}
+
+async fn wait_for_in_flight(stats: &McpStats, expected: usize, budget: Duration) {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if stats.in_flight() == expected {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "in-flight MCP jobs stayed at {}, expected {expected}",
+            stats.in_flight()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_hung_command_does_not_stop_dispatch() {
+    let (host, release) = BlockingHost::new();
+    let mut hung = Session::spawn_with_timeout(host, Duration::from_secs(30));
+    initialize(&mut hung).await;
+    let client = hung.client.clone();
+    let url = hung.url.clone();
+    let session = hung.session.clone().expect("session id");
+    let request = tokio::spawn(async move {
+        client
+            .post(url)
+            .header("mcp-session-id", session)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {"name": "hub_watch", "arguments": {"job": "hj_1"}}
+            }))
+            .send()
+            .await
+    });
+    wait_for_in_flight(&hung.stats, 1, Duration::from_secs(1)).await;
+
+    // Same server, different MCP session: the blocked command must not own its dispatcher.
+    let mut other = hung.other_client();
+    let initialize_answer = tokio::time::timeout(
+        Duration::from_secs(2),
+        other.request(1, "initialize", json!({})),
+    )
+    .await
+    .expect("a second client still initializes while a command is stuck");
+    assert_eq!(
+        initialize_answer["result"]["serverInfo"]["name"],
+        json!("zeroshot")
+    );
+    let ping = tokio::time::timeout(Duration::from_secs(2), other.request(2, "ping", json!({})))
+        .await
+        .expect("ping is still dispatched");
+    assert_eq!(ping["result"], json!({}));
+    let listed = tokio::time::timeout(
+        Duration::from_secs(2),
+        other.request(3, "tools/list", json!({})),
+    )
+    .await
+    .expect("tools/list is still dispatched");
+    assert!(listed["result"]["tools"].is_array());
+
+    release.send(()).expect("release the blocked command");
+    let finished = tokio::time::timeout(Duration::from_secs(2), request)
+        .await
+        .expect("blocked request finishes after release")
+        .expect("the request task joins")
+        .expect("response");
+    let body: Value = finished.json().await.expect("tool response JSON");
+    assert_eq!(body["id"], json!(9));
+    assert!(body.get("error").is_none(), "{body}");
+    wait_for_in_flight(&hung.stats, 0, Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn a_disconnected_command_frees_its_in_flight_slot() {
+    let mut session = Session::spawn_with_timeout(NeverHost, Duration::from_secs(30));
+    initialize(&mut session).await;
+    let client = session.client.clone();
+    let url = session.url.clone();
+    let id = session.session.clone().expect("session id");
+    let request = tokio::spawn(async move {
+        client
+            .post(url)
+            .header("mcp-session-id", id)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {"name": "hub_watch", "arguments": {"job": "hj_1"}}
+            }))
+            .send()
+            .await
+    });
+    wait_for_in_flight(&session.stats, 1, Duration::from_secs(1)).await;
+    request.abort();
+    wait_for_in_flight(&session.stats, 0, Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn notifications_cancelled_aborts_an_in_flight_job() {
+    let (host, release) = BlockingHost::new();
+    let mut session = Session::spawn_with_timeout(host, Duration::from_secs(30));
+    initialize(&mut session).await;
+    let client = session.client.clone();
+    let url = session.url.clone();
+    let id = session.session.clone().expect("session id");
+    let request = tokio::spawn(async move {
+        client
+            .post(url)
+            .header("mcp-session-id", id)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {"name": "hub_list", "arguments": {}}
+            }))
+            .send()
+            .await
+    });
+    wait_for_in_flight(&session.stats, 1, Duration::from_secs(1)).await;
+
+    let accepted = session
+        .send(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": 9}
+        }))
+        .await;
+    assert!(accepted.is_some(), "the cancellation is accepted");
+    wait_for_in_flight(&session.stats, 0, Duration::from_secs(2)).await;
+
+    release
+        .send(())
+        .expect("release the blocked command thread");
+    let _ = tokio::time::timeout(Duration::from_secs(2), request)
+        .await
+        .expect("the cancelled request stops waiting");
+}
+
+#[tokio::test]
+async fn an_open_event_stream_does_not_stop_other_clients() {
+    let host = HubLifecycleHost::new(vec![Vec::new()], Vec::new(), HashMap::new());
+    let mut session = Session::spawn(host);
+    initialize(&mut session).await;
+    let stream = session
+        .start_stream(&json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "events/stream",
+            "params": {}
+        }))
+        .await;
+    assert_eq!(stream.status(), reqwest::StatusCode::OK);
+
+    let mut other = session.other_client();
+    initialize(&mut other).await;
+    let listed = tokio::time::timeout(
+        Duration::from_secs(2),
+        other.request(2, "tools/list", json!({})),
+    )
+    .await
+    .expect("tools/list is answered while another session streams events");
+    assert!(listed["result"]["tools"].is_array());
+    drop(stream);
+}
+
+#[tokio::test]
+async fn deleting_a_session_aborts_its_stream_and_invalidates_it() {
+    let host = HubLifecycleHost::new(vec![Vec::new()], Vec::new(), HashMap::new());
+    let mut session = Session::spawn(host);
+    initialize(&mut session).await;
+    let stream = session
+        .start_stream(&json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "events/stream",
+            "params": {}
+        }))
+        .await;
+    assert_eq!(stream.status(), reqwest::StatusCode::OK);
+
+    let deleted = session.delete().await;
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    tokio::time::timeout(Duration::from_secs(2), stream.text())
+        .await
+        .expect("DELETE closes the session stream")
+        .expect("stream body");
+
+    let rejected = session.request(7, "tools/list", json!({})).await;
+    assert_eq!(rejected["id"], json!(7));
+    assert_eq!(
+        rejected["error"]["data"]["code"],
+        json!("mcp.session_required")
+    );
+
+    let missing = session.delete().await;
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_command_timeout_is_a_json_rpc_error_and_the_server_keeps_serving() {
+    let mut session = Session::spawn_with_timeout(NeverHost, Duration::from_millis(100));
+    initialize(&mut session).await;
+    let timed_out = session
+        .request(
+            2,
+            "tools/call",
+            json!({"name": "hub_list", "arguments": {}}),
+        )
+        .await;
+    assert_eq!(timed_out["id"], json!(2));
+    assert_eq!(timed_out["error"]["code"], json!(-32602));
+    assert_eq!(timed_out["error"]["data"]["code"], json!("mcp.timeout"));
+    let ping = session.request(3, "ping", json!({})).await;
+    assert_eq!(ping["result"], json!({}));
+    let listed = session.request(4, "tools/list", json!({})).await;
+    assert!(listed["result"]["tools"].is_array());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

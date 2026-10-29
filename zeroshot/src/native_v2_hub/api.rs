@@ -29,6 +29,7 @@ use super::wire::{
     AddMember, AddPool, CreateSchedule, EnqueueJob, JobQuery, MemberQuery, StatsRequest,
     SetTagProfile, StreamFrame, StreamRequest, SubmitJob, UpdateMember,
 };
+use zeroshot_engine::native_v2_cli::mcp::McpStats;
 
 /// Response header carrying the CLI exit code of an error.
 pub(crate) const EXIT_CODE_HEADER: &str = "x-zeroshot-exit-code";
@@ -43,6 +44,8 @@ pub(crate) struct ApiState {
     /// Program observation streams run; `None` is this executable (or
     /// `ZEROSHOT_HUB_EXECUTABLE`), like the hub's target driver.
     pub executable: Option<std::path::PathBuf>,
+    /// In-flight MCP job accounting when this daemon serves `/mcp`.
+    pub mcp: Option<Arc<McpStats>>,
 }
 
 #[cfg(test)]
@@ -216,12 +219,16 @@ async fn not_found() -> Response {
     error_response(&HubError::Usage("unknown hub API route".to_owned()))
 }
 
-async fn health() -> Response {
-    json_response(
-        StatusCode::OK,
-        &json!({ "schema": "zeroshot.hub.health/v1", "ok": true }),
-        None,
-    )
+async fn health(State(state): State<Arc<ApiState>>) -> Response {
+    let mut health = json!({ "schema": "zeroshot.hub.health/v1", "ok": true });
+    if let Some(mcp) = &state.mcp {
+        let activity = mcp.activity();
+        health["mcp"] = json!({
+            "inFlight": activity.in_flight,
+            "oldestAgeMs": activity.oldest_age_ms,
+        });
+    }
+    json_response(StatusCode::OK, &health, None)
 }
 
 async fn daemon(State(state): State<Arc<ApiState>>) -> Response {
