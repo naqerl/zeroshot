@@ -83,6 +83,11 @@ jobs:
       - name: Run repository tooling tests
         run: npm test
 
+      # A workflow-only or checker-only change selects this job instead of native-check, so repeat
+      # the privileged-test guard here; keep this step in sync with native-check.
+      - name: Check privileged tests are named root_
+        run: python3 .github/scripts/check_privilege_gates.py
+
       - name: Validate distribution contract
         run: npm run distribution:check
 
@@ -214,6 +219,7 @@ jobs:
           cargo check --locked --package zeroshot --lib --features workspace
           cargo clippy --package zeroshot --all-targets --features ui -- -D warnings
 
+      # Workflow-only changes skip this native job, so tooling-check also runs this guard.
       - name: Check privileged tests are named root_
         if: runner.os == 'Linux'
         shell: bash

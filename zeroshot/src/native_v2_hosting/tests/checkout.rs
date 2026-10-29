@@ -1076,9 +1076,12 @@ async fn root_retained_workspace_transfers_to_a_different_concurrent_writer_iden
         successor_metadata.uid()
     );
 
+    // Command::uid and Command::gid drop credentials before the child chdirs, so start the stale
+    // writer somewhere its identity can traverse and target the retained file by absolute path.
     let stale_writer = std::process::Command::new("/bin/sh")
-        .args(["-c", "printf stale >> retained.txt"])
-        .current_dir(&successor_workspace)
+        .args(["-c", "printf stale >> \"$1\"", "sh"])
+        .arg(&successor_retained)
+        .current_dir("/")
         .uid(blocker_metadata.uid())
         .gid(blocker_metadata.gid())
         .output()

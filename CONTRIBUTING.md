@@ -83,9 +83,11 @@ smoke `docker/zeroshot-target/Dockerfile`.
 
 The root lanes in `.github/workflows/ci.yml` and `.github/workflows/coverage.yml` run the lib test
 binary with the `root_` filter, so a test that returns early unless the effective uid is 0 must be
-named `root_*`. `.github/scripts/check_privilege_gates.py` enforces that naming, and CI fails if
-either lane stops passing the filter. A test that needs root for only part of its body keeps running
-unprivileged and uses an `if unsafe { libc::geteuid() } == 0 { ... }` block instead of a rename.
+named `root_*`. `.github/scripts/check_privilege_gates.py` enforces that naming, and CI runs it in
+both `native-check` and `tooling-check` because workflow-only or checker-only changes skip the native
+lane. CI fails if either lane stops passing the filter. A test that needs root for only part of its
+body keeps running unprivileged and uses an `if unsafe { libc::geteuid() } == 0 { ... }` block
+instead of a rename.
 
 ## Generated files
 

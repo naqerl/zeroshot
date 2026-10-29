@@ -100,6 +100,16 @@ it('preserves explicit cross-lane ownership', () => {
   }
 });
 
+it('runs repository tooling for privileged-gate workflow and checker changes', () => {
+  for (const pathname of [
+    '.github/scripts/check_privilege_gates.py',
+    '.github/workflows/ci.yml',
+    '.github/workflows/coverage.yml',
+  ]) {
+    assert.equal(classifyPaths([pathname]).tooling, true, pathname);
+  }
+});
+
 it('runs every lane for release, CI, unknown, or unresolvable changes', () => {
   for (const paths of [
     ['.github/workflows/ci.yml'],
