@@ -59,6 +59,7 @@ pub(super) async fn hub_with(driver: FakeDriver, executable: Option<PathBuf>) ->
         token: TOKEN.to_owned(),
         heartbeat: Arc::new(Mutex::new(json!({"schema": "zeroshot.hub.daemon/v1"}))),
         executable,
+        mcp: None,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -810,6 +811,7 @@ async fn the_metrics_listener_serves_only_metrics() {
         token: TOKEN.to_owned(),
         heartbeat: Arc::new(Mutex::new(json!({}))),
         executable: None,
+        mcp: None,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

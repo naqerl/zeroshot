@@ -531,6 +531,7 @@ async fn hub_with(driver: FakeDriver) -> Hub {
         token: TOKEN.to_owned(),
         heartbeat: Arc::new(Mutex::new(json!({}))),
         executable: None,
+        mcp: None,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

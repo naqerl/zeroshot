@@ -1,0 +1,10 @@
+[Unit]
+Description=Probe the Zeroshot hub MCP endpoint every two minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+Unit=zeroshot-hub-watchdog.service
+
+[Install]
+WantedBy=timers.target

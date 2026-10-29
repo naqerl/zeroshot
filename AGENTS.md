@@ -769,7 +769,13 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   per-run leases before treating an in-process ACP owner without a controller socket as live.
   Ordinary runs retain run-scoped session keys.
 - The hub daemon (`zeroshot hub daemon run`) serves Streamable HTTP MCP on `POST /mcp` on its
-  normal API listener, behind the same bearer-token authorization as `/v1/hub/*`. The default
+  normal API listener, behind the same bearer-token authorization as `/v1/hub/*`. It runs every
+  host operation on its own command thread with a configurable
+  `ZEROSHOT_MCP_COMMAND_TIMEOUT_MS` budget, cancels the operation when its client disconnects or
+  `notifications/cancelled`/`events/unsubscribe` names it, and `DELETE /mcp` tears down the
+  session's streams and in-flight jobs. `/v1/hub/health` reports `mcp.inFlight` and
+  `mcp.oldestAgeMs`; `systemd/zeroshot-hub-watchdog.*` and `scripts/hub-watchdog.sh` probe a real
+  JSON-RPC request and never restart on 401. The default
   endpoint is `http://127.0.0.1:7383/mcp`, the token defaults to the hub folder's `api-token`, and
   the daemon heartbeat records the MCP URL as `mcp`. There is no standalone MCP command or process.
   Each tool builds the same command value as the CLI and runs it through the existing public or hub
@@ -976,8 +982,9 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   The hub daemon also serves MCP on `POST /mcp`; it does not itself start a run. Its read-only tools
   are `status`, `logs`, `watch`, `list`, `report`, `hub_list`, `hub_ps`, `hub_jobs`, `hub_stats`,
   `hub_logs`, and `hub_daemon_status`; `hub_jobs` pages job history newest first by state, label,
-  and `since`. `watch`, `logs`, and `hub_logs` follow until the stream ends; live run
-  events use the events extension. `run`, `resume`, `hub_submit`, and `hub_enqueue` submit work.
+  and `since`. `watch`, `logs`, `hub_logs`, and `hub_watch` follow until the stream ends or the
+  MCP command budget expires (`mcp.timeout`, resumable with `after`); live run events use the
+  events extension. `run`, `resume`, `hub_submit`, and `hub_enqueue` submit work.
 - Destructive commands such as `zeroshot force-stop` require explicit user intent. The MCP
   `force-stop` tool is that command.
 
