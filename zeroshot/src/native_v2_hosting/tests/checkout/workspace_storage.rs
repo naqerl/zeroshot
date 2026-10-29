@@ -103,7 +103,7 @@ async fn external_restore_failure_never_releases_an_allocated_capsule() {
 }
 
 const COMMENT_URL: &str = "https://github.com/acme/project/pull/17";
-const COMMENT_GH: &str = r#"#!/usr/bin/python3
+const COMMENT_GH: &str = r#"#!/usr/bin/env python3
 import json, os, pathlib, sys
 assert os.environ['GH_TOKEN'] == 'checkout-secret'
 assert sys.argv[1] == 'api'
@@ -174,7 +174,10 @@ async fn comment_fixture(
                    "linkedIssues":[]}
     });
     fixture.admitted = admit(request).await;
-    let program = fixture.root.write_executable("gh-fixture", COMMENT_GH);
+    let program = fixture.root.write_executable(
+        "gh-fixture",
+        &openengine_cluster_testkit::fixture::python3_script(COMMENT_GH),
+    );
     fs::write(
         program.with_extension("scope"),
         serde_json::to_vec(&json!({

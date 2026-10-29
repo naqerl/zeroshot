@@ -110,6 +110,12 @@ guidance, not a filesystem boundary. Hosted nodes share the prepared workspace a
 They retain separate session homes and process cleanup markers, so ending one node does not terminate
 another node or the run's startup services.
 
+Hosting applications can supply nonsecret machine facts and operating guidance through
+`ProductionHostingConfig.agent_context`, using an `AgentContextProvider`. Zeroshot samples this
+context before every agent execution, including resumed attempts and auxiliary agents, and adds
+it to the prompt for every harness. The context is transient: it does not change the saved graph,
+runtime plan, or durable invocation. Local and direct targets attach no host context by default.
+
 Zeroshot controls the response format and session continuation. Web search follows Codex's
 configuration: by default it uses live search with full access and cached search otherwise. For local
 runs, an explicit `web_search="cached"` prevents Zeroshot from adding bypass because Codex can
@@ -136,6 +142,11 @@ runs increase peak disk usage and can fail with `no space left on device`.
 
 On tight disks, clean unnecessary build artifacts or keep large generated directories outside the
 workspace where practical.
+
+Restic progress streams are drained with bounded memory, retaining the final snapshot summary.
+Large progress output does not abort a backup. Failures identify the operation and failure stage
+or exit status without exposing private child output; the previous published checkpoint remains
+available when a later backup fails.
 
 ## Direct target
 
