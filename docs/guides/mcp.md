@@ -144,24 +144,28 @@ A filter that matches nothing is an empty `jobs` array, not an error.
 
 The server advertises `io.modelcontextprotocol/events` (SEP-3415). One subscription covers the
 whole hub. `events/list` reports one event type, `hub`, described as everything in the hub, with
-`delivery` `poll` and `push`. It also lists the four `name` values a notification may carry:
+`delivery` `poll` and `push`. It also lists, as `names`, the four kinds a notification may
+carry in `data.kind`:
 
-| Name          | Data                                                                                             |
+| Kind          | Data                                                                                             |
 | ------------- | ------------------------------------------------------------------------------------------------ |
-| `hub.job`     | `jobId`, `title`, `state`, `target`, `project`, `runId`, `attempts`, `pinnedRevision`, `labels`, `submittedAt`, `finishedAt`, `failureReason`, `failureClassification`, `errorKind`, `headBranch`, `headRevision`, `status`, `terminal`, `snapshot`, `reason`, `at`, `cursor`, `summary`, `replayed`, `sequence` |
-| `hub.run`     | the durable run watch record: `runId`, `cursor`, `runCursor`, `status`, `summary`, `replayed`    |
-| `hub.pool`    | `kind`, `pool`, `leaseId`, `serverId`, `memberId`, `machine`, `phase`, `previousPhase`, `reason`, `at`, `cursor`, `summary`, `replayed` |
-| `hub.warning` | `jobId`, `runId`, `message`, `at`, `cursor`, `summary`, `replayed`                              |
+| `hub.job`     | `kind`, `jobId`, `title`, `state`, `target`, `project`, `runId`, `attempts`, `pinnedRevision`, `labels`, `submittedAt`, `finishedAt`, `failureReason`, `failureClassification`, `errorKind`, `headBranch`, `headRevision`, `status`, `terminal`, `snapshot`, `reason`, `at`, `cursor`, `summary`, `replayed`, `sequence` |
+| `hub.run`     | `kind` and the durable run watch record: `runId`, `cursor`, `runCursor`, `status`, `summary`, `replayed`    |
+| `hub.pool`    | `kind`, `scope`, `pool`, `leaseId`, `serverId`, `memberId`, `machine`, `phase`, `previousPhase`, `reason`, `at`, `cursor`, `summary`, `replayed` |
+| `hub.warning` | `kind`, `jobId`, `runId`, `message`, `at`, `cursor`, `summary`, `replayed`                              |
 
-A client that does not care about the kind reads the stream as it is; a client that cares
-branches on `name`. The normal way to watch the hub is a request with no `name` field at all:
+Every occurrence's envelope `name` is the name the client subscribed with: `hub` for a
+subscription without a `name`, otherwise the requested name (`hub.job`, `hub.event`, …). MCP events
+clients match an occurrence to its subscription by that name and drop one that does not match, so
+the kind never goes there. A client that does not care about the kind reads the stream as it is; a
+client that cares branches on `data.kind`. The normal way to watch the hub is a request with no `name` field at all:
 
 ```
 events/subscribe {}
 ```
 
 ```json
-{"eventId": "hub:42", "name": "hub.run", "timestamp": "RFC3339", "data": {}, "_meta": {}}
+{"eventId": "hub:42", "name": "hub", "timestamp": "RFC3339", "data": {"kind": "hub.run"}, "_meta": {}}
 ```
 
 `summary`, `replayed`, and the hub cursor live inside `data`. `data.cursor` is the same
@@ -179,8 +183,8 @@ Subscription arguments are all optional filters:
 - Omit `name` to subscribe to the whole hub. This is the normal form and needs no other field.
 - `runId` narrows to that run, its job, and its warnings. `jobId` narrows to that job, its run,
   and that run's warnings. Supplying both is invalid params (`-32602`).
-- `name` still selects one carried type: `hub.job`, `hub.run`, `hub.pool`, or `hub.warning`.
-  `hub` and `hub.event` are aliases for every hub event; `run.event` is the legacy run-watch
+- `name` still selects one carried kind: `hub.job`, `hub.run`, `hub.pool`, or `hub.warning`, and
+  its occurrences carry that `name`. `hub` and `hub.event` are aliases for every hub event; `run.event` is the legacy run-watch
   form. An unknown name is invalid params (`-32602`), like any other bad subscription field.
   There is no wildcard syntax.
 - `target`, `kinds` (`hub.job`, `hub.run`, `hub.pool`, `hub.warning`), `states`, `phases`,
@@ -264,7 +268,7 @@ occurrence, using its attempt and complete active-execution set, so `{A, B}` to 
 publishes A's finish. `hub.pool`
 reports each lease as `requested`, `creating`, `booting`, `preparing`, `ready`, `in_use`, `idle`,
 `draining`, `deleted`, or `failed`, with `previousPhase` chaining its transitions. Pool-level
-records use `kind: "pool"` and the phases `added`, `removed`, `paused`, `resumed`, `blocked`,
+records use `scope: "pool"` (lease records `scope: "lease"`) and the phases `added`, `removed`, `paused`, `resumed`, `blocked`,
 and `shortage`. See
 [Watching a machine come up](hub-pools.md#watching-a-machine-come-up). A running job receives one
 `hub.warning` per hour; a run-watch or stream failure also produces `hub.warning`, and the

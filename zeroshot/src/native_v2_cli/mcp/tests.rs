@@ -664,7 +664,7 @@ fn stream_notifications(frames: &[Value]) -> Vec<&Value> {
 fn hub_event_states(frames: &[Value], job_id: &str) -> Vec<String> {
     stream_notifications(frames)
         .into_iter()
-        .filter(|frame| frame["params"]["name"] == json!("hub.job"))
+        .filter(|frame| frame["params"]["data"]["kind"] == json!("hub.job"))
         .filter(|frame| frame["params"]["data"]["jobId"] == json!(job_id))
         .filter_map(|frame| frame["params"]["data"]["state"].as_str().map(str::to_owned))
         .collect()
@@ -1056,9 +1056,22 @@ async fn events_list_describes_one_hub_type_and_poll_and_push() {
         json!(["eventId", "name", "timestamp", "data", "_meta"])
     );
     assert_eq!(
-        event["payloadSchema"]["properties"]["name"]["enum"],
-        json!(["hub.job", "hub.run", "hub.pool", "hub.warning"])
+        event["payloadSchema"]["properties"]["name"]["const"],
+        json!("hub"),
+        "every occurrence carries the subscribed name"
     );
+    for (kind, schema) in [
+        ("hub.job", 0),
+        ("hub.run", 1),
+        ("hub.pool", 2),
+        ("hub.warning", 3),
+    ] {
+        assert_eq!(
+            event["payloadSchema"]["properties"]["data"]["oneOf"][schema]["properties"]["kind"]["const"],
+            json!(kind),
+            "data.kind names the carried kind"
+        );
+    }
     assert!(
         event["payloadSchema"]["properties"]["data"].is_object(),
         "payload documents data"
@@ -1124,10 +1137,11 @@ async fn hub_events_multiplex_a_whole_hub_on_one_cursor() {
         .cloned()
         .unwrap_or_default();
     for id in 3..20 {
-        if ["hub.job", "hub.run", "hub.pool"]
-            .iter()
-            .all(|name| events.iter().any(|event| event["name"] == json!(name)))
-        {
+        if ["hub.job", "hub.run", "hub.pool"].iter().all(|name| {
+            events
+                .iter()
+                .any(|event| event["data"]["kind"] == json!(name))
+        }) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1149,7 +1163,9 @@ async fn hub_events_multiplex_a_whole_hub_on_one_cursor() {
     }
     for name in ["hub.job", "hub.run", "hub.pool"] {
         assert!(
-            events.iter().any(|event| event["name"] == json!(name)),
+            events
+                .iter()
+                .any(|event| event["data"]["kind"] == json!(name)),
             "{name} arrives on the hub stream: {events:?}"
         );
     }
@@ -1174,7 +1190,7 @@ async fn hub_events_multiplex_a_whole_hub_on_one_cursor() {
     assert!(sequences.windows(2).all(|pair| pair[0] <= pair[1]));
     let run = events
         .iter()
-        .find(|event| event["name"] == json!("hub.run"))
+        .find(|event| event["data"]["kind"] == json!("hub.run"))
         .expect("run event");
     assert_eq!(run["data"]["runId"], json!("run-public"));
     assert_eq!(run["data"]["runCursor"], json!("v2:1"));
@@ -1224,7 +1240,10 @@ async fn hub_events_filter_run_and_pool_kinds_on_replay() {
         .as_array()
         .expect("filtered events");
     assert!(!runs.is_empty());
-    assert!(runs.iter().all(|event| event["name"] == json!("hub.run")));
+    assert!(
+        runs.iter()
+            .all(|event| event["data"]["kind"] == json!("hub.run"))
+    );
     assert!(
         runs.iter()
             .all(|event| event["data"]["summary"]["phase"] == json!("running"))
@@ -1302,13 +1321,18 @@ async fn events_stream_pushes_a_hub_run_notification() {
     let frames = collect_stream(response, Duration::from_secs(2), |frames| {
         stream_notifications(frames)
             .iter()
-            .any(|frame| frame["params"]["name"] == json!("hub.run"))
+            .any(|frame| frame["params"]["data"]["kind"] == json!("hub.run"))
     })
     .await;
     let event = stream_notifications(&frames)
         .into_iter()
-        .find(|frame| frame["params"]["name"] == json!("hub.run"))
+        .find(|frame| frame["params"]["data"]["kind"] == json!("hub.run"))
         .expect("a hub.run event");
+    assert_eq!(
+        event["params"]["name"],
+        json!("hub.run"),
+        "a subscription by kind carries the name it subscribed with"
+    );
     assert_eq!(event["params"]["data"]["runId"], json!("run-public"));
     assert_eq!(event["params"]["data"]["replayed"], json!(false));
     assert_eq!(
@@ -1342,7 +1366,7 @@ async fn events_job_selector_filters_the_hub_stream() {
     let frames = collect_stream(response, Duration::from_secs(2), |frames| {
         let names = stream_notifications(frames)
             .into_iter()
-            .filter_map(|frame| frame["params"]["name"].as_str())
+            .filter_map(|frame| frame["params"]["data"]["kind"].as_str())
             .collect::<Vec<_>>();
         names.contains(&"hub.job") && names.contains(&"hub.run")
     })
@@ -1466,7 +1490,7 @@ async fn hub_subscription_opens_before_any_job_and_follows_its_lifecycle() {
     assert!(!has_complete_frame(&frames));
     let job_events = stream_notifications(&frames)
         .into_iter()
-        .filter(|frame| frame["params"]["name"] == json!("hub.job"))
+        .filter(|frame| frame["params"]["data"]["kind"] == json!("hub.job"))
         .collect::<Vec<_>>();
     assert!(
         job_events
@@ -1795,7 +1819,7 @@ async fn hub_resume_past_the_feed_head_is_clamped_and_keeps_delivering() {
             runs.extend(
                 events
                     .iter()
-                    .filter(|event| event["name"] == json!("hub.run"))
+                    .filter(|event| event["data"]["kind"] == json!("hub.run"))
                     .cloned(),
             );
         }
@@ -1859,7 +1883,7 @@ async fn hub_run_keeps_a_shrinking_active_set_as_a_new_occurrence() {
             runs.extend(
                 events
                     .iter()
-                    .filter(|event| event["name"] == json!("hub.run"))
+                    .filter(|event| event["data"]["kind"] == json!("hub.run"))
                     .cloned(),
             );
         }
@@ -2047,7 +2071,7 @@ async fn hub_stream_survives_a_terminal_run_and_carries_the_next_job() {
         .await;
     let frames = collect_stream(response, Duration::from_secs(4), |frames| {
         let terminal = stream_notifications(frames).iter().any(|frame| {
-            frame["params"]["name"] == json!("hub.run")
+            frame["params"]["data"]["kind"] == json!("hub.run")
                 && frame["params"]["data"]["summary"]["terminal"] == json!(true)
         });
         let second = hub_event_states(frames, "hj_two")
@@ -2058,7 +2082,7 @@ async fn hub_stream_survives_a_terminal_run_and_carries_the_next_job() {
     .await;
     assert!(
         stream_notifications(&frames).iter().any(|frame| {
-            frame["params"]["name"] == json!("hub.run")
+            frame["params"]["data"]["kind"] == json!("hub.run")
                 && frame["params"]["data"]["summary"]["terminal"] == json!(true)
         }),
         "{frames:#?}"
@@ -2142,13 +2166,14 @@ async fn hub_poll_resumes_from_a_cursor_captured_before_a_terminal_event() {
     }));
     assert!(
         events.iter().any(|event| {
-            event["name"] == json!("hub.run") && event["data"]["summary"]["terminal"] == json!(true)
+            event["data"]["kind"] == json!("hub.run")
+                && event["data"]["summary"]["terminal"] == json!(true)
         }),
         "{later}"
     );
     assert!(
         events.iter().any(|event| {
-            event["name"] == json!("hub.job")
+            event["data"]["kind"] == json!("hub.job")
                 && event["data"]["jobId"] == json!("hj_two")
                 && event["data"]["state"] == json!("running")
         }),
@@ -2296,7 +2321,7 @@ async fn a_nameless_subscription_streams_jobs_runs_and_pool_phases() {
     let frames = collect_stream(response, Duration::from_secs(5), |frames| {
         let names = stream_notifications(frames)
             .into_iter()
-            .filter_map(|frame| frame["params"]["name"].as_str())
+            .filter_map(|frame| frame["params"]["data"]["kind"].as_str())
             .collect::<std::collections::HashSet<_>>();
         ["hub.job", "hub.run", "hub.pool"]
             .iter()
@@ -2306,7 +2331,7 @@ async fn a_nameless_subscription_streams_jobs_runs_and_pool_phases() {
     let notifications = stream_notifications(&frames);
     let names = notifications
         .iter()
-        .filter_map(|frame| frame["params"]["name"].as_str())
+        .filter_map(|frame| frame["params"]["data"]["kind"].as_str())
         .collect::<Vec<_>>();
     for name in ["hub.job", "hub.run", "hub.pool"] {
         assert!(
@@ -2316,14 +2341,26 @@ async fn a_nameless_subscription_streams_jobs_runs_and_pool_phases() {
     }
     assert!(
         names.iter().collect::<std::collections::HashSet<_>>().len() >= 3,
-        "the subscription carries distinct names: {names:?}"
+        "the subscription carries distinct kinds: {names:?}"
+    );
+    assert!(
+        notifications
+            .iter()
+            .filter(|frame| frame["method"] == json!("notifications/events/event"))
+            .all(|frame| frame["params"]["name"] == json!("hub")),
+        "every occurrence carries the subscribed name so MCP events clients can route it"
     );
     let pool = notifications
         .iter()
-        .find(|frame| frame["params"]["name"] == json!("hub.pool"))
+        .find(|frame| frame["params"]["data"]["kind"] == json!("hub.pool"))
         .expect("pool phase");
     assert_eq!(pool["params"]["data"]["phase"], json!("ready"));
     assert_eq!(pool["params"]["data"]["pool"], json!("burst"));
+    assert_eq!(
+        pool["params"]["data"]["scope"],
+        json!("lease"),
+        "the lease-or-pool discriminator moved to data.scope"
+    );
     assert_eq!(pool["params"]["data"]["leaseId"], json!("zs-feed"));
     assert_eq!(
         pool["params"]["data"]["machine"]["serverType"],
@@ -2381,7 +2418,7 @@ async fn hub_run_selector_narrows_the_stream_without_ending_it() {
     let notifications = stream_notifications(&frames);
     assert!(
         notifications.iter().any(|frame| {
-            frame["params"]["name"] == json!("hub.run")
+            frame["params"]["data"]["kind"] == json!("hub.run")
                 && frame["params"]["data"]["runId"] == json!("run-a")
         }),
         "{frames:#?}"
@@ -3269,7 +3306,7 @@ async fn http_transport_streams_events_as_server_sent_events() {
     let frames = collect_stream(response, Duration::from_secs(2), |frames| {
         stream_notifications(frames)
             .iter()
-            .any(|frame| frame["params"]["name"] == json!("hub.run"))
+            .any(|frame| frame["params"]["data"]["kind"] == json!("hub.run"))
     })
     .await;
     assert!(
