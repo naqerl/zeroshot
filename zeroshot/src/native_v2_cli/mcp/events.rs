@@ -11,9 +11,7 @@ use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncWrite;
 use tokio::sync::{Mutex, Notify, broadcast};
 
-use super::args::{
-    bool_prop, object_schema, optional_string, reject_unknown, string_array_prop, string_prop,
-};
+use super::args::{integer_prop, object_schema, optional_string, reject_unknown, string_prop};
 use super::host::{parse_cli, McpFailure, McpHost, WatchStream};
 use super::super::hub::{HubCommand, HubPoolCommand, HubRequest};
 use super::super::{NativeV2CliCommand, RunWatchCommand};
@@ -51,7 +49,7 @@ const HUB_RECENT_JOBS: usize = 512;
 const HUB_CURSOR_PATTERN: &str = "^hub:(snapshot:[0-9]+:[0-9]+|[0-9]+)$";
 const HUB_BROADCAST_LIMIT: usize = 1024;
 pub(crate) const PHASES: &[&str] = &["admitted", "running", "stopping", "finished"];
-/// Phases a pool lease or pool record can carry; `phases` also filters these.
+/// Phases a pool lease or pool record can carry; the CLI hub event filter also accepts these.
 pub(crate) const POOL_PHASES: &[&str] = &[
     "requested",
     "creating",
@@ -70,7 +68,7 @@ pub(crate) const POOL_PHASES: &[&str] = &[
     "blocked",
     "shortage",
 ];
-/// The states a `hub.job` occurrence can carry; `states` filters match this vocabulary.
+/// The states a `hub.job` occurrence can carry; the CLI hub event filter accepts this vocabulary.
 pub(crate) const JOB_STATES: &[&str] = &[
     "submitted",
     "queued",
@@ -94,7 +92,6 @@ type HubSnapshot = (
 
 pub(super) struct Prepared {
     subscription: HubSubscription,
-    filters: Filters,
 }
 
 struct HubSubscription {
@@ -111,6 +108,8 @@ struct HubSubscription {
 
 pub(super) enum EventError {
     Invalid(McpFailure),
+    /// A narrowing argument was supplied to the hub type, which carries every hub event.
+    Filtered(&'static str),
     NotFound,
     Failed(McpFailure),
 }
@@ -124,7 +123,9 @@ struct PollRequest {
     target: Option<String>,
     cursor: Option<String>,
     max_events: usize,
-    filters: Filters,
+    /// The kind implied by a kind-named subscription (`hub.job`, ...). A hub subscription by
+    /// name or alias carries every kind. This is subscription identity, not a narrowing argument.
+    kinds: Option<Vec<String>>,
     hub: bool,
 }
 
@@ -148,72 +149,33 @@ struct JobSnapshot {
     target: Option<String>,
 }
 
-#[derive(Clone, Default)]
-struct Filters {
-    phases: Option<Vec<String>>,
-    states: Option<Vec<String>>,
-    nodes: Option<Vec<String>>,
-    kinds: Option<Vec<String>>,
-    labels: Option<Vec<(String, String)>>,
-    terminal_only: bool,
-    verbose: bool,
-}
+/// Narrowing arguments that used to filter a `hub` subscription. They are rejected in this
+/// fixed order so the reported argument is deterministic.
+const NARROWING_ARGUMENTS: [&str; 7] = [
+    "kinds",
+    "states",
+    "phases",
+    "nodes",
+    "labels",
+    "terminalOnly",
+    "verbose",
+];
+const NARROWING_MESSAGES: [&str; 7] = [
+    "the hub event type carries every event; \"kinds\" is not supported",
+    "the hub event type carries every event; \"states\" is not supported",
+    "the hub event type carries every event; \"phases\" is not supported",
+    "the hub event type carries every event; \"nodes\" is not supported",
+    "the hub event type carries every event; \"labels\" is not supported",
+    "the hub event type carries every event; \"terminalOnly\" is not supported",
+    "the hub event type carries every event; \"verbose\" is not supported",
+];
 
-impl Filters {
-    fn accepts(&self, data: &Value, terminal: bool) -> bool {
-        if self.terminal_only && !terminal {
-            return false;
-        }
-        if let Some(phases) = &self.phases {
-            let phase = data
-                .pointer("/status/phase")
-                .or_else(|| data.get("state"))
-                .or_else(|| data.get("phase"))
-                .and_then(Value::as_str);
-            if !phase.is_some_and(|phase| phases.iter().any(|allowed| allowed == phase)) {
-                return false;
-            }
-        }
-        if let Some(states) = &self.states {
-            let state = data.get("state").and_then(Value::as_str);
-            if !state.is_some_and(|state| states.iter().any(|allowed| allowed == state)) {
-                return false;
-            }
-        }
-        if let Some(labels) = &self.labels {
-            let present = data.get("labels").and_then(Value::as_object);
-            if !labels.iter().all(|(key, value)| {
-                present
-                    .and_then(|labels| labels.get(key))
-                    .and_then(Value::as_str)
-                    == Some(value.as_str())
-            }) {
-                return false;
-            }
-        }
-        if let Some(nodes) = &self.nodes {
-            // A terminal record carries no active executions, so a node filter would
-            // otherwise swallow the one event that tells the caller the run ended.
-            if data.get("status").is_none() {
-                return true;
-            }
-            let matched = data
-                .pointer("/status/activeExecutions")
-                .and_then(Value::as_array)
-                .is_some_and(|executions| {
-                    executions.iter().any(|execution| {
-                        execution
-                            .get("node")
-                            .and_then(Value::as_str)
-                            .is_some_and(|node| nodes.iter().any(|allowed| allowed == node))
-                    })
-                });
-            if !matched && !terminal {
-                return false;
-            }
-        }
-        true
-    }
+/// The first narrowing argument the subscription supplied, if any.
+fn narrowing_argument(arguments: &Map<String, Value>) -> Option<&'static str> {
+    NARROWING_ARGUMENTS
+        .iter()
+        .copied()
+        .find(|name| arguments.contains_key(*name))
 }
 
 struct Batch {
@@ -271,7 +233,7 @@ pub(super) struct HubFeed {
     /// Latest durable run record per job, used to carry delivery facts into the one terminal
     /// `hub.job` occurrence.
     run_facts: RefCell<HashMap<String, Value>>,
-    /// Labels of the latest job view, so every job-derived record can be label filtered.
+    /// Labels of the latest job view, so every job-derived record carries them.
     job_labels: RefCell<HashMap<String, Value>>,
     /// Jobs whose terminal occurrence this feed already published. A late subscriber gets that
     /// final state in its bootstrap snapshot instead of waiting for an event it missed.
@@ -429,8 +391,8 @@ impl HubFeed {
     }
 
     fn publish(&self, mut event: HubEvent) {
-        // Run and warning records describe a job, so `labels` filtering has the same
-        // meaning on every job-derived kind instead of only on `hub.job`.
+        // Run and warning records describe a job, so carry the job's labels on every
+        // job-derived kind, not only on `hub.job`.
         if event.name != HUB_JOB
             && let Some(job_id) = &event.job_id
             && let Some(labels) = self.job_labels.borrow().get(job_id).cloned()
@@ -809,10 +771,9 @@ where
             truncated,
             selector: request.selector.clone(),
             target: request.target.clone(),
-            kinds: request.filters.kinds.clone(),
+            kinds: request.kinds.clone(),
             stream: request.stream.clone(),
         },
-        filters: request.filters.clone(),
     };
     feed.release_poller();
     Ok(prepared)
@@ -838,18 +799,11 @@ pub(super) async fn drive<W>(prepared: Prepared, output: StreamOutput<W>) -> std
 where
     W: AsyncWrite + Unpin + Send,
 {
-    let Prepared {
-        subscription,
-        filters,
-    } = prepared;
-    drive_hub(subscription, filters, output).await
+    let Prepared { subscription } = prepared;
+    drive_hub(subscription, output).await
 }
 
-async fn drive_hub<W>(
-    subscription: HubSubscription,
-    filters: Filters,
-    output: StreamOutput<W>,
-) -> std::io::Result<()>
+async fn drive_hub<W>(subscription: HubSubscription, output: StreamOutput<W>) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin + Send,
 {
@@ -876,7 +830,6 @@ where
         selector: &selector,
         target: &target,
         kinds: &kinds,
-        filters: &filters,
         stream: &stream,
     };
     let mut sequence = 0u64;
@@ -965,8 +918,9 @@ where
                                     remember_job_state(&event, &mut job_states);
                                 }
                             }
-                            // Advance even when a repeated state or a filter suppressed delivery;
-                            // the cursor is durable feed position, not a delivered-event count.
+                            // Advance even when a repeated state or the subscription's kind
+                            // suppressed delivery; the cursor is durable feed position, not a
+                            // delivered-event count.
                             cursor = Some(hub_cursor(event.sequence));
                         }
                     }
@@ -1028,7 +982,6 @@ struct HubFilter<'a> {
     selector: &'a Selector,
     target: &'a Option<String>,
     kinds: &'a Option<Vec<String>>,
-    filters: &'a Filters,
     stream: &'a str,
 }
 
@@ -1068,13 +1021,10 @@ fn hub_event_value(event: &HubEvent, filter: &HubFilter<'_>, stamp: Stamp<'_>) -
         .clone()
         .unwrap_or_else(|| hub_cursor(event.sequence));
     let mut data = if event.name == HUB_RUN {
-        event_data(&event.data, filter.filters.verbose)
+        event_data(&event.data, false)
     } else {
         event.data.clone()
     };
-    if !filter.filters.accepts(&data, event.terminal) {
-        return None;
-    }
     let summary = if event.name == HUB_RUN {
         summary(&data)
     } else {
@@ -1126,6 +1076,17 @@ fn truncation_bounds(value: &Value) -> (Option<u64>, Option<u64>) {
 pub(super) fn rpc_error(error: EventError) -> (i64, &'static str, Value) {
     match error {
         EventError::Invalid(failure) => (-32602, "Invalid params", failure_data(failure)),
+        EventError::Filtered(argument) => {
+            let index = NARROWING_ARGUMENTS
+                .iter()
+                .position(|name| *name == argument)
+                .expect("a narrowing argument has a fixed message");
+            (
+                -32602,
+                NARROWING_MESSAGES[index],
+                json!({"code": "mcp.events.filtered", "argument": argument}),
+            )
+        }
         // An unknown event name is a bad subscription parameter, not a missing session: a
         // client can correct the typo without restarting the MCP session.
         EventError::NotFound => (-32602, "Invalid params", json!({"kind": "event"})),
@@ -1228,175 +1189,21 @@ fn parse_subscription(params: &Value, capped: bool) -> Result<PollRequest, Event
         || name_kinds.is_some()
         || matches!(name.as_deref(), Some("hub") | Some("hub.event"));
     let target = optional_string(arguments, "target").map_err(EventError::Invalid)?;
-    let mut filters = parse_filters(arguments)?;
-    if filters.kinds.is_none() {
-        filters.kinds = name_kinds.or_else(|| {
-            (hub && name.as_deref() == Some(EVENT_NAME)).then(|| vec![HUB_RUN.to_owned()])
-        });
+    if let Some(argument) = narrowing_argument(arguments) {
+        return Err(EventError::Filtered(argument));
     }
+    reject_unknown(arguments, &["runId", "jobId", "target"]).map_err(EventError::Invalid)?;
+    let kinds = name_kinds
+        .or_else(|| (hub && name.as_deref() == Some(EVENT_NAME)).then(|| vec![HUB_RUN.to_owned()]));
     Ok(PollRequest {
         stream: name.unwrap_or_else(|| "hub".to_owned()),
         selector,
         target,
         cursor,
         max_events,
-        filters,
+        kinds,
         hub,
     })
-}
-
-fn parse_filters(arguments: &Map<String, Value>) -> Result<Filters, EventError> {
-    reject_unknown(
-        arguments,
-        &[
-            "runId",
-            "jobId",
-            "target",
-            "kinds",
-            "phases",
-            "states",
-            "nodes",
-            "labels",
-            "terminalOnly",
-            "verbose",
-        ],
-    )
-    .map_err(EventError::Invalid)?;
-    let phases = match arguments.get("phases") {
-        None | Some(Value::Null) => None,
-        Some(Value::Array(values)) => {
-            let mut phases = Vec::with_capacity(values.len());
-            for value in values {
-                let Some(phase) = value.as_str() else {
-                    return Err(EventError::Invalid(McpFailure::invalid(
-                        "phases must be an array of strings",
-                    )));
-                };
-                if !PHASES.contains(&phase) && !POOL_PHASES.contains(&phase) {
-                    return Err(EventError::Invalid(McpFailure::invalid(format!(
-                        "unknown phase {phase}"
-                    ))));
-                }
-                phases.push(phase.to_owned());
-            }
-            Some(phases)
-        }
-        Some(_) => {
-            return Err(EventError::Invalid(McpFailure::invalid(
-                "phases must be an array of strings",
-            )));
-        }
-    };
-    let states = match arguments.get("states") {
-        None | Some(Value::Null) => None,
-        Some(Value::Array(values)) => {
-            let mut states = Vec::with_capacity(values.len());
-            for value in values {
-                let Some(state) = value.as_str() else {
-                    return Err(EventError::Invalid(McpFailure::invalid(
-                        "states must be an array of strings",
-                    )));
-                };
-                if !JOB_STATES.contains(&state) {
-                    return Err(EventError::Invalid(McpFailure::invalid(format!(
-                        "unknown job state {state}"
-                    ))));
-                }
-                states.push(state.to_owned());
-            }
-            Some(states)
-        }
-        Some(_) => {
-            return Err(EventError::Invalid(McpFailure::invalid(
-                "states must be an array of strings",
-            )));
-        }
-    };
-    let nodes = match arguments.get("nodes") {
-        None | Some(Value::Null) => None,
-        Some(Value::Array(values)) => {
-            let mut nodes = Vec::with_capacity(values.len());
-            for value in values {
-                let Some(node) = value.as_str() else {
-                    return Err(EventError::Invalid(McpFailure::invalid(
-                        "nodes must be an array of strings",
-                    )));
-                };
-                nodes.push(node.to_owned());
-            }
-            Some(nodes)
-        }
-        Some(_) => {
-            return Err(EventError::Invalid(McpFailure::invalid(
-                "nodes must be an array of strings",
-            )));
-        }
-    };
-    let labels = match arguments.get("labels") {
-        None | Some(Value::Null) => None,
-        Some(Value::Object(values)) => {
-            let mut labels = Vec::with_capacity(values.len());
-            for (key, value) in values {
-                let Some(value) = value.as_str() else {
-                    return Err(EventError::Invalid(McpFailure::invalid(
-                        "labels must be an object of string values",
-                    )));
-                };
-                labels.push((key.clone(), value.to_owned()));
-            }
-            labels.sort();
-            Some(labels)
-        }
-        Some(_) => {
-            return Err(EventError::Invalid(McpFailure::invalid(
-                "labels must be an object of string values",
-            )));
-        }
-    };
-    let kinds = match arguments.get("kinds") {
-        None | Some(Value::Null) => None,
-        Some(Value::Array(values)) => {
-            let mut kinds = Vec::with_capacity(values.len());
-            for value in values {
-                let Some(kind) = value.as_str() else {
-                    return Err(EventError::Invalid(McpFailure::invalid(
-                        "kinds must be an array of hub event names",
-                    )));
-                };
-                if !HUB_EVENTS.contains(&kind) {
-                    return Err(EventError::Invalid(McpFailure::invalid(format!(
-                        "unknown hub event kind {kind}"
-                    ))));
-                }
-                kinds.push(kind.to_owned());
-            }
-            Some(kinds)
-        }
-        Some(_) => {
-            return Err(EventError::Invalid(McpFailure::invalid(
-                "kinds must be an array of hub event names",
-            )));
-        }
-    };
-    Ok(Filters {
-        phases,
-        states,
-        nodes,
-        kinds,
-        labels,
-        terminal_only: optional_bool(arguments, "terminalOnly")?,
-        verbose: optional_bool(arguments, "verbose")?,
-    })
-}
-
-fn optional_bool(arguments: &Map<String, Value>, key: &str) -> Result<bool, EventError> {
-    match arguments.get(key) {
-        None | Some(Value::Null) => Ok(false),
-        Some(Value::Bool(value)) => Ok(*value),
-        Some(_) => Err(EventError::Invalid(McpFailure::invalid(format!(
-            "{key} must be a boolean"
-        )))),
-    }
 }
 
 fn max_events(map: &Map<String, Value>) -> Result<usize, EventError> {
@@ -1483,7 +1290,7 @@ async fn collect_after(
             continue;
         }
         cursor = event_cursor;
-        if let Some(occurrence) = occurrence(&event, &request.filters, false).map_err(classify)? {
+        if let Some(occurrence) = occurrence(&event, false).map_err(classify)? {
             events.push(occurrence);
         }
     }
@@ -1582,8 +1389,7 @@ where
     let filter = HubFilter {
         selector: &request.selector,
         target: &request.target,
-        kinds: &request.filters.kinds,
-        filters: &request.filters,
+        kinds: &request.kinds,
         stream: &request.stream,
     };
     let mut job_states = HashMap::new();
@@ -1655,7 +1461,8 @@ where
         // in one frame and reports hasMore: false.
         has_more = true;
     } else {
-        // Filters can hide every replay record while the cursor still has to advance past it.
+        // A kind-named subscription can hide every replay record while the cursor still has
+        // to advance past it.
         if let Some(last) = replay.last()
             && last.sequence > cursor
         {
@@ -1671,7 +1478,7 @@ where
     }
 
     // Assign the per-caller sequence only after clipping, so a delivered batch is contiguous
-    // and starts at 1 even when filters or maxEvents skipped occurrences.
+    // and starts at 1 even when a kind-named subscription or maxEvents skipped occurrences.
     for (_, value) in &mut selected {
         let next = sequence.get().saturating_add(1);
         sequence.set(next);
@@ -1792,8 +1599,8 @@ where
 
 /// Remember the latest job state one subscriber has actually delivered. A bootstrap and the
 /// poller's concurrent first look can report the same or an older state; only a real transition
-/// should reach the client. Filtered records are not remembered, so a later transition that does
-/// match the requested filter is not mistaken for a repeat.
+/// should reach the client. Records elsewhere in the stream are not remembered, so a later
+/// transition in a kind-named subscription is not mistaken for a repeat.
 fn repeated_job_state(event: &HubEvent, states: &HashMap<String, String>) -> bool {
     if event.name != HUB_JOB {
         return false;
@@ -1864,8 +1671,7 @@ where
     let filter = HubFilter {
         selector: &request.selector,
         target: &request.target,
-        kinds: &request.filters.kinds,
-        filters: &request.filters,
+        kinds: &request.kinds,
         stream: &request.stream,
     };
     let mut events = Vec::with_capacity(views.len());
@@ -2803,18 +2609,10 @@ fn summary(data: &Value) -> Value {
     })
 }
 
-fn occurrence(
-    event: &Value,
-    filters: &Filters,
-    replayed: bool,
-) -> Result<Option<Value>, McpFailure> {
+fn occurrence(event: &Value, replayed: bool) -> Result<Option<Value>, McpFailure> {
     let cursor = watch_cursor(event)?;
     let run_id = event.get("runId").and_then(Value::as_str).unwrap_or("run");
-    let mut data = event_data(event, filters.verbose);
-    let terminal = data.pointer("/status/phase").and_then(Value::as_str) == Some("finished");
-    if !filters.accepts(&data, terminal) {
-        return Ok(None);
-    }
+    let mut data = event_data(event, false);
     let summary = summary(&data);
     if let Some(map) = data.as_object_mut() {
         map.insert("summary".to_owned(), summary);
@@ -2853,66 +2651,30 @@ fn input_schema(name: &str) -> Value {
         &[],
         vec![
             (
-                "runId",
-                string_prop(
-                    "Only emit events for this run. Omit it and jobId to receive the whole hub.",
+                "cursor",
+                string_prop("Resume from this hub:<sequence> cursor."),
+            ),
+            (
+                "maxAgeMs",
+                integer_prop(
+                    "Accepted for MCP compatibility but not applied; watch records carry no \
+                     occurrence time.",
                 ),
             ),
             (
-                "jobId",
-                string_prop("Only emit events for this hub job and its run."),
-            ),
-            (
-                "target",
-                string_prop("Only emit events for this named target."),
-            ),
-            (
-                "kinds",
-                string_array_prop(
-                    "Only emit these event names: hub.job, hub.run, hub.pool, or hub.warning.",
-                ),
-            ),
-            (
-                "phases",
-                string_array_prop(
-                    "Only emit hub.run and hub.pool events whose phase is admitted, running, \
-                     stopping, or finished (or a pool lease phase).",
-                ),
-            ),
-            (
-                "states",
-                string_array_prop(
-                    "Only emit hub.job events in one of these job states: submitted, queued, \
-                     scheduled, placing, running, succeeded, failed, dequeued, or cancelled.",
-                ),
-            ),
-            (
-                "labels",
-                json!({
-                    "type": "object",
-                    "description": "Only emit events whose job carries every one of these labels.",
-                    "additionalProperties": {"type": "string"},
-                }),
-            ),
-            (
-                "nodes",
-                string_array_prop(
-                    "Only emit run events with an active execution at one of these graph nodes.",
-                ),
-            ),
-            ("terminalOnly", bool_prop("Only emit terminal events.")),
-            (
-                "verbose",
-                bool_prop("Keep the full recorded failure array on terminal run events."),
+                "maxEvents",
+                integer_prop("Bound the events returned by one poll from 1 to 1000."),
             ),
         ],
     );
     schema["description"] = json!(format!(
-        "Long-lived {name} subscription. Omit runId and jobId to receive every hub.job, \
-         hub.run, hub.pool, and hub.warning event on one stream. The stream stays open after \
-         terminal run events and idle periods; stop it with events/unsubscribe, session end, or \
-         cancellation. Resume with the hub:N cursor from notifications/events/active. maxAgeMs \
-         is accepted but not applied because durable watch records carry no occurrence time."
+        "Long-lived {name} subscription. Every occurrence carries one of hub.job, hub.run, \
+         hub.pool, or hub.warning in data.kind; narrowing arguments are refused because one \
+         subscription must carry every hub event. Optional runId, jobId, or target selectors \
+         choose which subscription this is. The stream stays open after terminal run events and \
+         idle periods; stop it with events/unsubscribe, session end, or cancellation. Resume \
+         with the hub:N cursor from notifications/events/active. maxAgeMs is accepted but not \
+         applied because durable watch records carry no occurrence time."
     ));
     schema
 }
