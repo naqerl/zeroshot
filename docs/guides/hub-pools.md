@@ -205,7 +205,8 @@ loss — an inconclusive answer is not a deleted server, so the lease keeps drai
 reports the failed confirmation. A lease that never received a server is not reconciled either:
 there is no lost resource to report, so it keeps its pool from claiming removal.
 
-Pool-wide changes use `kind: "pool"` and the phases `added`, `removed`, `paused`, `resumed`,
+Every `hub.pool` record carries `kind: "hub.pool"`, like every hub event, and `scope`: `"lease"`
+for a lease transition, `"pool"` for a pool-wide one. Pool-wide changes use `scope: "pool"` and the phases `added`, `removed`, `paused`, `resumed`,
 `blocked`, and `shortage`. They carry the pool name and no lease, and a `reason` for every phase
 except `added` and `removed`. `paused` follows a failed boot and says how many failures in a row
 stopped new servers and for how long; `resumed` follows a server that joined or a
@@ -217,10 +218,11 @@ An example notification for a lease that just became ready:
 ```json
 {
   "eventId": "hub:57",
-  "name": "hub.pool",
+  "name": "hub",
   "timestamp": "2026-02-11T09:41:12.481Z",
   "data": {
-    "kind": "lease",
+    "kind": "hub.pool",
+    "scope": "lease",
     "pool": "burst",
     "leaseId": "zs-hj-42",
     "serverId": 41892345,

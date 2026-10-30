@@ -786,7 +786,10 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   `hub:<sequence>` cursor. Omitting selectors subscribes to the whole hub; `runId`, `jobId`,
   `target`, and other filters narrow that feed without binding it, and single-kind names select
   one event kind (`run.event` is the `hub.run` alias). Occurrences keep the flattened five-field
-  envelope (`eventId`, `name`, `timestamp`, `data`, `_meta`); `summary`, `replayed`, and the hub
+  envelope (`eventId`, `name`, `timestamp`, `data`, `_meta`). The envelope `name` is always the
+  name the client subscribed with (`hub` when omitted), because MCP events clients route and
+  validate occurrences by it; the carried kind is `data.kind` (`hub.pool` records keep their
+  lease-or-pool discriminator as `data.scope`). `summary`, `replayed`, and the hub
   `cursor` live inside `data`, while run records retain their durable `v2:` cursor as
   `data.runCursor`. `replayed` is true only for records drained at subscribe time. Terminal events
   are ordinary events and heartbeats continue while idle; only unsubscribe, session end, or

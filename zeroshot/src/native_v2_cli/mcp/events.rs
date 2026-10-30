@@ -106,6 +106,7 @@ struct HubSubscription {
     selector: Selector,
     target: Option<String>,
     kinds: Option<Vec<String>>,
+    stream: String,
 }
 
 pub(super) enum EventError {
@@ -115,6 +116,10 @@ pub(super) enum EventError {
 }
 
 struct PollRequest {
+    /// The name the client subscribed with (`hub` when omitted). Every hub occurrence carries it
+    /// as its envelope `name`, because MCP events clients match an occurrence to its subscription
+    /// by name; the carried kind travels in `data.kind`.
+    stream: String,
     selector: Selector,
     target: Option<String>,
     cursor: Option<String>,
@@ -639,9 +644,10 @@ pub(super) fn list(params: &Value) -> Result<Value, EventError> {
     }
     let descriptions = [(
         "hub",
-        "everything in the hub: jobs, runs, pool leases, and warnings. Each notification keeps \
-         its own name, one of hub.job, hub.run, hub.pool, or hub.warning, so a client can branch \
-         on the kind or ignore it and read the stream.",
+        "everything in the hub: jobs, runs, pool leases, and warnings. Every notification is \
+         named after the subscription (hub) and carries its kind, one of hub.job, hub.run, \
+         hub.pool, or hub.warning, in data.kind, so a client can branch on the kind or ignore it \
+         and read the stream.",
     )];
     let events = descriptions
         .into_iter()
@@ -804,6 +810,7 @@ where
             selector: request.selector.clone(),
             target: request.target.clone(),
             kinds: request.filters.kinds.clone(),
+            stream: request.stream.clone(),
         },
         filters: request.filters.clone(),
     };
@@ -855,6 +862,7 @@ where
         selector,
         target,
         kinds,
+        stream,
     } = subscription;
     let StreamOutput {
         id,
@@ -869,6 +877,7 @@ where
         target: &target,
         kinds: &kinds,
         filters: &filters,
+        stream: &stream,
     };
     let mut sequence = 0u64;
     let mut job_states = HashMap::new();
@@ -1020,6 +1029,7 @@ struct HubFilter<'a> {
     target: &'a Option<String>,
     kinds: &'a Option<Vec<String>>,
     filters: &'a Filters,
+    stream: &'a str,
 }
 
 /// One delivery's position: replay state, monotone sequence, and the enclosing request ID.
@@ -1083,6 +1093,7 @@ fn hub_event_value(event: &HubEvent, filter: &HubFilter<'_>, stamp: Stamp<'_>) -
                 map.insert("runCursor".to_owned(), run_cursor);
             }
         }
+        map.insert("kind".to_owned(), json!(event.name));
         map.insert("cursor".to_owned(), json!(&event_cursor));
         map.insert("summary".to_owned(), summary);
         map.insert("replayed".to_owned(), json!(stamp.replayed));
@@ -1093,7 +1104,7 @@ fn hub_event_value(event: &HubEvent, filter: &HubFilter<'_>, stamp: Stamp<'_>) -
     }
     let value = json!({
         "eventId": event_cursor,
-        "name": event.name,
+        "name": filter.stream,
         "timestamp": event.timestamp,
         "data": data,
         "_meta": stamp.id.map(meta).unwrap_or_else(|| json!({})),
@@ -1224,6 +1235,7 @@ fn parse_subscription(params: &Value, capped: bool) -> Result<PollRequest, Event
         });
     }
     Ok(PollRequest {
+        stream: name.unwrap_or_else(|| "hub".to_owned()),
         selector,
         target,
         cursor,
@@ -1572,6 +1584,7 @@ where
         target: &request.target,
         kinds: &request.filters.kinds,
         filters: &request.filters,
+        stream: &request.stream,
     };
     let mut job_states = HashMap::new();
     let snapshots = if bootstrap {
@@ -1853,6 +1866,7 @@ where
         target: &request.target,
         kinds: &request.filters.kinds,
         filters: &request.filters,
+        stream: &request.stream,
     };
     let mut events = Vec::with_capacity(views.len());
     for mut view in views {
@@ -2397,7 +2411,7 @@ fn publish_pool(feed: &HubFeed, record: &Value) {
     let terminal = matches!(phase.as_str(), "deleted" | "failed" | "removed");
     let target = member.or(lease).or(pool).map(str::to_owned);
     let data = json!({
-        "kind": record.get("kind").cloned().unwrap_or_else(|| json!("lease")),
+        "scope": record.get("kind").cloned().unwrap_or_else(|| json!("lease")),
         "pool": pool,
         "leaseId": record.get("leaseId").cloned().unwrap_or(Value::Null),
         "serverId": record.get("serverId").cloned().unwrap_or(Value::Null),
@@ -2908,8 +2922,9 @@ fn payload_schema(name: &str) -> Value {
         "type": "object",
         "description": "Trimmed durable run watch record. data.cursor is the hub cursor; data.runCursor keeps the run's v2: cursor.",
         "additionalProperties": true,
-        "required": ["runId", "cursor", "status", "summary", "replayed"],
+        "required": ["kind", "runId", "cursor", "status", "summary", "replayed"],
         "properties": {
+            "kind": {"const": HUB_RUN},
             "runId": {"type": "string"},
             "cursor": {"type": "string", "pattern": "^hub:[0-9]+$"},
             "runCursor": {"type": "string", "pattern": "^v2:[0-9]+$"},
@@ -2935,8 +2950,9 @@ fn payload_schema(name: &str) -> Value {
     let job_data = json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["jobId", "title", "state", "target", "project", "runId", "attempts", "pinnedRevision", "labels", "submittedAt", "finishedAt", "failureReason", "errorKind", "reason", "at", "cursor", "summary", "replayed", "sequence"],
+        "required": ["kind", "jobId", "title", "state", "target", "project", "runId", "attempts", "pinnedRevision", "labels", "submittedAt", "finishedAt", "failureReason", "errorKind", "reason", "at", "cursor", "summary", "replayed", "sequence"],
         "properties": {
+            "kind": {"const": HUB_JOB},
             "jobId": {"type": "string"},
             "cursor": {"type": "string", "pattern": HUB_CURSOR_PATTERN, "description": "Durable hub:<sequence> cursor, or hub:snapshot:<delivered>:<start> for a bootstrap record."},
             "sequence": {"type": "integer", "minimum": 1},
@@ -2969,9 +2985,10 @@ fn payload_schema(name: &str) -> Value {
     let pool_data = json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["kind", "pool", "leaseId", "serverId", "memberId", "machine", "phase", "previousPhase", "at", "reason", "cursor", "summary", "replayed"],
+        "required": ["kind", "scope", "pool", "leaseId", "serverId", "memberId", "machine", "phase", "previousPhase", "at", "reason", "cursor", "summary", "replayed"],
         "properties": {
-            "kind": {"type": "string", "enum": ["lease", "pool"]},
+            "kind": {"const": HUB_POOL},
+            "scope": {"type": "string", "enum": ["lease", "pool"], "description": "Whether the transition is one lease's or the pool's own."},
             "pool": {"type": "string"},
             "cursor": {"type": "string", "pattern": "^hub:[0-9]+$"},
             "leaseId": {"type": ["string", "null"]},
@@ -3002,8 +3019,9 @@ fn payload_schema(name: &str) -> Value {
     let warning_data = json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["jobId", "runId", "message", "at", "cursor", "summary", "replayed"],
+        "required": ["kind", "jobId", "runId", "message", "at", "cursor", "summary", "replayed"],
         "properties": {
+            "kind": {"const": HUB_WARNING},
             "jobId": {"type": "string"},
             "runId": {"type": "string"},
             "cursor": {"type": "string", "pattern": "^hub:[0-9]+$"},
@@ -3032,9 +3050,8 @@ fn payload_schema(name: &str) -> Value {
                 "description": "The record's resume cursor: durable hub:<sequence>, or hub:snapshot:<delivered>:<start> for a bootstrap snapshot record."
             },
             "name": {
-                "type": "string",
-                "description": "Event name carried by this multiplexed subscription.",
-                "enum": HUB_EVENTS
+                "const": name,
+                "description": "The subscribed event name. A subscription by kind or alias carries that name instead; data.kind names the carried kind."
             },
             "timestamp": {"type": "string", "format": "date-time"},
             "data": data,
