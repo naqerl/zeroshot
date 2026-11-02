@@ -29,6 +29,7 @@ use thiserror::Error;
 pub use crate::active_memory::hooks::run_hook_helper as run_active_memory_hook;
 pub use crate::native_v2_contract::RunSubmissionIntent as TargetRunIntent;
 use crate::native_v2_admission::NativeV2AdmissionError;
+use crate::native_v2_observability::history::RunReport;
 use crate::native_v2_supervisor::RunEnvironmentError;
 
 #[path = "native_v2_templates.rs"]
@@ -59,6 +60,8 @@ pub use diagnostic::{ERROR_FORMAT_ENV, JSON_ERROR_FORMAT, NativeV2CliDiagnostic}
 mod parser;
 
 mod delegations;
+#[path = "native_v2_cli/hub.rs"]
+pub mod hub;
 mod profiles;
 pub use delegations::{DelegationAction, DelegationCommand, DelegationResult};
 pub(crate) use profiles::LocalRunProfileStore;
@@ -82,12 +85,18 @@ pub use execution::{
 };
 pub use parser::{Cli, parse_native_v2_args};
 
+#[path = "native_v2_cli/mcp.rs"]
+pub mod mcp;
+
 mod acp;
 pub use acp::{AcpServeError, serve_local_acp};
 
 #[cfg(test)]
 #[path = "native_v2_cli/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(in crate::native_v2_cli) use tests::support::{Call as CliTestCall, FakeBackend as CliTestBackend};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetAdd {
@@ -363,6 +372,7 @@ pub enum NativeV2CliCommand {
         target: Option<String>,
     },
     Status(RunSelector),
+    Report(RunSelector),
     Watch(RunWatchCommand),
     Logs(RunLogsCommand),
     Attach {
@@ -373,6 +383,7 @@ pub enum NativeV2CliCommand {
     Resume(RunResumeCommand),
     Checkpoints(RunCheckpointsCommand),
     DiscardWorkspace(RunSelector),
+    Hub(hub::HubRequest),
 }
 
 impl NativeV2CliCommand {
@@ -723,6 +734,16 @@ pub trait NativeV2CliBackend: Send + Sync {
         target: Option<&str>,
         params: RunForceParams,
     ) -> Result<CliRunForceResult, NativeV2CliError>;
+    async fn run_report(
+        &self,
+        target: Option<&str>,
+        run_id: RunId,
+    ) -> Result<RunReport, NativeV2CliError> {
+        let _ = (target, run_id);
+        Err(NativeV2CliError::Target(
+            "target does not support run reports".to_owned(),
+        ))
+    }
     async fn authorize_resume_connection_requirements(
         &self,
         target: Option<&str>,

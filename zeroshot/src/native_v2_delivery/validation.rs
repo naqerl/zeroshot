@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -15,10 +16,13 @@ use crate::execution::process::{
     ProcessSessionOutput, ProcessStdout,
 };
 use crate::native_v2_runner::NodeRunnerError;
+use tokio::time::Instant;
 
 const VALIDATION_KIND: &str = "openengine.delivery-validation/v1";
 const MAX_VALIDATION_BYTES: usize = 1024 * 1024;
 const MAX_REASON_BYTES: usize = 8 * 1024;
+/// A process that fails to settle after its turn deadline still cannot hold delivery cleanup open.
+const VALIDATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Controller-owned executable outside the checkout, never supplied to provider children.
 #[derive(Clone)]
@@ -28,7 +32,7 @@ pub struct TrustedDeliveryValidator {
     active: std::sync::Arc<tokio::sync::Mutex<Option<ValidationTask>>>,
 }
 
-type ValidationTask = tokio::task::JoinHandle<Result<DeliveryValidationDecision, NodeRunnerError>>;
+type ValidationTask = tokio::task::JoinHandle<Result<DeliveryValidationOutcome, NodeRunnerError>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -60,6 +64,12 @@ pub enum DeliveryValidationDecision {
     Accepted,
     Repair { reason: String },
     Pending,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum DeliveryValidationOutcome {
+    Decision(DeliveryValidationDecision),
+    TimedOut,
 }
 
 #[derive(Serialize)]
@@ -110,12 +120,15 @@ impl TrustedDeliveryValidator {
         &self.path
     }
 
-    /// No turn deadline is imposed. Cancellation and every exchange exit await containment cleanup.
-    pub async fn validate(
+    /// A turn deadline supplied by the delivery poll policy applies. Cancellation and every
+    /// exchange exit await containment cleanup, and the owned task remains drainable if the
+    /// deadline expires before cleanup settles.
+    pub(crate) async fn validate_within(
         &self,
         request: DeliveryValidationRequest<'_>,
         cancellation: DriverCancellation,
-    ) -> Result<DeliveryValidationDecision, NodeRunnerError> {
+        deadline: Option<Instant>,
+    ) -> Result<DeliveryValidationOutcome, NodeRunnerError> {
         let frame = encode_request(&request)?;
         let executable = self.clone();
         let mut active = self.active.lock().await;
@@ -125,24 +138,62 @@ impl TrustedDeliveryValidator {
         // The adapter can drop its operation future on cancellation. Retain the owned helper
         // task so its process-tree cleanup is awaited before delivery releases the workspace.
         *active = Some(tokio::spawn(async move {
-            executable.validate_frame(frame, cancellation).await
+            executable
+                .validate_frame(frame, cancellation, deadline)
+                .await
         }));
+        let wait = deadline.map(|deadline| {
+            deadline.saturating_duration_since(Instant::now()) + VALIDATION_DRAIN_TIMEOUT
+        });
         let outcome = match active.as_mut() {
-            Some(task) => task.await,
+            Some(task) => match wait {
+                Some(wait) => match tokio::time::timeout(wait, &mut *task).await {
+                    Ok(joined) => joined,
+                    // Keep the owned task active so the adapter's required drain reaps it.
+                    Err(_) => return Ok(DeliveryValidationOutcome::TimedOut),
+                },
+                None => task.await,
+            },
             None => return Err(NodeRunnerError::CleanupUnconfirmed),
         };
         *active = None;
         outcome.map_err(|_| NodeRunnerError::CleanupUnconfirmed)?
     }
 
+    /// Test-only convenience for callers that exercise the exchange without a caller deadline.
+    #[cfg(test)]
+    pub async fn validate(
+        &self,
+        request: DeliveryValidationRequest<'_>,
+        cancellation: DriverCancellation,
+    ) -> Result<DeliveryValidationDecision, NodeRunnerError> {
+        match self
+            .validate_within(
+                request,
+                cancellation,
+                Some(Instant::now() + Duration::from_secs(30 * 60)),
+            )
+            .await?
+        {
+            DeliveryValidationOutcome::Decision(decision) => Ok(decision),
+            DeliveryValidationOutcome::TimedOut => Err(failure("timed out")),
+        }
+    }
+
     pub(crate) async fn drain(&self) -> Result<(), NodeRunnerError> {
         let mut active = self.active.lock().await;
-        if let Some(task) = active.take() {
-            match task.await {
-                Err(_) | Ok(Err(NodeRunnerError::CleanupUnconfirmed)) => {
+        if let Some(mut task) = active.take() {
+            match tokio::time::timeout(VALIDATION_DRAIN_TIMEOUT, &mut task).await {
+                Err(_) => {
+                    // Cleanup could not be confirmed inside the bound. Stop the detached task and
+                    // fail closed rather than release a workspace that may still be in use.
+                    task.abort();
                     return Err(NodeRunnerError::CleanupUnconfirmed);
                 }
-                Ok(_) => {}
+                Ok(Err(_)) | Ok(Ok(Err(NodeRunnerError::CleanupUnconfirmed))) => {
+                    return Err(NodeRunnerError::CleanupUnconfirmed);
+                }
+                Ok(Ok(_)) => {}
             }
         }
         Ok(())
@@ -152,13 +203,14 @@ impl TrustedDeliveryValidator {
         &self,
         frame: ProcessFrame,
         cancellation: DriverCancellation,
-    ) -> Result<DeliveryValidationDecision, NodeRunnerError> {
+        deadline: Option<Instant>,
+    ) -> Result<DeliveryValidationOutcome, NodeRunnerError> {
         if cancellation.is_cancelled() {
             return Err(NodeRunnerError::Cancelled);
         }
         let executable = Self::new(self.path.clone(), &self.workspace)
             .map_err(|_| failure("executable is unavailable or no longer private"))?;
-        let command = executable.command()?;
+        let command = executable.command(deadline)?;
         let mut process = LocalProcessRunner::new()
             .open(command, cancellation)
             .await
@@ -173,12 +225,15 @@ impl TrustedDeliveryValidator {
         if completion.cancelled {
             return Err(NodeRunnerError::Cancelled);
         }
+        if completion.timed_out {
+            return Ok(DeliveryValidationOutcome::TimedOut);
+        }
         let (_, bytes) = exchanged?;
         validate_completion(&completion)?;
-        parse_response(&bytes)
+        parse_response(&bytes).map(DeliveryValidationOutcome::Decision)
     }
 
-    fn command(&self) -> Result<ProcessSessionCommand, NodeRunnerError> {
+    fn command(&self, deadline: Option<Instant>) -> Result<ProcessSessionCommand, NodeRunnerError> {
         let program = self
             .path
             .to_str()
@@ -193,7 +248,7 @@ impl TrustedDeliveryValidator {
                 current_dir: self.workspace.clone(),
                 mode: WorkspaceAccessMode::ReadWrite,
             },
-            deadline: None,
+            deadline,
         })
     }
 }

@@ -460,6 +460,7 @@ async fn local_resume_reconciles_a_failed_successor_start_for_retry() {
                         context: None,
                         reason: EnumLabel::new("runtime_failed").assert_value(),
                     },
+                    timestamp: None,
                 },
             ],
         )

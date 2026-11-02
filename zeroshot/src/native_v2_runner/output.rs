@@ -10,9 +10,10 @@ use super::{
     wait_for_cancellation,
 };
 
-/// Built-in providers emit at most four terminal-usage records per execution: the initial turn,
-/// one provider continuation, and two correction turns. Mirroring the primary durable capacity
-/// leaves generous headroom for custom drivers while keeping cancellation cleanup memory bounded.
+/// Built-in providers emit at most seven terminal-usage records per execution: the initial turn,
+/// one provider continuation, up to three format corrections, and up to two contract corrections.
+/// Mirroring the primary durable capacity leaves generous headroom for custom drivers while keeping
+/// cancellation cleanup memory bounded.
 pub(super) const CANCELLED_TERMINAL_CAPACITY: usize = DURABLE_OUTPUT_CAPACITY;
 pub(super) const CANCELLED_TERMINAL_OVERFLOW_DETAIL: &str =
     "terminal events exceeded the cancellation-safe durable queue capacity";

@@ -17,6 +17,7 @@ fn failed(reason: &str) -> RunEvent {
             reason: reason.parse().assert_value(),
             context: None,
         },
+        timestamp: None,
     }
 }
 
@@ -48,6 +49,7 @@ async fn terminal_event_and_status_keep_same_evidence_even_when_the_worker_is_vo
                     RunEvent::ExecutionVoided {
                         reference: worker.clone(),
                         reason: ExecutionVoidReason::ParallelJoin,
+                        timestamp: None,
                     },
                     diagnostic(
                         None,
@@ -100,7 +102,7 @@ async fn terminal_event_and_status_keep_same_evidence_even_when_the_worker_is_vo
             appended.snapshot.executions[&worker.execution].state,
             NodeState::Voided { .. }
         ));
-        let RunEvent::Terminal { result } = &appended.events.last().assert_value().event else {
+        let RunEvent::Terminal { result, .. } = &appended.events.last().assert_value().event else {
             panic!("terminal event missing");
         };
         assert_eq!(Some(result), appended.snapshot.terminal.as_ref());
@@ -142,6 +144,7 @@ async fn recovered_evidence_and_diagnostic_loss_do_not_change_success_or_usage()
                 result: TerminalResult::Succeeded {
                     output: Value::Null,
                 },
+                timestamp: None,
             },
         ]);
         let appended = ledger.append(&run_id, events).await.assert_value();
@@ -214,12 +217,14 @@ async fn force_stop_does_not_invent_causality_and_invalid_diagnostic_batch_is_at
                         reference: worker,
                         outcome: WorkerOutcome::declared_failure(WorkerErrorCode::Refusal),
                     },
+                    timestamp: None,
                 },
                 RunEvent::Terminal {
                     result: TerminalResult::Failed {
                         reason: "force_stopped".parse().assert_value(),
                         context: None,
                     },
+                    timestamp: None,
                 },
             ],
         )
@@ -340,6 +345,7 @@ async fn primary_failure_retains_its_diagnostics_across_auxiliary_interruption()
                     RunEvent::RunTokenUsageObserved { usage: None },
                     RunEvent::Terminal {
                         result: primary.clone(),
+                        timestamp: None,
                     },
                 ],
             )

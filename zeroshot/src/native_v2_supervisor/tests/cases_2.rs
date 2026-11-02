@@ -95,7 +95,7 @@ async fn live_registration_failure_still_durably_drains_before_settlement() {
         .position(|event| {
             matches!(
                 &event.event,
-                RunEvent::NodeCompleted { completion }
+                RunEvent::NodeCompleted { completion, .. }
                     if completion.reference.node.as_str() == "worker"
                         && matches!(completion.outcome, WorkerOutcome::Error {
                             code: WorkerErrorCode::Crash,
@@ -182,7 +182,7 @@ async fn force_stop_closes_active_work_and_never_dispatches_again() {
         .position(|event| {
             matches!(
                 &event.event,
-                RunEvent::NodeCompleted { completion }
+                RunEvent::NodeCompleted { completion, .. }
                     if completion.reference.node.as_str() == "first"
             )
         })

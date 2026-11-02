@@ -8,8 +8,8 @@ use crate::execution::process::{
     ProcessFrame, ProcessRunnerError, ProcessStdout, MAX_PROCESS_MESSAGE_BYTES,
 };
 use crate::native_v2_capsule::provider_process::{
-    ProviderProcess, ProviderExecutionFiles, provider_error_output, redaction_values,
-    report_provider_error, safe_provider_text,
+    ProviderProcess, ProviderExecutionFiles, provider_error_output, redact_agent_response,
+    redaction_values, report_provider_error, safe_provider_text,
 };
 use crate::native_v2_runner::{
     AgentResponseState, DriverControl, DriverInvocation, NodeRunnerError, ProviderSchemaDialect,
@@ -257,15 +257,18 @@ impl<'a> CopilotRpc<'a> {
         state: &mut AgentResponseState,
         text: &str,
     ) -> Result<Option<WorkerOutcome>, NodeRunnerError> {
-        let response = resolve_agent_response_with_dialect(
-            &self.invocation.response,
-            text,
-            ProviderSchemaDialect::OpenAiStrict,
-        )?;
+        let response = redact_agent_response(
+            resolve_agent_response_with_dialect(
+                &self.invocation.response,
+                text,
+                ProviderSchemaDialect::OpenAiStrict,
+            )?,
+            &self.redactions,
+        );
         if let Some(error) = response.correction_error() {
             if let Some(mut output) = provider_error_output("Copilot", &error, &self.redactions)? {
                 output.diagnostic = state
-                    .corrections_exhausted()
+                    .corrections_exhausted(&response)
                     .then_some(FailureDiagnosticKind::Failure);
                 self.control.emit(output).await?;
             }

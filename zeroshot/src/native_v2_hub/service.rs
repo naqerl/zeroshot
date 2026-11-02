@@ -1,0 +1,1391 @@
+//! The daemon's hub: the single writer of hub state.
+//!
+//! State lives in memory behind one async mutex and is written to `state.json` after every
+//! change. The mutex is held only for in-memory work: target calls (discovery, load probes,
+//! status polls, submissions) run on snapshots outside it and their results are merged back by
+//! job ID or member name, so reads never wait for a slow target. A second mutex serializes
+//! placement decisions (dispatcher passes and `submit`), so a job is never placed twice.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::future::join_all;
+use serde_json::{Value, json};
+use tokio::sync::Mutex;
+
+use super::clock::{self, now_ms};
+use super::cron;
+use super::driver::{HubDriver, force_stop_arguments, route};
+use super::error::HubError;
+use super::metrics::Metrics;
+use super::model::{
+    HubState, Job, JobError, JobErrorKind, JobState, LOCAL_MEMBER, Member, MemberState,
+    PlacementSpec, Requirements, Schedule, ScheduleState,
+};
+use super::placement::{Fit, Placement, Rejection, describe, fit, matching_members, place, rejections};
+use super::lease::{PoolReport, PoolRuntime};
+use super::pool;
+use super::profile;
+use super::schedule::{self, Dispatched, LostTarget, TickReport, WithheldTarget};
+use super::stats;
+use super::store::HubStore;
+use super::wire::{
+    AddMember, JobFile, JobQuery, MemberQuery, StatsRequest, StreamRequest, UpdateMember,
+};
+use crate::native_v2_target::{FileTargetRegistry, TargetAccess, TargetRegistry};
+
+/// Run arguments whose value is a file the client uploads with the job.
+pub(crate) const FILE_FLAGS: [&str; 5] = [
+    "--input",
+    "--graph",
+    "--runtime-config",
+    "--uniform-runtime-config",
+    "--environment",
+];
+
+pub(crate) struct HubService {
+    store: HubStore,
+    driver: Arc<dyn HubDriver>,
+    registry: FileTargetRegistry,
+    state: Mutex<HubState>,
+    placement: Mutex<()>,
+    metrics: Metrics,
+    /// Unconfirmed submissions a job may have before it fails.
+    unconfirmed_limit: u32,
+    /// Optional `hub daemon run --max-stall`; a running job whose cursor stays unchanged for this
+    /// long is stopped and failed.
+    max_stall_ms: Option<u64>,
+    /// Eval work in progress, so the worker never runs one piece twice at once.
+    eval_claims: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// Provider and tunnel effects of pools; `None` without a provider token.
+    pools: Option<PoolRuntime>,
+}
+
+pub(crate) fn member_document(member: &Member) -> Value {
+    json!({ "schema": "zeroshot.hub.member/v1", "member": member.view() })
+}
+
+pub(crate) fn job_document(job: &Job, now: u64) -> Value {
+    json!({ "schema": "zeroshot.hub.job/v1", "job": job.view(now) })
+}
+
+pub(crate) fn schedule_document(schedule: &Schedule) -> Value {
+    json!({ "schema": "zeroshot.hub.schedule/v1", "schedule": schedule.view() })
+}
+
+impl HubService {
+    /// Load the hub folder's state and put jobs interrupted mid-placement back in the queue.
+    pub(crate) fn open(
+        store: HubStore,
+        driver: Arc<dyn HubDriver>,
+        registry: FileTargetRegistry,
+    ) -> Result<Self, HubError> {
+        let mut state = {
+            let lock = store.lock()?;
+            store.load(&lock)?
+        };
+        if schedule::recover_placing(&mut state) > 0 {
+            let lock = store.lock()?;
+            store.save(&lock, &state)?;
+        }
+        Ok(Self {
+            store,
+            driver,
+            registry,
+            state: Mutex::new(state),
+            placement: Mutex::new(()),
+            metrics: Metrics::default(),
+            unconfirmed_limit: schedule::DEFAULT_UNCONFIRMED_LIMIT,
+            max_stall_ms: None,
+            eval_claims: std::sync::Mutex::default(),
+            pools: None,
+        })
+    }
+
+    /// Export token counters for these job label keys as well.
+    #[must_use]
+    pub(crate) fn with_metric_labels(mut self, keys: Vec<String>) -> Self {
+        self.metrics = Metrics::new(keys);
+        self
+    }
+
+    /// Fail jobs after this many unconfirmed submissions (`None` keeps the default).
+    #[must_use]
+    pub(crate) fn with_unconfirmed_limit(mut self, limit: Option<u32>) -> Self {
+        self.unconfirmed_limit = limit.unwrap_or(self.unconfirmed_limit);
+        self
+    }
+
+    /// Create, tunnel to and delete pool servers with this runtime.
+    #[must_use]
+    pub(crate) fn with_pools(mut self, runtime: PoolRuntime) -> Self {
+        self.pools = Some(runtime);
+        self
+    }
+
+    pub(super) fn pool_runtime(&self) -> Option<&PoolRuntime> {
+        self.pools.as_ref()
+    }
+
+    pub(super) fn registry(&self) -> &FileTargetRegistry {
+        &self.registry
+    }
+
+    pub(super) async fn placement_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.placement.lock().await
+    }
+
+    /// Stop running jobs whose watch cursor does not advance for this long (`None` disables it).
+    #[must_use]
+    pub(crate) fn with_max_stall(mut self, max_stall_ms: Option<u64>) -> Self {
+        self.max_stall_ms = max_stall_ms;
+        self
+    }
+
+    pub(crate) fn metrics(&self) -> &Metrics {
+        &self.metrics
+    }
+
+    /// The Prometheus exposition document of this hub.
+    pub(crate) async fn render_metrics(&self) -> String {
+        let state = self.snapshot().await;
+        self.metrics.render(&state, now_ms())
+    }
+
+    pub(super) fn eval_claims(&self) -> &std::sync::Mutex<std::collections::BTreeSet<String>> {
+        &self.eval_claims
+    }
+
+    pub(crate) fn store(&self) -> &HubStore {
+        &self.store
+    }
+
+    pub(crate) async fn snapshot(&self) -> HubState {
+        self.state.lock().await.clone()
+    }
+
+    /// Apply `change` to a copy of the state, persist it, then publish it. A failed change or
+    /// write leaves the state untouched.
+    pub(super) async fn mutate<R>(
+        &self,
+        change: impl FnOnce(&mut HubState) -> Result<R, HubError>,
+    ) -> Result<R, HubError> {
+        let mut state = self.state.lock().await;
+        let mut next = state.clone();
+        let result = change(&mut next)?;
+        if next != *state {
+            let lock = self.store.lock()?;
+            self.store.save(&lock, &next)?;
+            *state = next;
+        }
+        Ok(result)
+    }
+
+    pub(super) fn driver(&self) -> &dyn HubDriver {
+        self.driver.as_ref()
+    }
+
+    // ---------------------------------------------------------------- members
+
+    pub(crate) async fn add(&self, request: AddMember) -> Result<Value, HubError> {
+        if request.name != LOCAL_MEMBER {
+            self.registry.get(&request.name).map_err(|error| {
+                HubError::MemberNotFound(format!(
+                    "{error}; register it on the hub host first with `zeroshot target add {} \
+                     --url ORIGIN`",
+                    request.name
+                ))
+            })?;
+        }
+        let mut member = Member {
+            tags: request.tags,
+            slots: request.slots.max(1),
+            priority: request.priority,
+            ..Member::new(request.name, now_ms())
+        };
+        schedule::discover(
+            std::slice::from_mut(&mut member),
+            self.driver(),
+            now_ms(),
+            0,
+        )
+        .await;
+        self.mutate(|state| {
+            if state.member(&member.name).is_some() {
+                return Err(HubError::Conflict(format!(
+                    "{} is already a hub member; use `zeroshot hub update`",
+                    member.name
+                )));
+            }
+            state.members.push(member.clone());
+            Ok(member_document(&member))
+        })
+        .await
+    }
+
+    pub(crate) async fn update(
+        &self,
+        name: &str,
+        request: UpdateMember,
+    ) -> Result<Value, HubError> {
+        self.mutate(|state| {
+            let member = state
+                .members
+                .iter_mut()
+                .find(|member| member.name == name)
+                .ok_or_else(|| HubError::MemberNotFound(format!("{name} is not a hub member")))?;
+            member.tags.retain(|tag| !request.remove_tags.contains(tag));
+            for tag in request.add_tags {
+                if !member.tags.contains(&tag) {
+                    member.tags.push(tag);
+                }
+            }
+            member.tags.sort();
+            if let Some(slots) = request.slots {
+                member.slots = slots.max(1);
+            }
+            if let Some(priority) = request.priority {
+                member.priority = priority;
+            }
+            if let Some(member_state) = request.state {
+                member.state = member_state;
+            }
+            Ok(member_document(member))
+        })
+        .await
+    }
+
+    pub(crate) async fn remove(&self, name: &str) -> Result<Value, HubError> {
+        self.mutate(|state| {
+            if state.member(name).is_none() {
+                return Err(HubError::MemberNotFound(format!(
+                    "{name} is not a hub member"
+                )));
+            }
+            let placed = state
+                .jobs
+                .iter()
+                .filter(|job| job.state == JobState::Running && job.target.as_deref() == Some(name))
+                .map(|job| job.job_id.clone())
+                .collect::<Vec<_>>();
+            if !placed.is_empty() {
+                return Err(HubError::Conflict(format!(
+                    "{name} still has placed jobs: {}; stop or dequeue them before removing the member",
+                    placed.join(", ")
+                )));
+            }
+            state.members.retain(|member| member.name != name);
+            Ok(json!({ "schema": "zeroshot.hub.member/v1", "removed": name }))
+        })
+        .await
+    }
+
+    fn member_kind(&self, name: &str) -> (Value, Value) {
+        if name == LOCAL_MEMBER {
+            return (json!("local"), Value::Null);
+        }
+        match self.registry.get(name) {
+            Ok(record) => {
+                let kind = match record.access {
+                    TargetAccess::Direct => "direct",
+                    TargetAccess::Hosted { .. } => "hosted",
+                };
+                (json!(kind), json!(record.origin))
+            }
+            Err(_) => (json!("unregistered"), Value::Null),
+        }
+    }
+
+    pub(crate) async fn list(&self, query: MemberQuery) -> Result<Value, HubError> {
+        let mut state = self.snapshot().await;
+        let loads = if query.probe {
+            let mut members = state.members.clone();
+            schedule::discover(&mut members, self.driver(), now_ms(), 0).await;
+            state = self
+                .mutate(|state| {
+                    schedule::merge_capabilities(&mut state.members, &members);
+                    Ok(state.clone())
+                })
+                .await?;
+            let probed = state
+                .members
+                .iter()
+                .filter(|member| query.tags.iter().all(|tag| member.has_tag(tag)))
+                .filter(|member| member.state != MemberState::Disabled)
+                .collect::<Vec<_>>();
+            let loads = schedule::probe(&probed, &state.jobs, self.driver()).await;
+            self.metrics.record_loads(&loads);
+            Some(loads)
+        } else {
+            None
+        };
+        let now = now_ms();
+        let targets = state
+            .members
+            .iter()
+            .filter(|member| query.tags.iter().all(|tag| member.has_tag(tag)))
+            .map(|member| {
+                let mut view = member.view();
+                let (kind, origin) = self.member_kind(&member.name);
+                view["kind"] = kind;
+                view["origin"] = origin;
+                view["hubRunning"] = json!(
+                    state
+                        .jobs
+                        .iter()
+                        .filter(|job| job.state == JobState::Running
+                            && job.target.as_deref() == Some(member.name.as_str()))
+                        .count()
+                );
+                let queued = state.jobs.iter().filter(|job| {
+                    job.state == JobState::Queued
+                        && matching_members(std::slice::from_ref(member), &job.placement).len() == 1
+                });
+                let (mut matching, mut rejects) = (0, Vec::new());
+                for job in queued {
+                    match fit(member, &job.requirements) {
+                        Fit::Unsupported(reason) => {
+                            rejects.push(json!({ "jobId": job.job_id, "reason": reason }));
+                        }
+                        Fit::Supported | Fit::Unknown => matching += 1,
+                    }
+                }
+                view["queuedMatching"] = json!(matching);
+                view["rejects"] = json!(rejects);
+                if let Some(load) = loads.as_ref().and_then(|loads| loads.get(&member.name)) {
+                    view["health"] = json!(if load.reachable() {
+                        "ready"
+                    } else {
+                        "unreachable"
+                    });
+                    view["active"] = json!(load.active);
+                    view["free"] = json!(member.slots.saturating_sub(load.active));
+                    view["probeError"] = json!(load.error);
+                    view["probedAt"] = json!(clock::rfc3339(now));
+                }
+                view
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({ "schema": "zeroshot.hub.targets/v1", "targets": targets }))
+    }
+
+    // ---------------------------------------------------------------- jobs
+
+    /// Write uploaded files under `spool/ID/` and point the run arguments at them. A working
+    /// folder that does not exist on this host is replaced by the spool folder.
+    fn spool(&self, job: &mut Job, files: Vec<JobFile>) -> Result<(), HubError> {
+        let (run_args, cwd) = (&mut job.run_args, &mut job.cwd);
+        let folder = self.store.directory().join("spool").join(&job.job_id);
+        if files.is_empty() && cwd.is_dir() {
+            return Ok(());
+        }
+        create_private_directory(&folder)?;
+        for (index, file) in files.into_iter().enumerate() {
+            let positions = (1..run_args.len())
+                .filter(|&position| {
+                    FILE_FLAGS.contains(&run_args[position - 1].as_str())
+                        && run_args[position] == file.argument
+                })
+                .collect::<Vec<_>>();
+            if positions.is_empty() {
+                return Err(HubError::Usage(format!(
+                    "uploaded file {:?} is not a file argument of the run",
+                    file.argument
+                )));
+            }
+            let name = Path::new(&file.argument).file_name().map_or_else(
+                || "file".to_owned(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            let path = folder.join(format!("{index}-{name}"));
+            replace_private(&path, file.content.as_bytes())?;
+            let text = path.to_string_lossy().into_owned();
+            for position in positions {
+                run_args[position].clone_from(&text);
+            }
+        }
+        if !cwd.is_dir() {
+            cwd.clone_from(&folder);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn submit(
+        &self,
+        mut job: Job,
+        files: Vec<JobFile>,
+    ) -> Result<Value, HubError> {
+        let _placing = self.placement.lock().await;
+        if let Some(existing) = idempotent(&self.snapshot().await, &job) {
+            return Ok(job_document(&existing, now_ms()));
+        }
+        self.spool(&mut job, files)?;
+        let mut members = self.snapshot().await.members;
+        schedule::discover(
+            &mut members,
+            self.driver(),
+            now_ms(),
+            schedule::CAPABILITY_TTL_MS,
+        )
+        .await;
+        let state = self
+            .mutate(|state| {
+                schedule::merge_capabilities(&mut state.members, &members);
+                Ok(state.clone())
+            })
+            .await?;
+        job.requirements.machine =
+            profile::machine_for(&state.pools, &job.placement, &job.requirements);
+        if let Some(rejected) = unplaceable(&state, &job.placement, &job.requirements) {
+            self.metrics.record_rejection(Some(&rejected));
+            return Err(HubError::no_eligible(describe(&job.placement), rejected));
+        }
+        let matching = matching_members(&state.members, &job.placement);
+        let loads = schedule::probe(&matching, &state.jobs, self.driver()).await;
+        self.metrics.record_loads(&loads);
+        let now = now_ms();
+        // A pool that serves the job starts a server for it once it is queued, so a job a
+        // pool can serve is parked exactly as `enqueue` parks it.
+        let pool_serves = pool::serving(&state.pools, &job.placement, &job.requirements).is_some();
+        match place(&state.members, &job.placement, &job.requirements, &loads) {
+            Placement::Place(member) => {
+                job.state = JobState::Running;
+                job.target = Some(member.clone());
+                self.mutate(|state| {
+                    state.jobs.push(job.clone());
+                    Ok(())
+                })
+                .await?;
+                let (job, dispatched) = self.dispatch(&job.job_id, &member, now).await?;
+                self.note_placed(&job, &dispatched).await?;
+                if let Dispatched::Rejected(error) = dispatched {
+                    return Err(error);
+                }
+                Ok(job_document(&job, now))
+            }
+            Placement::NoEligible { rejected } if !pool_serves => {
+                self.metrics.record_rejection(Some(&rejected));
+                Err(HubError::no_eligible(describe(&job.placement), rejected))
+            }
+            Placement::NoEligible { .. } => self.park(job, now).await,
+            Placement::Busy { .. } if pool_serves => self.park(job, now).await,
+            Placement::Busy { .. } => {
+                self.metrics.record_rejection(None);
+                Err(HubError::NoCapacity(describe(&job.placement)))
+            }
+        }
+    }
+
+    /// Stop the runs of selected jobs through the same target operation as `hub force-stop`.
+    /// Returns failed stops by job ID; jobs without a confirmed run are not stopped.
+    async fn stop_runs<'a>(
+        &self,
+        runs: impl Iterator<Item = (&'a String, Option<&'a str>, Option<&'a str>)>,
+    ) -> BTreeMap<String, String> {
+        let stops = runs.filter_map(|(job_id, target, run_id)| {
+            let run_id = run_id?;
+            Some(async move {
+                let stopped = match target {
+                    Some(target) => self.driver().stop(target, run_id).await,
+                    None => Err(HubError::Target {
+                        message: format!("run {run_id} has no member to stop it on"),
+                        diagnostic: None,
+                    }),
+                };
+                (job_id.clone(), stopped)
+            })
+        });
+        join_all(stops)
+            .await
+            .into_iter()
+            .filter_map(|(job_id, result)| result.err().map(|error| (job_id, error.to_string())))
+            .collect()
+    }
+
+    /// Keep a job for later placement, as `enqueue` does, and return it as queued.
+    async fn park(&self, job: Job, now: u64) -> Result<Value, HubError> {
+        self.mutate(|state| {
+            state.jobs.push(job.clone());
+            Ok(())
+        })
+        .await?;
+        Ok(job_document(&job, now))
+    }
+
+    /// Mark a pool member as busy once a target confirmed the run, so the lease reports
+    /// `in_use` only for a job that actually started.
+    async fn note_placed(&self, job: &Job, dispatched: &Dispatched) -> Result<(), HubError> {
+        if !matches!(dispatched, Dispatched::Placed) {
+            return Ok(());
+        }
+        let Some(member) = job.target.clone() else {
+            return Ok(());
+        };
+        let at = now_ms();
+        self.mutate(|state| {
+            pool::record_member_phase(state, &member, pool::PoolPhase::InUse, at);
+            Ok(())
+        })
+        .await
+    }
+
+    /// Submit a job already marked as placing on `member`, outside the state lock, and record
+    /// the outcome.
+    async fn dispatch(
+        &self,
+        job_id: &str,
+        member: &str,
+        now: u64,
+    ) -> Result<(Job, Dispatched), HubError> {
+        let Some(mut job) = self
+            .snapshot()
+            .await
+            .jobs
+            .into_iter()
+            .find(|job| job.job_id == job_id)
+        else {
+            return Err(HubError::JobNotFound(job_id.to_owned()));
+        };
+        let dispatched = schedule::dispatch(
+            &mut job,
+            member,
+            self.driver(),
+            (now, self.unconfirmed_limit),
+        )
+        .await;
+        self.metrics.record_placement(member, dispatched.label());
+        self.mutate(|state| {
+            if let Some(slot) = state.jobs.iter_mut().find(|slot| slot.job_id == job.job_id) {
+                if slot.is_placing() {
+                    *slot = job.clone();
+                } else if let (Some(error), Some(run_id)) = (&mut slot.error, &job.run_id) {
+                    // Dequeued while this submission was in flight: note the run, never adopt it.
+                    error.message = format!(
+                        "{}; {member} then accepted run {run_id}, which the hub does not follow",
+                        error.message
+                    );
+                }
+            }
+            Ok(())
+        })
+        .await?;
+        Ok((job, dispatched))
+    }
+
+    pub(crate) async fn enqueue(
+        &self,
+        mut job: Job,
+        files: Vec<JobFile>,
+    ) -> Result<Value, HubError> {
+        let now = now_ms();
+        if let Some(existing) = idempotent(&self.snapshot().await, &job) {
+            return Ok(job_document(&existing, now));
+        }
+        self.spool(&mut job, files)?;
+        self.mutate(|state| {
+            if let Some(existing) = idempotent(state, &job) {
+                return Ok(job_document(&existing, now));
+            }
+            job.requirements.machine =
+                profile::machine_for(&state.pools, &job.placement, &job.requirements);
+            if let Some(rejected) = unplaceable(state, &job.placement, &job.requirements) {
+                self.metrics.record_rejection(Some(&rejected));
+                return Err(HubError::no_eligible(describe(&job.placement), rejected));
+            }
+            let document = job_document(&job, now);
+            state.jobs.push(job);
+            Ok(document)
+        })
+        .await
+    }
+
+    pub(crate) async fn create_schedule(
+        &self,
+        mut schedule: Schedule,
+        files: Vec<JobFile>,
+    ) -> Result<Value, HubError> {
+        let parsed = cron::parse(&schedule.cron)?;
+        let (_, zone) = cron::timezone(Some(&schedule.timezone))?;
+        let now = now_ms();
+        schedule.next_fire_ms = Some(cron::next_fire(&parsed, &zone, now)?);
+        let existing = |state: &HubState| {
+            schedule.submission_key.as_ref().and_then(|key| {
+                state
+                    .schedules
+                    .iter()
+                    .find(|existing| existing.submission_key.as_ref() == Some(key))
+                    .cloned()
+            })
+        };
+        if let Some(existing) = existing(&self.snapshot().await) {
+            return Ok(schedule_document(&existing));
+        }
+        self.spool(&mut schedule.template, files)?;
+        self.mutate(|state| {
+            if let Some(existing) = existing(state) {
+                return Ok(schedule_document(&existing));
+            }
+            let template = &schedule.template;
+            if let Some(rejected) = unplaceable(state, &template.placement, &template.requirements)
+            {
+                self.metrics.record_rejection(Some(&rejected));
+                return Err(HubError::no_eligible(
+                    describe(&template.placement),
+                    rejected,
+                ));
+            }
+            let document = schedule_document(&schedule);
+            state.schedules.push(schedule.clone());
+            Ok(document)
+        })
+        .await
+    }
+
+    pub(crate) async fn ps(&self, query: JobQuery) -> Result<Value, HubError> {
+        validate_job_state(&query.state)?;
+        let state = self.snapshot().await;
+        let now = now_ms();
+        let mut selected = state
+            .jobs
+            .iter()
+            .filter(|job| state_matches(job, &query.state, now))
+            .filter(|job| query.target.is_none() || job.target == query.target)
+            .filter(|job| {
+                query
+                    .labels
+                    .iter()
+                    .all(|(key, value)| job.labels.get(key) == Some(value))
+            })
+            .collect::<Vec<_>>();
+        if let Some(limit) = query.limit {
+            let skip = selected.len().saturating_sub(limit);
+            selected.drain(..skip);
+        }
+        if query.state == "recurring" {
+            selected.clear();
+        }
+        let views = selected
+            .iter()
+            .map(|job| self.job_view(job, now))
+            .collect::<Vec<_>>();
+        let schedules = state
+            .schedules
+            .iter()
+            .filter(|schedule| match query.state.as_str() {
+                "all" => true,
+                "active" | "recurring" => schedule.state == ScheduleState::Active,
+                _ => false,
+            })
+            .filter(|schedule| {
+                query.target.is_none() || schedule.template.placement.target == query.target
+            })
+            .filter(|schedule| {
+                query
+                    .labels
+                    .iter()
+                    .all(|(key, value)| schedule.template.labels.get(key) == Some(value))
+            })
+            .map(Schedule::view)
+            .collect::<Vec<_>>();
+        Ok(json!({ "schema": "zeroshot.hub.jobs/v1", "jobs": views, "schedules": schedules }))
+    }
+
+    /// One newest-first page of job history: the progress and terminal facts of matching jobs,
+    /// without their run arguments. An empty page is a page, not an error.
+    pub(crate) async fn job_history(&self, query: JobQuery) -> Result<Value, HubError> {
+        validate_job_state(&query.state)?;
+        if query.state == "recurring" {
+            return Err(HubError::Usage(
+                "invalid --state \"recurring\": job history lists jobs; recurring schedules are \
+                 listed by --state all or active on `hub ps`"
+                    .to_owned(),
+            ));
+        }
+        let limit = query.limit.unwrap_or(JOB_HISTORY_PAGE);
+        let state = self.snapshot().await;
+        let now = now_ms();
+        let mut matching = state
+            .jobs
+            .iter()
+            .filter(|job| state_matches(job, &query.state, now))
+            .filter(|job| {
+                query
+                    .since_ms
+                    .is_none_or(|since| job.submitted_at_ms >= since)
+            })
+            .filter(|job| {
+                query
+                    .labels
+                    .iter()
+                    .all(|(key, value)| job.labels.get(key) == Some(value))
+            })
+            .collect::<Vec<_>>();
+        matching.sort_by(|left, right| {
+            right
+                .submitted_at_ms
+                .cmp(&left.submitted_at_ms)
+                .then_with(|| right.job_id.cmp(&left.job_id))
+        });
+        matching.truncate(limit);
+        let jobs = matching
+            .iter()
+            .map(|job| job.history_view(now))
+            .collect::<Vec<_>>();
+        let mut filters = json!({"state": query.state, "labels": query.labels});
+        if let Some(since) = query.since_ms {
+            filters["since"] = json!(clock::rfc3339(since));
+        }
+        Ok(json!({
+            "schema": "zeroshot.hub.job-history/v1",
+            "filters": filters,
+            "limit": limit,
+            "returned": jobs.len(),
+            "jobs": jobs,
+        }))
+    }
+
+    /// One job with its live run status, read from the target outside the state lock.
+    pub(crate) async fn status(&self, job_id: &str) -> Result<Value, HubError> {
+        let job = self.job(job_id).await?;
+        let run = match (&job.target, &job.run_id) {
+            (Some(target), Some(run_id)) => {
+                let result = self.driver().status(target, run_id).await;
+                let now = now_ms();
+                let run_id = run_id.clone();
+                let job = self
+                    .mutate(|state| {
+                        if result.is_ok() {
+                            schedule::record_target_health(state, target, now);
+                        }
+                        let job = state
+                            .jobs
+                            .iter_mut()
+                            .find(|job| job.job_id == job_id)
+                            .ok_or_else(|| HubError::JobNotFound(job_id.to_owned()))?;
+                        let status = if job.state == JobState::Running
+                            && job.run_id.as_deref() == Some(run_id.as_str())
+                        {
+                            schedule::apply_refresh(job, result, now)
+                        } else {
+                            result.ok()
+                        };
+                        Ok((job.clone(), status))
+                    })
+                    .await?;
+                let mut document = json!({
+                    "schema": "zeroshot.hub.job/v1",
+                    "job": self.job_view(&job.0, now),
+                });
+                document["run"] = job.1.unwrap_or(Value::Null);
+                return Ok(document);
+            }
+            _ => Value::Null,
+        };
+        let now = now_ms();
+        let mut document = json!({
+            "schema": "zeroshot.hub.job/v1",
+            "job": self.job_view(&job, now),
+        });
+        document["run"] = run;
+        Ok(document)
+    }
+
+    /// A job view with the limit that actually applies to it, resolved from the job override and
+    /// then the hub's `--max-stall`.
+    fn job_view(&self, job: &Job, now: u64) -> Value {
+        let mut view = job.view(now);
+        let limit = schedule::StallLimit::for_job(job, self.max_stall_ms);
+        view["jobMaxStallMs"] = json!(job.max_stall_ms);
+        view["maxStallMs"] = json!(limit.map(|limit| limit.max_stall_ms));
+        view["maxStallSource"] = json!(limit.map(|limit| limit.source.as_str()));
+        view
+    }
+
+    async fn job(&self, job_id: &str) -> Result<Job, HubError> {
+        self.state
+            .lock()
+            .await
+            .jobs
+            .iter()
+            .find(|job| job.job_id == job_id)
+            .cloned()
+            .ok_or_else(|| HubError::JobNotFound(job_id.to_owned()))
+    }
+
+    pub(crate) async fn dequeue(&self, job_id: &str) -> Result<Value, HubError> {
+        self.mutate(|state| {
+            if let Some(schedule) = state
+                .schedules
+                .iter_mut()
+                .find(|schedule| schedule.schedule_id == job_id)
+            {
+                if schedule.state == ScheduleState::Removed {
+                    return Err(HubError::InvalidState(format!(
+                        "hub schedule {job_id} is already removed"
+                    )));
+                }
+                schedule.state = ScheduleState::Removed;
+                schedule.removed_at_ms = Some(now_ms());
+                schedule.next_fire_ms = None;
+                return Ok(schedule_document(schedule));
+            }
+            let now = now_ms();
+            let job = state
+                .jobs
+                .iter_mut()
+                .find(|job| job.job_id == job_id)
+                .ok_or_else(|| HubError::JobNotFound(job_id.to_owned()))?;
+            if job.is_placing() {
+                return Ok(dequeue_placing(job, now));
+            }
+            if job.state != JobState::Queued {
+                return Err(HubError::InvalidState(format!(
+                    "hub job {job_id} is {}; only queued, scheduled, or placing jobs can be \
+                     dequeued{}",
+                    job.display_state(now),
+                    if job.state == JobState::Running {
+                        "; use `zeroshot hub force-stop` to stop its run"
+                    } else {
+                        ""
+                    }
+                )));
+            }
+            job.state = JobState::Dequeued;
+            job.finished_at_ms = Some(now);
+            Ok(job_document(job, now))
+        })
+        .await
+    }
+
+    pub(crate) async fn stats(&self, request: StatsRequest) -> Result<Value, HubError> {
+        let by = request
+            .by
+            .iter()
+            .map(|dimension| stats::Dimension::parse(dimension))
+            .collect::<Result<Vec<_>, _>>()?;
+        let prices = request
+            .prices
+            .map(|prices| {
+                serde_json::from_value::<stats::Prices>(prices).map_err(|error| {
+                    HubError::Usage(format!("--prices is not a price table: {error}"))
+                })
+            })
+            .transpose()?;
+        let state = self.snapshot().await;
+        let query = stats::StatsQuery {
+            by: &by,
+            since_ms: request.since_ms,
+            until_ms: request.until_ms,
+            prices: prices.as_ref(),
+        };
+        Ok(stats::aggregate(&state.jobs, &query))
+    }
+
+    /// The `zeroshot` arguments that observe or stop a job's run.
+    pub(crate) async fn observation(
+        &self,
+        job_id: &str,
+        request: StreamRequest,
+    ) -> Result<Vec<String>, HubError> {
+        let job = self.job(job_id).await?;
+        let (Some(target), Some(run_id)) = (&job.target, &job.run_id) else {
+            return Err(HubError::InvalidState(format!(
+                "hub job {job_id} is {} and has no run yet{}",
+                job.display_state(now_ms()),
+                if job.state == JobState::Queued {
+                    "; use `zeroshot hub dequeue` to cancel it"
+                } else {
+                    ""
+                }
+            )));
+        };
+        let mut arguments = match request {
+            StreamRequest::Watch { after } => {
+                let mut arguments = vec!["watch".to_owned(), run_id.clone()];
+                arguments.extend(
+                    after
+                        .into_iter()
+                        .flat_map(|after| ["--after".to_owned(), after]),
+                );
+                arguments
+            }
+            StreamRequest::Logs { after, execution } => {
+                let mut arguments = vec!["logs".to_owned(), run_id.clone()];
+                arguments.extend(
+                    after
+                        .into_iter()
+                        .flat_map(|after| ["--after".to_owned(), after]),
+                );
+                arguments.extend(
+                    execution
+                        .into_iter()
+                        .flat_map(|execution| ["--execution".to_owned(), execution]),
+                );
+                arguments
+            }
+            StreamRequest::Attach { execution } => {
+                vec!["attach".to_owned(), run_id.clone(), execution]
+            }
+            StreamRequest::ForceStop => return Ok(force_stop_arguments(target, run_id)),
+        };
+        arguments.extend(route(target));
+        Ok(arguments)
+    }
+
+    // ---------------------------------------------------------------- dispatcher
+
+    /// One dispatcher pass. Each phase holds the state lock only to read or merge; polls,
+    /// discovery, probes, and submissions run between phases.
+    pub(crate) async fn pass(&self) -> Result<(TickReport, Value), HubError> {
+        let started = std::time::Instant::now();
+        let result = match self.pass_phases().await {
+            Ok((report, mut view)) => match self.pool_pass().await {
+                Ok(pools) => {
+                    self.metrics.record_pool_pass(&pools);
+                    if pools != PoolReport::default() {
+                        view["pools"] = pools.view();
+                    }
+                    Ok((report, view))
+                }
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        self.metrics
+            .record_pass(started.elapsed().as_secs_f64(), result.is_err());
+        result
+    }
+
+    async fn pass_phases(&self) -> Result<(TickReport, Value), HubError> {
+        let _placing = self.placement.lock().await;
+        let now = now_ms();
+        let (fired, polls) = self
+            .mutate(|state| Ok((cron::fire_due(state, now), schedule::polls(state))))
+            .await?;
+        let results = schedule::poll(polls, self.driver()).await;
+        let now = now_ms();
+        let (finished, members) = self
+            .mutate(|state| {
+                let finished = schedule::apply_polls(state, results, now);
+                Ok((finished, state.members.clone()))
+            })
+            .await?;
+        let mut report = TickReport {
+            fired,
+            finished,
+            ..TickReport::default()
+        };
+        let now = now_ms();
+        let hub_max_stall_ms = self.max_stall_ms;
+        let stalled = self
+            .mutate(|state| {
+                Ok(schedule::stalled_runs(&state.jobs, now, |job| {
+                    schedule::StallLimit::for_job(job, hub_max_stall_ms)
+                }))
+            })
+            .await?;
+        if !stalled.is_empty() {
+            let stopped = self
+                .stop_runs(stalled.iter().map(|run| {
+                    (
+                        &run.job_id,
+                        Some(run.target.as_str()),
+                        Some(run.run_id.as_str()),
+                    )
+                }))
+                .await;
+            report.stalled = self
+                .mutate(|state| {
+                    Ok(schedule::settle_stalled(
+                        &mut state.jobs,
+                        schedule::StallSettlement {
+                            now_ms: now,
+                            stalled: &stalled,
+                            stop_errors: &stopped,
+                        },
+                    ))
+                })
+                .await?;
+        }
+        // Probe every member on this pass, so a placed job's member is observed even when no
+        // queued job needs placement. Health failures accumulate across passes.
+        let snapshot = self.snapshot().await;
+        let probed = snapshot.members.iter().collect::<Vec<_>>();
+        let mut loads = schedule::probe(&probed, &snapshot.jobs, self.driver()).await;
+        self.metrics.record_loads(&loads);
+        let now = now_ms();
+        let lost = self
+            .mutate(|state| {
+                schedule::record_health(&mut state.members, &mut state.jobs, &loads, now);
+                Ok(schedule::lost_targets(state))
+            })
+            .await?;
+        if !lost.is_empty() {
+            let (lost, withheld) = self.confirm_lost_targets(lost, &loads).await;
+            report.target_lost = self
+                .mutate(|state| {
+                    schedule::note_withheld(&mut state.jobs, &withheld);
+                    Ok(schedule::settle_lost_targets(&mut state.jobs, now, &lost))
+                })
+                .await?;
+        }
+        let placing = schedule::placing(&self.snapshot().await);
+        for (job_id, member) in placing {
+            let (job, dispatched) = self.dispatch(&job_id, &member, now).await?;
+            self.note_placed(&job, &dispatched).await?;
+            schedule::record_dispatch(&mut report, &job, &dispatched);
+        }
+        let due = !schedule::due_jobs(&self.snapshot().await.jobs, now_ms()).is_empty();
+        if due {
+            let mut members = members;
+            schedule::discover(
+                &mut members,
+                self.driver(),
+                now,
+                schedule::CAPABILITY_TTL_MS,
+            )
+            .await;
+            self.mutate(|state| {
+                schedule::merge_capabilities(&mut state.members, &members);
+                Ok(())
+            })
+            .await?;
+            let now = now_ms();
+            let chosen = self
+                .mutate(|state| Ok(schedule::choose(state, now, &mut loads)))
+                .await?;
+            for (job_id, member) in chosen {
+                let (job, dispatched) = self.dispatch(&job_id, &member, now).await?;
+                self.note_placed(&job, &dispatched).await?;
+                schedule::record_dispatch(&mut report, &job, &dispatched);
+            }
+            report.loads = Some(loads);
+        }
+        let view = report.view(&self.snapshot().await, now_ms());
+        Ok((report, view))
+    }
+}
+
+/// Require decisive confirmation before failing a lost-target job. A pool member is checked
+/// against the provider; a named member gets a direct TCP check of its endpoint. An inconclusive
+/// probe, a rate-limited provider check, or an endpoint that still answers keeps the job running.
+impl HubService {
+    async fn confirm_lost_targets(
+        &self,
+        lost: Vec<LostTarget>,
+        loads: &BTreeMap<String, super::placement::Load>,
+    ) -> (Vec<LostTarget>, Vec<WithheldTarget>) {
+        let state = self.snapshot().await;
+        let mut confirmed = Vec::new();
+        let mut withheld = Vec::new();
+        for mut target in lost {
+            let Some(count) = target.unreachable_probes else {
+                confirmed.push(target);
+                continue;
+            };
+            if loads
+                .get(&target.member)
+                .is_some_and(super::placement::Load::reachable)
+            {
+                withheld.push(withhold(
+                    &target,
+                    count,
+                    "a probe succeeded: job kept running".to_owned(),
+                ));
+                continue;
+            }
+            let Some(member) = state.member(&target.member) else {
+                confirmed.push(target);
+                continue;
+            };
+            if member.pool.is_some() {
+                let lease = state
+                    .leases
+                    .iter()
+                    .find(|lease| lease.name == target.member);
+                let Some(lease) = lease else {
+                    withheld.push(withhold(
+                        &target,
+                        count,
+                        "no pool lease record is available to confirm the server: inconclusive, \
+                         job kept running"
+                            .to_owned(),
+                    ));
+                    continue;
+                };
+                let label = lease
+                    .server_id
+                    .map_or_else(|| lease.name.clone(), |id| id.to_string());
+                let Some(pools) = &self.pools else {
+                    withheld.push(withhold(
+                        &target,
+                        count,
+                        format!(
+                            "pool lease {label} cannot be checked without a provider token: \
+                             inconclusive, job kept running"
+                        ),
+                    ));
+                    continue;
+                };
+                let Some(hub_id) = state.hub_id.as_deref() else {
+                    withheld.push(withhold(
+                        &target,
+                        count,
+                        format!(
+                            "pool lease {label} has no hub label to check: inconclusive, job kept \
+                             running"
+                        ),
+                    ));
+                    continue;
+                };
+                match pools.server_exists(hub_id, lease).await {
+                    Ok(false) => {
+                        target.evidence = Some(format!(
+                            "pool lease {label} no longer exists (provider confirmed)"
+                        ));
+                        target.classification = Some(schedule::CLASSIFIED_PROVIDER_ABSENT);
+                        confirmed.push(target);
+                    }
+                    Ok(true) => withheld.push(withhold(
+                        &target,
+                        count,
+                        format!(
+                            "pool lease {label} still exists (provider confirmed): job kept running"
+                        ),
+                    )),
+                    Err(error) => withheld.push(withhold(
+                        &target,
+                        count,
+                        format!(
+                            "pool lease {label} could not be confirmed ({error}): inconclusive, \
+                             job kept running"
+                        ),
+                    )),
+                }
+                continue;
+            }
+            let endpoint = self.endpoint_check(&target.member).await;
+            match endpoint {
+                EndpointCheck::Alive(at) => withheld.push(withhold(
+                    &target,
+                    count,
+                    format!(
+                        "target endpoint {at} still accepts TCP connections: inconclusive, job kept \
+                         running"
+                    ),
+                )),
+                EndpointCheck::Refused(why) => {
+                    target.evidence = Some(format!(
+                        "target endpoint {} is not reachable: {why}",
+                        target.member
+                    ));
+                    target.classification = Some(schedule::CLASSIFIED_ENDPOINT_REFUSED);
+                    confirmed.push(target);
+                }
+                EndpointCheck::Unknown(why) => withheld.push(withhold(
+                    &target,
+                    count,
+                    format!(
+                        "the target endpoint could not be checked ({why}): inconclusive, job kept \
+                         running"
+                    ),
+                )),
+            }
+        }
+        (confirmed, withheld)
+    }
+
+    async fn endpoint_check(&self, member: &str) -> EndpointCheck {
+        let Ok(record) = self.registry.get(member) else {
+            return EndpointCheck::Unknown("no stored target endpoint".to_owned());
+        };
+        let Ok(url) = reqwest::Url::parse(&record.origin) else {
+            return EndpointCheck::Unknown("the stored target origin is not a URL".to_owned());
+        };
+        let Some(port) = url.port_or_known_default() else {
+            return EndpointCheck::Unknown("the stored target origin has no port".to_owned());
+        };
+        // URL hosts keep IPv6 brackets in `host_str`, which `lookup_host` cannot resolve. Match
+        // the typed host instead: IP literals connect directly and only domain names are looked up.
+        let (host, at) = match url.host() {
+            Some(url::Host::Domain(name)) => (url::Host::Domain(name), format!("{name}:{port}")),
+            Some(url::Host::Ipv4(ip)) => (url::Host::Ipv4(ip), format!("{ip}:{port}")),
+            Some(url::Host::Ipv6(ip)) => (url::Host::Ipv6(ip), format!("[{ip}]:{port}")),
+            None => {
+                return EndpointCheck::Unknown("the stored target origin has no host".to_owned());
+            }
+        };
+        let addresses = match host {
+            url::Host::Ipv4(ip) => vec![std::net::SocketAddr::from((ip, port))],
+            url::Host::Ipv6(ip) => vec![std::net::SocketAddr::from((ip, port))],
+            url::Host::Domain(name) => {
+                let resolved = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    tokio::net::lookup_host((name, port)),
+                )
+                .await;
+                match resolved {
+                    Ok(Ok(addresses)) => {
+                        let addresses = addresses.collect::<Vec<_>>();
+                        if addresses.is_empty() {
+                            return EndpointCheck::Unknown(format!("{at} resolved to no address"));
+                        }
+                        addresses
+                    }
+                    Ok(Err(error)) => {
+                        return EndpointCheck::Unknown(format!(
+                            "{at} could not be resolved: {error}"
+                        ));
+                    }
+                    Err(_) => {
+                        return EndpointCheck::Unknown(format!("resolving {at} timed out"));
+                    }
+                }
+            }
+        };
+        let mut refused = Vec::new();
+        let mut other = Vec::new();
+        let mut timed_out = false;
+        for address in addresses {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::net::TcpStream::connect(address),
+            )
+            .await
+            {
+                Ok(Ok(_)) => return EndpointCheck::Alive(at),
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    refused.push(format!("{address}: {error}"));
+                }
+                Ok(Err(error)) => other.push(format!("{address}: {error}")),
+                Err(_) => timed_out = true,
+            }
+        }
+        // Only an actual TCP refusal is proof. A lookup, timeout or other connect error says
+        // nothing about whether the member is gone, and a mixed answer is not decisive.
+        if refused.is_empty() {
+            return EndpointCheck::Unknown(if timed_out {
+                format!("connecting to {at} timed out")
+            } else {
+                format!("connecting to {at} failed: {}", other.join("; "))
+            });
+        }
+        if timed_out || !other.is_empty() {
+            let mut why = Vec::new();
+            if timed_out {
+                why.push(format!("connecting to {at} timed out"));
+            }
+            if !other.is_empty() {
+                why.push(format!("{at}: {}", other.join("; ")));
+            }
+            why.push(format!("refused: {}", refused.join("; ")));
+            return EndpointCheck::Unknown(why.join("; "));
+        }
+        EndpointCheck::Refused(refused.join("; "))
+    }
+}
+
+fn withhold(target: &LostTarget, count: u32, reason: String) -> WithheldTarget {
+    WithheldTarget {
+        job_id: target.job_id.clone(),
+        member: target.member.clone(),
+        reason: format!("{} probe {count}x failed: {reason}", target.member),
+    }
+}
+
+enum EndpointCheck {
+    Alive(String),
+    Refused(String),
+    Unknown(String),
+}
+
+/// Dequeue a job placing on its member. The target may hold a run under the job's submission key
+/// (the submission was unconfirmed or still in flight); the hub records that and stops placing
+/// the job, but never follows or adopts such a run.
+fn dequeue_placing(job: &mut Job, now: u64) -> Value {
+    let member = job.target.clone().unwrap_or_default();
+    job.state = JobState::Dequeued;
+    job.finished_at_ms = Some(now);
+    job.error = Some(JobError::new(
+        JobErrorKind::DequeuedWhilePlacing,
+        format!(
+            "dequeued while placing on {member}; a run with submission key hub-{}-{} may exist \
+             there, and the hub does not follow it",
+            job.job_id,
+            job.attempts + 1
+        ),
+    ));
+    job_document(job, now)
+}
+
+/// The state filters `hub ps` and `hub jobs` accept.
+const JOB_STATES: [&str; 9] = [
+    "active",
+    "all",
+    "recurring",
+    "queued",
+    "scheduled",
+    "running",
+    "succeeded",
+    "failed",
+    "dequeued",
+];
+
+/// Jobs one history page returns when the caller sets no `--limit`.
+pub(crate) const JOB_HISTORY_PAGE: usize = 20;
+
+fn validate_job_state(filter: &str) -> Result<(), HubError> {
+    if JOB_STATES.contains(&filter) {
+        return Ok(());
+    }
+    Err(HubError::Usage(format!(
+        "invalid --state {filter:?}: use one of {}",
+        JOB_STATES.join(", ")
+    )))
+}
+
+fn state_matches(job: &Job, filter: &str, now: u64) -> bool {
+    let state = job.display_state(now);
+    match filter {
+        "all" => true,
+        "active" => matches!(state, "queued" | "scheduled" | "running"),
+        filter => state == filter,
+    }
+}
+
+/// An earlier job accepted with the same hub submission key, if any.
+fn idempotent(state: &HubState, job: &Job) -> Option<Job> {
+    let key = job.submission_key.as_ref()?;
+    state
+        .jobs
+        .iter()
+        .find(|existing| existing.submission_key.as_ref() == Some(key))
+        .cloned()
+}
+
+/// Why no member can ever take a job, or `None` when a member or a pool can.
+fn unplaceable(
+    state: &HubState,
+    spec: &PlacementSpec,
+    requirements: &Requirements,
+) -> Option<Vec<Rejection>> {
+    if pool::serving(&state.pools, spec, requirements).is_some() {
+        return None;
+    }
+    rejections(&state.members, spec, requirements)
+}
+
+pub(crate) fn create_private_directory(path: &Path) -> Result<(), HubError> {
+    crate::private_file::create_directory(path).map_err(|error| {
+        HubError::storage(&format!("{} could not be created", path.display()), error)
+    })
+}
+
+/// Atomically replace `path` with `bytes`, owner-only (see [`crate::private_file::replace`]).
+pub(crate) fn replace_private(path: &Path, bytes: &[u8]) -> Result<(), HubError> {
+    crate::private_file::replace(path, bytes).map_err(|error| {
+        HubError::storage(&format!("{} could not be written", path.display()), error)
+    })
+}

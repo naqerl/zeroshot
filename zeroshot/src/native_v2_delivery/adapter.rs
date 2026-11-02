@@ -16,6 +16,8 @@ mod sync;
 mod target;
 
 const MAX_FEEDBACK_DIAGNOSTIC_BYTES: usize = 4 * 1024 * 1024;
+/// One forge or Git authority call may not hold the delivery open forever.
+const AUTHORITY_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[cfg(all(test, target_os = "linux"))]
 mod ownership_tests;
@@ -86,6 +88,19 @@ impl NativeV2DeliveryAdapter {
     pub fn with_trusted_github_token(mut self, token: Option<Arc<str>>) -> Self {
         self.trusted_github_token = token;
         self
+    }
+
+    /// One authority operation's deadline. Poll attempts and intervals govern repeated polling,
+    /// not how long a single push, review observation, or merge request may take, so every call
+    /// starts from this bounded operation budget and narrows to what remains before retrying.
+    fn delivery_deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + AUTHORITY_CALL_TIMEOUT
+    }
+
+    /// The trusted validation helper's operation deadline comes from the caller-authored poll
+    /// policy; an until-cancelled policy still bounds one helper invocation.
+    fn validation_deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + self.config.poll.budget().unwrap_or(AUTHORITY_CALL_TIMEOUT)
     }
 }
 
@@ -728,24 +743,34 @@ impl NativeV2DeliveryAdapter {
         };
         emit(preparation.control, "delivery: pushing run branch").await?;
         let mut refreshed = preflight::OperationRetry::default();
+        let deadline = self.delivery_deadline();
         loop {
             ensure_active(preparation.control)?;
-            match self
-                .authority
-                .push_branch(&push, preparation.credentials.current())
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let result = if remaining.is_zero() {
+                Err(SourceDeliveryError::Unavailable.with_context("source branch push timed out"))
+            } else {
+                tokio::time::timeout(
+                    remaining,
+                    self.authority
+                        .push_branch(&push, preparation.credentials.current()),
+                )
                 .await
-            {
+                .map_err(|_| {
+                    SourceDeliveryError::Unavailable.with_context("source branch push timed out")
+                })?
+            };
+            let error = match result {
                 Ok(()) => return Ok(()),
-                Err(error) => {
-                    self.retry_operation(
-                        error,
-                        preparation
-                            .credentials
-                            .operation_context(preparation.control, &mut refreshed),
-                    )
-                    .await?
-                }
-            }
+                Err(error) => error,
+            };
+            self.retry_operation(
+                error,
+                preparation
+                    .credentials
+                    .operation_context(preparation.control, &mut refreshed),
+            )
+            .await?;
         }
     }
 
@@ -1027,27 +1052,40 @@ impl NativeV2DeliveryAdapter {
         drive: &mut ReviewDrive<'_, '_>,
     ) -> Result<ReviewProgress, DeliveryStop> {
         let mut retry = preflight::OperationRetry::default();
+        let deadline = self.delivery_deadline();
         loop {
             ensure_active(drive.control)?;
-            match self
-                .authority
-                .inspect_review(&drive.review, drive.credentials.current())
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let result = if remaining.is_zero() {
+                Err(SourceDeliveryError::Unavailable.with_context("review observation timed out"))
+            } else {
+                tokio::time::timeout(
+                    remaining,
+                    self.authority
+                        .inspect_review(&drive.review, drive.credentials.current()),
+                )
                 .await
-            {
+                .map_err(|_| {
+                    SourceDeliveryError::Unavailable.with_context("review observation timed out")
+                })?
+            };
+            let error = match result {
                 Ok(observation) => {
                     return checked_progress(&drive.review, observation);
                 }
-                Err(error) if error.authentication_failed() || error.retryable_operation() => {
-                    self.retry_operation(
-                        error,
-                        drive
-                            .credentials
-                            .operation_context(drive.control, &mut retry),
-                    )
-                    .await?;
+                Err(error) if error.authentication_failed() || error.retryable_operation() => error,
+                Err(error) => {
+                    self.reconcile_observation_error(drive, error).await?;
+                    continue;
                 }
-                Err(error) => self.reconcile_observation_error(drive, error).await?,
-            }
+            };
+            self.retry_operation(
+                error,
+                drive
+                    .credentials
+                    .operation_context(drive.control, &mut retry),
+            )
+            .await?;
         }
     }
 
@@ -1076,12 +1114,23 @@ impl NativeV2DeliveryAdapter {
     ) -> Result<SourceMergeRequestOutcome, DeliveryStop> {
         emit(drive.control, "delivery: requesting merge").await?;
         let mut retry = preflight::OperationRetry::default();
+        let deadline = self.delivery_deadline();
         loop {
             ensure_active(drive.control)?;
-            let result = self
-                .authority
-                .request_merge(&drive.review, drive.credentials.current())
-                .await;
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let result = if remaining.is_zero() {
+                Err(SourceDeliveryError::Unavailable.with_context("merge request timed out"))
+            } else {
+                tokio::time::timeout(
+                    remaining,
+                    self.authority
+                        .request_merge(&drive.review, drive.credentials.current()),
+                )
+                .await
+                .map_err(|_| {
+                    SourceDeliveryError::Unavailable.with_context("merge request timed out")
+                })?
+            };
             let Some(outcome) = self
                 .operation_result(
                     result,

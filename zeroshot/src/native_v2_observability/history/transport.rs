@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use openengine_cluster_protocol::{Cursor, RunId};
-use crate::native_v2_observability::history::{
+use super::{
     RUN_HISTORY_DEFINITION_MAX_BYTES, RUN_HISTORY_LIST_MAX_BYTES, RUN_HISTORY_PAGE_MAX_BYTES,
     RUN_HISTORY_PROBLEM_MAX_BYTES,
 };
@@ -94,7 +94,9 @@ impl RunHistoryResponse {
         Self::new(status.as_u16(), body)
     }
 
-    pub(super) fn into_parts(self) -> (u16, Vec<u8>) {
+    /// Returns the HTTP status and bounded body for host-side decoding.
+    #[must_use]
+    pub fn into_parts(self) -> (u16, Vec<u8>) {
         (self.status, self.body)
     }
 }
@@ -136,5 +138,4 @@ pub trait RunHistoryTransport: Send + Sync {
 }
 
 #[cfg(test)]
-#[path = "run_history_transport/tests.rs"]
 mod tests;

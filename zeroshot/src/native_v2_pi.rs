@@ -267,8 +267,19 @@ impl PiAdapter {
         // The gateway lane registers its own provider, carrying the caller's endpoint, key, and
         // wire protocol. The anthropic lane only retargets the endpoint and keeps Pi's Messages
         // protocol, the same escape hatch Claude Code offers through `ANTHROPIC_BASE_URL`.
-        let (model, reasoning) = match &invocation.node.binding {
-            NodeRuntimeBinding::Agent { model, effort, .. } => (model.as_str(), effort.is_some()),
+        let (model, reasoning, context_window, max_tokens) = match &invocation.node.binding {
+            NodeRuntimeBinding::Agent {
+                model,
+                effort,
+                context_window,
+                max_tokens,
+                ..
+            } => (
+                model.as_str(),
+                effort.is_some(),
+                *context_window,
+                *max_tokens,
+            ),
             _ => {
                 return Err(NodeRunnerError::DriverDetail(
                     "Pi command requires an agent runtime binding".to_owned(),
@@ -286,6 +297,8 @@ impl PiAdapter {
                         api: &api,
                         model,
                         reasoning,
+                        context_window,
+                        max_tokens,
                     },
                 ))
             }
@@ -460,17 +473,19 @@ async fn resolve_pi_response(
     result: PiResult,
     state: &PiRunState,
 ) -> Result<PiTurnAdvance, NodeRunnerError> {
-    let response = resolve_agent_response_with_schema(
-        &turn.invocation.response,
-        &result.message,
-        state.dialect,
-    )?;
+    let response = state
+        .retry
+        .redact_response(resolve_agent_response_with_schema(
+            &turn.invocation.response,
+            &result.message,
+            state.dialect,
+        )?);
     state
         .retry
         .report_correction(
             turn.control,
             &response,
-            state.response.corrections_exhausted(),
+            state.response.corrections_exhausted(&response),
         )
         .await?;
     if matches!(response, AgentResponse::Correction { .. }) {

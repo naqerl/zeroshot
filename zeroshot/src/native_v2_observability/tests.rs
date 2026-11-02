@@ -4,14 +4,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use openengine_cluster_protocol::{
-    IdempotencyKey, NodeName, RunAttachParams, RunId, RunLogsParams, RunStatus, RunStatusParams,
-    RunWatchEventNotification, RunWatchParams, Sha256Digest, TerminalResult, TokenCount,
-    WorkerOutcome,
+    IdempotencyKey, NodeName, PositiveInteger, RunAttachParams, RunId, RunLogsParams, RunStatus,
+    RunStatusParams, RunWatchEventNotification, RunWatchParams, Sha256Digest, TerminalResult,
+    TokenCount, UnixTimestampMillis, WorkerOutcome,
 };
 use serde_json::Value;
 use tokio::sync::{Barrier, Notify};
 
 use super::*;
+use crate::full_v1_reducer::{ExecutionVoidReason, StructuralOccurrence};
 use crate::native_v2_contract::{
     AdmittedRun, ExecutionRef, NodeCompletion, NodeInvocation, TokenUsageDelta,
 };
@@ -73,6 +74,7 @@ fn completed(reference: &ExecutionRef, output: Value) -> RunEvent {
                 artifacts: Vec::new(),
             },
         },
+        timestamp: None,
     }
 }
 
@@ -182,6 +184,149 @@ use status::cursor_fixture;
 
 use openengine_cluster_testkit::assertions::{AssertValue};
 
+#[tokio::test]
+async fn history_definition_folds_node_lifecycle_and_counters() {
+    let (ledger, run_id) = ledger_run("018f5e78-7f95-7c22-8d98-3f15af20c981").await;
+    let worker = reference(&run_id, "worker", 7);
+    let worker_retry = ExecutionRef {
+        execution: crate::full_v1_reducer::ExecutionId::new(9).assert_value(),
+        ..worker.clone()
+    };
+    let reviewer = reference(&run_id, "reviewer", 8);
+    let timestamp = |value| UnixTimestampMillis::new(value).assert_value();
+    ledger
+        .append(
+            &run_id,
+            vec![
+                RunEvent::RunStarted,
+                RunEvent::NodeStarted {
+                    reference: worker.clone(),
+                    occurrence: StructuralOccurrence {
+                        node: worker.node.clone(),
+                        map_indices: Vec::new(),
+                    },
+                    attempt: PositiveInteger::new(1).assert_value(),
+                    input: Value::Null,
+                    timestamp: Some(timestamp(100)),
+                },
+                RunEvent::NodeStarted {
+                    reference: worker_retry.clone(),
+                    occurrence: StructuralOccurrence {
+                        node: worker_retry.node.clone(),
+                        map_indices: Vec::new(),
+                    },
+                    attempt: PositiveInteger::new(2).assert_value(),
+                    input: Value::Null,
+                    timestamp: Some(timestamp(150)),
+                },
+                RunEvent::NodeStarted {
+                    reference: reviewer.clone(),
+                    occurrence: StructuralOccurrence {
+                        node: reviewer.node.clone(),
+                        map_indices: Vec::new(),
+                    },
+                    attempt: PositiveInteger::new(1).assert_value(),
+                    input: Value::Null,
+                    timestamp: Some(timestamp(200)),
+                },
+                RunEvent::ExecutionVoided {
+                    reference: reviewer,
+                    reason: ExecutionVoidReason::ParallelJoin,
+                    timestamp: Some(timestamp(220)),
+                },
+                RunEvent::NodeCompleted {
+                    completion: NodeCompletion {
+                        reference: worker_retry,
+                        outcome: WorkerOutcome::Verified {
+                            output: Value::Null,
+                            artifacts: Vec::new(),
+                        },
+                    },
+                    timestamp: Some(timestamp(300)),
+                },
+                RunEvent::SafeLog {
+                    execution: None,
+                    timestamp: timestamp(310),
+                    stream: crate::v2_run_ledger::SafeLogStream::System,
+                    line: SafeLogLine::new("Pi compacted the session context").assert_value(),
+                    diagnostic: None,
+                },
+                RunEvent::SafeLog {
+                    execution: None,
+                    timestamp: timestamp(311),
+                    stream: crate::v2_run_ledger::SafeLogStream::System,
+                    line: SafeLogLine::new("final output rejected: malformed").assert_value(),
+                    diagnostic: None,
+                },
+            ],
+        )
+        .await
+        .assert_value();
+    let service = crate::native_v2_observability::history::RunHistoryService::for_ledger(ledger);
+    let definition = service.definition(&run_id).await.assert_value();
+    assert_eq!(definition.compactions, 1);
+    assert_eq!(definition.format_rejections, 1);
+    let worker_row = definition
+        .nodes
+        .iter()
+        .find(|node| node.name.as_str() == "worker")
+        .assert_value();
+    assert_eq!(worker_row.node_instance, "7");
+    assert_eq!(worker_row.attempts, 2);
+    assert_eq!(worker_row.started_at, Some(timestamp(100)));
+    assert_eq!(worker_row.completed_at, Some(timestamp(300)));
+    assert_eq!(worker_row.duration_ms, Some(200));
+    assert!(!worker_row.voided);
+    let reviewer_row = definition
+        .nodes
+        .iter()
+        .find(|node| node.name.as_str() == "reviewer")
+        .assert_value();
+    assert_eq!(reviewer_row.attempts, 1);
+    assert_eq!(reviewer_row.duration_ms, None);
+    assert!(reviewer_row.voided);
+    let report = crate::native_v2_observability::history::build_run_report(&definition, None);
+    let value = serde_json::to_value(report).assert_value();
+    assert_eq!(value["schema"], "zeroshot.run.report/v1");
+    assert_eq!(value["totals"]["wallClockMs"], 200);
+    assert_eq!(value["totals"]["nodeDurationMs"], 200);
+    assert_eq!(value["totals"]["unattributedMs"], 0);
+    assert_eq!(value["totals"]["compactions"], 1);
+    assert_eq!(value["totals"]["formatRejections"], 1);
+
+    let mut legacy = serde_json::to_value(&definition).assert_value();
+    let fields = legacy.as_object_mut().assert_value();
+    fields.remove("nodes");
+    fields.remove("compactions");
+    fields.remove("formatRejections");
+    let decoded: crate::native_v2_observability::history::RunDefinition =
+        serde_json::from_value(legacy).assert_value();
+    assert!(decoded.nodes.is_empty());
+    assert_eq!(decoded.compactions, 0);
+    assert_eq!(decoded.format_rejections, 0);
+
+    let mut untimed = definition;
+    for node in &mut untimed.nodes {
+        node.started_at = None;
+        node.completed_at = None;
+        node.duration_ms = None;
+    }
+    let undated = serde_json::to_value(crate::native_v2_observability::history::build_run_report(
+        &untimed, None,
+    ))
+    .assert_value();
+    assert_eq!(undated["totals"]["wallClockMs"], Value::Null);
+    assert_eq!(undated["totals"]["nodeDurationMs"], 0);
+    assert_eq!(undated["totals"]["unattributedMs"], Value::Null);
+    let undated_nodes = undated["nodes"].as_array().assert_value();
+    assert_eq!(undated_nodes.len(), 2);
+    for node in undated_nodes {
+        assert_eq!(node["startedAt"], Value::Null);
+        assert_eq!(node["completedAt"], Value::Null);
+        assert_eq!(node["durationMs"], Value::Null);
+    }
+}
+
 async fn finish_worker_run(ledger: &dyn RunLedger, worker: &ExecutionRef) {
     ledger
         .append(
@@ -192,6 +337,7 @@ async fn finish_worker_run(ledger: &dyn RunLedger, worker: &ExecutionRef) {
                     result: TerminalResult::Succeeded {
                         output: Value::Null,
                     },
+                    timestamp: None,
                 },
             ],
         )

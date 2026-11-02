@@ -115,6 +115,7 @@ async fn durable_watch_resumes_exclusively_without_gaps_or_duplicates() {
                     result: TerminalResult::Succeeded {
                         output: terminal_output.clone(),
                     },
+                    timestamp: None,
                 },
             ],
         )

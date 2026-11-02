@@ -56,6 +56,7 @@ pub(super) fn terminal() -> RunEvent {
         result: TerminalResult::Succeeded {
             output: Value::Null,
         },
+        timestamp: None,
     }
 }
 
@@ -68,6 +69,7 @@ pub(super) fn completed(fixture: &Fixture, execution: u64) -> RunEvent {
                 artifacts: vec![],
             },
         },
+        timestamp: None,
     }
 }
 

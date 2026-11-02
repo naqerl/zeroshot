@@ -16,7 +16,8 @@ use crate::execution::process::{
 };
 use crate::native_v2_contract::NodeRuntimeBinding;
 use crate::native_v2_runner::{
-    DriverControl, DriverInvocation, LiveOutput, LiveOutputStream, NodeRole, NodeRunnerError,
+    AgentResponse, DriverControl, DriverInvocation, LiveOutput, LiveOutputStream, NodeRole,
+    NodeRunnerError,
 };
 use crate::worker_catalog::ReasoningEffort;
 
@@ -519,6 +520,10 @@ impl ProviderFailureRetry {
         redact_provider_error(error, &self.redactions)
     }
 
+    pub(crate) fn redact_response(&self, response: AgentResponse) -> AgentResponse {
+        redact_agent_response(response, &self.redactions)
+    }
+
     pub(crate) async fn report_correction(
         &self,
         control: &DriverControl,
@@ -534,6 +539,14 @@ impl ProviderFailureRetry {
         }
         Ok(())
     }
+}
+
+/// Keeps provider-owned response detail on the same redaction boundary as ordinary error output.
+pub(crate) fn redact_agent_response(
+    response: AgentResponse,
+    redactions: &[String],
+) -> AgentResponse {
+    response.redact_diagnostic(|text| safe_provider_text(text, redactions))
 }
 
 /// Publish useful provider-owned detail after redacting credentials known at this boundary.

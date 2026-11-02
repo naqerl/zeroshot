@@ -311,6 +311,31 @@ The target also serves its profile editor and run viewer at `http://127.0.0.1:80
 See the [target image guide](docker/zeroshot-target/README.md) for persistent storage, network
 isolation, builds, and HTTPS.
 
+## When the hub MCP hangs
+
+A hub daemon answers MCP on `POST /mcp` with the same bearer token as its other routes. If that
+endpoint stops answering while `GET /v1/hub/health` still returns `{"ok":true}`, check the health
+document's `mcp.inFlight` and `mcp.oldestAgeMs`: a stuck command shows up as a job that stays in
+flight for longer than its `ZEROSHOT_MCP_COMMAND_TIMEOUT_MS` budget (default two minutes). The
+daemon bounds every command, cancels work when its HTTP client disconnects, and aborts a session's
+streams and jobs on `DELETE /mcp`.
+
+For unattended restarts, install the user-scoped watchdog timer:
+
+```bash
+scripts/install-hub-watchdog.sh
+systemctl --user status zeroshot-hub-watchdog.timer
+```
+
+Its probe is a real JSON-RPC `tools/list` request, not `/v1/hub/health` or a bare TCP connect,
+because both of those still succeed when the MCP queue is jammed. `curl -m 8` enforces the probe
+deadline; a timeout or an empty answer counts as a failure (the expected `202` acknowledgement of
+the id-less probe is a success), two consecutive failures restart `zeroshot-hub.service`, and a
+`401` is never treated as a hang and never restarts anything. The
+units and probe live in `systemd/zeroshot-hub-watchdog.{service,timer}` and
+`scripts/hub-watchdog.sh`, and honor `ZEROSHOT_HUB_DIR`, `ZEROSHOT_HUB_MCP_URL`, and
+`ZEROSHOT_HUB_TOKEN_FILE` when the hub does not use the default folders.
+
 ## Community
 
 - [Discord](https://theopenengine.com/discord): ask questions, share runs and graphs, and talk to the team.

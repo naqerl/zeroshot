@@ -101,6 +101,12 @@ pub(crate) struct ControlCache {
 }
 
 impl ControlCache {
+    pub(crate) fn empty() -> Self {
+        Self {
+            runs: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
     async fn entry(&self, id: &RunId) -> SharedReplay {
         let mut runs = self.runs.lock().await;
         if let Some(index) = runs.iter().position(|(existing, _)| existing == id) {

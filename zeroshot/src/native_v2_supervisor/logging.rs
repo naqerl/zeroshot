@@ -20,7 +20,10 @@ pub(super) fn completion_events(
     {
         events.push(log);
     }
-    events.push(RunEvent::NodeCompleted { completion });
+    events.push(RunEvent::NodeCompleted {
+        completion,
+        timestamp: Some(crate::native_v2_runner::current_timestamp()),
+    });
     Ok(events)
 }
 
@@ -73,7 +76,10 @@ pub(crate) fn terminal_events(result: TerminalResult) -> Result<Vec<RunEvent>, R
             None,
         )?);
     }
-    events.push(RunEvent::Terminal { result });
+    events.push(RunEvent::Terminal {
+        result,
+        timestamp: Some(crate::native_v2_runner::current_timestamp()),
+    });
     Ok(events)
 }
 

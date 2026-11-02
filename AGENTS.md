@@ -136,7 +136,10 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   durable replay. Final-round facts replace older facts when the loop returns to its parent.
 - Model identifiers are opaque provider-owned strings. Do not infer a harness from a provider/model,
   maintain runtime model catalogs, or validate provider availability. Admission may reject only known
-  incompatible harness/provider pairs.
+  incompatible harness/provider pairs. A caller may declare optional bounded `contextWindow` and
+  `maxTokens` on an agent binding; they are declarations rather than catalog knowledge, are written
+  only to the Pi gateway model entry when supplied, and stay absent so the provider keeps its own
+  defaults otherwise. Never infer either value from the model identifier.
 - Full-v1 loops may declare `maxIterationsInput` as an integer path in the initial input.
   Reusable profiles verify the authored default `maxIterations`; native-v2 run admission binds a
   present positive safe integer from caller input and re-verifies the concrete graph. An absent
@@ -347,10 +350,18 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   documents use atomic private-file replacement with descriptor-based ownership; Linux pins the
   private home before publication and never follows a worker-created destination link.
 - Structured-output correction runs in the same provider session under the node's existing
-  execution policy; local response validation remains authoritative.
+  execution policy; local response validation remains authoritative. Provider responses are read
+  tolerantly before contract validation: surrounding whitespace, one Markdown JSON fence, and a
+  first-`{`/last-`}` JSON span are accepted, and a verifier may omit the `response` envelope by
+  returning its channel (`output`, `signals`, and/or `diagnostic`; absent members take the contract
+  defaults and an unused `artifacts` member is ignored), while workers still require the envelope. A
+  format fault (unreadable envelope or unknown top-level shape) has its own three-correction budget
+  per node visit, does not consume the contract-correction budget, and publishes a debug record
+  naming its count and reason.
 - Provider continuation is bounded: Claude continues once after `system/api_retry`; Codex continues
   once after a terminal execution error. Both send literal `Continue` in the same session when one
-  exists. Structured output receives at most two correction turns before `malformed`.
+  exists. Structured output that violates a valid envelope receives at most two correction turns
+  before `malformed`.
 - Pi drives one `pi --mode json` process per turn, with the node prompt on stdin so a large input
   payload can never exceed the platform argument limit. Model identifiers stay caller-owned and Pi
   owns their resolution. Its provider lanes are `anthropic`, `openai`, `openrouter`, `bedrock`, and
@@ -362,7 +373,8 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   name the wire protocol (`openai-responses`, `openai-completions`, or `anthropic-messages`) and
   reach any endpoint Pi implements without probing it. The registered model entry carries the
   caller's identifier, the chosen protocol, and a `reasoning` flag mirroring the binding's authored
-  effort; context window, output limit, and cost stay Pi-owned defaults. The same file is Pi's only
+  effort. It carries `contextWindow` and `maxTokens` only when the caller declared them, so omitted
+  limits and cost stay Pi-owned defaults. The same file is Pi's only
   caller-owned-endpoint mechanism, which is why it also backs a declared or ambient
   `ANTHROPIC_BASE_URL` on the `anthropic` lane and `OPENAI_BASE_URL`/`OPENAI_API_BASE` on the
   `openai` lane: those overrides retarget the endpoint and keep each built-in provider's own
@@ -758,6 +770,36 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   loss terminalizes active work as `runtime_lost` and poisons the session. The local UI requires both
   per-run leases before treating an in-process ACP owner without a controller socket as live.
   Ordinary runs retain run-scoped session keys.
+- The hub daemon (`zeroshot hub daemon run`) serves Streamable HTTP MCP on `POST /mcp` on its
+  normal API listener, behind the same bearer-token authorization as `/v1/hub/*`. It runs every
+  host operation on its own command thread with a configurable
+  `ZEROSHOT_MCP_COMMAND_TIMEOUT_MS` budget, cancels the operation when its client disconnects or
+  `notifications/cancelled`/`events/unsubscribe` names it, and `DELETE /mcp` tears down the
+  session's streams and in-flight jobs. `/v1/hub/health` reports `mcp.inFlight` and
+  `mcp.oldestAgeMs`; `systemd/zeroshot-hub-watchdog.*` and `scripts/hub-watchdog.sh` probe a real
+  JSON-RPC request and never restart on 401. The default
+  endpoint is `http://127.0.0.1:7383/mcp`, the token defaults to the hub folder's `api-token`, and
+  the daemon heartbeat records the MCP URL as `mcp`. There is no standalone MCP command or process.
+  Each tool builds the same command value as the CLI and runs it through the existing public or hub
+  executor. Tool parameters for graph, initial input, exact or uniform runtime, and environment
+  definitions are inline JSON values materialized into private temporary files for the command's
+  lifetime. The `io.modelcontextprotocol/events` extension exposes one session-spanning hub
+  subscription carrying `hub.job`, `hub.run`, `hub.pool`, and `hub.warning` over one monotonic
+  `hub:<sequence>` cursor. Omitting selectors subscribes to the whole hub; `runId`, `jobId`,
+  `target`, and other filters narrow that feed without binding it, and single-kind names select
+  one event kind (`run.event` is the `hub.run` alias). Occurrences keep the flattened five-field
+  envelope (`eventId`, `name`, `timestamp`, `data`, `_meta`). The envelope `name` is always the
+  name the client subscribed with (`hub` when omitted), because MCP events clients route and
+  validate occurrences by it; the carried kind is `data.kind` (`hub.pool` records keep their
+  lease-or-pool discriminator as `data.scope`). `summary`, `replayed`, and the hub
+  `cursor` live inside `data`, while run records retain their durable `v2:` cursor as
+  `data.runCursor`. `replayed` is true only for records drained at subscribe time. Terminal events
+  are ordinary events and heartbeats continue while idle; only unsubscribe, session end, or
+  cancellation closes a stream. `events/poll` and `events/stream` both replay from the same hub
+  log. `truncated` is false unless replay shortfall or backpressure permanently lost events, and
+  then carries the lost `{from,to}` range; a resumable `maxEvents` clip is only `hasMore`.
+  Explicit per-run `run.event` polls retain their legacy `v2:` cursors. Signed webhooks are
+  unsupported. The endpoint does not itself start a run.
 
 ## CLI and target contracts
 
@@ -821,8 +863,138 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   plans have static inputs, no cross-node dataflow, and no retry-in-place. Agent runtime bindings
   cannot declare `GH_TOKEN`; the sole merge-delivery binding owns the GitHub write credential. A
   node's queue deadline is the earlier of plan expiry and seven days after readiness.
-- Read-only safe commands include `zeroshot list`, `zeroshot status`, and `zeroshot logs`.
-- Destructive commands such as `zeroshot force-stop` require explicit user intent.
+- `zeroshot hub` pools registered targets plus `local`. One daemon per hub folder (`hub daemon
+  run`, held by `hub/daemon.lock`, heartbeat in `hub/daemon.json`) owns the hub: it is the only
+  writer of `hub/state.json` (beside `targets.json`, or `ZEROSHOT_HUB_DIR`), dispatches
+  continuously, and serves the hub API (JSON over HTTP, default `127.0.0.1:7383`, bearer token in
+  `hub/api-token` or `--token-file`). State sits behind one in-memory lock that is never held across
+  target calls; a second lock serializes placement (passes and `submit`). `schedule::Dispatched` owns
+  dispatch outcome kinds: `Placed`; `Unconfirmed` when the driver returns `HubError::Unanswered`
+  (a timeout, no receipt, a transport or protocol failure), which keeps the job placing (running
+  without a run ID, `errorKind` `submission_unconfirmed`) on its member with no attempt counted,
+  so every pass resubmits it there with the same key, counted in `unconfirmed_submissions` apart
+  from `attempts`, until `--unconfirmed-limit` (default 30) fails it as `unconfirmed_limit`; and
+  `Rejected`, the only other kind that fails the job. Hub jobs have no expiry: a job ends only when
+  its run ends, it is force-stopped, or it is reaped with its member. Lifetimes are observable
+  events rather than deadlines, and active runs are reported hourly through `hub.warning`. The
+  opt-in `hub daemon run --max-stall` persists each running job's watch cursor and cursor-change
+  time, resets both when the cursor advances, and force-stops a run whose cursor stayed unchanged for
+  the configured duration, failing it with reason and error kind `stalled`. Its heartbeat reports
+  the duration as `maxStallMs` (`null` when disabled). `hub dequeue` also removes placing jobs
+  (`dequeued_while_placing`); a run the target accepts under their key is noted, never adopted. Jobs placing when a daemon stops stay on their member as unconfirmed. Hub-side job problems
+  are a typed `JobError` (plain strings from older state load as `unclassified`). API errors carry the
+  `zeroshot.error/v1` diagnostic plus `x-zeroshot-exit-code`; logs, watch, attach, and force-stop
+  stream NDJSON frames from a `zeroshot` child on the hub host. Every other hub command is a client
+  of the context chosen by `--hub`, `ZEROSHOT_HUB`, `hub context use`, then built-in `local` (this
+  machine's daemon via its heartbeat). `hub-contexts.json` in the config folder stores URLs and token
+  sources (`--token-file`/`--token-env`), never tokens. Clients upload `--input`, `--graph`,
+  `--runtime-config`, `--uniform-runtime-config`, and `--environment` files; the daemon spools them
+  in `hub/spool/ID/`. An unreachable hub is `hub.unreachable` (exit 5, details name the context and
+  URL); a wrong token is `hub.unauthorized`. `hub install --systemd` writes a user unit (`--system`
+  for a system unit) and `--docker` runs a host-network container named `zeroshot-hub`; both pin
+  `ZEROSHOT_CONFIG_DIR`, `ZEROSHOT_HUB_DIR`, and `ZEROSHOT_STATE_DIR` and pass `--listen` and
+  `--token-file` through. Every target operation is delegated to this executable's own `run
+  --detach`, `list`, `status`, `watch`, `logs`, `attach`, and `force-stop` in a child process
+  (`ZEROSHOT_HUB_EXECUTABLE` overrides it for tests and demos), so the hub never bypasses admission,
+  authentication, or observation contracts. Placement also matches each job's requirements
+  (explicit source or hooks exclude `local`, named targets need a pushed revision, generic Git
+  transport and per-node lanes need their discovery markers) against capability kinds cached from
+  `/.well-known/zeroshot-native-v2`. Cron schedules use `croner` with an explicit IANA zone (`jiff`
+  bundled tzdb). Member capacity is hub-declared `slots`; load is the observed nonterminal runs.
+  Dispatch submission keys are `hub-JOB_ID-ATTEMPT`. Exit code 3 means no capacity or an expired
+  wait, and 4 means that no active member matches or supports the job. Every pass probes every
+  member, including when no job is due; a running job is failed as `target_lost` when its member
+  disappears or remains unreachable for three consecutive probes, and removing a member with a
+  placed job is refused with the job IDs.
+- Hub pools (`native_v2_hub/pool.rs` model and scaling, `lease.rs` per-pass lease steps,
+  `provision.rs` `Provisioner` trait plus cloud-init, `hetzner.rs` reqwest client, `tunnel.rs`
+  `ssh -N -L`, `archive.rs`) create Hetzner servers for queued jobs only a pool matches. An empty
+  pool is eligible, so such jobs queue rather than exit 4, and `hub submit` parks a job a pool
+  serves instead of failing as no-capacity. A lease steps one phase per pass:
+  Creating, Booting, Connecting, Active, Draining, Deleting, Done. A server is deleted only after
+  each of its runs is terminal, has its postmortem, and is archived to `hub/archive/JOB_ID/`. The
+  reaper (start, then every 5 min) deletes resources labelled `zeroshot/hub=ID` that state does not
+  own or that are past `zeroshot/expires`. Failed boots pause the pool (5 min doubling to 1 h).
+  `pool_events` records every lease and pool transition from the code that performs it: leases
+  report `requested`, `creating`, `booting`, `preparing`, `ready`, `in_use`, `idle`, `draining`,
+  `deleted`, or `failed` with `previousPhase`, and pools report `added`, `removed`, `paused`,
+  `resumed`, `blocked`, `shortage`; `removed` waits for every lease of the pool to be deleted.
+  Each pass reconciles a lease whose pool was removed and whose server the provider no longer lists
+  into `deleted` with its reason, failing any run still placing there with
+  `failureClassification: provider_confirmed_absent`; a live server, a lease in an existing pool, and
+  an inconclusive provider answer all leave the lease alone.
+  MCP publishes them as `hub.pool` events from `hub pool list`, so no caller polls for readiness. The
+  API token comes from `--hetzner-token-file` or `HCLOUD_TOKEN` and is never stored. Labels carry
+  IDs, server type and location only. The hub registers the pool's public key with the provider,
+  reuses an existing key by public key or MD5 fingerprint, attaches it to the server by key ID,
+  and also writes it plus a non-expiring login in user data; key-registration failures remain
+  distinct from server create/delete errors. No secret enters either. `data.rs` owns the btrfs
+  data folder: an automatically sized file on the server's local disk and the idempotent, strict
+  boot script (mkfs.btrfs, fstab, snapshot and reflink probe, then the target). `health.rs` is the
+  SSH check run in Connecting before registration; its failure is a failed boot, and a joined
+  member reports the observed `data: {fs: "btrfs", mode: "file", sizeBytes: N}` in `hub list` and
+  `hub pool list`. zeroshot itself needs only reflinks (`FICLONE`). Pools take
+  ordered `--type`/`--location` lists with no default type, checked against the provider catalog
+  (`cax*` needs `--multi-arch`). `profile.rs` owns tag profiles and resolves a job's machine
+  (`Spec`): job size tags (`server-type=`, `min-vcpu=`, `min-ram-gb=`), else the highest-ranked
+  profiled tag (priority, then vCPU, then memory; ties rejected at `tag set`), else the pool's
+  lists. `capacity.rs` owns catalog validation, candidate order, create-error classes, per-spec
+  shortages (30 s doubling to 10 min, separate from the boot pause), blocking (quota/invalid until
+  `hub pool resume`) and `--wait-max`. `placement.rs` never places a tag-profile job on an
+  undersized member. Tests use the fake provisioner in `tests/pool.rs`, `tests/pool_capacity.rs`
+  `tests/pool_profiles.rs`, `tests/pool_data.rs` and `tests/pool_health.rs`, and a local mock API in `tests/hetzner.rs`. Never call the real
+  API from tests.
+- `zeroshot/src/private_file.rs` owns owner-only file replacement for the shipped CLI: a random
+  `create_new` sibling with mode `0600`, fsync, rename over the destination, and cleanup on failure,
+  so readers never see a partial file and a link is replaced rather than written through. The target
+  registry and every hub file (state, heartbeat, contexts, token, spool, eval blobs and work files,
+  installed units) go through it; hub code calls `service::replace_private` and
+  `service::create_private_directory`.
+- `native_v2_hub/usage.rs` owns token-usage completeness for `hub stats`, eval reports, and
+  `/metrics`. A job keeps the run's protocol `TokenUsage` as reported, or an explicit `invalid`
+  record when it cannot be read. Only complete usage is totalled or priced; incomplete and invalid
+  usage is counted separately (`jobsWithIncompleteUsage`, `jobsWithInvalidUsage`), cache totals are
+  claimed only when every counted job reported them, and an overflowing total is withheld
+  (`usageOverflowed`) rather than published partially.
+- Hub metrics: `GET /metrics` (Prometheus text 0.0.4, hand-rolled in `native_v2_hub/metrics.rs`)
+  needs the API token; `--metrics-listen` adds a token-free listener that must be loopback, and
+  `--metrics-label KEY` opts job label keys into token counters. State-derived series are
+  recomputed per scrape; pass, placement, and API series count since daemon start. Never label by
+  job, run, schedule, or eval ID; label values cap at 50 distinct (`_other`), removed members are
+  `_removed`, and routes use axum templates.
+- Hub evals (`hub eval`, `native_v2_hub/eval*`) store suites, cases, and runs in
+  `HubState.evals` and file contents in `hub/eval/blobs/SHA256`. Case IDs (`ec_`) hash the
+  captured request, run IDs (`er_`) hash the request plus `--key`, and sample job IDs hash run,
+  case, variant, and repeat, so retries never duplicate work. Samples are ordinary queued hub jobs
+  labeled `eval.*`. Variant overrides are a pure merge in `eval/variant.rs` (graph/template and the
+  two runtime flags replace each other; model/harness/provider/runtime-patch edit the runtime file).
+  The daemon's eval worker (claimed work spawned beside dispatch) measures finished samples, runs
+  checks with `sh -c` in `hub/eval/work/...`, and runs `cmd:` judges on the hub host or
+  `zeroshot:` judges as `eval.role=judge` hub jobs whose terminal output (`Job.output`, kept only
+  for judge jobs) is the verdict. `eval/judge.rs` `HostCommand::run` owns host commands: input
+  written and capped output read together inside the timeout, and a typed `Ended` (not started,
+  timed out, incomplete input, exited N). Only an exit after reading the whole request yields a
+  verdict, and a check the hub could not start records `error` and leaves the pass unmeasured
+  instead of failing the candidate. Reports are pure (`eval/report.rs`); `--fail-on-regression`
+  exits 6 on a regression and 3 while incomplete. Judge and report schemas are documented in
+  `docs/guides/hub-operations.md`; keep them in sync.
+- Read-only safe commands include `zeroshot list`, `zeroshot status`, `zeroshot report`,
+  `zeroshot logs`, `zeroshot hub list`, `zeroshot hub ps`, `zeroshot hub stats`,
+  `zeroshot hub daemon status`, `zeroshot hub eval report|status|list`, and
+  `zeroshot hub context list`. `zeroshot report RUN_ID` emits one
+  `zeroshot.run.report/v1` JSON document from retained history; it never starts, resumes, or stops
+  a run, and named targets reuse their discovered run-history capability. `zeroshot hub eval run`
+  enqueues real runs.
+  `zeroshot hub install` and `zeroshot hub uninstall` change system services and need explicit
+  user intent; prefer `--dry-run` first.
+  The hub daemon also serves MCP on `POST /mcp`; it does not itself start a run. Its read-only tools
+  are `status`, `logs`, `watch`, `list`, `report`, `hub_list`, `hub_ps`, `hub_jobs`, `hub_stats`,
+  `hub_logs`, and `hub_daemon_status`; `hub_jobs` pages job history newest first by state, label,
+  and `since`. `watch`, `logs`, `hub_logs`, and `hub_watch` follow until the stream ends or the
+  MCP command budget expires (`mcp.timeout`, resumable with `after`); live run events use the
+  events extension. `run`, `resume`, `hub_submit`, and `hub_enqueue` submit work.
+- Destructive commands such as `zeroshot force-stop` require explicit user intent. The MCP
+  `force-stop` tool is that command.
 
 ## Where to look
 
@@ -831,6 +1003,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 | Canonical crate and CLI       | `zeroshot/`                                                                                                                                                                                       |
 | CLI grammar/help              | `zeroshot/src/native_v2_cli/parser.rs`                                                                                                                                                            |
 | CLI composition               | `zeroshot/src/native_v2_cli.rs`, `zeroshot/src/main.rs`                                                                                                                                           |
+| MCP server                    | `zeroshot/src/native_v2_cli/mcp.rs`, `zeroshot/src/mcp_host.rs`                                                                                                                                   |
 | CLI self-update               | `zeroshot/src/native_v2_cli/update.rs`                                                                                                                                                            |
 | Built-in templates            | `zeroshot/src/native_v2_templates.rs`, `zeroshot/src/native_v2_templates/`                                                                                                                        |
 | Local run composition         | `zeroshot/src/native_v2_local.rs`                                                                                                                                                                 |
@@ -839,10 +1012,12 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 | Portable controller           | `zeroshot/src/native_v2_portable_controller.rs`, `zeroshot/src/native_v2_portable_controller/`                                                                                                    |
 | Provider/delivery composition | `zeroshot/src/native_v2_candidate.rs`, `zeroshot/src/native_v2_candidate/`                                                                                                                        |
 | Target server                 | `zeroshot/src/native_v2_target.rs`, `zeroshot/src/native_v2_target/`                                                                                                                              |
+| Hub (target pool and queue)   | `zeroshot/src/native_v2_cli/hub.rs`, `zeroshot/src/native_v2_cli/parser/hub.rs`, `zeroshot/src/native_v2_hub.rs`, `zeroshot/src/native_v2_hub/`                                                   |
 | Target authority/auth         | `zeroshot/src/native_v2_target_authority.rs`, `zeroshot/src/native_v2_target_authority/`                                                                                                          |
 | Contained execution           | `zeroshot/src/execution.rs`, `zeroshot/src/execution/`                                                                                                                                            |
 | Faults and redaction          | `zeroshot/src/fault.rs`, `zeroshot/src/fault/`                                                                                                                                                    |
 | Run ledger                    | `zeroshot/src/v2_run_ledger.rs`, `zeroshot/src/v2_run_ledger/`                                                                                                                                    |
+| Run history and report        | `zeroshot/src/native_v2_observability/history.rs`, `zeroshot/src/native_v2_observability/history/`                                                                                                |
 | Cluster protocol types        | `crates/openengine-cluster-protocol/`                                                                                                                                                             |
 | Cluster server                | `crates/openengine-cluster-server/`                                                                                                                                                               |
 | Cluster client                | `crates/openengine-cluster-client/`                                                                                                                                                               |

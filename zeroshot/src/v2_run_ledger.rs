@@ -232,13 +232,19 @@ pub enum RunEvent {
         occurrence: StructuralOccurrence,
         attempt: PositiveInteger,
         input: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp: Option<UnixTimestampMillis>,
     },
     NodeCompleted {
         completion: NodeCompletion,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp: Option<UnixTimestampMillis>,
     },
     ExecutionVoided {
         reference: ExecutionRef,
         reason: ExecutionVoidReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp: Option<UnixTimestampMillis>,
     },
     SafeLog {
         execution: Option<ExecutionId>,
@@ -264,6 +270,8 @@ pub enum RunEvent {
     ForceStopRequested,
     Terminal {
         result: TerminalResult,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp: Option<UnixTimestampMillis>,
     },
 }
 

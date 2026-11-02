@@ -20,10 +20,9 @@ use crate::native_v2_cli::{
     profile_revision, LocalRunProfileStore, NativeV2CliError, ProfileSaveConflict,
 };
 
-mod run_history_transport;
 mod runs;
 mod server;
-pub use run_history_transport::{
+pub use crate::native_v2_observability::history::{
     RunHistoryRequest, RunHistoryResponse, RunHistoryTransport, RunHistoryTransportError,
 };
 pub use server::{serve, serve_with_target, RunHistoryTarget, UiService};

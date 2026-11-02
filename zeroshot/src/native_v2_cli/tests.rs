@@ -26,6 +26,8 @@ mod delegation_tests;
 mod documented_example_tests;
 #[path = "tests/environment.rs"]
 mod environment_tests;
+#[path = "tests/hub.rs"]
+mod hub_tests;
 #[path = "tests/lifecycle.rs"]
 mod lifecycle_tests;
 #[path = "tests/management.rs"]

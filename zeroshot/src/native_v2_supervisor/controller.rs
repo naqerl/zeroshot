@@ -25,6 +25,7 @@ impl NativeV2Supervisor {
         &self,
         dispatches: &[Dispatch],
     ) -> Result<bool, NativeV2SupervisorError> {
+        let timestamp = Some(crate::native_v2_runner::current_timestamp());
         let events = dispatches
             .iter()
             .map(|dispatch| RunEvent::NodeStarted {
@@ -32,6 +33,7 @@ impl NativeV2Supervisor {
                 occurrence: dispatch.occurrence.clone(),
                 attempt: dispatch.attempt,
                 input: dispatch.input.clone(),
+                timestamp,
             })
             .collect();
         if let Err(error) = self.ledger.append(&self.run_id, events).await {
@@ -139,6 +141,7 @@ impl NativeV2Supervisor {
             events.push(RunEvent::ExecutionVoided {
                 reference: finished.reference,
                 reason,
+                timestamp: Some(crate::native_v2_runner::current_timestamp()),
             });
             super::logging::clear_recorded_diagnostics(&mut events, &snapshot, has_detail);
             self.ledger.append(&self.run_id, events).await?;

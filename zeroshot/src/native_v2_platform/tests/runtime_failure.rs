@@ -67,7 +67,7 @@ impl FaultLedger {
                 matches!(event, RunEvent::NodeCompleted { .. })
             }
             FailurePoint::PeerCompletionPanic => matches!(
-                event, RunEvent::NodeCompleted { completion }
+                event, RunEvent::NodeCompleted { completion, .. }
                     if completion.reference.node.as_str() == "left"
             ),
         })
