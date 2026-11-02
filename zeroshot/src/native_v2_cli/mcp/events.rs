@@ -11,7 +11,9 @@ use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncWrite;
 use tokio::sync::{Mutex, Notify, broadcast};
 
-use super::args::{integer_prop, object_schema, optional_string, reject_unknown, string_prop};
+use super::args::{
+    bool_prop, integer_prop, object_schema, optional_string, reject_unknown, string_prop,
+};
 use super::host::{parse_cli, McpFailure, McpHost, WatchStream};
 use super::super::hub::{HubCommand, HubPoolCommand, HubRequest};
 use super::super::{NativeV2CliCommand, RunWatchCommand};
@@ -20,9 +22,12 @@ pub(super) const EXTENSION_ID: &str = "io.modelcontextprotocol/events";
 const EVENT_NAME: &str = "run.event";
 const HUB_JOB: &str = "hub.job";
 const HUB_RUN: &str = "hub.run";
+/// The raw per-cursor run trail. It is stored for every watch record but delivered only to
+/// subscriptions that opt in with `detail: true` or the `hub.run.detail` kind.
+const HUB_RUN_DETAIL: &str = "hub.run.detail";
 const HUB_POOL: &str = "hub.pool";
 const HUB_WARNING: &str = "hub.warning";
-const HUB_EVENTS: &[&str] = &[HUB_JOB, HUB_RUN, HUB_POOL, HUB_WARNING];
+const HUB_EVENTS: &[&str] = &[HUB_JOB, HUB_RUN, HUB_RUN_DETAIL, HUB_POOL, HUB_WARNING];
 const SUBSCRIPTION_META: &str = "io.modelcontextprotocol/subscriptionId";
 const FIRST_WAIT: Duration = Duration::from_secs(2);
 const IDLE_WAIT: Duration = Duration::from_millis(50);
@@ -104,6 +109,7 @@ struct HubSubscription {
     target: Option<String>,
     kinds: Option<Vec<String>>,
     stream: String,
+    detail: bool,
 }
 
 pub(super) enum EventError {
@@ -126,6 +132,9 @@ struct PollRequest {
     /// The kind implied by a kind-named subscription (`hub.job`, ...). A hub subscription by
     /// name or alias carries every kind. This is subscription identity, not a narrowing argument.
     kinds: Option<Vec<String>>,
+    /// Deliver the raw per-cursor trail (`hub.run.detail`) instead of collapsing runs to node
+    /// transitions. Naming the detail kind in `name` is the same opt-in.
+    detail: bool,
     hub: bool,
 }
 
@@ -205,6 +214,9 @@ pub(super) struct HubEvent {
     target: Option<String>,
     phase: Option<String>,
     terminal: bool,
+    /// A stored per-cursor record that starts a new node or ends the running phase. Delivery
+    /// exposes it as the collapsed `hub.run` kind unless the subscriber opted into detail.
+    transition: bool,
     /// A bootstrap state synthesized when a subscription starts without a cursor. It is sent
     /// before live work but is never appended to the durable log or counted as a new cursor.
     snapshot: bool,
@@ -238,10 +250,22 @@ pub(super) struct HubFeed {
     /// Jobs whose terminal occurrence this feed already published. A late subscriber gets that
     /// final state in its bootstrap snapshot instead of waiting for an event it missed.
     terminal_jobs: RefCell<HashSet<String>>,
-    /// The immediately previous `hub.run` occurrence per job. Comparing against only that
-    /// occurrence keeps a shrinking active set (A,B -> A) a real transition instead of a
-    /// historical duplicate, and carries the job attempt into the identity.
-    run_seen: RefCell<HashMap<String, String>>,
+    /// Per-run collapse state: the node the last collapsed event reported, when that node
+    /// started, and how many observed cursors have not been announced yet. The raw records stay
+    /// in `log`; this only decides which of them becomes the collapsed `hub.run` evidence.
+    runs: RefCell<HashMap<String, RunProgress>>,
+}
+
+/// Facts kept between watch records for one run so a collapsed event can prove liveness.
+#[derive(Default)]
+struct RunProgress {
+    seen: bool,
+    node: Option<String>,
+    node_key: Option<String>,
+    phase: Option<String>,
+    node_changed_at: Option<String>,
+    node_changed_at_ms: u64,
+    cursors_since_last_event: u64,
 }
 
 /// Facts the warning publisher keeps between intervals for each running job: the execution it
@@ -347,7 +371,7 @@ impl HubFeed {
         self.terminal_jobs
             .borrow_mut()
             .retain(|job_id| live.contains(job_id));
-        self.run_seen
+        self.runs
             .borrow_mut()
             .retain(|job_id, _| live.contains(job_id));
     }
@@ -367,7 +391,7 @@ impl HubFeed {
             run_facts: RefCell::new(HashMap::new()),
             job_labels: RefCell::new(HashMap::new()),
             terminal_jobs: RefCell::new(HashSet::new()),
-            run_seen: RefCell::new(HashMap::new()),
+            runs: RefCell::new(HashMap::new()),
         }
     }
 
@@ -472,9 +496,102 @@ impl HubFeed {
     }
 }
 
+/// The node the run currently reports, plus a stable identity for the whole active node set.
+/// Parallel branches expose one active execution each; `node` is the first one for the payload,
+/// while `key` lets a shrinking set (A,B -> A) count as a real node change.
+fn active_nodes(event: &Value) -> (Option<String>, Option<String>) {
+    let mut nodes = event
+        .pointer("/status/activeExecutions")
+        .and_then(Value::as_array)
+        .map(|executions| {
+            executions
+                .iter()
+                .filter_map(|execution| execution.get("node").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let first = nodes.first().map(|node| (*node).to_owned());
+    nodes.sort_unstable();
+    nodes.dedup();
+    let key = (!nodes.is_empty()).then(|| nodes.join(","));
+    (first, key)
+}
+
+fn terminal_reason(event: &Value) -> Value {
+    event
+        .pointer("/status/terminalResult/reason")
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+#[cfg(test)]
+impl HubFeed {
+    pub(super) fn test_publish_run(&self, run_id: &str, job_id: &str, event: Value) {
+        self.publish_run(
+            RunOrigin {
+                run_id,
+                job_id,
+                target: None,
+            },
+            event,
+        );
+    }
+
+    pub(super) fn test_publish_warning(&self, job_id: &str, run_id: &str, facts: Value) {
+        self.publish_warning(job_id, run_id, facts);
+    }
+
+    /// Deliver the stored log through the same subscription parser and filter the real poll and
+    /// stream paths use, without an HTTP round trip.
+    pub(super) fn test_deliver(&self, name: Option<&str>, arguments: Value) -> Vec<Value> {
+        let mut params = json!({"arguments": arguments});
+        if let Some(name) = name {
+            params["name"] = json!(name);
+        }
+        let Ok(request) = parse_subscription(&params, false) else {
+            panic!("test subscription parses");
+        };
+        let filter = HubFilter {
+            selector: &request.selector,
+            target: &request.target,
+            kinds: &request.kinds,
+            stream: &request.stream,
+            detail: request.detail,
+        };
+        self.log
+            .borrow()
+            .events
+            .iter()
+            .filter_map(|event| {
+                hub_event_value(
+                    event,
+                    &filter,
+                    Stamp {
+                        replayed: false,
+                        sequence: 0,
+                        id: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    pub(super) fn test_log_records(&self) -> Vec<(u64, &'static str, bool)> {
+        self.log
+            .borrow()
+            .events
+            .iter()
+            .map(|event| (event.sequence, event.name, event.transition))
+            .collect()
+    }
+}
+
 fn snapshot_key(event: &HubEvent) -> Option<(&'static str, String)> {
     match event.name {
         HUB_JOB => event.job_id.clone().map(|key| ("job", key)),
+        // Only a transition record is the run's observable state. A non-transition detail
+        // record is an intermediate cursor, never the snapshot a late subscriber needs.
+        HUB_RUN_DETAIL if event.transition => event.run_id.clone().map(|key| ("run", key)),
         HUB_RUN => event.run_id.clone().map(|key| ("run", key)),
         HUB_POOL => event
             .data
@@ -608,8 +725,10 @@ pub(super) fn list(params: &Value) -> Result<Value, EventError> {
         "hub",
         "everything in the hub: jobs, runs, pool leases, and warnings. Every notification is \
          named after the subscription (hub) and carries its kind, one of hub.job, hub.run, \
-         hub.pool, or hub.warning, in data.kind, so a client can branch on the kind or ignore it \
-         and read the stream.",
+         hub.run.detail, hub.pool, or hub.warning, in data.kind, so a client can branch on the kind \
+         or ignore it and read the stream. hub.run fires only when the run's node changes or its \
+         phase leaves running; the raw per-cursor trail is hub.run.detail and is delivered only to \
+         subscriptions that opt in with detail: true or the hub.run.detail name.",
     )];
     let events = descriptions
         .into_iter()
@@ -773,6 +892,7 @@ where
             target: request.target.clone(),
             kinds: request.kinds.clone(),
             stream: request.stream.clone(),
+            detail: request.detail,
         },
     };
     feed.release_poller();
@@ -817,6 +937,7 @@ where
         target,
         kinds,
         stream,
+        detail,
     } = subscription;
     let StreamOutput {
         id,
@@ -831,6 +952,7 @@ where
         target: &target,
         kinds: &kinds,
         stream: &stream,
+        detail,
     };
     let mut sequence = 0u64;
     let mut job_states = HashMap::new();
@@ -983,6 +1105,7 @@ struct HubFilter<'a> {
     target: &'a Option<String>,
     kinds: &'a Option<Vec<String>>,
     stream: &'a str,
+    detail: bool,
 }
 
 /// One delivery's position: replay state, monotone sequence, and the enclosing request ID.
@@ -992,9 +1115,25 @@ struct Stamp<'a> {
     id: Option<&'a Value>,
 }
 
+fn delivered_name(event: &HubEvent, detail: bool) -> Option<&'static str> {
+    if event.name != HUB_RUN_DETAIL {
+        return Some(event.name);
+    }
+    if detail {
+        // An explicit opt-in keeps every cursor, including the one that changed the node.
+        return Some(HUB_RUN_DETAIL);
+    }
+    // Default subscribers only see the node transitions; the intermediate cursors stay in the
+    // durable log for readers that ask for them.
+    event.transition.then_some(HUB_RUN)
+}
+
 fn hub_event_value(event: &HubEvent, filter: &HubFilter<'_>, stamp: Stamp<'_>) -> Option<Value> {
+    // The raw trail is always stored. Delivery decides whether this record is the collapsed
+    // `hub.run` transition or an opt-in `hub.run.detail` occurrence.
+    let name = delivered_name(event, filter.detail)?;
     if let Some(kinds) = filter.kinds {
-        if !kinds.iter().any(|kind| kind == event.name) {
+        if !kinds.iter().any(|kind| kind == name) {
             return None;
         }
     }
@@ -1020,12 +1159,13 @@ fn hub_event_value(event: &HubEvent, filter: &HubFilter<'_>, stamp: Stamp<'_>) -
         .snapshot_cursor
         .clone()
         .unwrap_or_else(|| hub_cursor(event.sequence));
-    let mut data = if event.name == HUB_RUN {
+    let is_run = matches!(name, HUB_RUN | HUB_RUN_DETAIL);
+    let mut data = if is_run {
         event_data(&event.data, false)
     } else {
         event.data.clone()
     };
-    let summary = if event.name == HUB_RUN {
+    let summary = if is_run {
         summary(&data)
     } else {
         json!({
@@ -1038,12 +1178,12 @@ fn hub_event_value(event: &HubEvent, filter: &HubFilter<'_>, stamp: Stamp<'_>) -
     if let Some(map) = data.as_object_mut() {
         // hub.run carries a durable v2: watch cursor in its recorded data. Keep that
         // provenance while data.cursor remains the hub-wide resume cursor.
-        if event.name == HUB_RUN {
+        if is_run {
             if let Some(run_cursor) = map.get("cursor").cloned() {
                 map.insert("runCursor".to_owned(), run_cursor);
             }
         }
-        map.insert("kind".to_owned(), json!(event.name));
+        map.insert("kind".to_owned(), json!(name));
         map.insert("cursor".to_owned(), json!(&event_cursor));
         map.insert("summary".to_owned(), summary);
         map.insert("replayed".to_owned(), json!(stamp.replayed));
@@ -1192,9 +1332,39 @@ fn parse_subscription(params: &Value, capped: bool) -> Result<PollRequest, Event
     if let Some(argument) = narrowing_argument(arguments) {
         return Err(EventError::Filtered(argument));
     }
-    reject_unknown(arguments, &["runId", "jobId", "target"]).map_err(EventError::Invalid)?;
-    let kinds = name_kinds
+    reject_unknown(arguments, &["runId", "jobId", "target", "detail"])
+        .map_err(EventError::Invalid)?;
+    let mut detail = match arguments.get("detail") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(EventError::Invalid(McpFailure::invalid(
+                "detail must be a boolean",
+            )));
+        }
+    };
+    let mut kinds = name_kinds
         .or_else(|| (hub && name.as_deref() == Some(EVENT_NAME)).then(|| vec![HUB_RUN.to_owned()]));
+    // Naming the raw kind (as `name`) is the same opt-in as `detail: true`.
+    if kinds
+        .as_ref()
+        .is_some_and(|kinds| kinds.iter().any(|kind| kind == HUB_RUN_DETAIL))
+    {
+        detail = true;
+    }
+    if detail {
+        if let Some(kinds) = kinds.as_mut() {
+            // `detail: true` swaps the collapsed run kind for the raw trail. Without this a
+            // `run.event` subscription would opt in and then filter its own detail records out.
+            for kind in kinds.iter_mut() {
+                if kind == HUB_RUN {
+                    *kind = HUB_RUN_DETAIL.to_owned();
+                }
+            }
+            let mut seen = HashSet::new();
+            kinds.retain(|kind| seen.insert(kind.clone()));
+        }
+    }
     Ok(PollRequest {
         stream: name.unwrap_or_else(|| "hub".to_owned()),
         selector,
@@ -1202,6 +1372,7 @@ fn parse_subscription(params: &Value, capped: bool) -> Result<PollRequest, Event
         cursor,
         max_events,
         kinds,
+        detail,
         hub,
     })
 }
@@ -1391,6 +1562,7 @@ where
         target: &request.target,
         kinds: &request.kinds,
         stream: &request.stream,
+        detail: request.detail,
     };
     let mut job_states = HashMap::new();
     let snapshots = if bootstrap {
@@ -1673,6 +1845,7 @@ where
         target: &request.target,
         kinds: &request.kinds,
         stream: &request.stream,
+        detail: request.detail,
     };
     let mut events = Vec::with_capacity(views.len());
     for mut view in views {
@@ -1725,6 +1898,7 @@ where
                 .map(str::to_owned),
             phase: Some(state.clone()),
             terminal,
+            transition: false,
             snapshot: true,
             snapshot_cursor: None,
         };
@@ -2082,6 +2256,7 @@ where
             .map(str::to_owned),
         phase: Some(state.to_owned()),
         terminal,
+        transition: false,
         snapshot: false,
         snapshot_cursor: None,
     });
@@ -2238,6 +2413,7 @@ fn publish_pool(feed: &HubFeed, record: &Value) {
         target,
         phase: Some(phase),
         terminal,
+        transition: false,
         snapshot: false,
         snapshot_cursor: None,
     });
@@ -2276,7 +2452,11 @@ struct RunOrigin<'a> {
 }
 
 impl HubFeed {
+    /// Store every watch record, but mark only node changes and phase exits from `running` as
+    /// collapsed transitions. The raw record (with its cursor) is still appended to the log, so
+    /// `hub ps` history and detail subscribers keep the complete trail.
     fn publish_run(&self, origin: RunOrigin<'_>, mut event: Value) {
+        let (at, now_ms) = now_stamp();
         let phase = event
             .pointer("/status/phase")
             .and_then(Value::as_str)
@@ -2284,73 +2464,113 @@ impl HubFeed {
         let terminal = phase.as_deref() == Some("finished");
         self.warnings
             .borrow_mut()
-            .observe(origin.job_id, &event, now_ms());
+            .observe(origin.job_id, &event, now_ms);
         if let Some(map) = event.as_object_mut() {
             map.entry("runId").or_insert_with(|| json!(origin.run_id));
+        }
+        let (node, node_key) = active_nodes(&event);
+        let run_cursor = event
+            .get("cursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let reason = terminal_reason(&event);
+        let (transition, previous_node, cursors_since_last_event, node_changed_at, elapsed) = {
+            let mut runs = self.runs.borrow_mut();
+            let entry = runs.entry(origin.job_id.to_owned()).or_default();
+            let first = !entry.seen;
+            // The node set identifies a transition: a parallel run that shrinks from A,B to A
+            // really did finish a node even though its first active node is unchanged.
+            let node_changed = !first && entry.node_key != node_key;
+            let node_moved = first || node_changed;
+            let current_phase = phase.as_deref();
+            // Leaving `running` ends the progress window. Later non-running phases (stopping ->
+            // finished) still announce their own transition, so the terminal event is never lost
+            // when a subscriber first observes the run already stopping.
+            let left_running = current_phase.is_some_and(|phase| phase != "running")
+                && entry.phase.as_deref() != current_phase;
+            let transition = node_moved || left_running;
+            let previous_node = entry.node.clone();
+            // The current record is itself a cursor observation, so it counts toward the gap
+            // between collapsed events. The very first event has no previous cursor to count.
+            let cursors_since_last_event = if first {
+                0
+            } else if transition {
+                entry.cursors_since_last_event.saturating_add(1)
+            } else {
+                entry.cursors_since_last_event
+            };
+            if transition {
+                entry.cursors_since_last_event = 0;
+            } else {
+                entry.cursors_since_last_event = entry.cursors_since_last_event.saturating_add(1);
+            }
+            // Only a real node change starts a new quiet window. A phase-only transition keeps the
+            // retained node start, so `elapsedMsInNode` measures the time the node stayed the same.
+            if node_moved {
+                entry.node = node.clone();
+                entry.node_key = node_key;
+                entry.node_changed_at = Some(at.clone());
+                entry.node_changed_at_ms = now_ms;
+            }
+            entry.phase = phase.clone();
+            entry.seen = true;
+            (
+                transition,
+                previous_node,
+                cursors_since_last_event,
+                entry.node_changed_at.clone(),
+                now_ms.saturating_sub(entry.node_changed_at_ms),
+            )
+        };
+        if let Some(map) = event.as_object_mut() {
+            if transition {
+                // The collapsed event is the whole liveness answer: a reader can tell from it
+                // and the clock whether the run moved, how long the node has been unchanged, and
+                // whether the run ended. Non-transition records keep the plain watch record.
+                map.insert(
+                    "node".to_owned(),
+                    node.map(Value::String).unwrap_or(Value::Null),
+                );
+                map.insert(
+                    "previousNode".to_owned(),
+                    previous_node.map(Value::String).unwrap_or(Value::Null),
+                );
+                map.insert(
+                    "phase".to_owned(),
+                    phase.clone().map(Value::String).unwrap_or(Value::Null),
+                );
+                map.insert(
+                    "runCursor".to_owned(),
+                    run_cursor.map(Value::String).unwrap_or(Value::Null),
+                );
+                map.insert("lastCursorAt".to_owned(), json!(at.clone()));
+                map.insert(
+                    "cursorsSinceLastEvent".to_owned(),
+                    json!(cursors_since_last_event),
+                );
+                map.insert("elapsedMsInNode".to_owned(), json!(elapsed));
+                map.insert(
+                    "nodeChangedAt".to_owned(),
+                    node_changed_at.map(Value::String).unwrap_or(Value::Null),
+                );
+                map.insert("terminal".to_owned(), json!(terminal));
+                map.insert("reason".to_owned(), reason);
+            }
         }
         self.run_facts
             .borrow_mut()
             .insert(origin.job_id.to_owned(), event.clone());
-        let phase_name = phase.as_deref().unwrap_or("running");
-        let mut keys = Vec::new();
-        if let Some(executions) = event
-            .pointer("/status/activeExecutions")
-            .and_then(Value::as_array)
-            .filter(|executions| !executions.is_empty())
-        {
-            for execution in executions {
-                let node = execution.get("node").and_then(Value::as_str).unwrap_or("");
-                let id = execution
-                    .get("execution")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                keys.push(format!("{}|{phase_name}|{node}|{id}", origin.job_id));
-            }
-        } else {
-            keys.push(format!("{}|{phase_name}||", origin.job_id));
-        }
-        // One run occurrence covers every execution that was active at that moment, so the
-        // identity of the occurrence is the whole ordered set. Watching individual tuples would
-        // miss a shrinking active set whose remaining tuple was already seen.
-        keys.sort();
-        let attempt = event
-            .pointer("/attempt")
-            .or_else(|| event.pointer("/status/attempt"))
-            .or_else(|| event.pointer("/status/attempts"))
-            .and_then(Value::as_u64)
-            .map(|attempt| attempt.to_string())
-            .unwrap_or_default();
-        let occurrence = format!("{attempt}|{}", keys.join(";"));
-        // Compare only with the immediately previous occurrence, not everything the job has
-        // ever reported: A,B -> A is a real node finish even though A alone was seen before.
-        let fresh = {
-            let mut seen = self.run_seen.borrow_mut();
-            if seen
-                .get(origin.job_id)
-                .is_some_and(|previous| previous == &occurrence)
-            {
-                false
-            } else {
-                seen.insert(origin.job_id.to_owned(), occurrence);
-                true
-            }
-        };
-        // The public status can change metadata, warnings, and delivery facts without a new
-        // phase, attempt, execution, or active node. Those changes update `run_facts` and the
-        // warning book but must not produce look-alike phase transitions on the feed.
-        if !fresh {
-            return;
-        }
         self.publish(HubEvent {
             sequence: 0,
-            name: HUB_RUN,
-            timestamp: now_rfc3339(),
+            name: HUB_RUN_DETAIL,
+            timestamp: at,
             data: event,
             run_id: Some(origin.run_id.to_owned()),
             job_id: Some(origin.job_id.to_owned()),
             target: origin.target,
             phase,
             terminal,
+            transition,
             snapshot: false,
             snapshot_cursor: None,
         });
@@ -2464,6 +2684,7 @@ impl HubFeed {
             target: None,
             phase: None,
             terminal: false,
+            transition: false,
             snapshot: false,
             snapshot_cursor: None,
         });
@@ -2640,6 +2861,17 @@ fn now_rfc3339() -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
 }
 
+/// One clock read for an event's payload and its elapsed-time evidence.
+fn now_stamp() -> (String, u64) {
+    let now = OffsetDateTime::now_utc();
+    let millis = u64::try_from(now.unix_timestamp_nanos() / 1_000_000).unwrap_or(0);
+    (
+        now.format(&Rfc3339)
+            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned()),
+        millis,
+    )
+}
+
 fn meta(id: &Value) -> Value {
     let mut object = Map::new();
     object.insert(SUBSCRIPTION_META.to_owned(), id.clone());
@@ -2665,12 +2897,21 @@ fn input_schema(name: &str) -> Value {
                 "maxEvents",
                 integer_prop("Bound the events returned by one poll from 1 to 1000."),
             ),
+            (
+                "detail",
+                bool_prop(
+                    "Deliver the raw per-cursor trail as hub.run.detail instead of the collapsed \
+                     node-transition hub.run events.",
+                ),
+            ),
         ],
     );
     schema["description"] = json!(format!(
         "Long-lived {name} subscription. Every occurrence carries one of hub.job, hub.run, \
-         hub.pool, or hub.warning in data.kind; narrowing arguments are refused because one \
-         subscription must carry every hub event. Optional runId, jobId, or target selectors \
+         hub.run.detail, hub.pool, or hub.warning in data.kind; narrowing arguments are refused \
+         because one subscription must carry every hub event. hub.run fires only when the run's \
+         node changes or its phase leaves running; set detail: true (or subscribe to \
+         hub.run.detail) for the raw per-cursor trail. Optional runId, jobId, or target selectors \
          choose which subscription this is. The stream stays open after terminal run events and \
          idle periods; stop it with events/unsubscribe, session end, or cancellation. Resume \
          with the hub:N cursor from notifications/events/active. maxAgeMs is accepted but not \
@@ -2682,14 +2923,27 @@ fn input_schema(name: &str) -> Value {
 fn payload_schema(name: &str) -> Value {
     let run_data = json!({
         "type": "object",
-        "description": "Trimmed durable run watch record. data.cursor is the hub cursor; data.runCursor keeps the run's v2: cursor.",
+        "description": "Collapsed run transition. data.cursor is the hub cursor; data.runCursor keeps the run's v2: cursor, and cursorsSinceLastEvent plus lastCursorAt prove the run moved between events.",
         "additionalProperties": true,
-        "required": ["kind", "runId", "cursor", "status", "summary", "replayed"],
+        "required": [
+            "kind", "runId", "cursor", "runCursor", "status", "summary", "replayed", "node",
+            "previousNode", "phase", "lastCursorAt", "cursorsSinceLastEvent",
+            "elapsedMsInNode", "nodeChangedAt", "terminal", "reason"
+        ],
         "properties": {
             "kind": {"const": HUB_RUN},
             "runId": {"type": "string"},
             "cursor": {"type": "string", "pattern": "^hub:[0-9]+$"},
-            "runCursor": {"type": "string", "pattern": "^v2:[0-9]+$"},
+            "runCursor": {"type": ["string", "null"], "pattern": "^v2:[0-9]+$"},
+            "node": {"type": ["string", "null"]},
+            "previousNode": {"type": ["string", "null"]},
+            "phase": {"type": ["string", "null"], "enum": ["admitted", "running", "stopping", "finished", null]},
+            "lastCursorAt": {"type": ["string", "null"], "format": "date-time"},
+            "cursorsSinceLastEvent": {"type": "integer", "minimum": 0},
+            "elapsedMsInNode": {"type": "integer", "minimum": 0},
+            "nodeChangedAt": {"type": ["string", "null"], "format": "date-time"},
+            "terminal": {"type": "boolean"},
+            "reason": {"type": ["string", "null"]},
             "status": {
                 "type": "object",
                 "description": "Public run status. status.metadata is present only when phase is finished.",
@@ -2703,6 +2957,26 @@ fn payload_schema(name: &str) -> Value {
                     },
                     "metadata": {"type": "object"}
                 }
+            },
+            "summary": {"type": "object"},
+            "replayed": {"type": "boolean"},
+            "sequence": {"type": "integer", "minimum": 1}
+        }
+    });
+    let run_detail_data = json!({
+        "type": "object",
+        "description": "One raw per-cursor run record from the durable log. data.cursor is the hub cursor; data.runCursor keeps the run's v2: cursor. Transition records also carry the collapsed-event evidence.",
+        "additionalProperties": true,
+        "required": ["kind", "runId", "cursor", "runCursor", "status", "summary", "replayed", "sequence"],
+        "properties": {
+            "kind": {"const": HUB_RUN_DETAIL},
+            "runId": {"type": "string"},
+            "cursor": {"type": "string", "pattern": "^hub:[0-9]+$"},
+            "runCursor": {"type": ["string", "null"], "pattern": "^v2:[0-9]+$"},
+            "status": {
+                "type": "object",
+                "description": "Public run status. status.metadata is present only when phase is finished.",
+                "additionalProperties": true
             },
             "summary": {"type": "object"},
             "replayed": {"type": "boolean"},
@@ -2797,9 +3071,10 @@ fn payload_schema(name: &str) -> Value {
     let data = match name {
         HUB_JOB => job_data,
         HUB_RUN => run_data,
+        HUB_RUN_DETAIL => run_detail_data,
         HUB_POOL => pool_data,
         HUB_WARNING => warning_data,
-        _ => json!({"oneOf": [job_data, run_data, pool_data, warning_data]}),
+        _ => json!({"oneOf": [job_data, run_data, pool_data, warning_data, run_detail_data]}),
     };
     json!({
         "type": "object",
@@ -2950,6 +3225,7 @@ mod warning_tests {
             target: None,
             phase: None,
             terminal: false,
+            transition: false,
             snapshot,
             snapshot_cursor: None,
         }

@@ -784,10 +784,16 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   executor. Tool parameters for graph, initial input, exact or uniform runtime, and environment
   definitions are inline JSON values materialized into private temporary files for the command's
   lifetime. The `io.modelcontextprotocol/events` extension exposes one session-spanning hub
-  subscription carrying `hub.job`, `hub.run`, `hub.pool`, and `hub.warning` over one monotonic
-  `hub:<sequence>` cursor. Omitting selectors subscribes to the whole hub; `runId`, `jobId`,
-  `target`, and other filters narrow that feed without binding it, and single-kind names select
-  one event kind (`run.event` is the `hub.run` alias). Occurrences keep the flattened five-field
+  subscription carrying `hub.job`, `hub.run`, `hub.run.detail`, `hub.pool`, and `hub.warning` over
+  one monotonic `hub:<sequence>` cursor. Omitting selectors subscribes to the whole hub; `runId`,
+  `jobId`, `target`, and other filters narrow that feed without binding it, and single-kind names
+  select one event kind (`run.event` is the `hub.run` alias). `hub.run` is collapsed to node
+  changes and phase exits from `running`; every watch record still lands in the log as
+  `hub.run.detail` and is delivered only when a subscription opts in with `detail: true` or the
+  `hub.run.detail` name. A collapsed event carries `node`, `previousNode`, `phase`, `runCursor`,
+  `lastCursorAt`, `cursorsSinceLastEvent`, `elapsedMsInNode`, `nodeChangedAt`, `terminal`, and
+  `reason`, so one event plus the clock answers whether the run is moving. Occurrences keep the
+  flattened five-field
   envelope (`eventId`, `name`, `timestamp`, `data`, `_meta`). The envelope `name` is always the
   name the client subscribed with (`hub` when omitted), because MCP events clients route and
   validate occurrences by it; the carried kind is `data.kind` (`hub.pool` records keep their
