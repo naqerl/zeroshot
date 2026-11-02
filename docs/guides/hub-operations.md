@@ -128,8 +128,17 @@ failed for inactivity. With it, every running job records the target status's `a
 that cursor last changed. If the cursor stays unchanged for the configured duration, the daemon
 force-stops the run and fails the job with `failureReason` `stalled` and `errorKind` `stalled`.
 The error names the cursor and how long it stayed unchanged. A new cursor resets both fields.
+When a successful status read does not carry `atCursor`, it still resets the inactivity clock, and
+a job that has never produced a cursor falls back to its last successful target contact before its
+placement time.
 If the force-stop does not succeed, the job stays `running` with that `errorKind`; the next
 dispatcher pass retries the stop, and the job settles only after the target confirms it.
+
+A job may ask for its own budget with `--max-stall-ms MS` on `zeroshot hub submit` or
+`zeroshot hub enqueue`, such as `--max-stall-ms 7200000` for a long build. The job's value wins
+over the hub's `--max-stall`; omitting both leaves that run unlimited. `zeroshot hub status`
+reports the effective `maxStallMs` and its `maxStallSource` (`job` or `hub`). The failure names
+the limit, its source, and the measured silence.
 
 Both fields are persisted in hub state as `lastCursor` and `lastCursorAt`, so a daemon restart
 does not lose the stall clock. The daemon heartbeat (`daemon.json` and the `started` record)

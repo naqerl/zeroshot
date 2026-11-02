@@ -74,6 +74,7 @@ pub(crate) fn new_job(spec: &HubJobSpec, now_ms: u64) -> Result<Job, HubError> {
         project,
         models,
         submission_key: spec.submission_key.clone(),
+        max_stall_ms: spec.max_stall_ms,
         submitted_at_ms: now_ms,
         not_before_ms: None,
         attempts: 0,

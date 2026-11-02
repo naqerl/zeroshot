@@ -66,6 +66,7 @@ pub(super) fn job(id: &str, submitted_at_ms: u64) -> Job {
         project: None,
         models: Vec::new(),
         submission_key: None,
+        max_stall_ms: None,
         submitted_at_ms,
         not_before_ms: None,
         attempts: 0,
@@ -261,9 +262,155 @@ async fn a_stalled_run_is_stopped_and_failed_with_its_cursor_and_still_time() {
         error.message
     );
     assert!(error.message.contains("ms"), "{}", error.message);
+    assert!(
+        error.message.contains("no cursor movement for "),
+        "the measured silence is in the diagnostic: {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("limit 100ms from hub default"),
+        "the hub limit and its source are in the diagnostic: {}",
+        error.message
+    );
+    assert_eq!(report.stalled[0]["maxStallMs"], json!(100));
+    assert_eq!(report.stalled[0]["maxStallSource"], json!("hub"));
     assert_eq!(
         driver.stops.lock().expect("fake lock").as_slice(),
         [("box".to_owned(), "run-stalled".to_owned())]
+    );
+}
+
+#[test]
+fn a_job_stall_limit_overrides_the_hub_limit() {
+    let mut running = job("hj_override", 0);
+    running.state = JobState::Running;
+    running.target = Some("box".to_owned());
+    running.run_id = Some("run-override".to_owned());
+    running.last_cursor = Some("run-override-cursor".to_owned());
+    running.last_cursor_at_ms = Some(0);
+    running.max_stall_ms = Some(200);
+    let limit = |job: &Job| super::schedule::StallLimit::for_job(job, Some(100));
+    assert!(
+        super::schedule::stalled_runs(std::slice::from_ref(&running), 150, limit).is_empty(),
+        "the job's larger limit wins over the hub's"
+    );
+    let stalled = super::schedule::stalled_runs(std::slice::from_ref(&running), 250, limit);
+    assert_eq!(stalled.len(), 1);
+    assert_eq!(stalled[0].max_stall_ms, 200);
+    assert_eq!(
+        stalled[0].limit_source,
+        super::schedule::StallLimitSource::Job
+    );
+}
+
+#[test]
+fn a_job_stall_limit_works_without_a_hub_limit() {
+    let mut running = job("hj_own", 0);
+    running.state = JobState::Running;
+    running.target = Some("box".to_owned());
+    running.run_id = Some("run-own".to_owned());
+    running.last_cursor = Some("run-own-cursor".to_owned());
+    running.last_cursor_at_ms = Some(0);
+    running.max_stall_ms = Some(50);
+    let stalled = super::schedule::stalled_runs(&[running], 60, |job| {
+        super::schedule::StallLimit::for_job(job, None)
+    });
+    assert_eq!(stalled.len(), 1, "a job limit needs no hub-wide limit");
+    assert_eq!(stalled[0].max_stall_ms, 50);
+    assert_eq!(
+        stalled[0].limit_source,
+        super::schedule::StallLimitSource::Job
+    );
+}
+
+#[test]
+fn a_stalled_run_without_a_cursor_falls_back_to_its_dispatch_time() {
+    let mut running = job("hj_silent", 0);
+    running.state = JobState::Running;
+    running.target = Some("box".to_owned());
+    running.run_id = Some("run-silent".to_owned());
+    running.dispatched_at_ms = Some(10);
+    let stalled = super::schedule::stalled_runs(&[running], 100, |job| {
+        super::schedule::StallLimit::for_job(job, Some(50))
+    });
+    assert_eq!(
+        stalled.len(),
+        1,
+        "a status without a cursor must not disable the limit"
+    );
+    assert_eq!(stalled[0].job_id, "hj_silent");
+    assert_eq!(stalled[0].cursor, "");
+    assert_eq!(stalled[0].still_ms, 90);
+}
+
+#[tokio::test]
+async fn a_job_stall_limit_keeps_a_run_past_the_hub_limit_until_its_own() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let driver = std::sync::Arc::new(FakeDriver::default());
+    let service = super::service::HubService::open(
+        super::store::HubStore::new(directory.path().join("hub")),
+        driver.clone(),
+        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
+    )
+    .expect("service")
+    .with_max_stall(Some(100));
+    let job_limit = 10_000;
+    let now = super::clock::now_ms();
+    let mut running = job("hj_override", 0);
+    running.state = JobState::Running;
+    running.target = Some("box".to_owned());
+    running.run_id = Some("run-override".to_owned());
+    running.last_cursor = Some("run-override-cursor".to_owned());
+    running.last_cursor_at_ms = Some(now.saturating_sub(5_000));
+    running.max_stall_ms = Some(job_limit);
+    service
+        .mutate(|state| {
+            state.members.push(member("box", &[], 1, 0));
+            state.jobs.push(running);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+
+    let status = service.status("hj_override").await.expect("status");
+    assert_eq!(status["job"]["jobMaxStallMs"], json!(job_limit));
+    assert_eq!(status["job"]["maxStallMs"], json!(job_limit));
+    assert_eq!(status["job"]["maxStallSource"], json!("job"));
+
+    let (report, _) = service.pass().await.expect("pass");
+    assert!(
+        report.stalled.is_empty(),
+        "the job may use its larger budget past the hub limit"
+    );
+    let observed = service.snapshot().await.jobs.remove(0);
+    assert_eq!(observed.state, JobState::Running);
+    assert!(driver.stops.lock().expect("fake lock").is_empty());
+
+    let now = super::clock::now_ms();
+    service
+        .mutate(|state| {
+            state.jobs[0].last_cursor_at_ms = Some(now.saturating_sub(job_limit + 2_000));
+            Ok(())
+        })
+        .await
+        .expect("age cursor");
+    let (report, _) = service.pass().await.expect("pass at own limit");
+    assert_eq!(report.stalled.len(), 1);
+    assert_eq!(report.stalled[0]["maxStallSource"], json!("job"));
+    let settled = service.snapshot().await.jobs.remove(0);
+    assert_eq!(settled.state, JobState::Failed);
+    let error = settled.error.expect("stall error");
+    assert!(
+        error
+            .message
+            .contains(&format!("limit {job_limit}ms from job")),
+        "the job limit and its source are in the diagnostic: {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("no cursor movement for "),
+        "the measured silence is in the diagnostic: {}",
+        error.message
     );
 }
 

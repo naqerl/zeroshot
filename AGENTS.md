@@ -866,7 +866,10 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   opt-in `hub daemon run --max-stall` persists each running job's watch cursor and cursor-change
   time, resets both when the cursor advances, and force-stops a run whose cursor stayed unchanged for
   the configured duration, failing it with reason and error kind `stalled`. Its heartbeat reports
-  the duration as `maxStallMs` (`null` when disabled). `hub dequeue` also removes placing jobs
+  the duration as `maxStallMs` (`null` when disabled). A job may override that budget for itself
+  with `--max-stall-ms` on `hub submit`/`hub enqueue`; the job value wins over the hub's
+  `--max-stall`, and the diagnostic and `hub status` name the effective limit and its source.
+  `hub dequeue` also removes placing jobs
   (`dequeued_while_placing`); a run the target accepts under their key is noted, never adopted. Jobs placing when a daemon stops stay on their member as unconfirmed. Hub-side job problems
   are a typed `JobError` (plain strings from older state load as `unclassified`). API errors carry the
   `zeroshot.error/v1` diagnostic plus `x-zeroshot-exit-code`; logs, watch, attach, and force-stop

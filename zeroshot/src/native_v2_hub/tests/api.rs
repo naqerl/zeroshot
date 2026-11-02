@@ -91,6 +91,7 @@ fn spec(input: &Path, target: Option<&str>) -> HubJobSpec {
         environment: false,
         cwd: None,
         submission_key: None,
+        max_stall_ms: None,
     }
 }
 

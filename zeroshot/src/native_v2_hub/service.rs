@@ -61,8 +61,22 @@ pub(crate) fn member_document(member: &Member) -> Value {
     json!({ "schema": "zeroshot.hub.member/v1", "member": member.view() })
 }
 
-pub(crate) fn job_document(job: &Job, now: u64) -> Value {
-    json!({ "schema": "zeroshot.hub.job/v1", "job": job.view(now) })
+pub(crate) fn job_document(job: &Job, now: u64, hub_max_stall_ms: Option<u64>) -> Value {
+    json!({
+        "schema": "zeroshot.hub.job/v1",
+        "job": job_view(job, now, hub_max_stall_ms),
+    })
+}
+
+/// A job view with the stall limit that actually applies to it, resolved from the job override and
+/// then the hub's `--max-stall`.
+pub(crate) fn job_view(job: &Job, now: u64, hub_max_stall_ms: Option<u64>) -> Value {
+    let mut view = job.view(now);
+    let limit = schedule::StallLimit::for_job(job, hub_max_stall_ms);
+    view["jobMaxStallMs"] = json!(job.max_stall_ms);
+    view["maxStallMs"] = json!(limit.map(|limit| limit.max_stall_ms));
+    view["maxStallSource"] = json!(limit.map(|limit| limit.source.as_str()));
+    view
 }
 
 pub(crate) fn schedule_document(schedule: &Schedule) -> Value {
@@ -394,7 +408,7 @@ impl HubService {
     ) -> Result<Value, HubError> {
         let _placing = self.placement.lock().await;
         if let Some(existing) = idempotent(&self.snapshot().await, &job) {
-            return Ok(job_document(&existing, now_ms()));
+            return Ok(job_document(&existing, now_ms(), self.max_stall_ms));
         }
         self.spool(&mut job, files)?;
         let mut members = self.snapshot().await.members;
@@ -432,7 +446,7 @@ impl HubService {
                 if let Dispatched::Rejected(error) = dispatched {
                     return Err(error);
                 }
-                Ok(job_document(&job, now))
+                Ok(job_document(&job, now, self.max_stall_ms))
             }
             Placement::NoEligible { rejected } => {
                 self.metrics.record_rejection(Some(&rejected));
@@ -444,7 +458,7 @@ impl HubService {
                     Ok(())
                 })
                 .await?;
-                Ok(job_document(&job, now))
+                Ok(job_document(&job, now, self.max_stall_ms))
             }
             Placement::Busy { .. } => {
                 self.metrics.record_rejection(None);
@@ -529,18 +543,18 @@ impl HubService {
     ) -> Result<Value, HubError> {
         let now = now_ms();
         if let Some(existing) = idempotent(&self.snapshot().await, &job) {
-            return Ok(job_document(&existing, now));
+            return Ok(job_document(&existing, now, self.max_stall_ms));
         }
         self.spool(&mut job, files)?;
         self.mutate(|state| {
             if let Some(existing) = idempotent(state, &job) {
-                return Ok(job_document(&existing, now));
+                return Ok(job_document(&existing, now, self.max_stall_ms));
             }
             if let Some(rejected) = rejections(&state.members, &job.placement, &job.requirements) {
                 self.metrics.record_rejection(Some(&rejected));
                 return Err(HubError::no_eligible(describe(&job.placement), rejected));
             }
-            let document = job_document(&job, now);
+            let document = job_document(&job, now, self.max_stall_ms);
             state.jobs.push(job);
             Ok(document)
         })
@@ -630,7 +644,10 @@ impl HubService {
         if query.state == "recurring" {
             selected.clear();
         }
-        let views = selected.iter().map(|job| job.view(now)).collect::<Vec<_>>();
+        let views = selected
+            .iter()
+            .map(|job| job_view(job, now, self.max_stall_ms))
+            .collect::<Vec<_>>();
         let schedules = state
             .schedules
             .iter()
@@ -678,13 +695,13 @@ impl HubService {
                         Ok((job.clone(), status))
                     })
                     .await?;
-                let mut document = job_document(&job.0, now);
+                let mut document = job_document(&job.0, now, self.max_stall_ms);
                 document["run"] = job.1.unwrap_or(Value::Null);
                 return Ok(document);
             }
             _ => Value::Null,
         };
-        let mut document = job_document(&job, now_ms());
+        let mut document = job_document(&job, now_ms(), self.max_stall_ms);
         document["run"] = run;
         Ok(document)
     }
@@ -701,6 +718,7 @@ impl HubService {
     }
 
     pub(crate) async fn dequeue(&self, job_id: &str) -> Result<Value, HubError> {
+        let max_stall_ms = self.max_stall_ms;
         self.mutate(|state| {
             if let Some(schedule) = state
                 .schedules
@@ -724,7 +742,7 @@ impl HubService {
                 .find(|job| job.job_id == job_id)
                 .ok_or_else(|| HubError::JobNotFound(job_id.to_owned()))?;
             if job.is_placing() {
-                return Ok(dequeue_placing(job, now));
+                return Ok(dequeue_placing(job, now, max_stall_ms));
             }
             if job.state != JobState::Queued {
                 return Err(HubError::InvalidState(format!(
@@ -740,7 +758,7 @@ impl HubService {
             }
             job.state = JobState::Dequeued;
             job.finished_at_ms = Some(now);
-            Ok(job_document(job, now))
+            Ok(job_document(job, now, max_stall_ms))
         })
         .await
     }
@@ -851,10 +869,15 @@ impl HubService {
             finished,
             ..TickReport::default()
         };
-        if let Some(max_stall_ms) = self.max_stall_ms {
+        {
+            let hub_max_stall_ms = self.max_stall_ms;
             let now = now_ms();
             let stalled = self
-                .mutate(|state| Ok(schedule::stalled_runs(&state.jobs, now, max_stall_ms)))
+                .mutate(|state| {
+                    Ok(schedule::stalled_runs(&state.jobs, now, |job| {
+                        schedule::StallLimit::for_job(job, hub_max_stall_ms)
+                    }))
+                })
                 .await?;
             let stopped = self
                 .stop_runs(stalled.iter().map(|run| {
@@ -871,7 +894,6 @@ impl HubService {
                         &mut state.jobs,
                         schedule::StallSettlement {
                             now_ms: now,
-                            max_stall_ms,
                             stalled: &stalled,
                             stop_errors: &stopped,
                         },
@@ -931,7 +953,7 @@ impl HubService {
 /// Dequeue a job placing on its member. The target may hold a run under the job's submission key
 /// (the submission was unconfirmed or still in flight); the hub records that and stops placing
 /// the job, but never follows or adopts such a run.
-fn dequeue_placing(job: &mut Job, now: u64) -> Value {
+fn dequeue_placing(job: &mut Job, now: u64, hub_max_stall_ms: Option<u64>) -> Value {
     let member = job.target.clone().unwrap_or_default();
     job.state = JobState::Dequeued;
     job.finished_at_ms = Some(now);
@@ -944,7 +966,7 @@ fn dequeue_placing(job: &mut Job, now: u64) -> Value {
             job.attempts + 1
         ),
     ));
-    job_document(job, now)
+    job_document(job, now, hub_max_stall_ms)
 }
 
 fn state_matches(job: &Job, filter: &str, now: u64) -> bool {

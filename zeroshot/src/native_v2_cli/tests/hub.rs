@@ -88,6 +88,58 @@ fn submit_keeps_run_arguments_and_separates_placement() {
 }
 
 #[test]
+fn hub_jobs_carry_their_own_stall_limit_and_keep_it_out_of_run_arguments() {
+    let HubCommand::Submit(submit) = parse(&[
+        "hub",
+        "submit",
+        "--title",
+        "Slow",
+        "--input",
+        "in.json",
+        "--max-stall-ms",
+        "7200000",
+    ])
+    .expect("hub submit parses") else {
+        panic!("expected submit");
+    };
+    let HubCommand::Enqueue(enqueue) = parse(&[
+        "hub",
+        "enqueue",
+        "--title",
+        "Slow",
+        "--input",
+        "in.json",
+        "--max-stall-ms",
+        "7200000",
+    ])
+    .expect("hub enqueue parses") else {
+        panic!("expected enqueue");
+    };
+    for job in [submit.job, enqueue.job] {
+        assert_eq!(job.max_stall_ms, Some(7_200_000));
+        assert!(
+            !job.run_args.iter().any(|arg| arg == "--max-stall-ms"),
+            "a hub-only flag never reaches the run: {:?}",
+            job.run_args
+        );
+    }
+    assert!(
+        parse(&[
+            "hub",
+            "submit",
+            "--title",
+            "Slow",
+            "--input",
+            "in.json",
+            "--max-stall-ms",
+            "0",
+        ])
+        .is_err(),
+        "a zero limit is rejected"
+    );
+}
+
+#[test]
 fn hub_jobs_preserve_task_from_and_reject_review_source_conflicts() {
     let url = "https://github.com/owner/repo/pull/1";
     let expected = ["--title", "Review", "--task-from", url];
