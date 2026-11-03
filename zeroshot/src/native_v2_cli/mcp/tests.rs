@@ -9,6 +9,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
 use super::super::{CliTestBackend, CliTestCall, NeverDetach, RunWatchCommand};
+use super::events::HubFeed;
 use super::{McpFailure, McpHost, McpServer, WatchStream, serve_http_listener};
 use crate::native_v2_cli::hub::{HubCommand, HubRequest};
 use crate::native_v2_cli::{NativeV2CliCommand, execute_native_v2_cli};
@@ -2186,4 +2187,282 @@ async fn http_transport_streams_events_as_server_sent_events() {
     );
     assert!(!has_complete_frame(&frames));
     server.abort();
+}
+
+/// One watch record inside a node, the shape the durable `watch` subscription emits.
+fn trail_event(cursor: &str, node: &str) -> Value {
+    watch_event("run-trail", cursor, running_status(node))
+}
+
+/// A run with 119 cursors inside `code`, one that enters `acceptance`, and an optional terminal
+/// record. The collapsed feed must deliver the transitions, not the intermediates.
+fn trail_feed(terminal: bool) -> HubFeed {
+    let feed = HubFeed::new();
+    for index in 1..=119 {
+        feed.test_publish_run(
+            "run-trail",
+            "hj_trail",
+            trail_event(&format!("v2:{index}"), "code"),
+        );
+    }
+    feed.test_publish_run("run-trail", "hj_trail", trail_event("v2:120", "acceptance"));
+    if terminal {
+        feed.test_publish_run(
+            "run-trail",
+            "hj_trail",
+            watch_event("run-trail", "v2:121", finished_status()),
+        );
+    }
+    feed
+}
+
+/// The same 120-record run exposed through the real hub feed poller and `events/poll` path.
+fn trail_feed_host() -> HubLifecycleHost {
+    let mut events = (1..=119)
+        .map(|index| trail_event(&format!("v2:{index}"), "code"))
+        .collect::<Vec<_>>();
+    events.push(trail_event("v2:120", "acceptance"));
+    HubLifecycleHost::new(
+        vec![vec![hub_lifecycle_job(
+            "hj_trail",
+            "running",
+            Some("run-trail"),
+        )]],
+        vec![hub_member("builder")],
+        HashMap::from([("run-trail".to_owned(), events)]),
+    )
+}
+
+#[test]
+fn hub_run_events_collapse_to_node_transitions() {
+    let feed = trail_feed(false);
+    let collapsed = feed.test_deliver(Some("hub.run"), json!({}));
+    assert_eq!(collapsed.len(), 2, "{collapsed:?}");
+    assert!(
+        collapsed
+            .iter()
+            .all(|event| event["data"]["kind"] == json!("hub.run"))
+    );
+
+    let entering = &collapsed[0]["data"];
+    assert_eq!(entering["node"], json!("code"));
+    assert_eq!(entering["previousNode"], Value::Null);
+    assert_eq!(entering["runCursor"], json!("v2:1"));
+    assert_eq!(entering["cursorsSinceLastEvent"], json!(0));
+    assert_eq!(entering["terminal"], json!(false));
+    assert!(entering["lastCursorAt"].is_string());
+    assert!(entering["nodeChangedAt"].is_string());
+    assert_eq!(entering["elapsedMsInNode"], json!(0));
+
+    let acceptance = &collapsed[1]["data"];
+    assert_eq!(acceptance["node"], json!("acceptance"));
+    assert_eq!(acceptance["previousNode"], json!("code"));
+    assert_eq!(acceptance["runCursor"], json!("v2:120"));
+    assert_eq!(acceptance["cursorsSinceLastEvent"], json!(119));
+    assert_eq!(acceptance["terminal"], json!(false));
+    assert_eq!(acceptance["reason"], Value::Null);
+    assert_eq!(acceptance["summary"]["node"], json!("acceptance"));
+}
+
+#[test]
+fn hub_run_collapse_treats_a_shrinking_active_set_as_a_node_change() {
+    let feed = HubFeed::new();
+    let mut parallel = trail_event("v2:1", "code");
+    parallel["status"]["activeExecutions"] = json!([
+        {"execution": "exec-1", "node": "code"},
+        {"execution": "exec-2", "node": "acceptance"}
+    ]);
+    feed.test_publish_run("run-trail", "hj_trail", parallel);
+    feed.test_publish_run("run-trail", "hj_trail", trail_event("v2:2", "code"));
+
+    let collapsed = feed.test_deliver(Some("hub.run"), json!({}));
+    assert_eq!(collapsed.len(), 2, "{collapsed:?}");
+    assert_eq!(collapsed[1]["data"]["runCursor"], json!("v2:2"));
+    assert_eq!(collapsed[1]["data"]["node"], json!("code"));
+    assert_eq!(collapsed[1]["data"]["previousNode"], json!("code"));
+    assert_eq!(collapsed[1]["data"]["cursorsSinceLastEvent"], json!(1));
+}
+
+#[test]
+fn hub_run_phase_exit_keeps_the_node_start_and_grows_the_elapsed() {
+    let feed = HubFeed::new();
+    feed.test_publish_run("run-trail", "hj_trail", trail_event("v2:1", "code"));
+    // A phase-only transition must not restart the quiet window. Wait long enough that the
+    // millisecond clock has provably moved before the run starts stopping.
+    std::thread::sleep(Duration::from_millis(20));
+    let mut stopping = trail_event("v2:2", "code");
+    stopping["status"]["phase"] = json!("stopping");
+    feed.test_publish_run("run-trail", "hj_trail", stopping);
+
+    let collapsed = feed.test_deliver(Some("hub.run"), json!({}));
+    assert_eq!(collapsed.len(), 2, "{collapsed:?}");
+    let entering = &collapsed[0]["data"];
+    let leaving = &collapsed[1]["data"];
+    assert_eq!(entering["phase"], json!("running"));
+    assert_eq!(leaving["phase"], json!("stopping"));
+    // The node did not change, so both events name the same node and keep the same node start.
+    assert_eq!(leaving["node"], json!("code"));
+    assert_eq!(leaving["previousNode"], json!("code"));
+    assert_eq!(leaving["nodeChangedAt"], entering["nodeChangedAt"]);
+    assert_eq!(entering["elapsedMsInNode"], json!(0));
+    let elapsed = leaving["elapsedMsInNode"]
+        .as_u64()
+        .expect("elapsedMsInNode is an integer");
+    assert!(
+        elapsed >= 10,
+        "the quiet window keeps growing while the node is unchanged: {elapsed}"
+    );
+    assert_eq!(leaving["cursorsSinceLastEvent"], json!(1));
+}
+
+#[test]
+fn hub_run_detail_delivers_the_raw_trail_only_when_asked() {
+    let feed = trail_feed(false);
+    let default = feed.test_deliver(Some("hub.run"), json!({}));
+    assert_eq!(
+        default.len(),
+        2,
+        "default hub subscribers only see transitions"
+    );
+
+    let detail = feed.test_deliver(None, json!({"detail": true}));
+    assert_eq!(detail.len(), 120, "{detail:?}");
+    assert!(
+        detail
+            .iter()
+            .all(|event| event["data"]["kind"] == json!("hub.run.detail"))
+    );
+    assert_eq!(detail[0]["data"]["runCursor"], json!("v2:1"));
+    assert_eq!(detail[119]["data"]["runCursor"], json!("v2:120"));
+    // The transition record is still the detail record at that cursor; it carries the evidence
+    // that identifies the node change for a detail subscriber too.
+    assert_eq!(detail[119]["data"]["previousNode"], json!("code"));
+
+    let named = feed.test_deliver(Some("hub.run.detail"), json!({}));
+    assert_eq!(named.len(), 120);
+    assert!(
+        named
+            .iter()
+            .all(|event| event["data"]["kind"] == json!("hub.run.detail"))
+    );
+
+    let alias = feed.test_deliver(Some("run.event"), json!({"detail": true}));
+    assert_eq!(alias.len(), 120, "the run.event alias honours detail");
+    assert!(
+        alias
+            .iter()
+            .all(|event| event["data"]["kind"] == json!("hub.run.detail"))
+    );
+}
+
+#[tokio::test]
+async fn hub_run_detail_poll_replays_every_cursor_through_the_feed() {
+    let mut session = Session::spawn(trail_feed_host());
+    initialize(&mut session).await;
+    let mut events = Vec::new();
+    let mut cursor = json!("hub:0");
+    for id in 2..200 {
+        let response = session
+            .request(
+                id,
+                "events/poll",
+                json!({
+                    "name": "hub.run.detail",
+                    "arguments": {},
+                    "cursor": cursor,
+                    "maxEvents": 1000
+                }),
+            )
+            .await;
+        assert_eq!(response["result"]["resultType"], json!("complete"));
+        if let Some(batch) = response["result"]["events"].as_array() {
+            events.extend(batch.iter().cloned());
+        }
+        cursor = response["result"]["cursor"].clone();
+        if events.len() >= 120 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(events.len(), 120, "{events:?}");
+    assert!(
+        events
+            .iter()
+            .all(|event| event["name"] == json!("hub.run.detail"))
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event["data"]["kind"] == json!("hub.run.detail"))
+    );
+    assert_eq!(events[0]["data"]["runCursor"], json!("v2:1"));
+    assert_eq!(events[119]["data"]["runCursor"], json!("v2:120"));
+    assert_eq!(events[119]["data"]["previousNode"], json!("code"));
+}
+
+#[test]
+fn hub_run_collapse_keeps_every_record_in_the_log() {
+    let feed = trail_feed(false);
+    let records = feed.test_log_records();
+    assert_eq!(records.len(), 120, "one durable record per cursor");
+    assert!(
+        records.iter().all(|(_, name, _)| *name == "hub.run.detail"),
+        "the raw trail keeps the detail kind in the log"
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|(_, _, transition)| *transition)
+            .count(),
+        2,
+        "only the node transitions are collapsed"
+    );
+
+    // Delivery never rewrites the log: the collapsed and detail views differ, the trail does not.
+    assert_eq!(feed.test_deliver(Some("hub.run"), json!({})).len(), 2);
+    assert_eq!(feed.test_log_records().len(), 120);
+    assert_eq!(feed.test_deliver(None, json!({"detail": true})).len(), 120);
+    assert_eq!(feed.test_log_records().len(), 120);
+}
+
+#[test]
+fn hub_run_terminal_phase_adds_one_terminal_event_with_the_reason() {
+    let feed = trail_feed(true);
+    let collapsed = feed.test_deliver(Some("hub.run"), json!({}));
+    assert_eq!(collapsed.len(), 3, "{collapsed:?}");
+    let terminal = &collapsed[2]["data"];
+    assert_eq!(terminal["terminal"], json!(true));
+    assert_eq!(terminal["node"], Value::Null);
+    assert_eq!(terminal["previousNode"], json!("acceptance"));
+    assert_eq!(terminal["phase"], json!("finished"));
+    assert_eq!(terminal["reason"], json!("worker_failed"));
+    assert_eq!(terminal["runCursor"], json!("v2:121"));
+    assert_eq!(collapsed[2]["data"]["summary"]["terminal"], json!(true));
+}
+
+#[test]
+fn hub_run_collapse_leaves_warning_records_untouched() {
+    let feed = trail_feed(false);
+    feed.test_publish_warning(
+        "hj_trail",
+        "run-trail",
+        json!({"message": "stalled: no cursor movement"}),
+    );
+    let collapsed = feed.test_deliver(None, json!({}));
+    let warnings = collapsed
+        .iter()
+        .filter(|event| event["data"]["kind"] == json!("hub.warning"))
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(
+        warnings[0]["data"]["message"],
+        json!("stalled: no cursor movement")
+    );
+    assert_eq!(
+        collapsed
+            .iter()
+            .filter(|event| event["data"]["kind"] == json!("hub.run"))
+            .count(),
+        2
+    );
 }
