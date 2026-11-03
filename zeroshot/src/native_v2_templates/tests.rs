@@ -322,6 +322,60 @@ async fn crashed_parallel_review_retries_only_the_failed_verifier() {
 }
 
 #[tokio::test]
+async fn malformed_reviewer_output_names_the_envelope_instead_of_review_failed() {
+    let (verified, initial_input) = verified_software_template(TemplateDelivery::PullRequest).await;
+    let history = [
+        settled_worker(),
+        settled_failure(
+            SettledExecutionSpec {
+                execution: 2,
+                node_instance: 2,
+                node: "acceptance",
+                settled_at: 2,
+                input: json!({"task":"repair checkout","deliveryFeedback":""}),
+            },
+            WorkerErrorCode::Malformed,
+        ),
+        settled_review(3, "code", ACCEPTED_LABEL, "implementation sound"),
+    ];
+
+    assert_eq!(
+        reduce(&verified, &initial_input, &history).terminal,
+        Some(TerminalProjection::Failed {
+            context: None,
+            reason: "review_output_invalid".parse().assert_value()
+        })
+    );
+}
+
+#[tokio::test]
+async fn refused_reviewer_output_keeps_its_own_failure_reason() {
+    let (verified, initial_input) = verified_software_template(TemplateDelivery::None).await;
+    let history = [
+        settled_worker(),
+        settled_failure(
+            SettledExecutionSpec {
+                execution: 2,
+                node_instance: 2,
+                node: "acceptance",
+                settled_at: 2,
+                input: json!({"task":"repair checkout","deliveryFeedback":""}),
+            },
+            WorkerErrorCode::Refusal,
+        ),
+        settled_review(3, "code", REJECTED_LABEL, "unsafe error handling"),
+    ];
+
+    assert_eq!(
+        reduce(&verified, &initial_input, &history).terminal,
+        Some(TerminalProjection::Failed {
+            context: None,
+            reason: "review_refused".parse().assert_value()
+        })
+    );
+}
+
+#[tokio::test]
 async fn repeatedly_crashed_parallel_review_fails_after_the_retry_limit() {
     let (verified, initial_input) = verified_software_template(TemplateDelivery::None).await;
     let review_input = json!({"task":"repair checkout","deliveryFeedback":""});
@@ -508,7 +562,7 @@ async fn assert_recoverable_delivery(recoverable: &str) {
     let repair_input = json!({
         "task":"repair checkout",
         "phase":{"after":recoverable},
-        "acceptanceFeedback":"requirements met",
+        "acceptanceFeedback":"Repair the checkout flow.",
         "codeFeedback":"implementation sound",
         "deliveryFeedback":delivery_feedback
     });
@@ -565,7 +619,7 @@ fn assert_review_repair_preserves_delivery_feedback(
                 input: review_input.clone(),
             },
             ACCEPTED_LABEL,
-            "requirements met after integration",
+            REPAIRED_CHANGE_DESCRIPTION,
             repaired_change_manifest(),
         ),
         settled_review_execution(
@@ -583,7 +637,7 @@ fn assert_review_repair_preserves_delivery_feedback(
     let repair_input = json!({
         "task":"repair checkout",
         "phase":{"after":"accepted"},
-        "acceptanceFeedback":"requirements met after integration",
+        "acceptanceFeedback":"Repair the checkout flow and stabilize its delivery checks.",
         "codeFeedback":"repair an integration defect",
         "deliveryFeedback":delivery_feedback,
     });
@@ -624,7 +678,7 @@ fn assert_repaired_reviews_then_merge(
             input: review_input.clone(),
         },
         ACCEPTED_LABEL,
-        "CI repair meets the request",
+        REPAIRED_CHANGE_DESCRIPTION,
         repaired_change_manifest(),
     ));
     history.push(settled_review_execution(
@@ -828,7 +882,7 @@ async fn pull_request_delivery_routes_a_pre_review_git_failure_to_repair() {
         "worker",
         &json!({
             "task":"repair checkout", "phase":{"after":"repair_required"},
-            "acceptanceFeedback":"requirements met",
+            "acceptanceFeedback":"Repair the checkout flow.",
             "codeFeedback":"implementation sound",
             "deliveryFeedback":"git push: unfamiliar failure"
         }),

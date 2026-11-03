@@ -775,6 +775,103 @@ async fn a_contract_correction_does_not_reset_the_format_budget() {
 }
 
 #[tokio::test]
+async fn a_truncated_envelope_is_retried_with_the_schema_reminder_before_success() {
+    let (_cancel, control, _durable) = crate::native_v2_runner::test_support::control();
+    let mut state = AgentResponseState::new("initial prompt".to_owned());
+    let truncated =
+        resolve_agent_response(&worker_contract(), r#"{"response":{"answer":42"#).assert_value();
+    let AgentResponse::Correction {
+        kind,
+        prompt,
+        diagnostic,
+    } = truncated
+    else {
+        panic!("a truncated envelope must request a correction");
+    };
+    assert_eq!(kind, AgentCorrectionKind::Format);
+    let diagnostic = diagnostic.terminal_detail();
+    assert!(diagnostic.contains("EOF while parsing"), "{diagnostic}");
+    assert!(
+        diagnostic.contains(r#"rejected output: {"response":{"answer":42"#),
+        "{diagnostic}"
+    );
+    assert!(prompt.contains("Response contract:"));
+    assert!(prompt.contains("Return a corrected provider response only"));
+
+    let corrected =
+        resolve_agent_response(&worker_contract(), r#"{"response":{"answer":42}}"#).assert_value();
+    let outcome = state
+        .accept("test", &control, corrected)
+        .await
+        .assert_value()
+        .assert_value();
+    assert!(matches!(
+        outcome,
+        WorkerOutcome::Verified { output, .. } if output == json!({"answer": 42})
+    ));
+}
+
+#[tokio::test]
+async fn an_exhausted_envelope_keeps_the_raw_rejected_output_in_the_failure_record() {
+    let (_cancel, control, mut durable) = crate::native_v2_runner::test_support::control();
+    let mut state = AgentResponseState::new("initial prompt".to_owned());
+    let truncated = r#"{"response":{"answer":42"#;
+    for _ in 0..3 {
+        let response = resolve_agent_response(&worker_contract(), truncated).assert_value();
+        assert!(
+            state
+                .accept("test", &control, response)
+                .await
+                .assert_value()
+                .is_none()
+        );
+        let _ = durable.recv_output().await.assert_value();
+    }
+
+    let response = resolve_agent_response(&worker_contract(), truncated).assert_value();
+    let AgentResponse::Correction { diagnostic, .. } = &response else {
+        panic!("an exhausted envelope must remain a correction");
+    };
+    assert!(
+        diagnostic
+            .terminal_detail()
+            .contains(&format!("rejected output: {truncated}")),
+        "{}",
+        diagnostic.terminal_detail()
+    );
+    let outcome = state
+        .accept("test", &control, response)
+        .await
+        .assert_value()
+        .assert_value();
+    assert_eq!(outcome, WorkerOutcome::malformed());
+    let note = durable.recv_output().await.assert_value();
+    assert_eq!(note.stream, LiveOutputStream::System);
+    assert_eq!(note.diagnostic, None);
+    assert!(
+        note.text
+            .contains("remained malformed after 3 format corrections")
+    );
+    assert!(note.text.contains("workspace is retained for recovery"));
+}
+
+#[test]
+fn rejected_output_is_bounded_only_after_credential_redaction() {
+    let secret = "sentinel-secret";
+    let raw = format!(
+        "{}SE{secret}",
+        "x".repeat(MAX_RESPONSE_ERROR_BYTES.saturating_sub(20))
+    );
+    let error = NodeResponseError::new("bad envelope".to_owned()).with_rejected_output(&raw);
+    let redacted = error.redact(|text| text.replace(secret, "[REDACTED]"));
+    let detail = redacted.terminal_detail();
+    assert!(!detail.contains(secret), "{detail}");
+    assert!(!detail.contains("sentinel"), "{detail}");
+    assert!(detail.contains("[REDACTED]"), "{detail}");
+    assert!(detail.len() <= MAX_RESPONSE_ERROR_BYTES + 32, "{detail}");
+}
+
+#[tokio::test]
 async fn a_fourth_format_fault_fails_the_node_without_consuming_contract_corrections() {
     let (_cancel, control, mut durable) = crate::native_v2_runner::test_support::control();
     let mut state = AgentResponseState::new("initial prompt".to_owned());

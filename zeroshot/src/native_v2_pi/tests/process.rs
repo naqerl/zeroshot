@@ -504,4 +504,11 @@ async fn exhausted_corrections_publish_only_the_last_validation_error_as_failure
         .collect::<Vec<_>>();
     assert_eq!(failures.len(), 1);
     assert!(failures[0].text.contains("final output rejected:"));
+    assert!(
+        failures[0]
+            .text
+            .contains("rejected output: not a provider envelope"),
+        "{}",
+        failures[0].text
+    );
 }
