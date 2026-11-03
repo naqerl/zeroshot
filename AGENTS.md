@@ -356,7 +356,10 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   defaults and an unused `artifacts` member is ignored), while workers still require the envelope. A
   format fault (unreadable envelope or unknown top-level shape) has its own three-correction budget
   per node visit, does not consume the contract-correction budget, and publishes a debug record
-  naming its count and reason.
+  naming its count and reason. An exhausted correction publishes exactly one terminal failure
+  diagnostic carrying the last validation error and the bounded raw rejected output, after provider
+  credential redaction has run, so a truncated envelope is distinguishable from a reviewer verdict
+  in the durable failure record; the settlement note itself stays non-diagnostic.
 - Provider continuation is bounded: Claude continues once after `system/api_retry`; Codex continues
   once after a terminal execution error. Both send literal `Continue` in the same session when one
   exists. Structured output that violates a valid envelope receives at most two correction turns
@@ -647,9 +650,14 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   returns through both existing reviewers before delivery. CLI uniform runtimes without an explicit
   session scope and new UI templates use `node_instance` for this worker and `execution` for
   reviewers; exact runtime plans and explicit session scopes remain caller-owned. Saved graphs are
-  unchanged. The final rejected round fails without starting an unreviewable extra repair.
+  unchanged. A rejected verdict still continues through repair; an unreadable reviewer output fails
+  as `review_output_invalid` and a reviewer refusal as `review_refused`, keeping both distinct from a
+  crash and from a genuine rejection. The final rejected round fails without starting an
+  unreviewable extra repair, and the failed run retains its workspace for recovery.
 - Delivery-enabled software-change templates make the acceptance verifier the sole author of the
-  current change title and description after every review pass. Git delivery uses that manifest for
+  current change title and description after every review pass. Reviewer output stays small: the
+  title is structural output and the prospective description plus actionable findings travel through
+  the free-text diagnostic channel. Git delivery uses that manifest for
   commits and reviews, refreshes only its marker-delimited body section while preserving surrounding
   text. Verifier guidance reserves closing references for delivery, which appends them only from
   caller-owned issue input.

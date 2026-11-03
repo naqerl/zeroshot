@@ -95,10 +95,7 @@ pub(super) fn issue_review_graph(
     let route = choice(
         "review_result",
         state.clone(),
-        vec![ChoiceBranch {
-            when: executable_error_guard("reviewer")?,
-            node: fail("review_failed", "review_failed")?,
-        }],
+        super::review_failure_branches(&["reviewer"])?,
         Some(sequence(
             "review_completed",
             state.clone(),

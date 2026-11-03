@@ -117,7 +117,7 @@ pub(super) fn accepted_review_history(delivery: TemplateDelivery) -> Vec<Durable
                 input: json!({"task":"repair checkout","deliveryFeedback":""}),
             },
             ACCEPTED_LABEL,
-            "requirements met",
+            CHANGE_DESCRIPTION,
             acceptance_output,
         ),
         settled_review(3, "code", ACCEPTED_LABEL, "implementation sound"),
@@ -126,15 +126,13 @@ pub(super) fn accepted_review_history(delivery: TemplateDelivery) -> Vec<Durable
 
 pub(super) fn change_manifest() -> serde_json::Value {
     json!({
-        "title": CHANGE_TITLE,
-        "description": CHANGE_DESCRIPTION
+        "title": CHANGE_TITLE
     })
 }
 
 pub(super) fn repaired_change_manifest() -> serde_json::Value {
     json!({
-        "title": REPAIRED_CHANGE_TITLE,
-        "description": REPAIRED_CHANGE_DESCRIPTION
+        "title": REPAIRED_CHANGE_TITLE
     })
 }
 

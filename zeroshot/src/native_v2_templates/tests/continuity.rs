@@ -27,7 +27,7 @@ async fn review_and_delivery_repairs_share_the_budget_and_worker_instance() {
                     input: review_input.clone(),
                 },
                 ACCEPTED_LABEL,
-                "requirements met",
+                CHANGE_DESCRIPTION,
                 if delivery == TemplateDelivery::None {
                     Value::Null
                 } else {

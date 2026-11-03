@@ -55,6 +55,8 @@ const VERDICT_FIELD: &str = "verdict";
 const ACCEPTED_LABEL: &str = "accepted";
 const REJECTED_LABEL: &str = "rejected";
 const DELIVERY_NODE: &str = "deliver";
+const REVIEW_OUTPUT_INVALID_REASON: &str = "review_output_invalid";
+const REVIEW_REFUSED_REASON: &str = "review_refused";
 
 fn single_worker_graph() -> Result<GraphSpec, BuiltinTemplateError> {
     let state = task_type()?;
@@ -235,12 +237,13 @@ fn parallel_reviewers(
             "Verify the change independently against the user's request and observable behavior. \
              Try to run the repository's pre-commit checks and report the results. \
              When delivery feedback is present, verify that the repair addresses it. \
-             Accept only with concrete evidence; otherwise return actionable feedback. Provide \
-             an accurate, informative prospective pull request title and description for the \
-             complete change under review regardless of the verdict. Follow the repository's pull \
-             request conventions, keep the title concise, and keep the description focused on \
-             information useful to reviewers. If mentioning validation, use only results stated \
-             directly by command output and do not infer counts. Do not add issue-closing \
+             Accept only with concrete evidence; otherwise return actionable feedback. Return a \
+             concise, accurate prospective pull request title in the output title field. Return a \
+             concise prospective pull request description for the complete change under review in \
+             the free-text diagnostic message, together with any actionable findings, regardless of \
+             the verdict. Follow the repository's pull request conventions and keep the description \
+             focused on information useful to reviewers. If mentioning validation, use only results \
+             stated directly by command output and do not infer counts. Do not add issue-closing \
              references because delivery owns them."
         } else {
             "Verify the change independently against the user's request and observable behavior. \
@@ -250,7 +253,7 @@ fn parallel_reviewers(
         },
         feedback_target: ACCEPTANCE_FEEDBACK_FIELD,
         output: if delivery_metadata {
-            change_manifest_type()?
+            change_title_type()?
         } else {
             PayloadType::Null
         },
@@ -281,12 +284,10 @@ fn acceptance_write_bindings(
 ) -> Result<Vec<WriteBinding>, BuiltinTemplateError> {
     let mut bindings = vec![phase_write("acceptance", VERDICT_FIELD)?];
     if delivery_metadata {
+        // Keep the structural output short. The prospective description is free text and travels
+        // through the diagnostic channel instead of enlarging the JSON verdict object.
         bindings.push(output_write("acceptance", TITLE_FIELD, TITLE_FIELD)?);
-        bindings.push(output_write(
-            "acceptance",
-            DESCRIPTION_FIELD,
-            DESCRIPTION_FIELD,
-        )?);
+        bindings.push(diagnostic_write("acceptance", DESCRIPTION_FIELD)?);
     }
     Ok(bindings)
 }
@@ -329,16 +330,14 @@ fn review_route(
     Ok(GraphNode::Choice(ChoiceNode {
         name: node_name("review_result")?,
         state: state.clone(),
-        branches: non_empty(vec![
-            ChoiceBranch {
-                when: any_executable_error_guard(&["acceptance", "code"])?,
-                node: fail("review_failed", "review_failed")?,
-            },
-            ChoiceBranch {
+        branches: non_empty({
+            let mut branches = review_failure_branches(&["acceptance", "code"])?;
+            branches.push(ChoiceBranch {
                 when: accepted_reviews_guard()?,
                 node: accepted_change(state.clone(), delivery)?,
-            },
-        ])?,
+            });
+            branches
+        })?,
         otherwise: Some(Box::new(next_iteration("review_retry", state)?)),
         promoted_state_paths: vec![
             field_path(DELIVERY_FEEDBACK_FIELD)?,
@@ -580,6 +579,37 @@ fn any_executable_error_guard(nodes: &[&str]) -> Result<Guard, BuiltinTemplateEr
     Ok(Guard::Any {
         guards: non_empty(guards)?,
     })
+}
+
+fn any_error_guard(nodes: &[&str], labels: &[&str]) -> Result<Guard, BuiltinTemplateError> {
+    let guards = nodes
+        .iter()
+        .map(|name| control_guard(name, ControlSource::Error, None, labels))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Guard::Any {
+        guards: non_empty(guards)?,
+    })
+}
+
+/// Distinguishes an unreadable reviewer response from a genuine refusal. A rejected verdict is not
+/// a failure at all: it routes to repair just as it did before these branches existed.
+pub(super) fn review_failure_branches(
+    nodes: &[&str],
+) -> Result<Vec<ChoiceBranch>, BuiltinTemplateError> {
+    Ok(vec![
+        ChoiceBranch {
+            when: any_error_guard(nodes, &[WorkerErrorCode::Malformed.as_str()])?,
+            node: fail(REVIEW_OUTPUT_INVALID_REASON, REVIEW_OUTPUT_INVALID_REASON)?,
+        },
+        ChoiceBranch {
+            when: any_error_guard(nodes, &[WorkerErrorCode::Refusal.as_str()])?,
+            node: fail(REVIEW_REFUSED_REASON, REVIEW_REFUSED_REASON)?,
+        },
+        ChoiceBranch {
+            when: any_executable_error_guard(nodes)?,
+            node: fail("review_failed", "review_failed")?,
+        },
+    ])
 }
 
 fn feedback_paths() -> Result<Vec<FieldPath>, BuiltinTemplateError> {
