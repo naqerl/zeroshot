@@ -776,13 +776,18 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   executor. Tool parameters for graph, initial input, exact or uniform runtime, and environment
   definitions are inline JSON values materialized into private temporary files for the command's
   lifetime. The `io.modelcontextprotocol/events` extension exposes one session-spanning hub
-  subscription carrying `hub.job`, `hub.run`, `hub.pool`, and `hub.warning` over one monotonic
-  `hub:<sequence>` cursor. Omitting selectors subscribes to the whole hub; `runId`, `jobId`,
-  `target`, and other filters narrow that feed without binding it, and single-kind names select
-  one event kind (`run.event` is the `hub.run` alias). Occurrences keep the flattened five-field
-  envelope (`eventId`, `name`, `timestamp`, `data`, `_meta`); `summary`, `replayed`, and the hub
-  `cursor` live inside `data`, while run records retain their durable `v2:` cursor as
-  `data.runCursor`. `replayed` is true only for records drained at subscribe time. Terminal events
+  subscription carrying `hub.job`, `hub.run`, `hub.run.detail`, `hub.pool`, and `hub.warning` over
+  one monotonic `hub:<sequence>` cursor. Omitting selectors subscribes to the whole hub; `runId`,
+  `jobId`, `target`, and other filters narrow that feed without binding it, and single-kind names
+  select one event kind (`run.event` is the `hub.run` alias). `hub.run` is collapsed to node
+  changes and phase exits from `running`; every watch record still lands in the log as
+  `hub.run.detail` and is delivered only when a subscription opts in with `detail: true` or the
+  `hub.run.detail` name. A collapsed event carries `node`, `previousNode`, `phase`, `runCursor`,
+  `lastCursorAt`, `cursorsSinceLastEvent`, `elapsedMsInNode`, `nodeChangedAt`, `terminal`, and
+  `reason`, so one event plus the clock answers whether the run is moving. Occurrences keep the
+  flattened five-field envelope (`eventId`, `name`, `timestamp`, `data`, `_meta`); `summary`,
+  `replayed`, the carried kind in `data.kind`, and the hub `cursor` live inside `data`, while run
+  records retain their durable `v2:` cursor as `data.runCursor`. `replayed` is true only for records drained at subscribe time. Terminal events
   are ordinary events and heartbeats continue while idle; only unsubscribe, session end, or
   cancellation closes a stream. `events/poll` and `events/stream` both replay from the same hub
   log. `truncated` is false unless replay shortfall or backpressure permanently lost events, and

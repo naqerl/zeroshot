@@ -122,14 +122,15 @@ members; `hub_dequeue` cancels queued jobs or schedules; `hub_dispatch` requests
 ## Hub events
 
 The server advertises `io.modelcontextprotocol/events` (SEP-3415). One subscription covers the
-whole hub. `events/list` reports four event types, each with `delivery` `poll` and `push`:
+whole hub. `events/list` reports five event types, each with `delivery` `poll` and `push`:
 
-| Event         | Data                                                                                             |
-| ------------- | ------------------------------------------------------------------------------------------------ |
-| `hub.job`     | `jobId`, `title`, `state`, `target`, `project`, `reason`, `at`, `cursor`, `summary`, `replayed`  |
-| `hub.run`     | the durable run watch record: `runId`, `cursor`, `runCursor`, `status`, `summary`, `replayed`    |
-| `hub.pool`    | `pool`, `leaseId`, `serverId`, `machine`, `phase`, `reason`, `at`, `cursor`, `summary`, `replayed` |
-| `hub.warning` | `jobId`, `runId`, `message`, `at`, `cursor`, `summary`, `replayed`                              |
+| Event            | Data                                                                                             |
+| ---------------- | ------------------------------------------------------------------------------------------------ |
+| `hub.job`        | `jobId`, `title`, `state`, `target`, `project`, `reason`, `at`, `cursor`, `summary`, `replayed`  |
+| `hub.run`        | a collapsed run transition with `runId`, `cursor`, `runCursor`, `node`, `previousNode`, `phase`, `lastCursorAt`, `cursorsSinceLastEvent`, `elapsedMsInNode`, `nodeChangedAt`, `terminal`, `reason`, `status`, `summary`, `replayed` |
+| `hub.run.detail` | one raw per-cursor run watch record: `runId`, `cursor`, `runCursor`, `status`, `summary`, `replayed` |
+| `hub.pool`       | `pool`, `leaseId`, `serverId`, `machine`, `phase`, `reason`, `at`, `cursor`, `summary`, `replayed` |
+| `hub.warning`    | `jobId`, `runId`, `message`, `at`, `cursor`, `summary`, `replayed`                              |
 
 Every occurrence has exactly the flattened five-field envelope:
 
@@ -137,20 +138,33 @@ Every occurrence has exactly the flattened five-field envelope:
 {"eventId": "hub:42", "name": "hub.run", "timestamp": "RFC3339", "data": {}, "_meta": {}}
 ```
 
-`summary`, `replayed`, and the hub cursor live inside `data`. `data.cursor` is the same
-`hub:<sequence>` value as `eventId`. The sequence is monotonic across jobs, runs, pools, and
-warnings, so a client can keep one cursor and resume the whole feed. A `hub.run` record keeps its
-original durable `v2:<sequence>` watch cursor as `data.runCursor`.
+`summary`, `replayed`, the carried kind in `data.kind`, and the hub cursor live inside `data`.
+`data.cursor` is the same `hub:<sequence>` value as `eventId`. The sequence is monotonic across
+jobs, runs, pools, and warnings, so a client can keep one cursor and resume the whole feed. A
+`hub.run` or `hub.run.detail` record keeps its original durable `v2:<sequence>` watch cursor as
+`data.runCursor`.
+
+`hub.run` is collapsed to the moments that matter: the run's node changes or its phase leaves
+`running`. Cursor advances inside one node emit nothing. Every collapsed event carries the
+liveness evidence, so a reader can answer "is this run moving?" from one event plus the clock:
+`cursorsSinceLastEvent` counts the cursors between the previous collapsed event and this one,
+`lastCursorAt` records when the current cursor was observed, and `nodeChangedAt` plus
+`elapsedMsInNode` bound how long the current node has been unchanged. The raw per-cursor trail is
+never deleted: every watch record stays in the log as `hub.run.detail` and is delivered only to
+subscriptions that opt in with `detail: true` or with the `hub.run.detail` name.
 
 Subscription arguments are all optional filters:
 
 - No `runId` or `jobId`, and no `name`, subscribes to the whole hub.
 - `runId` narrows to that run, its job, and its warnings. `jobId` narrows to that job, its run,
   and that run's warnings. Supplying both is invalid params (`-32602`).
-- `name` selects one event type: `hub.job`, `hub.run`, `hub.pool`, or `hub.warning`. `hub.event`
-  and `run.event` are aliases for every hub event and for `hub.run` respectively.
-- `target`, `kinds` (`hub.job`, `hub.run`, `hub.pool`, `hub.warning`), `phases`, `nodes`,
-  `terminalOnly`, and `verbose` further filter occurrences. `phases` accepts `admitted`,
+- `name` selects one event type: `hub.job`, `hub.run`, `hub.run.detail`, `hub.pool`, or
+  `hub.warning`. `hub.event` and `run.event` are aliases for every hub event and for `hub.run`
+  respectively.
+- `detail: true` delivers the raw per-cursor trail as `hub.run.detail` instead of the collapsed
+  `hub.run` transitions. Explicitly naming `hub.run.detail` is the same opt-in.
+- `target`, `kinds` (`hub.job`, `hub.run`, `hub.run.detail`, `hub.pool`, `hub.warning`), `phases`,
+  `nodes`, `terminalOnly`, and `verbose` further filter occurrences. `phases` accepts `admitted`,
   `running`, `stopping`, and `finished`; `nodes` applies only to run records.
 - `maxAgeMs` is accepted and not applied because watch records carry no occurrence time.
 
@@ -200,10 +214,14 @@ subscribes to the whole hub.
 
 `hub.job` follows the same hub record as `hub_status`, including `submitted`, `queued`,
 `scheduled`, `placing`, `running`, `succeeded`, `failed`, `dequeued`, and `cancelled`. A job that
-fails or is cancelled before it runs still produces a terminal `hub.job` event. `hub.pool`
-reports member leases as `provisioning`, `active`, `draining`, `deleted`, or `failed`. A running
-job receives one `hub.warning` per hour; a run-watch or stream failure also produces
-`hub.warning`, and the subscription continues.
+fails or is cancelled before it runs still produces a terminal `hub.job` event. Run events are
+collapsed: `hub.run` fires only when the active node changes (including a shrinking parallel set)
+or the phase leaves `running`, and cursor advances inside one node publish nothing to default
+subscribers. The complete per-cursor trail is still durable and is delivered as `hub.run.detail`
+only to subscribers that ask for it by `detail: true` or by name. `hub.pool` reports member leases
+as `provisioning`, `active`, `draining`, `deleted`, or `failed`. A running job receives one
+`hub.warning` per hour; a run-watch or stream failure also produces `hub.warning`, and the
+subscription continues.
 
 ## Resume and stop
 
