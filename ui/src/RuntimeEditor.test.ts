@@ -186,3 +186,38 @@ test('harness labels and provider choices follow the native schema, including fu
     await server.close();
   }
 });
+
+test('script commands from JSON render safely in the runtime form', async () => {
+  const server = await createServer({
+    root: fileURLToPath(new URL('..', import.meta.url)),
+    configFile: false,
+    server: { middlewareMode: true, watch: null, hmr: false },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+  try {
+    const { RuntimeEditor } = await server.ssrLoadModule('/src/RuntimeEditor.tsx');
+    const render = (command: unknown) =>
+      renderToStaticMarkup(
+        createElement(RuntimeEditor, {
+          document: {
+            graph: { root: { kind: 'step', name: 'retrieve' } },
+            runtime: {
+              harness: 'codex',
+              provider: 'openai',
+              size: 'small',
+              nodes: { retrieve: { kind: 'script', command } },
+            },
+          },
+          schema: {},
+          edit: () => assert.fail('render must preserve the draft'),
+        })
+      );
+    assert.match(render(['python3', 'retrieve.py']), /Script: python3 retrieve.py/);
+    for (const command of ['python3', null, [], ['python3', 42]]) {
+      assert.match(render(command), /Script: Invalid command/);
+    }
+  } finally {
+    await server.close();
+  }
+});

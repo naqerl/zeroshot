@@ -3671,6 +3671,26 @@
         {
           "additionalProperties": false,
           "properties": {
+            "command": {
+              "$ref": "#/$defs/ScriptCommand"
+            },
+            "connections": {
+              "$ref": "#/$defs/DeclaredConnections"
+            },
+            "kind": {
+              "const": "script",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "command"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
             "connections": {
               "$ref": "#/$defs/DeclaredConnections"
             },
@@ -5486,6 +5506,15 @@
           "type": "object"
         }
       ]
+    },
+    "ScriptCommand": {
+      "items": {
+        "maxLength": 8192,
+        "type": "string"
+      },
+      "maxItems": 128,
+      "minItems": 1,
+      "type": "array"
     },
     "ServerCapabilities": {
       "additionalProperties": false,

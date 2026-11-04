@@ -215,6 +215,50 @@ pub const MIN_MODEL_MAX_TOKENS: u32 = 1;
 /// Largest accepted caller-declared model output limit.
 pub const MAX_MODEL_MAX_TOKENS: u32 = 10_000_000;
 
+/// Bounded, caller-owned executable and arguments, run without a shell.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct ScriptCommand(Vec<String>);
+
+impl ScriptCommand {
+    pub fn new(command: Vec<String>) -> Result<Self, super::NativeV2RunValueError> {
+        if command.is_empty()
+            || command.len() > 128
+            || command[0].trim().is_empty()
+            || command
+                .iter()
+                .any(|argument| argument.len() > 8192 || argument.contains('\0'))
+            || command.iter().map(String::len).sum::<usize>() > 65536
+        {
+            return Err(super::NativeV2RunValueError(
+                "script command requires an executable and at most 128 bounded, NUL-free arguments",
+            ));
+        }
+        Ok(Self(command))
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ScriptCommand {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(Vec::<String>::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+impl JsonSchema for ScriptCommand {
+    fn schema_name() -> Cow<'static, str> {
+        "ScriptCommand".into()
+    }
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({"type": "array", "minItems": 1, "maxItems": 128,
+            "items": {"type": "string", "maxLength": 8192}})
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum NodeRuntimeBinding {
@@ -251,6 +295,11 @@ pub enum NodeRuntimeBinding {
         #[serde(default, skip_serializing_if = "DeclaredConnections::is_empty")]
         connections: DeclaredConnections,
     },
+    Script {
+        command: ScriptCommand,
+        #[serde(default, skip_serializing_if = "DeclaredConnections::is_empty")]
+        connections: DeclaredConnections,
+    },
     CommentDelivery {
         #[serde(default, skip_serializing_if = "DeclaredConnections::is_empty")]
         connections: DeclaredConnections,
@@ -276,6 +325,7 @@ impl NodeRuntimeBinding {
     pub const fn declared_connections(&self) -> &DeclaredConnections {
         match self {
             Self::Agent { connections, .. }
+            | Self::Script { connections, .. }
             | Self::GitDelivery { connections, .. }
             | Self::CommentDelivery { connections } => connections,
         }
@@ -286,7 +336,9 @@ impl NodeRuntimeBinding {
     pub const fn context_window(&self) -> Option<u32> {
         match self {
             Self::Agent { context_window, .. } => *context_window,
-            Self::GitDelivery { .. } | Self::CommentDelivery { .. } => None,
+            Self::Script { .. }
+            | Self::GitDelivery { .. }
+            | Self::CommentDelivery { .. } => None,
         }
     }
 
@@ -295,7 +347,9 @@ impl NodeRuntimeBinding {
     pub const fn max_tokens(&self) -> Option<u32> {
         match self {
             Self::Agent { max_tokens, .. } => *max_tokens,
-            Self::GitDelivery { .. } | Self::CommentDelivery { .. } => None,
+            Self::Script { .. }
+            | Self::GitDelivery { .. }
+            | Self::CommentDelivery { .. } => None,
         }
     }
 

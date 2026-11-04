@@ -1,4 +1,4 @@
-import { isDeliveryKind } from './workers';
+import { isDeliveryKind, scriptCommandLabel } from './workers';
 import { useState } from 'react';
 import { allNodes, bindingFor, clone, executable, type Document, type Runtime } from './domain';
 import { Field } from './Field';
@@ -162,6 +162,8 @@ export function RuntimeEditor(p: {
             <small>
               {kind(n.name) === 'comment_delivery' ? 'Comment delivery' : 'Git delivery'}
             </small>
+          ) : kind(n.name) === 'script' ? (
+            <small>Script: {scriptCommandLabel(bindingFor(doc.runtime, n.name)?.command)}</small>
           ) : kind(n.name) === 'agent' ? (
             picker([n.name], `Model for ${n.name}`)
           ) : (

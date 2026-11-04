@@ -602,6 +602,16 @@ fn require_runtime_capabilities(
     controller: &ControllerDescriptor,
     runtime: &RuntimePlan,
 ) -> Result<(), TargetAuthorityError> {
+    if runtime.nodes().values().any(|binding| {
+        matches!(
+            binding,
+            openengine_cluster_protocol::NodeRuntimeBinding::Script { .. }
+        )
+    }) {
+        return Err(authority_error(
+            "script bindings currently require local execution",
+        ));
+    }
     require_node_runtime_lanes(controller, runtime)?;
     if runtime.nodes().values().any(|binding| {
         matches!(

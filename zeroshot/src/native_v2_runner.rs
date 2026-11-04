@@ -193,9 +193,9 @@ impl DriverInvocation {
     pub(crate) fn declared_max_output_tokens(&self) -> Option<u32> {
         match &self.node.binding {
             NodeRuntimeBinding::Agent { max_tokens, .. } => *max_tokens,
-            NodeRuntimeBinding::GitDelivery { .. } | NodeRuntimeBinding::CommentDelivery { .. } => {
-                None
-            }
+            NodeRuntimeBinding::Script { .. }
+            | NodeRuntimeBinding::GitDelivery { .. }
+            | NodeRuntimeBinding::CommentDelivery { .. } => None,
         }
     }
 
@@ -595,9 +595,9 @@ async fn wait_for_cancellation(receiver: &mut watch::Receiver<bool>) {
 fn session_scope(binding: &NodeRuntimeBinding) -> Result<SessionScope, NodeRunnerError> {
     match binding {
         NodeRuntimeBinding::Agent { session_scope, .. } => Ok(*session_scope),
-        NodeRuntimeBinding::GitDelivery { .. } | NodeRuntimeBinding::CommentDelivery { .. } => {
-            Ok(SessionScope::Execution)
-        }
+        NodeRuntimeBinding::Script { .. }
+        | NodeRuntimeBinding::GitDelivery { .. }
+        | NodeRuntimeBinding::CommentDelivery { .. } => Ok(SessionScope::Execution),
     }
 }
 

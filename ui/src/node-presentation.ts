@@ -11,8 +11,15 @@ import {
   Check,
   X,
 } from 'lucide-react';
-import { bindingFor, executable, labels, type Document, type GraphNode } from './domain';
-import { isDeliveryKind, workerOption, type WorkerOption } from './workers';
+import {
+  bindingFor,
+  executable,
+  labels,
+  type Binding,
+  type Document,
+  type GraphNode,
+} from './domain';
+import { isDeliveryKind, scriptCommandLabel, workerOption, type WorkerOption } from './workers';
 
 export const nodeIcons: Record<string, typeof Bot> = {
   step: Bot,
@@ -40,7 +47,7 @@ export function nodePresentation(document: Document, node: GraphNode, workers: W
       nodeIcons[delivery ? (comment ? 'comment_delivery' : 'git_delivery') : node.kind] ?? Layers,
     label: delivery ? (comment ? 'Comment delivery' : 'Git delivery') : labels[node.kind],
     delivery,
-    detail: delivery ? deliveryDetail(worker, comment) : binding?.model,
+    detail: delivery ? deliveryDetail(worker, comment) : activityDetail(binding),
   };
 }
 
@@ -49,4 +56,13 @@ function deliveryDetail(worker: WorkerOption | undefined, comment: boolean): str
   if (worker?.id === 'git_delivery_pr') return 'Pull request';
   if (worker?.id === 'git_delivery_merge') return 'Merge';
   return 'Git delivery';
+}
+
+function activityDetail(binding: Binding | undefined): string | undefined {
+  return binding?.kind === 'script' ? scriptCommandLabel(binding.command) : binding?.model;
+}
+
+export function activityLabel(nodeKind: string, bindingKind?: string): string {
+  if (bindingKind === 'script') return 'Script';
+  return labels[nodeKind];
 }

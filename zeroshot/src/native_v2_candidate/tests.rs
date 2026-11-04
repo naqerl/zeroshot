@@ -418,7 +418,8 @@ impl CapsuleAllocator for CandidateAllocator {
         let local = assemble_runner(
             admitted,
             agents,
-            CandidateDeliveries {
+            CandidateBindings {
+                scripts: None,
                 git: Some(delivery),
                 comment: None,
             },
@@ -598,7 +599,8 @@ async fn node_instance_session_reused_through_a_loop_stays_on_its_lane() {
             (CODEX_OPENAI, CandidateAgents::new(codex.clone())),
             (CLAUDE_ANTHROPIC, CandidateAgents::new(claude.clone())),
         ]),
-        CandidateDeliveries {
+        CandidateBindings {
+            scripts: None,
             git: Some(routing_delivery(root.path())),
             comment: None,
         },
@@ -1010,6 +1012,7 @@ fn candidate_node_lane_routes_each_agent_binding_only_to_its_own_lane() {
     let codex_agent = Arc::as_ptr(&codex).cast::<()>();
     let claude_agent = Arc::as_ptr(&claude).cast::<()>();
     let routes = CandidateNodeLane {
+        scripts: None,
         comment_delivery: None,
         default_lane: CODEX_OPENAI,
         agents: BTreeMap::from([
@@ -1044,6 +1047,7 @@ fn candidate_node_lane_routes_each_agent_binding_only_to_its_own_lane() {
     );
 
     let claude_only = CandidateNodeLane {
+        scripts: None,
         comment_delivery: None,
         default_lane: CODEX_OPENAI,
         agents: BTreeMap::from([(CLAUDE_ANTHROPIC, CandidateAgents::new(claude))]),

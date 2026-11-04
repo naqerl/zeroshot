@@ -144,9 +144,12 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   incompatible harness/provider pairs. A caller may declare optional bounded `contextWindow` and
   `maxTokens` on an agent binding; they are declarations rather than catalog knowledge, are written
   only to the Pi gateway model entry when supplied, and stay absent so the provider keeps its own
-  defaults otherwise. A bounded review verdict adds a runtime-derived output limit sized from its
-  own shape; a caller-declared limit can only lower it, and no value is inferred from the model
-  identifier.
+  defaults otherwise. Never infer either value from the model identifier.
+- A `script` binding executes an argv program on an existing step without instructions. The local
+  adapter in `native_v2_candidate::script` uses the shared process runner, bounded JSON stdin/stdout,
+  authoritative output validation, connection redaction and confirmed process-tree cleanup. It does
+  not invoke a shell or inherit ambient provider keys. Local-only placement is enforced both before
+  remote submission and at candidate construction. Keep service lifecycle outside the runtime.
 - Full-v1 loops may declare `maxIterationsInput` as an integer path in the initial input.
   Reusable profiles verify the authored default `maxIterations`; native-v2 run admission binds a
   present positive safe integer from caller input and re-verifies the concrete graph. An absent

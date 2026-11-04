@@ -1,3 +1,4 @@
+import { activityLabel } from './node-presentation';
 import { useEffect, useRef, useState } from 'react';
 import { Field } from './Field';
 import { InspectorPanel } from './InspectorPanel';
@@ -10,7 +11,6 @@ import {
   children,
   clone,
   executable,
-  labels,
   replaceNode,
   type Document,
   type GraphNode,
@@ -94,7 +94,7 @@ export function Inspector(p: InspectorProps) {
                         ? 'Run result'
                         : node.kind === 'fail'
                           ? 'Stop outcome'
-                          : labels[node.kind]}
+                          : activityLabel(node.kind, binding?.kind)}
               </h2>
             </div>
             <NameField
@@ -360,14 +360,16 @@ function ActivitySettings({
       )}
       {executable(node) && !delivery && (
         <>
-          <Field label="Instructions">
-            <textarea
-              rows={7}
-              value={node.instructions ?? ''}
-              onChange={(e) => graphChange('instructions', e.target.value)}
-              placeholder="What should this agent do?"
-            />
-          </Field>
+          {binding?.kind !== 'script' && (
+            <Field label="Instructions">
+              <textarea
+                rows={7}
+                value={node.instructions ?? ''}
+                onChange={(e) => graphChange('instructions', e.target.value)}
+                placeholder="What should this agent do?"
+              />
+            </Field>
+          )}
           {binding?.kind === 'agent' && (
             <>
               <ModelPicker

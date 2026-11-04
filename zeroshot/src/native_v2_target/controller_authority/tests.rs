@@ -80,3 +80,14 @@ fn lane_free_plans_are_accepted_by_every_target() {
         require_node_runtime_lanes(&controller, &lane_free()).assert_value();
     }
 }
+
+#[test]
+fn script_bindings_are_refused_before_remote_submission() {
+    let plan = runtime(json!({"kind":"script", "command":["python3", "retrieve.py"]}));
+    assert_eq!(
+        require_runtime_capabilities(&with_marker(), &plan)
+            .assert_error()
+            .to_string(),
+        "script bindings currently require local execution"
+    );
+}

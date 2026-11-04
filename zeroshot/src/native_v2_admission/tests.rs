@@ -187,9 +187,9 @@ async fn admits_authored_loop_and_parallel_verifiers_without_defaulting_effort()
     for binding in admitted.runtime.nodes().values() {
         let effort = match binding {
             NodeRuntimeBinding::Agent { effort, .. } => Some(effort),
-            NodeRuntimeBinding::GitDelivery { .. } | NodeRuntimeBinding::CommentDelivery { .. } => {
-                None
-            }
+            NodeRuntimeBinding::Script { .. }
+            | NodeRuntimeBinding::GitDelivery { .. }
+            | NodeRuntimeBinding::CommentDelivery { .. } => None,
         };
         let effort = effort.assert_value_with("fixture has only agent bindings");
         assert_eq!(*effort, None);
@@ -623,3 +623,32 @@ async fn rejects_invalid_caller_declared_model_limits_at_admission() {
 
 #[path = "tests/comments.rs"]
 mod comments;
+
+#[tokio::test]
+async fn scripts_require_a_step_without_instructions() {
+    let script: NodeRuntimeBinding =
+        serde_json::from_value(json!({"kind":"script", "command":["python3"]})).assert_value();
+    let mut plain = null_step("work", "app.work@1");
+    plain.as_object_mut().assert_value().remove("instructions");
+    NativeV2Admission
+        .admit(submission(
+            graph(vec![plain, succeed("done")]),
+            BTreeMap::from([(named("work"), script.clone())]),
+        ))
+        .await
+        .assert_value();
+    for node in [
+        null_step("work", "app.work@1"),
+        null_verifier("work", "app.work@1"),
+    ] {
+        assert!(matches!(
+            NativeV2Admission
+                .admit(submission(
+                    graph(vec![node, succeed("done")]),
+                    BTreeMap::from([(named("work"), script.clone())])
+                ))
+                .await,
+            Err(NativeV2AdmissionError::InvalidRuntimeBinding { .. })
+        ));
+    }
+}

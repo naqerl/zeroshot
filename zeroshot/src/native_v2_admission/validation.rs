@@ -189,6 +189,14 @@ fn validate_binding_kinds(
                 detail: error.to_string(),
             }
         })?;
+        if matches!(binding, NodeRuntimeBinding::Script { .. })
+            && (declaration.kind != LeafKind::Step || declaration.instructions.is_some())
+        {
+            return Err(NativeV2AdmissionError::InvalidRuntimeBinding {
+                node: declaration.name.clone(),
+                detail: "script bindings require a step without agent instructions".to_owned(),
+            });
+        }
         validate_binding_kind(declaration, binding)?;
         validate_instructions(declaration, binding)?;
     }

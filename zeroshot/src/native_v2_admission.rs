@@ -398,6 +398,7 @@ pub(crate) fn executable_runtime_roles(root: &GraphNode) -> Vec<(NodeName, bool)
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeRole {
+    Script,
     Agent,
     GitDelivery,
     CommentDelivery,
@@ -425,6 +426,7 @@ impl GraphBoundWorkerRegistry {
         let mut resolved = BTreeMap::<WorkerRef, ResolvedDeclaration>::new();
         for declaration in declarations {
             let role = match runtime.nodes().get(&declaration.name) {
+                Some(NodeRuntimeBinding::Script { .. }) => RuntimeRole::Script,
                 Some(NodeRuntimeBinding::Agent { .. }) => RuntimeRole::Agent,
                 Some(NodeRuntimeBinding::GitDelivery { .. }) => RuntimeRole::GitDelivery,
                 Some(NodeRuntimeBinding::CommentDelivery { .. }) => RuntimeRole::CommentDelivery,

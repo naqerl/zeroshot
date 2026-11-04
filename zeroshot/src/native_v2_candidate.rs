@@ -37,6 +37,9 @@ use crate::native_v2_runner::{
     ResolvedEnvironment, SessionFactory,
 };
 
+mod script;
+mod stateless;
+mod timing;
 #[cfg(test)]
 #[path = "native_v2_candidate/tests.rs"]
 mod tests;
@@ -136,6 +139,8 @@ pub enum NativeV2CandidateError {
     RuntimeMismatch,
     #[error("agent and delivery adapters must use the same run workspace")]
     WorkspaceMismatch,
+    #[error("script bindings currently require local execution")]
+    ScriptLocalOnly,
     #[error(transparent)]
     Claude(#[from] ClaudeAdapterConfigError),
     #[error(transparent)]
@@ -244,6 +249,22 @@ fn build_candidate(
     trusted: TrustedDeliveryCapabilities,
 ) -> Result<NativeNodeRunner, NativeV2CandidateError> {
     validate_config(admitted, &config)?;
+    let scripts = if admitted
+        .runtime
+        .nodes()
+        .values()
+        .any(|binding| matches!(binding, NodeRuntimeBinding::Script { .. }))
+    {
+        if !placement.is_local() {
+            return Err(NativeV2CandidateError::ScriptLocalOnly);
+        }
+        Some(script::ScriptAdapter::new(
+            config.workspace.clone(),
+            None,
+        ))
+    } else {
+        None
+    };
     let NativeV2CandidateConfig {
         lanes,
         delivery,
@@ -275,9 +296,10 @@ fn build_candidate(
     assemble_runner(
         admitted,
         agents,
-        CandidateDeliveries {
+        CandidateBindings {
             git: delivery,
             comment: comment_delivery,
+            scripts,
         },
         placement,
     )
@@ -388,7 +410,7 @@ fn validate_config(
 fn assemble_runner(
     admitted: &AdmittedRun,
     agents: BTreeMap<RuntimeLane, CandidateAgents>,
-    deliveries: CandidateDeliveries,
+    deliveries: CandidateBindings,
     placement: CandidatePlacement,
 ) -> Result<NativeNodeRunner, NativeV2CandidateError> {
     let routes = Arc::new(CandidateNodeLane {
@@ -396,6 +418,7 @@ fn assemble_runner(
         agents,
         delivery: deliveries.git,
         comment_delivery: deliveries.comment,
+        scripts: deliveries.scripts,
     });
     Ok(match placement.session_boundary() {
         SessionBoundary::Run => NativeNodeRunner::new(admitted, routes.clone(), routes)?,
@@ -405,7 +428,8 @@ fn assemble_runner(
     })
 }
 
-struct CandidateDeliveries {
+struct CandidateBindings {
+    scripts: Option<script::ScriptAdapter>,
     git: Option<Arc<NativeV2DeliveryAdapter>>,
     comment: Option<Arc<NativeV2CommentDeliveryAdapter>>,
 }
@@ -432,6 +456,7 @@ impl CandidateAgents {
 /// Routes only by the admitted closed binding: agent nodes use their effective lane's adapter,
 /// never another lane's, and the graph-visible delivery verifier uses trusted Git delivery.
 struct CandidateNodeLane {
+    scripts: Option<script::ScriptAdapter>,
     default_lane: RuntimeLane,
     agents: BTreeMap<RuntimeLane, CandidateAgents>,
     delivery: Option<Arc<NativeV2DeliveryAdapter>>,
@@ -448,11 +473,33 @@ impl CandidateNodeLane {
                 .agents
                 .get(&lane.unwrap_or(self.default_lane))
                 .ok_or(NodeRunnerError::Driver),
-            NodeRuntimeBinding::GitDelivery { .. } | NodeRuntimeBinding::CommentDelivery { .. } => {
-                Err(NodeRunnerError::Driver)
-            }
+            NodeRuntimeBinding::Script { .. }
+            | NodeRuntimeBinding::GitDelivery { .. }
+            | NodeRuntimeBinding::CommentDelivery { .. } => Err(NodeRunnerError::Driver),
         }
     }
+}
+
+async fn open_binding<T: SessionFactory>(
+    adapter: Option<&T>,
+    invocation: &NodeInvocation,
+    environment: &ResolvedEnvironment,
+) -> Result<Arc<dyn NodeSession>, NodeRunnerError> {
+    adapter
+        .ok_or(NodeRunnerError::Driver)?
+        .open(invocation, environment)
+        .await
+}
+
+async fn run_binding<T: NodeDriver>(
+    adapter: Option<&T>,
+    invocation: DriverInvocation,
+    control: DriverControl,
+) -> Result<openengine_cluster_protocol::WorkerOutcome, NodeRunnerError> {
+    adapter
+        .ok_or(NodeRunnerError::Driver)?
+        .run(invocation, control)
+        .await
 }
 
 #[async_trait]
@@ -469,19 +516,14 @@ impl SessionFactory for CandidateNodeLane {
                     .open(invocation, environment)
                     .await
             }
+            NodeRuntimeBinding::Script { .. } => {
+                open_binding(self.scripts.as_ref(), invocation, environment).await
+            }
             NodeRuntimeBinding::CommentDelivery { .. } => {
-                self.comment_delivery
-                    .as_ref()
-                    .ok_or(NodeRunnerError::Driver)?
-                    .open(invocation, environment)
-                    .await
+                open_binding(self.comment_delivery.as_deref(), invocation, environment).await
             }
             NodeRuntimeBinding::GitDelivery { .. } => {
-                self.delivery
-                    .as_ref()
-                    .ok_or(NodeRunnerError::Driver)?
-                    .open(invocation, environment)
-                    .await
+                open_binding(self.delivery.as_deref(), invocation, environment).await
             }
         }
     }
@@ -510,19 +552,14 @@ impl NodeDriver for CandidateNodeLane {
                 }
                 result
             }
+            NodeRuntimeBinding::Script { .. } => {
+                run_binding(self.scripts.as_ref(), invocation, control).await
+            }
             NodeRuntimeBinding::CommentDelivery { .. } => {
-                self.comment_delivery
-                    .as_ref()
-                    .ok_or(NodeRunnerError::Driver)?
-                    .run(invocation, control)
-                    .await
+                run_binding(self.comment_delivery.as_deref(), invocation, control).await
             }
             NodeRuntimeBinding::GitDelivery { .. } => {
-                self.delivery
-                    .as_ref()
-                    .ok_or(NodeRunnerError::Driver)?
-                    .run(invocation, control)
-                    .await
+                run_binding(self.delivery.as_deref(), invocation, control).await
             }
         }
     }
