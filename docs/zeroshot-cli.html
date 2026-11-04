@@ -70,6 +70,7 @@ section { margin-block: 2.5rem; }
 <li><a href="#zeroshot-hub-add"><code>zeroshot hub add</code></a></li>
 <li><a href="#zeroshot-hub-update"><code>zeroshot hub update</code></a></li>
 <li><a href="#zeroshot-hub-remove"><code>zeroshot hub remove</code></a></li>
+<li><a href="#zeroshot-hub-reset"><code>zeroshot hub reset</code></a></li>
 <li><a href="#zeroshot-hub-list"><code>zeroshot hub list</code></a></li>
 <li><a href="#zeroshot-hub-submit"><code>zeroshot hub submit</code></a></li>
 <li><a href="#zeroshot-hub-enqueue"><code>zeroshot hub enqueue</code></a></li>
@@ -1000,6 +1001,7 @@ Commands:
   add         Add a registered target, or `local`, to the hub
   update      Change a member&#39;s tags, slots, priority, or placement state
   remove      Remove a member from the hub. Its target registration is unchanged [alias: rm]
+  reset       Re-arm a reconciled member from its retained definition
   list        List members with health and load as JSON [alias: ls]
   submit      Place a run on a free member now
   enqueue     Accept a run into the hub queue for later placement, once or on a cron schedule
@@ -1141,6 +1143,23 @@ Options:
 Refuses while a job is placed on the member, naming the job IDs; stop or dequeue those jobs first. A job whose member disappears or stays unreachable is failed as target_lost.
 
 Usage: zeroshot hub remove [OPTIONS] &lt;NAME&gt;
+
+Arguments:
+  &lt;NAME&gt;
+          Member name: a registered target name or `local`
+
+Options:
+      --hub &lt;CONTEXT&gt;
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help (see a summary with &#39;-h&#39;)</code></pre></section>
+<section id="zeroshot-hub-reset"><h4><code>zeroshot hub reset</code></h4>
+<pre><code>Re-arm a reconciled member from its retained definition.
+
+Reconciliation drops the live lease of a member whose box was deleted out of band (or stayed unreachable), keeping its name, tags, slots, and priority. Reset makes that definition active capacity again and discovers the target once, so nobody has to remove and re-type a member. A member whose target answers during a dispatcher pass re-arms by itself.
+
+Usage: zeroshot hub reset [OPTIONS] &lt;NAME&gt;
 
 Arguments:
   &lt;NAME&gt;
@@ -2520,6 +2539,7 @@ Commands:
   add         Add a registered target, or `local`, to the hub
   update      Change a member&#39;s tags, slots, priority, or placement state
   remove      Remove a member from the hub. Its target registration is unchanged
+  reset       Re-arm a reconciled member from its retained definition
   list        List members with health and load as JSON
   submit      Place a run on a free member now
   enqueue     Accept a run into the hub queue for later placement, once or on a cron schedule

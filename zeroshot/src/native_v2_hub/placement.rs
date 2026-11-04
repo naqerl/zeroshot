@@ -38,17 +38,31 @@ pub(crate) enum Fit {
     Unsupported(String),
 }
 
+/// Whether a member satisfies the pinned target and every required tag.
+fn selects(member: &Member, spec: &PlacementSpec) -> bool {
+    spec.target
+        .as_ref()
+        .is_none_or(|target| *target == member.name)
+        && spec.tags.iter().all(|tag| member.tags.contains(tag))
+}
+
 /// Active members that satisfy the pinned target and every required tag, in registration order.
 pub(crate) fn matching_members<'a>(members: &'a [Member], spec: &PlacementSpec) -> Vec<&'a Member> {
     members
         .iter()
         .filter(|member| member.state == MemberState::Active)
-        .filter(|member| {
-            spec.target
-                .as_ref()
-                .is_none_or(|target| *target == member.name)
-        })
-        .filter(|member| spec.tags.iter().all(|tag| member.tags.contains(tag)))
+        .filter(|member| selects(member, spec))
+        .collect()
+}
+
+/// Reconciled members whose retained definition still selects this job. They are not capacity
+/// now, but a successful probe re-arms them, so a job waiting for one is queued rather than
+/// rejected or failed.
+pub(crate) fn retained_members<'a>(members: &'a [Member], spec: &PlacementSpec) -> Vec<&'a Member> {
+    members
+        .iter()
+        .filter(|member| member.state == MemberState::Stale)
+        .filter(|member| selects(member, spec))
         .collect()
 }
 
@@ -90,7 +104,19 @@ pub(crate) fn rejections(
     spec: &PlacementSpec,
     requirements: &Requirements,
 ) -> Option<Vec<Rejection>> {
+    let retained = retained_members(members, spec);
+    // A retained definition that might come back can run the job once re-armed; one already
+    // known not to support it cannot, so it is reported like any other unsupported member.
     let mut rejected = Vec::new();
+    for member in &retained {
+        match fit(member, requirements) {
+            Fit::Unsupported(reason) => rejected.push(Rejection {
+                member: member.name.clone(),
+                reason,
+            }),
+            Fit::Supported | Fit::Unknown => return None,
+        }
+    }
     for member in matching_members(members, spec) {
         match fit(member, requirements) {
             Fit::Unsupported(reason) => rejected.push(Rejection {
@@ -144,7 +170,16 @@ pub(crate) fn place(
     match free.first() {
         Some((_, member, _)) => Placement::Place(member.name.clone()),
         None => Placement::Busy {
-            matching: matching.iter().map(|member| member.name.clone()).collect(),
+            matching: matching
+                .iter()
+                .map(|member| member.name.clone())
+                .chain(
+                    retained_members(members, spec)
+                        .into_iter()
+                        .filter(|member| !matches!(fit(member, requirements), Fit::Unsupported(_)))
+                        .map(|member| member.name.clone()),
+                )
+                .collect(),
         },
     }
 }

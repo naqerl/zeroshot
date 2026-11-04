@@ -1484,6 +1484,48 @@ async fn hub_pool_reports_provisioning_then_active() {
 }
 
 #[tokio::test]
+async fn hub_pool_reports_a_reconciled_lease_once_with_its_reason() {
+    let host = HubLifecycleHost::new(
+        vec![Vec::new()],
+        vec![json!({
+            "name": "builder",
+            "state": "stale",
+            "staleReason": "reconciled-stale-lease",
+            "probeError": "registered as a member but not as a hub target",
+            "addedAt": "2026-01-01T00:00:00Z"
+        })],
+        HashMap::new(),
+    );
+    let mut session = Session::spawn(host);
+    initialize(&mut session).await;
+    let mut failed = Vec::new();
+    for _ in 0..40 {
+        let response = session
+            .request(
+                2,
+                "events/poll",
+                json!({"arguments": {}, "cursor": "hub:0", "maxEvents": 100}),
+            )
+            .await;
+        if let Some(events) = response["result"]["events"].as_array() {
+            for event in events {
+                if event["name"] == json!("hub.pool") && event["data"]["phase"] == json!("failed") {
+                    failed.push(event["data"].clone());
+                }
+            }
+        }
+        if !failed.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0]["pool"], json!("builder"));
+    assert_eq!(failed[0]["leaseId"], json!("builder"));
+    assert_eq!(failed[0]["reason"], json!("reconciled-stale-lease"));
+}
+
+#[tokio::test]
 async fn hub_run_selector_narrows_the_stream_without_ending_it() {
     let mut run_events = HashMap::new();
     run_events.insert(

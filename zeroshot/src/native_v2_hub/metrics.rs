@@ -566,13 +566,14 @@ fn render_members(out: &mut Exposition, state: &HubState, metrics: &Metrics) {
     out.family(
         "zeroshot_hub_member_state",
         "gauge",
-        "1 for each member's placement state (active, drain, disabled).",
+        "1 for each member's placement state (active, drain, disabled, stale).",
     );
     for member in &state.members {
         let name = match member.state {
             MemberState::Active => "active",
             MemberState::Drain => "drain",
             MemberState::Disabled => "disabled",
+            MemberState::Stale => "stale",
         };
         out.sample(
             "zeroshot_hub_member_state",

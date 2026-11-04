@@ -23,14 +23,17 @@ use super::model::{
     HubState, Job, JobError, JobErrorKind, JobState, LOCAL_MEMBER, Member, MemberState, Schedule,
     ScheduleState,
 };
-use super::placement::{Fit, Placement, describe, fit, matching_members, place, rejections};
+use super::placement::{
+    Fit, Placement, describe, fit, matching_members, place, rejections, retained_members,
+};
+use super::pool;
 use super::schedule::{self, Dispatched, TickReport};
 use super::stats;
 use super::store::HubStore;
 use super::wire::{
     AddMember, JobFile, JobQuery, MemberQuery, StatsRequest, StreamRequest, UpdateMember,
 };
-use crate::native_v2_target::{FileTargetRegistry, TargetAccess, TargetRegistry};
+use crate::native_v2_target::{FileTargetRegistry, TargetAccess, TargetConnectorError, TargetRegistry};
 
 /// Run arguments whose value is a file the client uploads with the job.
 pub(crate) const FILE_FLAGS: [&str; 5] = [
@@ -55,6 +58,18 @@ pub(crate) struct HubService {
     max_stall_ms: Option<u64>,
     /// Eval work in progress, so the worker never runs one piece twice at once.
     eval_claims: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// Leases dropped at boot, reported once by the first dispatcher pass.
+    pending_reconciled: std::sync::Mutex<Vec<Value>>,
+}
+
+/// Whether a member name still resolves as a hub target. `None` means the registry could not be
+/// read: that proves nothing about the lease, so reconciliation keeps it.
+fn target_presence(registry: &FileTargetRegistry, name: &str) -> pool::TargetPresence {
+    match registry.get(name) {
+        Ok(_) => Some(true),
+        Err(TargetConnectorError::NotFound(_)) => Some(false),
+        Err(_) => None,
+    }
 }
 
 pub(crate) fn member_document(member: &Member) -> Value {
@@ -94,10 +109,18 @@ impl HubService {
             let lock = store.lock()?;
             store.load(&lock)?
         };
-        if schedule::recover_placing(&mut state) > 0 {
+        let recovered = schedule::recover_placing(&mut state);
+        // Boot reconciliation: a lease whose box died before the restart, or whose target was
+        // deleted out of band, must never come back as capacity that is not there.
+        let booted = clock::now_ms();
+        let reconciled = pool::reconcile(&mut state.members, booted, |name| {
+            target_presence(&registry, name)
+        });
+        if recovered > 0 || !reconciled.is_empty() {
             let lock = store.lock()?;
             store.save(&lock, &state)?;
         }
+        let pending_reconciled = pool::report(&reconciled, &[], booted);
         Ok(Self {
             store,
             driver,
@@ -108,6 +131,7 @@ impl HubService {
             unconfirmed_limit: schedule::DEFAULT_UNCONFIRMED_LIMIT,
             max_stall_ms: None,
             eval_claims: std::sync::Mutex::default(),
+            pending_reconciled: std::sync::Mutex::new(pending_reconciled),
         })
     }
 
@@ -239,6 +263,11 @@ impl HubService {
             }
             if let Some(member_state) = request.state {
                 member.state = member_state;
+                // An explicit placement state is the operator's decision about this lease: keep
+                // it and forget the evidence reconciliation used to drop it.
+                member.stale = None;
+                member.unreachable_probes = 0;
+                member.unreachable_since_ms = None;
             }
             Ok(member_document(member))
         })
@@ -266,6 +295,43 @@ impl HubService {
             }
             state.members.retain(|member| member.name != name);
             Ok(json!({ "schema": "zeroshot.hub.member/v1", "removed": name }))
+        })
+        .await
+    }
+
+    /// Re-arm a reconciled member from its retained definition, without re-typing its tags,
+    /// slots, or priority. Capabilities are discovered again so the member can place work at once.
+    pub(crate) async fn reset(&self, name: &str) -> Result<Value, HubError> {
+        let now = now_ms();
+        let mut member = self
+            .mutate(|state| {
+                let member = state
+                    .members
+                    .iter_mut()
+                    .find(|member| member.name == name)
+                    .ok_or_else(|| {
+                        HubError::MemberNotFound(format!("{name} is not a hub member"))
+                    })?;
+                member.state = MemberState::Active;
+                member.stale = None;
+                member.unreachable_probes = 0;
+                member.unreachable_since_ms = None;
+                member.last_probe_ok_at_ms = None;
+                member.capabilities_at_ms = None;
+                member.capability_error = None;
+                Ok(member.clone())
+            })
+            .await?;
+        schedule::discover(std::slice::from_mut(&mut member), self.driver(), now, 0).await;
+        let discovered = member;
+        self.mutate(|state| {
+            schedule::merge_capabilities(&mut state.members, std::slice::from_ref(&discovered));
+            state
+                .members
+                .iter()
+                .find(|member| member.name == discovered.name)
+                .map(member_document)
+                .ok_or_else(|| HubError::MemberNotFound(format!("{name} is not a hub member")))
         })
         .await
     }
@@ -422,6 +488,11 @@ impl HubService {
         let state = self
             .mutate(|state| {
                 schedule::merge_capabilities(&mut state.members, &members);
+                // `hub submit` places directly, without a dispatcher pass: reconcile the leases
+                // first so capacity that is not there is never chosen.
+                pool::reconcile(&mut state.members, now_ms(), |name| {
+                    target_presence(&self.registry, name)
+                });
                 Ok(state.clone())
             })
             .await?;
@@ -429,9 +500,18 @@ impl HubService {
             self.metrics.record_rejection(Some(&rejected));
             return Err(HubError::no_eligible(describe(&job.placement), rejected));
         }
-        let matching = matching_members(&state.members, &job.placement);
-        let loads = schedule::probe(&matching, &state.jobs, self.driver()).await;
+        let mut probing = matching_members(&state.members, &job.placement);
+        probing.extend(retained_members(&state.members, &job.placement));
+        let loads = schedule::probe(&probing, &state.jobs, self.driver()).await;
         self.metrics.record_loads(&loads);
+        let state = self
+            .mutate(|state| {
+                pool::rearm(&mut state.members, &loads, |name| {
+                    target_presence(&self.registry, name)
+                });
+                Ok(state.clone())
+            })
+            .await?;
         let now = now_ms();
         match place(&state.members, &job.placement, &job.requirements, &loads) {
             Placement::Place(member) => {
@@ -915,6 +995,28 @@ impl HubService {
                 Ok(schedule::settle_lost_targets(&mut state.jobs, now, &lost))
             })
             .await?;
+        // Reconcile leases before choosing a member: capacity that is not there must never be
+        // picked, and a definition whose target answers again is re-armed in the same pass.
+        let now = now_ms();
+        let (reconciled, requeued) = self
+            .mutate(|state| {
+                let registered = |name: &str| target_presence(&self.registry, name);
+                let dropped = pool::reconcile(&mut state.members, now, registered);
+                let rearmed = pool::rearm(&mut state.members, &loads, registered);
+                // A job already placing on a lease this pass dropped must not be submitted to
+                // it: return it to the queue so the next decision picks live capacity.
+                let requeued = schedule::requeue_placements(state);
+                let mut entries = self
+                    .pending_reconciled
+                    .lock()
+                    .map(|mut pending| std::mem::take(&mut *pending))
+                    .unwrap_or_default();
+                entries.extend(pool::report(&dropped, &rearmed, now));
+                Ok((entries, requeued))
+            })
+            .await?;
+        report.reconciled = reconciled;
+        report.requeued = requeued;
         let placing = schedule::placing(&self.snapshot().await);
         for (job_id, member) in placing {
             let (job, dispatched) = self.dispatch(&job_id, &member, now).await?;

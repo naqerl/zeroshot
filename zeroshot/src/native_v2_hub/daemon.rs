@@ -303,6 +303,8 @@ impl super::schedule::TickReport {
             && self.finished.is_empty()
             && self.stalled.is_empty()
             && self.target_lost.is_empty()
+            && self.reconciled.is_empty()
+            && self.requeued.is_empty()
             && self.failed.is_empty()
     }
 }

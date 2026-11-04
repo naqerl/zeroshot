@@ -219,7 +219,9 @@ collapsed: `hub.run` fires only when the active node changes (including a shrink
 or the phase leaves `running`, and cursor advances inside one node publish nothing to default
 subscribers. The complete per-cursor trail is still durable and is delivered as `hub.run.detail`
 only to subscribers that ask for it by `detail: true` or by name. `hub.pool` reports member leases
-as `provisioning`, `active`, `draining`, `deleted`, or `failed`. A running job receives one
+as `provisioning`, `active`, `draining`, `deleted`, or `failed`. A lease the daemon reconciles away
+(a box deleted out of band, or a member unreachable past the stale budget) reports `failed` with
+reason `reconciled-stale-lease`; a re-armed definition reports `active`. A running job receives one
 `hub.warning` per hour; a run-watch or stream failure also produces `hub.warning`, and the
 subscription continues.
 

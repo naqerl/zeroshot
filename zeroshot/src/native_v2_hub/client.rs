@@ -295,6 +295,7 @@ async fn request_document(client: &HubClient, command: HubCommand) -> Result<Val
         HubCommand::Add(_)
         | HubCommand::Update(_)
         | HubCommand::Remove { .. }
+        | HubCommand::Reset { .. }
         | HubCommand::List { .. } => member_document(client, command).await,
         HubCommand::Enqueue(request) => enqueue(client, *request).await,
         HubCommand::Ps(HubPs {
@@ -358,6 +359,11 @@ async fn member_document(client: &HubClient, command: HubCommand) -> Result<Valu
                     &["v1", "hub", "members", &name],
                     None::<&Value>,
                 )
+                .await
+        }
+        HubCommand::Reset { name } => {
+            client
+                .post(&["v1", "hub", "members", &name, "reset"], &json!({}))
                 .await
         }
         HubCommand::List { tags, probe } => {

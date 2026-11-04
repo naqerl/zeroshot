@@ -858,12 +858,22 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   run`, held by `hub/daemon.lock`, heartbeat in `hub/daemon.json`) owns the hub: it is the only
   writer of `hub/state.json` (beside `targets.json`, or `ZEROSHOT_HUB_DIR`), dispatches
   continuously, and serves the hub API (JSON over HTTP, default `127.0.0.1:7383`, bearer token in
-  `hub/api-token` or `--token-file`). State sits behind one in-memory lock that is never held across
+  `hub/api-token` or `--token-file`). `native_v2_hub/pool.rs` reconciles member leases at startup
+  and before every placement: a member no longer registered as a target, or one unreachable for
+  more than two minutes across three probes, becomes `stale` — excluded from placement while its
+  definition is retained, reported once as a `hub.pool` `reconciled-stale-lease` record and in the
+  `reconciled` dispatch field, never turned into a job failure, and re-armed by a successful probe;
+  `POST /v1/hub/members/{name}/reset` (`zeroshot hub reset`) re-arms it explicitly, and a job
+  placing on a dropped lease returns to the queue instead of being submitted there, with its
+  abandoned `hub-JOB_ID-ATTEMPT` key named and its attempt advanced so no later submission adopts
+  that run. State sits behind one in-memory lock that is never held across
   target calls; a second lock serializes placement (passes and `submit`). `schedule::Dispatched` owns
   dispatch outcome kinds: `Placed`; `Unconfirmed` when the driver returns `HubError::Unanswered`
   (a timeout, no receipt, a transport or protocol failure), which keeps the job placing (running
   without a run ID, `errorKind` `submission_unconfirmed`) on its member with no attempt counted,
-  so every pass resubmits it there with the same key, counted in `unconfirmed_submissions` apart
+  so every pass resubmits it there with the same key until its member is reconciled away (then it
+  is requeued with the abandoned key named and the attempt advanced), counted in
+  `unconfirmed_submissions` apart
   from `attempts`, until `--unconfirmed-limit` (default 30) fails it as `unconfirmed_limit`; and
   `Rejected`, the only other kind that fails the job. Hub jobs have no expiry: a job ends only when
   its run ends, it is force-stopped, or it is reaped with its member. Lifetimes are observable
@@ -897,8 +907,9 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   bundled tzdb). Member capacity is hub-declared `slots`; load is the observed nonterminal runs.
   Dispatch submission keys are `hub-JOB_ID-ATTEMPT`. Exit code 3 means no capacity or an expired
   wait, and 4 means that no active member matches or supports the job. Every pass probes every
-  member, including when no job is due; a running job is failed as `target_lost` when its member
-  disappears or remains unreachable for three consecutive probes, and removing a member with a
+  member, including when no job is due; a running job with a confirmed run is failed as
+  `target_lost` when its member disappears or remains unreachable for three consecutive probes
+  (a job still placing has no run to lose and is requeued instead), and removing a member with a
   placed job is refused with the job IDs.
 - `zeroshot/src/private_file.rs` owns owner-only file replacement for the shipped CLI: a random
   `create_new` sibling with mode `0600`, fsync, rename over the destination, and cleanup on failure,

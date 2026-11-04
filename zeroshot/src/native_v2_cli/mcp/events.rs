@@ -1534,7 +1534,7 @@ fn member_phase(member: &Value) -> &'static str {
     match member.get("state").and_then(Value::as_str) {
         Some("active") => "active",
         Some("drain") => "draining",
-        Some("disabled") => "failed",
+        Some("disabled") | Some("stale") => "failed",
         Some("deleted") => "deleted",
         _ => "provisioning",
     }
@@ -1542,7 +1542,8 @@ fn member_phase(member: &Value) -> &'static str {
 
 fn publish_member(feed: &HubFeed, name: &str, member: &Value, phase: &str) {
     let reason = member
-        .get("probeError")
+        .get("staleReason")
+        .or_else(|| member.get("probeError"))
         .or_else(|| member.get("error"))
         .cloned()
         .unwrap_or(Value::Null);

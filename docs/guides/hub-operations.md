@@ -118,6 +118,11 @@ it. The target may still hold a run under the job's submission key; the error na
 the hub never follows or adopts such a run. If a submission that was in flight when you dequeued
 is then accepted, the error also names the run ID so you can stop it on the target.
 
+The same-key retry ends when the job's member is reconciled away: the job returns to the queue
+with `errorKind` `submission_unconfirmed`, its error names the abandoned
+`hub-JOB_ID-ATTEMPT` key so a run the target accepted under it can be stopped, and its attempt is
+advanced so a later submission cannot adopt that run.
+
 ## Stalled runs
 
 Lifetimes are observable events, not deadlines: a queued or running job is never expired by the
@@ -154,9 +159,42 @@ member is no longer in the hub, or when that member fails three consecutive load
 running. The error message names the member and the last successful probe. A member that is merely
 in the `drain` state still answers probes, so its jobs keep running.
 
+A job that is still `placing` has no run to lose, so it is not failed as `target_lost`. When its
+member is reconciled away, the job returns to the queue and the error names the submission key the
+old member may have accepted (see [Stale pool leases](#stale-pool-leases)).
+
 `zeroshot hub remove MEMBER` refuses while any job is placed on that member and names the job IDs.
 Stop placed jobs with `zeroshot hub force-stop JOB`, or dequeue jobs that are still placing, before
 removing the member. This keeps removal from orphaning a running job.
+
+## Stale pool leases
+
+A member is a durable definition (`name`, `tags`, `slots`, `priority`) plus the live target behind
+it. Deleting a box out of band leaves the definition with nothing that can serve work. The daemon
+reconciles those leases at startup and before every placement decision, so neither a killed box nor
+a crash survives a restart as capacity that is not there. It drops a lease when the member is no
+longer registered as a hub target, or when the member has been unreachable for more than two
+minutes across at least three consecutive probes.
+
+A reconciled member moves to the `stale` placement state. Its definition is kept, placement never
+chooses it, and a job waiting for it stays queued instead of failing with a misleading error: a
+stale lease is never reported as `source_checkout_unavailable`. Each dropped lease is reported once
+in `hub.pool` events and in the `reconciled` array of `POST /v1/hub/dispatch`, with reason
+`reconciled-stale-lease` and the member name. `zeroshot hub list` shows the state, the reason, and
+the evidence.
+
+A job that was already placing on a dropped lease goes back to the queue instead of being
+submitted to it; the pass reports it in the `requeued` array of `POST /v1/hub/dispatch` with the
+abandoned submission key and any known run ID, its error names that key, and its attempt is
+advanced so no later submission adopts the run. The next placement decision picks live capacity. An unpinned job places on any other live member while
+the stale definition waits, including `local`; a job pinned with `--target` waits for that
+definition instead of failing. A stale lease therefore never holds the queue.
+
+A definition comes back on its own: the next successful probe of a still-registered target re-arms
+it, which covers a recreated box or a recovered target. When the target is still down,
+`zeroshot hub reset MEMBER` (also `POST /v1/hub/members/{name}/reset`) clears the reconciled
+lease and its failure evidence and re-discovers the target, keeping `tags`, `slots`, and `priority`.
+Nobody has to remove a wedged member and retype its configuration.
 
 ## Evals
 

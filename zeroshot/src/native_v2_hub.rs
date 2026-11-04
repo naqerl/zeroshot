@@ -33,6 +33,7 @@ mod metrics;
 mod model;
 mod paths;
 mod placement;
+mod pool;
 mod schedule;
 mod service;
 mod stats;

@@ -64,6 +64,7 @@ pub(crate) fn router_with_mcp(state: Arc<ApiState>, mcp: Option<Router>) -> Rout
             "/v1/hub/members/{name}",
             patch(update_member).delete(remove_member),
         )
+        .route("/v1/hub/members/{name}/reset", post(reset_member))
         .route("/v1/hub/jobs", post(submit))
         .route("/v1/hub/jobs/query", post(ps))
         .route("/v1/hub/jobs/{id}", get(status).delete(dequeue))
@@ -250,6 +251,10 @@ async fn update_member(
 
 async fn remove_member(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Response {
     reply(state.service.remove(&name).await)
+}
+
+async fn reset_member(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Response {
+    reply(state.service.reset(&name).await)
 }
 
 async fn submit(State(state): State<Arc<ApiState>>, bytes: Bytes) -> Response {

@@ -1061,6 +1061,7 @@ Commands:
   add         Add a registered target, or `local`, to the hub
   update      Change a member's tags, slots, priority, or placement state
   remove      Remove a member from the hub. Its target registration is unchanged [alias: rm]
+  reset       Re-arm a reconciled member from its retained definition
   list        List members with health and load as JSON [alias: ls]
   submit      Place a run on a free member now
   enqueue     Accept a run into the hub queue for later placement, once or on a cron schedule
@@ -1214,6 +1215,27 @@ Remove a member from the hub. Its target registration is unchanged.
 Refuses while a job is placed on the member, naming the job IDs; stop or dequeue those jobs first. A job whose member disappears or stays unreachable is failed as target_lost.
 
 Usage: zeroshot hub remove [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>
+          Member name: a registered target name or `local`
+
+Options:
+      --hub <CONTEXT>
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+#### `zeroshot hub reset`
+
+```text
+Re-arm a reconciled member from its retained definition.
+
+Reconciliation drops the live lease of a member whose box was deleted out of band (or stayed unreachable), keeping its name, tags, slots, and priority. Reset makes that definition active capacity again and discovers the target once, so nobody has to remove and re-type a member. A member whose target answers during a dispatcher pass re-arms by itself.
+
+Usage: zeroshot hub reset [OPTIONS] <NAME>
 
 Arguments:
   <NAME>
@@ -2753,6 +2775,7 @@ Commands:
   add         Add a registered target, or `local`, to the hub
   update      Change a member's tags, slots, priority, or placement state
   remove      Remove a member from the hub. Its target registration is unchanged
+  reset       Re-arm a reconciled member from its retained definition
   list        List members with health and load as JSON
   submit      Place a run on a free member now
   enqueue     Accept a run into the hub queue for later placement, once or on a cron schedule

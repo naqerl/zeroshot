@@ -76,6 +76,15 @@ pub(super) enum HubCliCommand {
     #[command(visible_alias = "rm")]
     Remove(HubNameArgs),
 
+    /// Re-arm a reconciled member from its retained definition.
+    ///
+    /// Reconciliation drops the live lease of a member whose box was deleted out of band (or
+    /// stayed unreachable), keeping its name, tags, slots, and priority. Reset makes that
+    /// definition active capacity again and discovers the target once, so nobody has to remove
+    /// and re-type a member. A member whose target answers during a dispatcher pass re-arms by
+    /// itself.
+    Reset(HubNameArgs),
+
     /// List members with health and load as JSON.
     #[command(visible_alias = "ls")]
     List(HubListArgs),
@@ -589,6 +598,9 @@ impl HubCliCommand {
             Self::Add(args) => add_command(args),
             Self::Update(args) => update_command(args),
             Self::Remove(args) => Ok(HubCommand::Remove {
+                name: member_name(args.name)?,
+            }),
+            Self::Reset(args) => Ok(HubCommand::Reset {
                 name: member_name(args.name)?,
             }),
             Self::List(args) => Ok(HubCommand::List {

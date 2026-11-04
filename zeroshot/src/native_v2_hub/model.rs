@@ -44,6 +44,20 @@ impl HubState {
     }
 }
 
+/// A member lease that reconciliation proved cannot be live.
+///
+/// The member definition (name, tags, slots, priority) stays in place; only its live capacity is
+/// dropped. A successful probe of the same definition re-arms it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StaleLease {
+    /// Stable reason code, `reconciled-stale-lease` for reconciliation.
+    pub reason: String,
+    /// Operator-facing explanation naming what the lease is missing.
+    pub detail: String,
+    pub at_ms: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Member {
@@ -68,6 +82,12 @@ pub(crate) struct Member {
     /// When a load probe last succeeded, in Unix epoch milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_probe_ok_at_ms: Option<u64>,
+    /// When the current run of failed load probes began, in Unix epoch milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreachable_since_ms: Option<u64>,
+    /// Why this member's live lease was reconciled away; `None` while it is live capacity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale: Option<StaleLease>,
 }
 
 impl Member {
@@ -85,6 +105,8 @@ impl Member {
             capability_error: None,
             unreachable_probes: 0,
             last_probe_ok_at_ms: None,
+            unreachable_since_ms: None,
+            stale: None,
         }
     }
 
@@ -99,6 +121,9 @@ impl Member {
             "capabilities": self.capabilities,
             "capabilitiesAt": self.capabilities_at_ms.map(rfc3339),
             "capabilityError": self.capability_error,
+            "unreachableSince": self.unreachable_since_ms.map(rfc3339),
+            "stale": self.stale,
+            "staleReason": self.stale.as_ref().map(|stale| &stale.reason),
         })
     }
 }
@@ -163,6 +188,9 @@ pub(crate) enum MemberState {
     Active,
     Drain,
     Disabled,
+    /// Reconciled: the definition is retained but no live lease can serve work from it.
+    /// Placement never chooses it, and a successful probe re-arms it.
+    Stale,
 }
 
 impl From<HubMemberState> for MemberState {

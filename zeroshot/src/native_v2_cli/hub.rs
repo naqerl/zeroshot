@@ -35,6 +35,10 @@ pub enum HubCommand {
     Remove {
         name: String,
     },
+    /// Re-arm a reconciled member from its retained definition.
+    Reset {
+        name: String,
+    },
     List {
         tags: Vec<String>,
         probe: bool,

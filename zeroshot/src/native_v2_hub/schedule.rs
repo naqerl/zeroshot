@@ -26,6 +26,10 @@ pub(crate) struct TickReport {
     pub finished: Vec<Value>,
     pub stalled: Vec<Value>,
     pub target_lost: Vec<Value>,
+    /// Lease changes of this pass: stale leases dropped and re-armed definitions, one record each.
+    pub reconciled: Vec<Value>,
+    /// Placing jobs returned to the queue because their member can no longer take them.
+    pub requeued: Vec<Value>,
     pub failed: Vec<Value>,
     pub unconfirmed: Vec<Value>,
     pub loads: Option<BTreeMap<String, Load>>,
@@ -57,6 +61,8 @@ impl TickReport {
             "finished": self.finished,
             "stalled": self.stalled,
             "targetLost": self.target_lost,
+            "reconciled": self.reconciled,
+            "requeued": self.requeued,
             "dispatchFailed": self.failed,
             "dispatchUnconfirmed": self.unconfirmed,
             "queued": queued,
@@ -138,9 +144,13 @@ pub(crate) fn record_health(
         };
         if load.reachable {
             member.unreachable_probes = 0;
+            member.unreachable_since_ms = None;
             member.last_probe_ok_at_ms = Some(now_ms);
         } else {
             member.unreachable_probes = member.unreachable_probes.saturating_add(1);
+            // Keep the start of the current failure run: reconciliation measures how long the
+            // lease has been unreachable, not how many passes have run.
+            member.unreachable_since_ms.get_or_insert(now_ms);
         }
     }
     for job in jobs.iter_mut().filter(|job| job.state == JobState::Running) {
@@ -163,12 +173,13 @@ pub(crate) struct LostTarget {
     pub last_probe_ok_at_ms: Option<u64>,
 }
 
-/// Running jobs that can no longer be observed because their member is gone or unreachable.
+/// Running jobs with a confirmed run that can no longer be observed because their member is gone
+/// or unreachable. A job still placing has no run to lose: reconciliation returns it to the queue.
 pub(crate) fn lost_targets(state: &HubState) -> Vec<LostTarget> {
     state
         .jobs
         .iter()
-        .filter(|job| job.state == JobState::Running)
+        .filter(|job| job.state == JobState::Running && !job.is_placing())
         .filter_map(|job| {
             let name = job.target.as_deref()?;
             match state.member(name) {
@@ -575,6 +586,53 @@ pub(crate) fn placing(state: &HubState) -> Vec<(String, String)> {
         .filter(|job| job.is_placing())
         .filter_map(|job| Some((job.job_id.clone(), job.target.clone()?)))
         .collect()
+}
+
+/// Return placing jobs to the queue when their member can no longer take a submission, so a
+/// dropped lease never receives the run. A stale or missing member qualifies; the attempt is
+/// counted so a run the old member may still have accepted under the previous submission key is
+/// never adopted by a second submission.
+pub(crate) fn requeue_placements(state: &mut HubState) -> Vec<Value> {
+    let live = state
+        .members
+        .iter()
+        .filter(|member| member.state != MemberState::Stale)
+        .map(|member| member.name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut requeued = Vec::new();
+    for job in state.jobs.iter_mut().filter(|job| job.is_placing()) {
+        let Some(member) = job.target.clone() else {
+            continue;
+        };
+        if live.contains(&member) {
+            continue;
+        }
+        // The submission the old member may have accepted uses the key the next retry would
+        // have reused; name it, then advance the attempt so a later submission cannot adopt it.
+        let abandoned = job.attempts.saturating_add(1);
+        let submission_key = format!("hub-{}-{abandoned}", job.job_id);
+        let run_id = job.run_id.clone();
+        job.state = JobState::Queued;
+        job.target = None;
+        job.run_id = None;
+        job.dispatched_at_ms = None;
+        job.error = Some(JobError::new(
+            JobErrorKind::SubmissionUnconfirmed,
+            format!(
+                "{member} was reconciled away while the job was placing; a run with submission \
+                 key {submission_key} may exist there, and the hub does not follow it"
+            ),
+        ));
+        job.attempts = abandoned;
+        requeued.push(json!({
+            "jobId": job.job_id,
+            "member": member,
+            "reason": super::pool::RECONCILED_STALE_LEASE,
+            "submissionKey": submission_key,
+            "runId": run_id,
+        }));
+    }
+    requeued
 }
 
 /// Mark jobs that were mid-placement when a daemon stopped as unconfirmed on their member, so

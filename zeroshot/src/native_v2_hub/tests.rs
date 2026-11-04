@@ -39,6 +39,8 @@ mod mcp;
 mod metrics;
 #[path = "tests/paths.rs"]
 mod paths;
+#[path = "tests/pool.rs"]
+mod pool;
 #[path = "tests/usage.rs"]
 mod usage;
 
