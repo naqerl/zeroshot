@@ -8,7 +8,7 @@ use super::args::{
     bool_prop, inline_json_prop, inline_object_prop, integer_prop, object_schema, optional_string,
     reject_unknown, string_array_prop, string_prop,
 };
-use super::host::{parse_cli, McpFailure, McpHost};
+use super::host::{TIMEOUT_CODE, parse_cli, McpFailure, McpHost};
 use super::super::hub::HubCommand;
 use super::super::{Cli, NativeV2CliCommand};
 
@@ -132,6 +132,13 @@ const TOOLS: &[Tool] = &[
         argv: hub_ps_argv,
     },
     Tool {
+        name: "hub_jobs",
+        cli: &["hub", "jobs"],
+        allowed: &["hub", "state", "label", "since", "limit"],
+        schema: hub_jobs_schema,
+        argv: hub_jobs_argv,
+    },
+    Tool {
         name: "hub_status",
         cli: &["hub", "status"],
         allowed: &["hub", "job"],
@@ -237,8 +244,6 @@ const HUB_SUBMIT_KEYS: &[&str] = &[
     "tag",
     "strategy",
     "label",
-    "wait",
-    "queue",
     "title",
     "input",
     "taskFrom",
@@ -341,6 +346,9 @@ pub(super) async fn call(host: &impl McpHost, params: &Value) -> Result<Value, M
     drop(materialized);
     match result {
         Ok(stdout) => Ok(tool_success(stdout)),
+        // A command timeout is a server failure rather than a tool verdict, so the caller gets a
+        // JSON-RPC error instead of a normal tool result it might mistake for the command's answer.
+        Err(failure) if failure.code == TIMEOUT_CODE => Err(failure),
         Err(failure) => Ok(tool_error(&failure)),
     }
 }
@@ -432,6 +440,9 @@ fn tool_matches(name: &str, command: &NativeV2CliCommand) -> bool {
         }
         ("hub_ps", NativeV2CliCommand::Hub(request)) => {
             matches!(request.command, HubCommand::Ps(_))
+        }
+        ("hub_jobs", NativeV2CliCommand::Hub(request)) => {
+            matches!(request.command, HubCommand::Jobs(_))
         }
         ("hub_status", NativeV2CliCommand::Hub(request)) => {
             matches!(request.command, HubCommand::Status { .. })
@@ -696,24 +707,6 @@ fn hub_prefix(map: &Map<String, Value>, subcommand: &[&str]) -> Result<Vec<Strin
     Ok(argv)
 }
 
-fn push_wait(argv: &mut Vec<String>, map: &Map<String, Value>) -> Result<(), McpFailure> {
-    match map.get("wait") {
-        None | Some(Value::Null) | Some(Value::Bool(false)) => Ok(()),
-        Some(Value::Bool(true)) => {
-            argv.push("--wait".to_owned());
-            Ok(())
-        }
-        Some(Value::String(duration)) => {
-            argv.push("--wait".to_owned());
-            argv.push(duration.clone());
-            Ok(())
-        }
-        Some(_) => Err(McpFailure::invalid(
-            "wait must be a boolean or a duration string",
-        )),
-    }
-}
-
 fn push_probe(argv: &mut Vec<String>, map: &Map<String, Value>) -> Result<(), McpFailure> {
     match map.get("probe") {
         None | Some(Value::Null) | Some(Value::Bool(true)) => Ok(()),
@@ -806,6 +799,15 @@ fn hub_ps_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFailure> {
     Ok(argv)
 }
 
+fn hub_jobs_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFailure> {
+    let mut argv = hub_prefix(map, &["jobs"])?;
+    push_opt(&mut argv, map, "state", "--state")?;
+    push_repeat(&mut argv, map, "label", "--label")?;
+    push_opt(&mut argv, map, "since", "--since")?;
+    push_u64(&mut argv, map, "limit", "--limit")?;
+    Ok(argv)
+}
+
 fn hub_status_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFailure> {
     let mut argv = hub_prefix(map, &["status"])?;
     if let Some(job) = optional_string(map, "job")? {
@@ -817,8 +819,6 @@ fn hub_status_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFailure> 
 fn hub_submit_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFailure> {
     let mut argv = hub_prefix(map, &["submit"])?;
     push_placement(&mut argv, map)?;
-    push_wait(&mut argv, map)?;
-    push_flag(&mut argv, map, "queue", "--queue")?;
     push_run_flags(
         &mut argv,
         map,
@@ -1176,6 +1176,39 @@ fn hub_ps_schema() -> Value {
     )
 }
 
+fn hub_jobs_schema() -> Value {
+    object_schema(
+        &[],
+        vec![
+            (
+                "hub",
+                string_prop("Hub context. Omit for ZEROSHOT_HUB, then the current context."),
+            ),
+            (
+                "state",
+                string_prop(
+                    "Job state filter: active, queued, scheduled, running, succeeded, failed, \
+                     dequeued, or all. Defaults to all.",
+                ),
+            ),
+            (
+                "label",
+                string_array_prop("Only jobs carrying every listed KEY=VALUE label."),
+            ),
+            (
+                "since",
+                string_prop(
+                    "Only jobs created at or after this time: a duration such as 24h, or a timestamp.",
+                ),
+            ),
+            (
+                "limit",
+                integer_prop("Page size, newest first. Defaults to 20."),
+            ),
+        ],
+    )
+}
+
 fn hub_job_properties(extra: Vec<(&'static str, Value)>) -> Vec<(&'static str, Value)> {
     let mut properties = vec![
         (
@@ -1210,18 +1243,6 @@ fn hub_logs_schema() -> Value {
 
 fn hub_submit_schema() -> Value {
     let mut properties = placement_properties();
-    properties.push((
-        "wait",
-        json!({
-            "description": "Wait for a free member. true waits without a limit; \
-                a string is a duration such as 10m.",
-            "oneOf": [{"type": "boolean"}, {"type": "string"}]
-        }),
-    ));
-    properties.push((
-        "queue",
-        bool_prop("Queue the job when every matching member is busy."),
-    ));
     properties.extend(
         run_properties()
             .into_iter()

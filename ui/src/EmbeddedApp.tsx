@@ -99,7 +99,7 @@ function useHostedServices(configuration?: WorkspaceInit, host?: WorkspaceBridge
       .then((bootstrap) => {
         if (controller.signal.aborted) return;
         if (
-          bootstrap.workspace.kind !== 'cloud' ||
+          bootstrap.workspace.kind !== 'platform' ||
           bootstrap.workspace.id !== configuration.workspaceId
         )
           throw new ApiError(

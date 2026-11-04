@@ -1,13 +1,14 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, State};
@@ -23,17 +24,27 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::LocalSet;
 
-use super::host::McpHost;
+use super::host::{McpHost, OffloadedHost};
 use super::serve::{self, Action, SessionState};
 
 const MAX_BODY: usize = 16 * 1024 * 1024;
 const SESSION_HEADER: HeaderName = HeaderName::from_static("mcp-session-id");
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Default budget for one CLI command; `ZEROSHOT_MCP_COMMAND_TIMEOUT_MS` overrides it.
+const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+const COMMAND_TIMEOUT_ENV: &str = "ZEROSHOT_MCP_COMMAND_TIMEOUT_MS";
 
-struct Job {
-    session: Option<String>,
-    message: Value,
-    reply: oneshot::Sender<JobReply>,
+enum Job {
+    Message {
+        session: Option<String>,
+        message: Value,
+        reply: oneshot::Sender<JobReply>,
+        cancel: oneshot::Receiver<()>,
+    },
+    Delete {
+        session: String,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 struct JobReply {
@@ -52,6 +63,76 @@ struct HttpState {
     jobs: mpsc::UnboundedSender<Job>,
 }
 
+/// In-flight MCP job accounting exposed by the hub health document.
+///
+/// Job start times live behind one small lock so the health reader can report both the count
+/// and the age of the oldest job, which is what distinguishes a stuck command from an idle hub.
+#[derive(Default)]
+pub struct McpStats {
+    next: AtomicU64,
+    starts: StdMutex<BTreeMap<u64, u64>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct McpActivity {
+    pub in_flight: usize,
+    pub oldest_age_ms: Option<u64>,
+}
+
+impl McpStats {
+    fn begin(&self) -> u64 {
+        let id = self.next.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        let now = epoch_ms();
+        if let Ok(mut starts) = self.starts.lock() {
+            starts.insert(id, now);
+        }
+        id
+    }
+
+    fn finish(&self, id: u64) {
+        if let Ok(mut starts) = self.starts.lock() {
+            starts.remove(&id);
+        }
+    }
+
+    #[must_use]
+    pub fn activity(&self) -> McpActivity {
+        let now = epoch_ms();
+        let Ok(starts) = self.starts.lock() else {
+            return McpActivity::default();
+        };
+        McpActivity {
+            in_flight: starts.len(),
+            oldest_age_ms: starts
+                .values()
+                .min()
+                .map(|started| now.saturating_sub(*started)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_flight(&self) -> usize {
+        self.activity().in_flight
+    }
+}
+
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+fn command_timeout() -> Duration {
+    std::env::var(COMMAND_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_COMMAND_TIMEOUT)
+}
+
 /// The mounted MCP router plus the worker that answers its requests.
 ///
 /// The host is `!Send`, so [`McpServer::spawn`] owns a dedicated thread with a current-thread
@@ -60,6 +141,7 @@ struct HttpState {
 pub struct McpServer {
     stop: Option<oneshot::Sender<()>>,
     worker: Option<std::thread::JoinHandle<()>>,
+    stats: Arc<McpStats>,
 }
 
 impl McpServer {
@@ -68,11 +150,22 @@ impl McpServer {
     where
         H: McpHost + 'static,
     {
-        let (jobs, stop, worker) = spawn_worker(host)?;
+        Self::spawn_with_timeout(host, command_timeout())
+    }
+
+    /// Start the worker with an explicit per-command budget.
+    pub(crate) fn spawn_with_timeout<H>(host: H, timeout: Duration) -> io::Result<(Router, Self)>
+    where
+        H: McpHost + 'static,
+    {
+        let stats = Arc::new(McpStats::default());
+        let (jobs, stop, worker) = spawn_worker(host, timeout, Arc::clone(&stats))?;
         let router = Router::new()
             .route(
                 "/mcp",
-                post(mcp_handler).layer(DefaultBodyLimit::max(MAX_BODY)),
+                post(mcp_handler)
+                    .delete(mcp_delete_handler)
+                    .layer(DefaultBodyLimit::max(MAX_BODY)),
             )
             .with_state(HttpState { jobs });
         Ok((
@@ -80,8 +173,15 @@ impl McpServer {
             Self {
                 stop: Some(stop),
                 worker: Some(worker),
+                stats,
             },
         ))
+    }
+
+    /// In-flight job accounting, shared with the hub health endpoint.
+    #[must_use]
+    pub fn stats(&self) -> Arc<McpStats> {
+        Arc::clone(&self.stats)
     }
 
     /// Stop the worker and wait for its sessions to shut down.
@@ -166,21 +266,51 @@ async fn mcp_handler(State(state): State<HttpState>, headers: HeaderMap, body: B
     }
 }
 
+async fn mcp_delete_handler(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    let Some(session) = session_id(&headers) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let (reply, response) = oneshot::channel();
+    if state.jobs.send(Job::Delete { session, reply }).is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    match response.await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+struct RequestCancel(Option<oneshot::Sender<()>>);
+
+impl Drop for RequestCancel {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
+
 async fn request_reply(
     state: &HttpState,
     session: Option<String>,
     message: Value,
 ) -> Result<JobReply, ()> {
     let (reply, response) = oneshot::channel();
+    let (cancel, cancelled) = oneshot::channel();
+    let guard = RequestCancel(Some(cancel));
     state
         .jobs
-        .send(Job {
+        .send(Job::Message {
             session,
             message,
             reply,
+            cancel: cancelled,
         })
         .map_err(|_| ())?;
-    response.await.map_err(|_| ())
+    let result = response.await.map_err(|_| ());
+    drop(guard);
+    result
 }
 
 fn json_response(value: Value, session: Option<&str>) -> Response {
@@ -241,6 +371,8 @@ fn session_id(headers: &HeaderMap) -> Option<String> {
 
 fn spawn_worker<H>(
     host: H,
+    timeout: Duration,
+    stats: Arc<McpStats>,
 ) -> io::Result<(
     mpsc::UnboundedSender<Job>,
     oneshot::Sender<()>,
@@ -269,7 +401,7 @@ where
                 let local = LocalSet::new();
                 local
                     .run_until(async move {
-                        let host = Rc::new(host);
+                        let host = Rc::new(OffloadedHost::new(host, timeout));
                         let feed = Rc::new(super::events::HubFeed::new());
                         let sessions: Sessions = Rc::new(RefCell::new(HashMap::new()));
                         let _ = ready.send(Ok(()));
@@ -280,12 +412,64 @@ where
                                     let Some(job) = job else {
                                         break;
                                     };
-                                    let host = Rc::clone(&host);
-                                    let feed = Rc::clone(&feed);
-                                    let sessions = Rc::clone(&sessions);
-                                    tokio::task::spawn_local(async move {
-                                        process_job(&host, &feed, &sessions, job).await;
-                                    });
+                                    match job {
+                                        Job::Delete { session, reply } => {
+                                            let removed = sessions.borrow_mut().remove(&session);
+                                            let found = removed.is_some();
+                                            if let Some(entry) = removed {
+                                                entry.state.borrow_mut().shutdown();
+                                            }
+                                            let _ = reply.send(found);
+                                        }
+                                        Job::Message { session, message, reply, cancel } => {
+                                            let resolved = match resolve_session(&sessions, session, &message) {
+                                                Ok(resolved) => resolved,
+                                                Err(SessionError::Required) => {
+                                                    let _ = reply.send(JobReply {
+                                                        session: None,
+                                                        reply: session_required_reply(&message),
+                                                    });
+                                                    continue;
+                                                }
+                                                Err(SessionError::Unavailable) => {
+                                                    let _ = reply.send(JobReply {
+                                                        session: None,
+                                                        reply: WorkerReply::Message(serve::error_message(
+                                                            Value::Null,
+                                                            -32603,
+                                                            "Internal error",
+                                                            None,
+                                                        )),
+                                                    });
+                                                    continue;
+                                                }
+                                            };
+                                            let id = stats.begin();
+                                            let state = Rc::clone(&resolved.state);
+                                            let requests = request_ids(&message);
+                                            let host = Rc::clone(&host);
+                                            let feed = Rc::clone(&feed);
+                                            let guard = JobLease {
+                                                stats: Arc::clone(&stats),
+                                                id,
+                                            };
+                                            let reply_session = resolved.id;
+                                            let tracked = Rc::clone(&state);
+                                            let task = tokio::task::spawn_local(async move {
+                                                let _guard = guard;
+                                                tokio::select! {
+                                                    _ = cancel => {}
+                                                    value = process_request(&host, &feed, &state, &message) => {
+                                                        let _ = reply.send(JobReply {
+                                                            session: reply_session,
+                                                            reply: value,
+                                                        });
+                                                    }
+                                                }
+                                            });
+                                            tracked.borrow_mut().track_job(id, requests, task.abort_handle());
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -300,6 +484,34 @@ where
         Ok(Ok(())) => Ok((jobs, stop, worker)),
         Ok(Err(error)) => Err(io::Error::other(error)),
         Err(_) => Err(io::Error::other("MCP HTTP worker stopped during startup")),
+    }
+}
+
+struct JobLease {
+    stats: Arc<McpStats>,
+    id: u64,
+}
+
+impl Drop for JobLease {
+    fn drop(&mut self) {
+        self.stats.finish(self.id);
+    }
+}
+
+fn request_ids(message: &Value) -> Vec<String> {
+    match message {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.get("id"))
+            .filter(|id| serve::valid_id(id))
+            .map(serve::id_key)
+            .collect(),
+        _ => message
+            .get("id")
+            .filter(|id| serve::valid_id(id))
+            .map(serve::id_key)
+            .into_iter()
+            .collect(),
     }
 }
 
@@ -438,43 +650,6 @@ fn session_required_reply(message: &Value) -> WorkerReply {
         .filter(serve::valid_id)
         .unwrap_or(Value::Null);
     WorkerReply::Message(serve::error_message(id, -32600, "Invalid Request", data))
-}
-
-async fn process_job<H>(
-    host: &Rc<H>,
-    feed: &Rc<super::events::HubFeed>,
-    sessions: &Sessions,
-    job: Job,
-) where
-    H: McpHost + 'static,
-{
-    let resolved = match resolve_session(sessions, job.session, &job.message) {
-        Ok(resolved) => resolved,
-        Err(SessionError::Required) => {
-            let _ = job.reply.send(JobReply {
-                session: None,
-                reply: session_required_reply(&job.message),
-            });
-            return;
-        }
-        Err(SessionError::Unavailable) => {
-            let _ = job.reply.send(JobReply {
-                session: None,
-                reply: WorkerReply::Message(serve::error_message(
-                    Value::Null,
-                    -32603,
-                    "Internal error",
-                    None,
-                )),
-            });
-            return;
-        }
-    };
-    let reply = process_request(host, feed, &resolved.state, &job.message).await;
-    let _ = job.reply.send(JobReply {
-        session: resolved.id,
-        reply,
-    });
 }
 
 async fn process_request<H>(

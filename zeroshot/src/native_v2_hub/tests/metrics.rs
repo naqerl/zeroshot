@@ -8,7 +8,7 @@ use super::super::daemon::bind_loopback_metrics;
 use super::super::metrics::{Exposition, Histogram, Metrics, OTHER, VALUE_CAP, escape};
 use super::super::model::{HubState, JobState, Schedule, ScheduleState};
 use super::super::usage::{JobUsage, reported};
-use super::super::placement::{Load, Rejection};
+use super::super::placement::{Load, Reachability, Rejection};
 use super::super::service::HubService;
 use super::super::store::HubStore;
 use super::{FakeDriver, job, member};
@@ -247,7 +247,7 @@ fn record_activity(metrics: &Metrics) {
         (
             "a".to_owned(),
             Load {
-                reachable: true,
+                reachability: Reachability::Reachable,
                 active: 1,
                 error: None,
             },
@@ -255,7 +255,7 @@ fn record_activity(metrics: &Metrics) {
         (
             "b".to_owned(),
             Load {
-                reachable: false,
+                reachability: Reachability::Unreachable,
                 active: 0,
                 error: Some("down".to_owned()),
             },
@@ -436,6 +436,7 @@ async fn metrics_need_the_token_on_the_api_and_count_routes_by_template() {
         token: "t0ken".to_owned(),
         heartbeat: Arc::new(Mutex::new(json!({}))),
         executable: None,
+        mcp: None,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

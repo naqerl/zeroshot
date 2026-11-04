@@ -1,3 +1,7 @@
+---
+description: "Observe durable run state in the browser or CLI, inspect node transcripts, reconnect to a run and stop work without changing its history."
+---
+
 # Observe and control runs
 
 Run state persists when an observation client leaves, and reconnecting does not change the run
@@ -101,9 +105,9 @@ must be idle while they are restored.
 
 Local and Docker targets deduplicate checkpoints in a private Restic repository beside their run
 storage and advertise `openengine.workspace-checkpoints/v1`. They retain that repository only for a
-failed recovery lineage and delete it after a successful run. Cloud exposes recovery through
+failed recovery lineage and delete it after a successful run. Platform exposes recovery through
 authenticated hosted run routes, so failed-run checkpoints remain available for 30 days after the
-original capsule is removed. Cloud resolves declared connections from their original references.
+original capsule is removed. Platform resolves declared connections from their original references.
 Direct-target resume reuses the original source connection authorization and resolves fresh values;
 export `GH_TOKEN` again when the run uses it for checkout or GitHub delivery.
 

@@ -51,7 +51,7 @@ matched a larger model's score at a median 58% of its cost. More examples on zer
 and [a research run](https://zeroshot.sh/#not-just-coding).
 
 The CLI is free and MIT licensed. Run locally, [self-host](#self-hosted-run-the-docker-target), or
-use [zeroshot Cloud](https://cloud.zeroshot.sh/docs).
+use [Zeroshot Platform](https://app.zeroshot.sh/docs).
 
 <div align="center">
   <a href="https://zeroshot.sh/#topology">
@@ -160,10 +160,10 @@ A failed run with a recoverable workspace can be
 
 For other harnesses and providers, see [Runtimes and connections](docs/concepts/runtimes-and-connections.md).
 
-### Run in the cloud
+### Run on Zeroshot Platform
 
 Connect GitHub and bring your own model API keys.
-[Cloud setup guide →](https://cloud.zeroshot.sh/docs)
+[Platform setup guide →](https://app.zeroshot.sh/docs)
 
 ## Build your own graph
 
@@ -234,7 +234,7 @@ zeroshot run \
 
 The CLI and UI share the same local profiles. See
 [UI setup](docs/getting-started/install.md#open-the-workspace-ui). For shared team configurations,
-see [organization profiles](https://cloud.zeroshot.sh/docs/connections-and-profiles).
+see [organization profiles](https://app.zeroshot.sh/docs/connections-and-profiles).
 
 ## What the built-in workflow does
 
@@ -289,7 +289,7 @@ ignore it.
 
 Push needs a committed Git checkout and an HTTPS or SSH remote. PR and ship additionally need a
 forge adapter; GitHub is maintained today. Local GitHub PR and ship runs also need the GitHub CLI
-(`gh`) on `PATH`. Docker and cloud runs require an exact Git source.
+(`gh`) on `PATH`. Docker and Platform runs require an exact Git source.
 See [targets and source credentials](docs/concepts/targets.md) for setup.
 
 ### Self-hosted: run the Docker target
@@ -310,6 +310,31 @@ The target also serves its profile editor and run viewer at `http://127.0.0.1:80
 
 See the [target image guide](docker/zeroshot-target/README.md) for persistent storage, network
 isolation, builds, and HTTPS.
+
+## When the hub MCP hangs
+
+A hub daemon answers MCP on `POST /mcp` with the same bearer token as its other routes. If that
+endpoint stops answering while `GET /v1/hub/health` still returns `{"ok":true}`, check the health
+document's `mcp.inFlight` and `mcp.oldestAgeMs`: a stuck command shows up as a job that stays in
+flight for longer than its `ZEROSHOT_MCP_COMMAND_TIMEOUT_MS` budget (default two minutes). The
+daemon bounds every command, cancels work when its HTTP client disconnects, and aborts a session's
+streams and jobs on `DELETE /mcp`.
+
+For unattended restarts, install the user-scoped watchdog timer:
+
+```bash
+scripts/install-hub-watchdog.sh
+systemctl --user status zeroshot-hub-watchdog.timer
+```
+
+Its probe is a real JSON-RPC `tools/list` request, not `/v1/hub/health` or a bare TCP connect,
+because both of those still succeed when the MCP queue is jammed. `curl -m 8` enforces the probe
+deadline; a timeout or an empty answer counts as a failure (the expected `202` acknowledgement of
+the id-less probe is a success), two consecutive failures restart `zeroshot-hub.service`, and a
+`401` is never treated as a hang and never restarts anything. The
+units and probe live in `systemd/zeroshot-hub-watchdog.{service,timer}` and
+`scripts/hub-watchdog.sh`, and honor `ZEROSHOT_HUB_DIR`, `ZEROSHOT_HUB_MCP_URL`, and
+`ZEROSHOT_HUB_TOKEN_FILE` when the hub does not use the default folders.
 
 ## Community
 

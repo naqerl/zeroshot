@@ -1,0 +1,280 @@
+use super::*;
+
+#[async_trait]
+impl ClusterBackend for NativeV2PlatformController {
+    async fn initialize(
+        &self,
+        _context: &ConnectionContext,
+        _params: InitializeParams,
+    ) -> Result<InitializeResult, BackendError> {
+        let graph_profiles = GraphProfileSet::new(vec![GraphProfile::Full])
+            .map_err(|_| BackendError::new(INTERNAL_ERROR_CODE, "invalid capability set"))?;
+        Ok(InitializeResult::new(
+            ServerCapabilities {
+                graph_profiles,
+                logs: true,
+                agent_attach: true,
+            },
+            ClusterStatus::empty(),
+        ))
+    }
+
+    async fn get(
+        &self,
+        _context: &ConnectionContext,
+        _params: GetParams,
+    ) -> Result<GetResult, BackendError> {
+        Ok(GetResult::empty())
+    }
+
+    async fn run_submit(
+        &self,
+        _context: &ConnectionContext,
+        params: RunSubmitParams,
+    ) -> Result<RunSubmitResult, BackendError> {
+        let receipt = self.submit(params).await.map_err(platform_backend_error)?;
+        Ok(RunSubmitResult {
+            run_id: receipt.run_id,
+        })
+    }
+
+    async fn run_list(
+        &self,
+        _context: &ConnectionContext,
+        _params: RunListParams,
+    ) -> Result<RunListResult, BackendError> {
+        let summaries = self.list().await.map_err(platform_backend_error)?;
+        let mut runs = Vec::with_capacity(summaries.len());
+        for summary in summaries {
+            runs.push(
+                self.status(RunStatusParams {
+                    run_id: summary.run_id,
+                })
+                .await
+                .map_err(platform_backend_error)?,
+            );
+        }
+        Ok(RunListResult { runs })
+    }
+
+    async fn run_status(
+        &self,
+        _context: &ConnectionContext,
+        params: RunStatusParams,
+    ) -> Result<RunStatusResult, BackendError> {
+        self.status(params).await.map_err(platform_backend_error)
+    }
+
+    async fn run_watch(
+        &self,
+        _context: &ConnectionContext,
+        params: RunWatchParams,
+    ) -> Result<(RunWatchResult, RunWatchEventStream), BackendError> {
+        let (result, source) = self.watch(params).await.map_err(platform_backend_error)?;
+        Ok((result, RunSubscriptionStream::new(WatchSource(source))))
+    }
+
+    async fn run_logs(
+        &self,
+        _context: &ConnectionContext,
+        params: RunLogsParams,
+    ) -> Result<(RunLogsResult, RunLogEventStream), BackendError> {
+        let (result, source) = self.logs(params).await.map_err(platform_backend_error)?;
+        Ok((result, RunSubscriptionStream::new(LogsSource(source))))
+    }
+
+    async fn run_attach(
+        &self,
+        _context: &ConnectionContext,
+        params: RunAttachParams,
+    ) -> Result<(RunAttachResult, RunAttachEventStream), BackendError> {
+        let (result, source) = self.attach(params).await.map_err(platform_backend_error)?;
+        Ok((result, RunSubscriptionStream::new(AttachSource(source))))
+    }
+
+    async fn run_force(
+        &self,
+        _context: &ConnectionContext,
+        params: RunForceParams,
+    ) -> Result<RunForceResult, BackendError> {
+        self.force(params).await.map_err(platform_backend_error)
+    }
+
+    async fn run_checkpoints(
+        &self,
+        _context: &ConnectionContext,
+        params: openengine_cluster_protocol::RunCheckpointsParams,
+    ) -> Result<openengine_cluster_protocol::RunCheckpointsResult, BackendError> {
+        self.checkpoints(params)
+            .await
+            .map_err(platform_backend_error)
+    }
+
+    async fn run_resume(
+        &self,
+        _context: &ConnectionContext,
+        params: RunResumeParams,
+    ) -> Result<RunResumeResult, BackendError> {
+        self.resume(params).await.map_err(platform_backend_error)
+    }
+
+    async fn run_discard_workspace(
+        &self,
+        _context: &ConnectionContext,
+        params: RunDiscardWorkspaceParams,
+    ) -> Result<RunDiscardWorkspaceResult, BackendError> {
+        self.discard_workspace(params)
+            .await
+            .map_err(platform_backend_error)
+    }
+}
+
+struct WatchSource(RunWatchSubscription);
+
+#[async_trait]
+impl RunSubscriptionSource<RunWatchEventNotification> for WatchSource {
+    async fn next(&mut self) -> Option<RunSubscriptionItem<RunWatchEventNotification>> {
+        Some(durable_item(self.0.recv().await))
+    }
+}
+
+struct LogsSource(RunLogsSubscription);
+
+#[async_trait]
+impl RunSubscriptionSource<RunLogEventNotification> for LogsSource {
+    async fn next(&mut self) -> Option<RunSubscriptionItem<RunLogEventNotification>> {
+        Some(durable_item(self.0.recv().await))
+    }
+}
+
+fn durable_item<E>(result: Result<Option<E>, NativeV2ObservationError>) -> RunSubscriptionItem<E> {
+    match result {
+        Ok(Some(event)) => RunSubscriptionItem::Event(event),
+        Ok(None) => RunSubscriptionItem::Closed {
+            reason: SubscriptionCloseReason::Done,
+        },
+        Err(_) => RunSubscriptionItem::Closed {
+            reason: SubscriptionCloseReason::SourceUnavailable,
+        },
+    }
+}
+
+struct AttachSource(RunAttachSubscription);
+
+#[async_trait]
+impl RunSubscriptionSource<RunAttachEventNotification> for AttachSource {
+    async fn next(&mut self) -> Option<RunSubscriptionItem<RunAttachEventNotification>> {
+        match self.0.recv().await {
+            Ok(event) => Some(RunSubscriptionItem::Event(event)),
+            Err(NativeV2ObservationError::AttachLagged) => Some(RunSubscriptionItem::Closed {
+                reason: SubscriptionCloseReason::SlowConsumer,
+            }),
+            Err(_) => Some(RunSubscriptionItem::Closed {
+                reason: SubscriptionCloseReason::Done,
+            }),
+        }
+    }
+}
+
+fn platform_backend_error(error: NativeV2PlatformError) -> BackendError {
+    match error {
+        NativeV2PlatformError::Admission(error) => {
+            BackendError::invalid_params(GRAPH_INVALID, error.to_string(), None)
+        }
+        NativeV2PlatformError::Allocation(CapsuleAllocationUnavailable::SourceCheckout) => {
+            BackendError::application(
+                "source_checkout_unavailable",
+                "source checkout failed: repository access, branch, or revision is unavailable",
+                None,
+            )
+        }
+        NativeV2PlatformError::Ledger(RunLedgerError::SubmissionConflict { existing_run_id }) => {
+            BackendError::application(
+                IDEMPOTENCY_REUSE,
+                "submission key identifies another run",
+                Some(serde_json::json!({ "runId": existing_run_id })),
+            )
+        }
+        NativeV2PlatformError::Ledger(RunLedgerError::RunNotFound)
+        | NativeV2PlatformError::Observation(NativeV2ObservationError::RunNotFound) => {
+            BackendError::application(NOT_FOUND, "run was not found", None)
+        }
+        NativeV2PlatformError::Observation(NativeV2ObservationError::ExecutionNotFound) => {
+            BackendError::application(NOT_FOUND, "execution was not found", None)
+        }
+        NativeV2PlatformError::Observation(
+            NativeV2ObservationError::ExecutionNotActive
+            | NativeV2ObservationError::ExecutionNotLive,
+        ) => BackendError::application(GONE, "execution is no longer active", None),
+        NativeV2PlatformError::Observation(NativeV2ObservationError::Ledger(
+            RunLedgerError::Storage | RunLedgerError::SqliteStorage(_) | RunLedgerError::Corrupt,
+        )) => BackendError::application(
+            "SOURCE_UNAVAILABLE",
+            "durable run history is unavailable",
+            None,
+        ),
+        _ => BackendError::new(INTERNAL_ERROR_CODE, "native-v2 operation failed"),
+    }
+}
+
+pub(crate) fn submission_digest(
+    submission: &RunSubmission,
+) -> Result<Sha256Digest, NativeV2PlatformError> {
+    let bytes =
+        serde_json::to_vec(submission).map_err(|_| NativeV2PlatformError::SubmissionIdentity)?;
+    Sha256Digest::new(format!("{:x}", Sha256::digest(bytes)))
+        .map_err(|_| NativeV2PlatformError::SubmissionIdentity)
+}
+
+pub(super) async fn append_interrupted(
+    ledger: &dyn RunLedger,
+    stored: &StoredRun,
+    reason: &str,
+) -> Result<(), RunLedgerError> {
+    let Some(primary) = &stored.snapshot.primary_graph else {
+        return append_terminal_failure(ledger, stored, reason).await;
+    };
+    if stored.snapshot.terminal.is_some() {
+        return Ok(());
+    }
+    let mut events = Vec::new();
+    if primary.auxiliary_pending {
+        // Preserve observed counts, but a lost controller cannot account for every billed turn.
+        events.push(RunEvent::RunTokenUsageObserved { usage: None });
+        events.push(RunEvent::SafeLog {
+            execution: None,
+            timestamp: crate::native_v2_runner::current_timestamp(),
+            stream: crate::v2_run_ledger::SafeLogStream::System,
+            line: crate::v2_run_ledger::SafeLogLine::new(
+                "Active Memory postmortem interrupted before finalization; primary graph result preserved; auxiliary token usage is incomplete",
+            )?,
+            diagnostic: None,
+        });
+    }
+    events.extend(crate::native_v2_supervisor::logging::terminal_events(
+        primary.result.clone(),
+    )?);
+    ledger.append(&stored.snapshot.run_id, events).await?;
+    Ok(())
+}
+
+pub(super) async fn append_terminal_failure(
+    ledger: &dyn RunLedger,
+    stored: &StoredRun,
+    reason: &str,
+) -> Result<(), RunLedgerError> {
+    if stored.snapshot.terminal.is_some() {
+        return Ok(());
+    }
+    let events = crate::native_v2_supervisor::logging::terminal_failure_events(
+        &stored.snapshot,
+        reason,
+        WorkerErrorCode::Crash,
+    )?;
+    ledger.append(&stored.snapshot.run_id, events).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "backend/backend_error_tests.rs"]
+mod backend_error_tests;

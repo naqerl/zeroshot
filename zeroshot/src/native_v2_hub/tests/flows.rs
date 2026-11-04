@@ -7,9 +7,9 @@ use serde_json::{Value, json};
 #[cfg(unix)]
 use zeroshot_engine::native_v2_cli::hub::HubLogs;
 use zeroshot_engine::native_v2_cli::hub::{
-    HubApiOptions, HubCommand, HubContextCommand, HubDaemonRun, HubEnqueue, HubInstall, HubJobSpec,
-    HubManager, HubMemberAdd, HubMemberState, HubMemberUpdate, HubPs, HubStats, HubStrategy,
-    HubSubmit, HubUninstall,
+    HubApiOptions, HubCommand, HubContextCommand, HubDaemonRun, HubEnqueue, HubInstall,
+    HubJobHistory, HubJobSpec, HubManager, HubMemberAdd, HubMemberState, HubMemberUpdate, HubPs,
+    HubStats, HubStrategy, HubSubmit, HubUninstall,
 };
 
 use super::super::api::{ApiState, metrics_router, router};
@@ -59,6 +59,7 @@ pub(super) async fn hub_with(driver: FakeDriver, executable: Option<PathBuf>) ->
         token: TOKEN.to_owned(),
         heartbeat: Arc::new(Mutex::new(json!({"schema": "zeroshot.hub.daemon/v1"}))),
         executable,
+        mcp: None,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -122,13 +123,8 @@ pub(super) fn spec(folder: &Path, title: &str, target: Option<&str>) -> HubJobSp
     }
 }
 
-fn submit(job: HubJobSpec, queue: bool, wait: Option<Option<String>>) -> HubCommand {
-    HubCommand::Submit(Box::new(HubSubmit {
-        job,
-        detach: true,
-        wait,
-        queue,
-    }))
+fn submit(job: HubJobSpec) -> HubCommand {
+    HubCommand::Submit(Box::new(HubSubmit { job, detach: true }))
 }
 
 fn add(name: &str, slots: u32) -> HubCommand {
@@ -140,6 +136,21 @@ fn add(name: &str, slots: u32) -> HubCommand {
     })
 }
 
+fn jobs(state: &str, labels: &[&str], since: Option<&str>, limit: Option<usize>) -> HubCommand {
+    HubCommand::Jobs(HubJobHistory {
+        state: state.to_owned(),
+        labels: labels
+            .iter()
+            .map(|label| {
+                let (key, value) = label.split_once('=').expect("key=value label");
+                (key.to_owned(), value.to_owned())
+            })
+            .collect(),
+        since: since.map(str::to_owned),
+        limit,
+    })
+}
+
 fn ps(state: &str) -> HubCommand {
     HubCommand::Ps(HubPs {
         state: state.to_owned(),
@@ -147,6 +158,145 @@ fn ps(state: &str) -> HubCommand {
         labels: Vec::new(),
         limit: None,
     })
+}
+
+/// Job history is the durable progress and terminal record of every job: newest first, filtered
+/// by state, label and creation time, and an empty page for a filter that matches nothing.
+#[tokio::test]
+async fn job_history_pages_newest_first_and_filters() {
+    let hub = hub_with(FakeDriver::default(), None).await;
+    let client = &hub.client;
+    let empty = run(client, jobs("all", &[], None, None))
+        .await
+        .expect("empty history");
+    assert_eq!(empty["schema"], json!("zeroshot.hub.job-history/v1"));
+    assert_eq!(empty["jobs"], json!([]), "no jobs is an empty page");
+    assert_eq!(empty["returned"], json!(0));
+    assert_eq!(empty["limit"], json!(20));
+    let unmatched = run(client, jobs("all", &["eval.role=judge"], None, None))
+        .await
+        .expect("unmatched filter");
+    assert_eq!(
+        unmatched["jobs"],
+        json!([]),
+        "a filter with no match is no error"
+    );
+
+    let now = super::super::clock::now_ms();
+    let day = 86_400_000_u64;
+    hub.service
+        .mutate(|state| {
+            let mut failed = super::job("hj_failed", now.saturating_sub(2 * day));
+            failed.state = JobState::Failed;
+            failed
+                .labels
+                .insert("eval.role".to_owned(), "judge".to_owned());
+            failed.pinned_revision = Some("b".repeat(40));
+            failed.attempts = 2;
+            failed.last_cursor = Some("v2:42".to_owned());
+            failed.last_cursor_at_ms = Some(now.saturating_sub(day));
+            failed.finished_at_ms = Some(now.saturating_sub(day));
+            failed.failure_reason = Some("target_lost".to_owned());
+            failed.failure_classification = Some("provider_confirmed_absent".to_owned());
+            let mut running = super::job("hj_running", now.saturating_sub(3_600_000));
+            running.state = JobState::Running;
+            running.attempts = 1;
+            running.last_cursor = Some("v2:7".to_owned());
+            running.last_cursor_at_ms = Some(now.saturating_sub(60_000));
+            let mut queued = super::job("hj_queued", now.saturating_sub(60_000));
+            queued.state = JobState::Queued;
+            state.jobs.push(failed);
+            state.jobs.push(running);
+            state.jobs.push(queued);
+            Ok(())
+        })
+        .await
+        .expect("seed jobs");
+
+    let page = run(client, jobs("all", &[], None, None))
+        .await
+        .expect("history page");
+    let order = page["jobs"]
+        .as_array()
+        .expect("jobs")
+        .iter()
+        .map(|job| job["jobId"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(order, ["hj_queued", "hj_running", "hj_failed"], "{page}");
+    for job in page["jobs"].as_array().expect("jobs") {
+        assert!(job.get("runArgs").is_none(), "history omits run arguments");
+        assert!(job["createdAt"].is_string(), "{job}");
+        assert!(job["updatedAt"].is_string(), "{job}");
+        assert!(job["labels"].is_object(), "{job}");
+    }
+    let failed = &page["jobs"][2];
+    assert_eq!(failed["state"], json!("failed"));
+    assert_eq!(failed["failureReason"], json!("target_lost"), "{failed}");
+    assert_eq!(failed["pinnedRevision"], json!("b".repeat(40)));
+    assert_eq!(failed["attempts"], json!(2));
+    assert_eq!(failed["lastCursor"], json!("v2:42"));
+    assert!(
+        failed.get("failureClassification").is_none(),
+        "history names the failed observation through its reason and state"
+    );
+    assert!(
+        page["jobs"][0].get("failureReason").is_none(),
+        "a live job has no failure reason"
+    );
+    let running = &page["jobs"][1];
+    assert_eq!(running["lastCursor"], json!("v2:7"));
+    assert_eq!(
+        running["updatedAt"],
+        json!(super::super::clock::rfc3339(now.saturating_sub(60_000))),
+        "a running job is updated by its newest cursor"
+    );
+
+    let succeeded = run(client, jobs("succeeded", &[], None, None))
+        .await
+        .expect("state filter");
+    assert_eq!(succeeded["jobs"], json!([]));
+    let failing = run(client, jobs("failed", &[], None, None))
+        .await
+        .expect("failed filter");
+    assert_eq!(failing["returned"], json!(1));
+    assert_eq!(failing["jobs"][0]["jobId"], json!("hj_failed"));
+
+    let labelled = run(client, jobs("all", &["eval.role=judge"], None, None))
+        .await
+        .expect("label filter");
+    assert_eq!(labelled["returned"], json!(1));
+    assert_eq!(labelled["jobs"][0]["jobId"], json!("hj_failed"));
+    assert_eq!(
+        labelled["filters"]["labels"],
+        json!([["eval.role", "judge"]])
+    );
+
+    let recent = run(client, jobs("all", &[], Some("24h"), None))
+        .await
+        .expect("since filter");
+    let recent_ids = recent["jobs"]
+        .as_array()
+        .expect("jobs")
+        .iter()
+        .map(|job| job["jobId"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(recent_ids, ["hj_queued", "hj_running"], "{recent}");
+    assert!(recent["filters"]["since"].is_string(), "{recent}");
+
+    let newest = run(client, jobs("all", &[], None, Some(1)))
+        .await
+        .expect("limited page");
+    assert_eq!(newest["limit"], json!(1));
+    assert_eq!(newest["returned"], json!(1));
+    assert_eq!(newest["jobs"][0]["jobId"], json!("hj_queued"));
+
+    let invalid = expect_code(
+        client,
+        jobs("nonsense", &[], None, None),
+        "hub.invalid_request",
+    )
+    .await;
+    assert!(invalid.to_string().contains("--state"), "{invalid:?}");
 }
 
 #[tokio::test]
@@ -271,12 +421,9 @@ async fn removing_a_member_with_a_placed_job_is_refused_and_names_the_job() {
     let hub = hub_with(FakeDriver::default(), None).await;
     let client = &hub.client;
     run(client, add("local", 1)).await.expect("add local");
-    let placed = run(
-        client,
-        submit(spec(hub.directory.path(), "placed", None), false, None),
-    )
-    .await
-    .expect("submit");
+    let placed = run(client, submit(spec(hub.directory.path(), "placed", None)))
+        .await
+        .expect("submit");
     let job_id = placed["job"]["jobId"].as_str().expect("job id").to_owned();
     assert_eq!(placed["job"]["state"], json!("running"));
     assert_eq!(placed["job"]["target"], json!("local"));
@@ -321,7 +468,7 @@ async fn unreachable_members_probe_as_unreachable() {
 }
 
 #[tokio::test]
-async fn submissions_place_queue_wait_and_refuse_through_the_api() {
+async fn submissions_place_and_refuse_through_the_api() {
     let hub = hub_with(FakeDriver::default(), None).await;
     let client = &hub.client;
     let folder = hub.directory.path();
@@ -329,15 +476,11 @@ async fn submissions_place_queue_wait_and_refuse_through_the_api() {
 
     let mut keyed = spec(folder, "first", None);
     keyed.submission_key = Some("first-key".to_owned());
-    let placed = run(client, submit(keyed.clone(), false, None))
-        .await
-        .expect("submit");
+    let placed = run(client, submit(keyed.clone())).await.expect("submit");
     assert_eq!(placed["job"]["state"], json!("running"));
     assert_eq!(placed["job"]["target"], json!("local"));
     let job_id = placed["job"]["jobId"].as_str().expect("job id").to_owned();
-    let again = run(client, submit(keyed, false, None))
-        .await
-        .expect("same key");
+    let again = run(client, submit(keyed)).await.expect("same key");
     assert_eq!(
         again["job"]["jobId"],
         json!(job_id),
@@ -345,32 +488,17 @@ async fn submissions_place_queue_wait_and_refuse_through_the_api() {
     );
     assert_eq!(hub.driver.submissions.lock().expect("lock").len(), 1);
 
-    // The only slot is taken: no capacity, queue it, or wait for one.
+    // The only slot is taken: submit cannot place it now.
     let busy = expect_code(
         client,
-        submit(spec(folder, "second", None), false, None),
+        submit(spec(folder, "second", None)),
         "hub.no_capacity",
     )
     .await;
     assert_eq!(busy.exit_code(), super::super::error::EXIT_NO_CAPACITY);
-    let queued = run(client, submit(spec(folder, "third", None), true, None))
-        .await
-        .expect("queue");
-    assert_eq!(queued["job"]["state"], json!("queued"));
-    let waited = run(
-        client,
-        submit(
-            spec(folder, "fourth", None),
-            false,
-            Some(Some("1s".to_owned())),
-        ),
-    )
-    .await
-    .expect_err("no slot frees up");
-    assert!(matches!(waited, HubError::WaitTimeout(_)), "{waited:?}");
     expect_code(
         client,
-        submit(spec(folder, "elsewhere", Some("box")), false, None),
+        submit(spec(folder, "elsewhere", Some("box"))),
         "hub.no_eligible_target",
     )
     .await;
@@ -404,20 +532,10 @@ async fn submissions_place_queue_wait_and_refuse_through_the_api() {
     .await
     .expect("finished");
     assert_eq!(finished["job"]["state"], json!("succeeded"), "{finished}");
-    let queued_status = run(
-        client,
-        HubCommand::Status {
-            job: queued["job"]["jobId"].as_str().expect("id").to_owned(),
-        },
-    )
-    .await
-    .expect("queued status");
-    assert_eq!(queued_status["run"], Value::Null);
-
     let dispatched = run(client, HubCommand::Dispatch).await.expect("dispatch");
     assert!(dispatched.is_object(), "{dispatched}");
     let all = run(client, ps("all")).await.expect("ps all");
-    assert!(all["jobs"].as_array().expect("jobs").len() >= 2, "{all}");
+    assert!(!all["jobs"].as_array().expect("jobs").is_empty(), "{all}");
     let limited = run(
         client,
         HubCommand::Ps(HubPs {
@@ -591,6 +709,7 @@ async fn stats_validate_dimensions_and_price_tables_on_the_client() {
 async fn machine_local_commands_are_refused_through_a_context() {
     let hub = hub_with(FakeDriver::default(), None).await;
     let api = HubApiOptions {
+        hetzner_token_file: None,
         listen: None,
         token_file: None,
         metrics_listen: None,
@@ -659,7 +778,6 @@ async fn uploads_must_name_a_file_argument_of_the_run() {
     job.cwd = hub.directory.path().to_path_buf();
     let body = json!({
         "job": job,
-        "queue": true,
         "files": [{"argument": "elsewhere.json", "content": "{}"}],
     });
     let response = reqwest::Client::new()
@@ -694,6 +812,7 @@ async fn the_metrics_listener_serves_only_metrics() {
         token: TOKEN.to_owned(),
         heartbeat: Arc::new(Mutex::new(json!({}))),
         executable: None,
+        mcp: None,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -743,12 +862,9 @@ async fn observations_stream_the_target_command_and_its_exit_code() {
     let hub = hub_with(FakeDriver::default(), Some(echo_executable(folder.path()))).await;
     let client = &hub.client;
     run(client, add("local", 2)).await.expect("add");
-    let placed = run(
-        client,
-        submit(spec(hub.directory.path(), "observed", None), false, None),
-    )
-    .await
-    .expect("submit");
+    let placed = run(client, submit(spec(hub.directory.path(), "observed", None)))
+        .await
+        .expect("submit");
     let job = placed["job"]["jobId"].as_str().expect("job").to_owned();
     for command in [
         HubCommand::Watch {
@@ -781,8 +897,6 @@ async fn observations_stream_the_target_command_and_its_exit_code() {
         HubCommand::Submit(Box::new(HubSubmit {
             job: follow,
             detach: false,
-            wait: Some(None),
-            queue: false,
         })),
         &mut output,
     )
@@ -812,7 +926,7 @@ async fn an_unstartable_observer_reports_exit_1() {
     run(&hub.client, add("local", 1)).await.expect("add");
     let placed = run(
         &hub.client,
-        submit(spec(hub.directory.path(), "lost", None), false, None),
+        submit(spec(hub.directory.path(), "lost", None)),
     )
     .await
     .expect("submit");
@@ -892,7 +1006,7 @@ async fn placing_jobs_can_be_dequeued_through_the_api_and_are_never_adopted() {
     run(client, add("local", 1)).await.expect("add");
     let placing = run(
         client,
-        submit(spec(hub.directory.path(), "unanswered", None), false, None),
+        submit(spec(hub.directory.path(), "unanswered", None)),
     )
     .await
     .expect("an unconfirmed submission is not an error");

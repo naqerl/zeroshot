@@ -1,3 +1,7 @@
+---
+description: "Use the typed asynchronous zeroshot Python SDK with local, direct and hosted targets. Install a platform wheel and submit a run."
+---
+
 # Python SDK
 
 `the-open-engine-zeroshot` is a typed asynchronous client for local, direct, and named hosted
@@ -6,13 +10,14 @@ and engine on one release line.
 
 ## Install and run
 
-Download the wheel for your OS and CPU from [Python SDK releases](https://github.com/the-open-engine/zeroshot/releases?q=zeroshot-python-v).
-`x86_64` wheels target Intel/AMD CPUs; `arm64`/`aarch64` target ARM CPUs, including Apple silicon.
-Windows x64 uses `win_amd64`. Replace `WHEEL_FILE` with its local path:
+Install from PyPI with Python 3.11 or newer. Pip selects the wheel for your OS and CPU:
 
 ```console
-python -m pip install WHEEL_FILE
+python -m pip install the-open-engine-zeroshot
 ```
+
+Supported platforms are Linux x64/ARM64, macOS Intel/Apple silicon, and Windows x64.
+Import the package as `zeroshot`:
 
 ```python
 import asyncio
@@ -119,7 +124,7 @@ async def submit_release_plan() -> None:
         submission_key="checkout-release-1",
     )
 
-    async with Client(target=HostedTarget("cloud")) as client:
+    async with Client(target=HostedTarget("platform")) as client:
         plan = await client.submit_plan(request)
         status = await plan.wait(wait_timeout=21_600)
 
@@ -128,7 +133,7 @@ async def submit_release_plan() -> None:
 ```
 
 Submission is atomic, and every node receives a stable run ID. `needs` gates readiness only; plan
-nodes have no output interpolation or shared mutable input. After dependencies merge, Cloud
+nodes have no output interpolation or shared mutable input. After dependencies merge, Platform
 materializes the node against an exact source revision. When materialization completes, `readyAt`
 is set and the node's queue deadline is the earlier of plan expiry and seven days after `readyAt`.
 A merge conflict is repaired by the conflicting run itself in the same checkout and delivery loop.

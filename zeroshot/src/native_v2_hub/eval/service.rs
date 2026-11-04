@@ -593,12 +593,18 @@ impl HubService {
             last_cursor: None,
             last_cursor_at_ms: None,
             target_last_ok_at_ms: None,
+            reaper: None,
             finished_at_ms: None,
             failure_reason: None,
+            failure_classification: None,
             token_usage: None,
             error: None,
             schedule_id: None,
             output: None,
+            archive: None,
+            archive_skipped: None,
+            graph_hash: None,
+            pool_wait: None,
         })
     }
 

@@ -28,8 +28,9 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   profile UI. The UI is served by Rust and never needs a production Node server.
 - Canonical releases are explicit `vX.Y.Z` tags with major version 8 or newer.
 - The npm package is `@the-open-engine-company/zeroshot`.
-- That package owns the canonical `zeroshot` and `zeroshot-memory-init` skills and installs managed
-  copies for Codex, GitHub Copilot, Pi, and Claude Code at their user scopes. Do not fork skills by host.
+- That package owns the canonical `zeroshot`, `zeroshot-memory-init`, and `zeroshot-graph-design`
+  skills and installs managed copies for Codex, GitHub Copilot, Pi, and Claude Code at their user
+  scopes. Do not fork skills by host.
 - The target image is `ghcr.io/the-open-engine/zeroshot-target`.
 - The Python distribution is `the-open-engine-zeroshot`; its import package remains `zeroshot`.
 - Python SDK tags are `zeroshot-python-vZEROSHOT_SDK` and package versions are
@@ -52,7 +53,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 
 - Active Memory is host-owned opt-out state, separate from the checkout. Local CLI runs use one
   database under local state; direct targets use one persistent target-wide database with repository
-  scopes. Generic hosting embedders explicitly select a namespace; Cloud and ACP integration are
+  scopes. Generic hosting embedders explicitly select a namespace; Platform and ACP integration are
   not enabled implicitly. Runtime `activeMemory` independently controls repository and graph
   collection/recall; `globalAgents.postmortem` controls the built-in after-run agent and inherits an
   existing agent node's provider/model/connections. Four isolated verifier specialists separately maintain
@@ -227,7 +228,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   policy parser and `apply_permission_default` entry point; `PermissionPolicy` distinguishes unset,
   configured, and unavailable inspection results. Codex browser/computer access controls and explicit
   approval-review features count as authored policy.
-- The local target registry initializes `cloud` at `https://api.cloud.zeroshot.sh` with a persistent hosted device identity.
+- The local target registry initializes `platform` at `https://api.app.zeroshot.sh` with a persistent hosted device identity.
 - Local runs select an optional `--cwd` workspace, defaulting to the invoking folder. File arguments
   stay relative to the invoking folder. A Git checkout uses its canonical root; plain, unborn, and
   detached folders are allowed when the graph has no Git delivery. Workspace and active Zeroshot
@@ -401,7 +402,8 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   gateway lane must name its protocol through `GATEWAY_API`. Local validation remains authoritative
   and corrections stay bounded to two turns.
 - Copilot uses the pinned CLI's headless JSON-RPC protocol 3, with provider `github` and
-  caller-owned model IDs. Structured output and corrections share one session; node-instance
+  caller-owned model IDs. Remote session synchronization is disabled with `--sync-session off`.
+  Structured output and corrections share one session; node-instance
   revisits resume from the current user's `COPILOT_HOME` locally and a private home when contained.
   Local runs reuse stored Copilot login, host/auth endpoint settings, and supported custom-provider
   environment. Static custom-provider configuration and ambient or declared GitHub tokens cross
@@ -484,8 +486,8 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 - Hosted workspace recovery advertises `resume`, `checkpoints`, and `discard_workspace` in the
   separate `openengine.hosted-workspace-recovery/v1` outer discovery extension, leaving the strict
   `zeroshot.hosted-runs/v1` route object unchanged for older clients. POST bodies and results match
-  the OECP `Run*Params`/`Run*Result` types. These authenticated Cloud routes remain available after
-  capsule disposal. Cloud resolves the admitted connection references freshly; hosted recovery does
+  the OECP `Run*Params`/`Run*Result` types. These authenticated Platform routes remain available after
+  capsule disposal. Platform resolves the admitted connection references freshly; hosted recovery does
   not depend on local direct-target authorization or read local provider environment values.
   `ProductionHostingConfig` can accept host-owned `HostedWorkspaceStorage`; the allocator invokes
   it after source checkout and before provider dispatch, imports settled prerequisites, and
@@ -739,7 +741,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   services idempotently and keep live database state outside file checkpoint guarantees.
   Local runs reject hooks and use the invoking environment. Direct Docker setup modifies its
   operator-owned target container, shared by that target's runs; separate target containers are
-  needed for independent OS dependency sets. Cloud supplies its own disposable execution placement.
+  needed for independent OS dependency sets. Platform supplies its own disposable execution placement.
   Image-owned harness wrappers pin their Node interpreter independently of the project PATH.
 
 - Native local CLI and in-process execution support Unix and Windows. Shared OS facilities live in
@@ -769,7 +771,13 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   per-run leases before treating an in-process ACP owner without a controller socket as live.
   Ordinary runs retain run-scoped session keys.
 - The hub daemon (`zeroshot hub daemon run`) serves Streamable HTTP MCP on `POST /mcp` on its
-  normal API listener, behind the same bearer-token authorization as `/v1/hub/*`. The default
+  normal API listener, behind the same bearer-token authorization as `/v1/hub/*`. It runs every
+  host operation on its own command thread with a configurable
+  `ZEROSHOT_MCP_COMMAND_TIMEOUT_MS` budget, cancels the operation when its client disconnects or
+  `notifications/cancelled`/`events/unsubscribe` names it, and `DELETE /mcp` tears down the
+  session's streams and in-flight jobs. `/v1/hub/health` reports `mcp.inFlight` and
+  `mcp.oldestAgeMs`; `systemd/zeroshot-hub-watchdog.*` and `scripts/hub-watchdog.sh` probe a real
+  JSON-RPC request and never restart on 401. The default
   endpoint is `http://127.0.0.1:7383/mcp`, the token defaults to the hub folder's `api-token`, and
   the daemon heartbeat records the MCP URL as `mcp`. There is no standalone MCP command or process.
   Each tool builds the same command value as the CLI and runs it through the existing public or hub
@@ -785,9 +793,13 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   `hub.run.detail` name. A collapsed event carries `node`, `previousNode`, `phase`, `runCursor`,
   `lastCursorAt`, `cursorsSinceLastEvent`, `elapsedMsInNode`, `nodeChangedAt`, `terminal`, and
   `reason`, so one event plus the clock answers whether the run is moving. Occurrences keep the
-  flattened five-field envelope (`eventId`, `name`, `timestamp`, `data`, `_meta`); `summary`,
-  `replayed`, the carried kind in `data.kind`, and the hub `cursor` live inside `data`, while run
-  records retain their durable `v2:` cursor as `data.runCursor`. `replayed` is true only for records drained at subscribe time. Terminal events
+  flattened five-field
+  envelope (`eventId`, `name`, `timestamp`, `data`, `_meta`). The envelope `name` is always the
+  name the client subscribed with (`hub` when omitted), because MCP events clients route and
+  validate occurrences by it; the carried kind is `data.kind` (`hub.pool` records keep their
+  lease-or-pool discriminator as `data.scope`). `summary`, `replayed`, and the hub
+  `cursor` live inside `data`, while run records retain their durable `v2:` cursor as
+  `data.runCursor`. `replayed` is true only for records drained at subscribe time. Terminal events
   are ordinary events and heartbeats continue while idle; only unsubscribe, session end, or
   cancellation closes a stream. `events/poll` and `events/stream` both replay from the same hub
   log. `truncated` is false unless replay shortfall or backpressure permanently lost events, and
@@ -811,6 +823,9 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   so local validation and hosted rejection report the same cause.
 - Do not hand-edit `docs/zeroshot-cli.md` or `docs/zeroshot-cli.html`; regenerate with
   `cargo run -p zeroshot --example generate_cli_docs -- --write` and verify with `--check`.
+- Page descriptions live in Markdown front matter; generated reference descriptions live in
+  `scripts/docs_hook.py`. `docs/overrides/main.html` renders social metadata and breadcrumbs.
+  Fonts are self-hosted in `docs/assets/fonts/` with their licenses.
 - The public documentation site is the root `mkdocs.yml`. Python API pages are generated from the
   curated SDK exports and docstrings. Do not restore a second SDK-only MkDocs site.
 - Keep `docs/reference/python/*.md` out of Prettier; its Markdown formatter removes the indentation
@@ -871,10 +886,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   opt-in `hub daemon run --max-stall` persists each running job's watch cursor and cursor-change
   time, resets both when the cursor advances, and force-stops a run whose cursor stayed unchanged for
   the configured duration, failing it with reason and error kind `stalled`. Its heartbeat reports
-  the duration as `maxStallMs` (`null` when disabled). A job may override that budget for itself
-  with `--max-stall-ms` on `hub submit`/`hub enqueue`; the job value wins over the hub's
-  `--max-stall`, and the diagnostic and `hub status` name the effective limit and its source.
-  `hub dequeue` also removes placing jobs
+  the duration as `maxStallMs` (`null` when disabled). `hub dequeue` also removes placing jobs
   (`dequeued_while_placing`); a run the target accepts under their key is noted, never adopted. Jobs placing when a daemon stops stay on their member as unconfirmed. Hub-side job problems
   are a typed `JobError` (plain strings from older state load as `unclassified`). API errors carry the
   `zeroshot.error/v1` diagnostic plus `x-zeroshot-exit-code`; logs, watch, attach, and force-stop
@@ -900,6 +912,51 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   member, including when no job is due; a running job is failed as `target_lost` when its member
   disappears or remains unreachable for three consecutive probes, and removing a member with a
   placed job is refused with the job IDs.
+- Hub pools (`native_v2_hub/pool.rs` model and scaling, `lease.rs` per-pass lease steps,
+  `provision.rs` `Provisioner` trait plus cloud-init, `hetzner.rs` reqwest client, `tunnel.rs`
+  `ssh -N -L`, `archive.rs`) create Hetzner servers for queued jobs only a pool matches. An empty
+  pool is eligible, so such jobs queue rather than exit 4, and `hub submit` parks a job a pool
+  serves instead of failing as no-capacity. A lease steps one phase per pass:
+  Creating, Booting, Connecting, Active, Draining, Deleting, Done. A server is deleted only after
+  each of its runs is terminal, has its postmortem, and is archived to `hub/archive/JOB_ID/`. The
+  reaper (start, then every 5 min) deletes resources labelled `zeroshot/hub=ID` that state does not
+  own or that are past `zeroshot/expires`. Failed boots pause the pool (5 min doubling to 1 h).
+  A pool block also expires: its classified kind backs off quota/capacity/provider 1m, 2m, 5m,
+  15m, then every 30m, while auth/unknown waits 30m; a successful lease resets the schedule and
+  `hub pool resume` clears the block now. Only a refused create blocks the pool; rate limits,
+  timeouts and server errors keep the separate lease retry backoff.
+  `pool_events` records every lease and pool transition from the code that performs it: leases
+  report `requested`, `creating`, `booting`, `preparing`, `ready`, `in_use`, `idle`, `draining`,
+  `deleted`, or `failed` with `previousPhase`, and pools report `added`, `removed`, `paused`,
+  `resumed`, `blocked`, `shortage`; `blocked` also carries `blockedKind` and `blockedUntil`, one
+  event is recorded per block (never per suppressed attempt), and `resumed` covers an expiry or a
+  manual override. `removed` waits for every lease of the pool to be deleted.
+  Each pass reconciles a lease whose pool was removed and whose server the provider no longer lists
+  into `deleted` with its reason, failing any run still placing there with
+  `failureClassification: provider_confirmed_absent`; a live server, a lease in an existing pool, and
+  an inconclusive provider answer all leave the lease alone.
+  MCP publishes them as `hub.pool` events from `hub pool list`, so no caller polls for readiness. The
+  API token comes from `--hetzner-token-file` or `HCLOUD_TOKEN` and is never stored. Labels carry
+  IDs, server type and location only. The hub registers the pool's public key with the provider,
+  reuses an existing key by public key or MD5 fingerprint, attaches it to the server by key ID,
+  and also writes it plus a non-expiring login in user data; key-registration failures remain
+  distinct from server create/delete errors. No secret enters either. `data.rs` owns the btrfs
+  data folder: an automatically sized file on the server's local disk and the idempotent, strict
+  boot script (mkfs.btrfs, fstab, snapshot and reflink probe, then the target). `health.rs` is the
+  SSH check run in Connecting before registration; its failure is a failed boot, and a joined
+  member reports the observed `data: {fs: "btrfs", mode: "file", sizeBytes: N}` in `hub list` and
+  `hub pool list`. zeroshot itself needs only reflinks (`FICLONE`). Pools take
+  ordered `--type`/`--location` lists with no default type, checked against the provider catalog
+  (`cax*` needs `--multi-arch`). `profile.rs` owns tag profiles and resolves a job's machine
+  (`Spec`): job size tags (`server-type=`, `min-vcpu=`, `min-ram-gb=`), else the highest-ranked
+  profiled tag (priority, then vCPU, then memory; ties rejected at `tag set`), else the pool's
+  lists. `capacity.rs` owns catalog validation, candidate order, create-error classes, per-spec
+  shortages (30 s doubling to 10 min, separate from the boot pause), blocking (quota/invalid until
+  its expiry or `hub pool resume`) and `--wait-max`. `placement.rs` never places a tag-profile job
+  on an undersized member. Tests use the fake provisioner in `tests/pool.rs`,
+  `tests/pool_capacity.rs`, `tests/pool_blocked.rs`, `tests/pool_profiles.rs`, `tests/pool_data.rs`
+  and `tests/pool_health.rs`, and a local mock API in `tests/hetzner.rs`. Never call the real
+  API from tests.
 - `zeroshot/src/private_file.rs` owns owner-only file replacement for the shipped CLI: a random
   `create_new` sibling with mode `0600`, fsync, rename over the destination, and cleanup on failure,
   so readers never see a partial file and a link is replaced rather than written through. The target
@@ -944,9 +1001,11 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   `zeroshot hub install` and `zeroshot hub uninstall` change system services and need explicit
   user intent; prefer `--dry-run` first.
   The hub daemon also serves MCP on `POST /mcp`; it does not itself start a run. Its read-only tools
-  are `status`, `logs`, `watch`, `list`, `report`, `hub_list`, `hub_ps`, `hub_stats`, `hub_logs`,
-  and `hub_daemon_status`. `watch`, `logs`, and `hub_logs` follow until the stream ends; live run
-  events use the events extension. `run`, `resume`, `hub_submit`, and `hub_enqueue` submit work.
+  are `status`, `logs`, `watch`, `list`, `report`, `hub_list`, `hub_ps`, `hub_jobs`, `hub_stats`,
+  `hub_logs`, and `hub_daemon_status`; `hub_jobs` pages job history newest first by state, label,
+  and `since`. `watch`, `logs`, `hub_logs`, and `hub_watch` follow until the stream ends or the
+  MCP command budget expires (`mcp.timeout`, resumable with `after`); live run events use the
+  events extension. `run`, `resume`, `hub_submit`, and `hub_enqueue` submit work.
 - Destructive commands such as `zeroshot force-stop` require explicit user intent. The MCP
   `force-stop` tool is that command.
 
@@ -961,7 +1020,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 | CLI self-update               | `zeroshot/src/native_v2_cli/update.rs`                                                                                                                                                            |
 | Built-in templates            | `zeroshot/src/native_v2_templates.rs`, `zeroshot/src/native_v2_templates/`                                                                                                                        |
 | Local run composition         | `zeroshot/src/native_v2_local.rs`                                                                                                                                                                 |
-| Hosted/cloud composition      | `zeroshot/src/native_v2_cloud.rs`, `zeroshot/src/native_v2_hosting.rs`                                                                                                                            |
+| Hosted/platform composition   | `zeroshot/src/native_v2_platform.rs`, `zeroshot/src/native_v2_hosting.rs`                                                                                                                         |
 | Hosted merge plans            | `crates/openengine-cluster-protocol/src/native_v2_hosted/merge_plan.rs`, `zeroshot/src/native_v2_cli/execution/merge_plans.rs`, `zeroshot/src/native_v2_target/controller_authority/hosted_runs/` |
 | Portable controller           | `zeroshot/src/native_v2_portable_controller.rs`, `zeroshot/src/native_v2_portable_controller/`                                                                                                    |
 | Provider/delivery composition | `zeroshot/src/native_v2_candidate.rs`, `zeroshot/src/native_v2_candidate/`                                                                                                                        |
@@ -1020,6 +1079,8 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 - Drafts/layout are scoped to workspace identity. Saves acknowledge only their captured document
   generation; imports carry no foreign revision. Pending numeric text belongs to the document,
   survives inspector navigation, and commits only when valid. Navigation must preserve unsaved work.
+  Hosted workspaces use the `platform` kind with their existing opaque workspace IDs. The tag
+  rename starts a new browser storage namespace; earlier drafts and preferences are not imported.
 - The structured graph is canonical; React Flow/ELK provide presentation only. Flattening sequences
   or folding standard error routes must preserve scopes, identities, priority, conditions, and
   runtime bindings. Custom/unfamiliar routes stay visible. Layout and themes stay out of profiles.
@@ -1052,7 +1113,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 - `native_v2_observability::history` owns admitted definitions, bounded native pages and canonical
   control records without the `ui` feature. Its exported semantic validators are the single host
   boundary for definition identity/version, canonical contiguous cursors, page/control coherence,
-  and the reserved `runtime_failed`/`runtime_lost` failure metadata; UI and Cloud readers must reuse
+  and the reserved `runtime_failed`/`runtime_lost` failure metadata; UI and Platform readers must reuse
   them after wire decoding. Definitions contain bounded admission and terminal facts, never the
   accumulated execution snapshot; readers accept that legacy field only to strip it. Observer clones
   share its bounded projection cache.
@@ -1061,14 +1122,14 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   u64 IDs. SSE resumes after `Last-Event-ID` and drains through the terminal cursor before closing.
 - Private targets export capability-authenticated `POST /native-v2/history/definition` and
   `POST /native-v2/history/page` over their already-owned observer. Direct and hosted access modes
-  cannot use these private exports; Cloud applies per-run authorization before using its capability.
+  cannot use these private exports; Platform applies per-run authorization before using its capability.
   Request bodies carry run identity and cursor, keeping the target query surface unchanged.
 - Status reads query only an already-owned controller. Unpersisted runtime failure stays separate
   from durable snapshots/events and marks history incomplete. Missing authority drains retained
   history before an explicit error. Never invent completion; a durable terminal record takes precedence.
   History observation availability is separate from terminal run status: an available runtime failure
   can be emitted at the same cursor while following continues toward the final durable record.
-  Cloud may remain `collecting` through target/archive handoff; `finished` alone cannot end follow.
+  Platform may remain `collecting` through target/archive handoff; `finished` alone cannot end follow.
 - `run-history.ts` projects only the selected history prefix. Rust's canonical reducer supplies
   structural visits/decisions with source cursors and stable identities; JavaScript never evaluates
   guards or invents worker executions. Keep loop visits, retries, and Map items distinct. Projection
@@ -1092,7 +1153,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   `embed.html` mounts the same editor/viewer without standalone menus. Its version-1 bridge
   validates the parent window and exact origin, binds workspace authority, and correlates document
   generations and save snapshots. Host service URLs remain same-origin; optional CSRF configuration
-  carries cookie/header names only. Cloud owns menus, authentication, profile CAS and live/archive
+  carries cookie/header names only. Platform owns menus, authentication, profile CAS and live/archive
   adapters ([zero-cloud #301](https://github.com/the-open-engine/zero-cloud/issues/301)).
 - Shared fetch-based SSE preserves HTTP and stream problem codes, accepted execution cursors,
   bounded frame buffering and owned reader cancellation. A host source change must preserve the
@@ -1148,7 +1209,10 @@ python -m mkdocs build --strict
 ## Release convention
 
 - CI has native, Python, repository-tooling, npm-package, and strict-documentation lanes plus stable
-  aggregate `required`. Native changes also require macOS product and test compilation with the UI
+  aggregate `required`. On PRs, that aggregate waits for Greptile's latest review check on the exact
+  head to complete; findings remain review input for the worker rather than automatic CI failures.
+  Merge groups use the completed PR gate because Greptile does not review merge-group commits.
+  Native changes also require macOS product and test compilation with the UI
   feature, focused Unix controller socket regression tests, and APFS workspace clone tests that
   `ZEROSHOT_REQUIRE_APFS_CLONE` keeps from skipping. `.github/ci-path-classifier.js` owns
   fail-closed path routing and cross-lane
@@ -1171,7 +1235,10 @@ python -m mkdocs build --strict
   `@the-open-engine-company/zeroshot`, then invokes Python revision `1`.
 - Python revision `1` always produces its GitHub wheel release. PyPI publication is fail-closed by
   default and may be explicitly deferred with `publish_pypi: false`.
-- `.github/workflows/release-python.yml` may publish later SDK-only revisions.
+- The canonical release dispatches `.github/workflows/release-python.yml` on `main` as a standalone
+  run, binds the exact release commit/version and revision `1`, and waits for that returned run ID
+  before documentation. PyPI trusted publishing must remain in this standalone workflow, never in
+  a reusable workflow. The same entry point handles later SDK-only revisions and exact recovery.
 - `.github/workflows/docs.yml` publishes `main` as Current and canonical releases into `vX.Y/`
   after Python revision `1`; later SDK-only releases do not rebuild product documentation.
   The root always selects Current. Legacy `dev` and `stable` redirects stay outside the selector.

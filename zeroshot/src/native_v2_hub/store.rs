@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use fs2::FileExt;
 
 use super::error::HubError;
-use super::model::HubState;
+use super::model::{HubState, STATE_VERSION};
 use super::service::create_private_directory;
 
 const STATE_FILE: &str = "state.json";
@@ -88,8 +88,15 @@ impl HubStore {
     pub(crate) fn load(&self, _lock: &HubLock) -> Result<HubState, HubError> {
         let path = self.directory.join(STATE_FILE);
         match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
-                HubError::storage(&format!("{} is malformed", path.display()), error)
+            Ok(bytes) => migrate(&bytes).map_err(|error| match error {
+                Migration::Malformed(error) => {
+                    HubError::storage(&format!("{} is malformed", path.display()), error)
+                }
+                Migration::Newer(version) => HubError::Storage(format!(
+                    "{} has state version {version}, newer than this hub's {STATE_VERSION}; \
+                     upgrade zeroshot",
+                    path.display()
+                )),
             }),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HubState::default()),
             Err(error) => Err(HubError::storage("state could not be read", error)),
@@ -106,6 +113,71 @@ impl HubStore {
         create_private_directory(&self.directory)?;
         crate::private_file::replace(&self.directory.join(name), bytes)
             .map_err(|error| HubError::storage("state could not be replaced", error))
+    }
+}
+
+/// Why `state.json` could not be read as the current version.
+#[derive(Debug)]
+pub(crate) enum Migration {
+    Malformed(serde_json::Error),
+    /// Written by a newer hub; an older one must not drop fields it does not know.
+    Newer(u64),
+}
+
+/// Parse `state.json` of any supported version and upgrade it to [`STATE_VERSION`]. Version 1
+/// lacks pools, leases and job archives, which all default to empty, so its upgrade only bumps
+/// the version; strict field checking still applies to the result. Earlier version 2 files may
+/// carry removed pool data settings, lease TTL/expiry values, and lease Volume IDs, which are
+/// dropped here so they load and disappear on the next save.
+pub(crate) fn migrate(bytes: &[u8]) -> Result<HubState, Migration> {
+    let mut document: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(Migration::Malformed)?;
+    let version = document
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1);
+    if version > u64::from(STATE_VERSION) {
+        return Err(Migration::Newer(version));
+    }
+    drop_removed_fields(&mut document);
+    if let Some(object) = document.as_object_mut() {
+        object.insert("version".to_owned(), STATE_VERSION.into());
+    }
+    serde_json::from_value(document).map_err(Migration::Malformed)
+}
+
+/// Remove fields earlier version 2 files carry but this version no longer defines, from the
+/// pool, lease and member records only. A job's own `expiresAtMs` (from `--wait-max` or a
+/// schedule) remains.
+fn drop_removed_fields(document: &mut serde_json::Value) {
+    if let Some(pools) = document
+        .get_mut("pools")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for pool in pools {
+            if let Some(pool) = pool.as_object_mut() {
+                pool.remove("ttlMs");
+                pool.remove("data");
+            }
+        }
+    }
+    for key in ["leases", "members"] {
+        if let Some(records) = document
+            .get_mut(key)
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for record in records {
+                if let Some(record) = record.as_object_mut() {
+                    record.remove("expiresAtMs");
+                    if key == "leases" {
+                        record.remove("volumeId");
+                        if record.get("reason").and_then(serde_json::Value::as_str) == Some("ttl") {
+                            record.remove("reason");
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

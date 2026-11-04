@@ -144,6 +144,7 @@ pub(crate) async fn run_until<W: Write>(
     );
     let (mcp_router, mcp) = crate::mcp_host::spawn_production_mcp()
         .map_err(|error| HubError::storage("the MCP worker could not start", error))?;
+    let mcp_stats = mcp.stats();
     let manager = std::env::var(MANAGER_ENV).unwrap_or_else(|_| "foreground".to_owned());
     let mut heartbeat = json!({
         "schema": "zeroshot.hub.daemon/v1",
@@ -173,6 +174,7 @@ pub(crate) async fn run_until<W: Write>(
         token,
         heartbeat: shared.clone(),
         executable: None,
+        mcp: Some(mcp_stats),
     });
     let (stop, stopped) = tokio::sync::watch::channel(false);
     if let Some(metrics_listener) = metrics_listener {

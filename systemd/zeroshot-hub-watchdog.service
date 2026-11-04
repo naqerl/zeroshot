@@ -1,0 +1,10 @@
+[Unit]
+Description=Probe the Zeroshot hub MCP endpoint
+Documentation=https://github.com/the-open-engine/zeroshot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/lib/zeroshot/hub-watchdog.sh
+StateDirectory=zeroshot

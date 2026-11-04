@@ -489,7 +489,7 @@ where
     ) -> Result<RunConnectionRequirements, NativeV2CliError> {
         let target = self.target(name)?;
         if !matches!(target.access, TargetAccess::Direct) {
-            // Cloud resolves the admitted connection references with fresh hosted credentials.
+            // Platform resolves the admitted connection references with fresh hosted credentials.
             return Ok(RunConnectionRequirements::new());
         }
         let trusted = self

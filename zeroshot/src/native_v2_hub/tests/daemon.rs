@@ -278,6 +278,7 @@ async fn reads_do_not_wait_for_a_pass_blocked_on_a_slow_target() {
         target: None,
         labels: Vec::new(),
         limit: None,
+        since_ms: None,
     };
     let listed = tokio::time::timeout(std::time::Duration::from_secs(2), service.ps(query))
         .await
@@ -513,13 +514,14 @@ fn one_daemon_owns_a_hub_folder() {
 
 #[tokio::test]
 async fn the_daemon_serves_the_api_dispatches_and_stops_on_shutdown() {
-    use zeroshot_engine::native_v2_cli::hub::{HubDaemonRun, HubSubmit};
+    use zeroshot_engine::native_v2_cli::hub::{HubDaemonRun, HubEnqueue, HubSubmit};
     let directory = tempfile::tempdir().expect("tempdir");
     let store = HubStore::new(directory.path().join("hub"));
     let token_file = directory.path().join("secrets").join("token");
     let options = HubDaemonRun {
         interval: "1s".to_owned(),
         api: HubApiOptions {
+            hetzner_token_file: None,
             listen: Some("127.0.0.1:0".to_owned()),
             token_file: Some(token_file.clone()),
             metrics_listen: Some("127.0.0.1:0".to_owned()),
@@ -565,21 +567,31 @@ async fn the_daemon_serves_the_api_dispatches_and_stops_on_shutdown() {
         )
         .await
         .expect("add");
-        // Queue more work than fits; the daemon's next pass places the queued job.
-        for title in ["first", "second"] {
-            super::super::client::execute(
-                &client,
-                zeroshot_engine::native_v2_cli::hub::HubCommand::Submit(Box::new(HubSubmit {
-                    job: super::flows::spec(&folder, title, None),
-                    detach: true,
-                    wait: None,
-                    queue: true,
-                })),
-                &mut output,
-            )
-            .await
-            .expect("submit");
-        }
+        // The first job takes the only slot; `enqueue` queues the second, which the
+        // daemon's next pass places.
+        super::super::client::execute(
+            &client,
+            zeroshot_engine::native_v2_cli::hub::HubCommand::Submit(Box::new(HubSubmit {
+                job: super::flows::spec(&folder, "first", None),
+                detach: true,
+            })),
+            &mut output,
+        )
+        .await
+        .expect("submit");
+        super::super::client::execute(
+            &client,
+            zeroshot_engine::native_v2_cli::hub::HubCommand::Enqueue(Box::new(HubEnqueue {
+                job: super::flows::spec(&folder, "second", None),
+                at: None,
+                cron: None,
+                cron_timezone: None,
+                priority: 0,
+            })),
+            &mut output,
+        )
+        .await
+        .expect("enqueue");
         let metrics = heartbeat["metricsListen"].as_str().expect("metrics listen");
         let scraped = reqwest::get(format!("http://{metrics}/metrics"))
             .await
@@ -663,6 +675,7 @@ async fn the_daemon_refuses_bad_options_before_serving() {
     let options = |interval: &str, listen: &str, metrics: Option<&str>| HubDaemonRun {
         interval: interval.to_owned(),
         api: HubApiOptions {
+            hetzner_token_file: None,
             listen: Some(listen.to_owned()),
             token_file: Some(directory.path().join("token")),
             metrics_listen: metrics.map(str::to_owned),
@@ -756,6 +769,7 @@ async fn install_and_uninstall_print_plans_on_dry_runs() {
         volumes: vec![PathBuf::from("/srv/repos")],
         interval: "5s".to_owned(),
         api: HubApiOptions {
+            hetzner_token_file: None,
             listen: None,
             token_file: Some(PathBuf::from("relative-token")),
             metrics_listen: None,
@@ -1037,6 +1051,7 @@ async fn the_daemon_reports_failing_passes_and_keeps_serving() {
     let options = HubDaemonRun {
         interval: "1s".to_owned(),
         api: HubApiOptions {
+            hetzner_token_file: None,
             listen: Some("127.0.0.1:0".to_owned()),
             token_file: Some(directory.path().join("token")),
             metrics_listen: None,

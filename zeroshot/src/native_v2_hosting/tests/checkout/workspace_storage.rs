@@ -29,7 +29,7 @@ impl HostedWorkspaceStorage for ExternalStorage {
         }
         fs::write(
             request.workspace.join("restored.txt"),
-            b"durable cloud bytes",
+            b"durable platform bytes",
         )?;
         Ok(HostedWorkspace {
             comment_publications: self.comment_publications.clone(),
@@ -48,6 +48,7 @@ impl HostedWorkspaceStorage for ExternalStorage {
                 },
             )),
             execution_seed: Vec::new(),
+            // Recovery keeps the historical identity even after the product rename.
             delivery_run_id: Some(RunId::new("original-cloud-delivery")),
         })
     }
@@ -70,7 +71,7 @@ async fn external_workspace_restore_precedes_dispatch_and_preserves_delivery_lin
         .join("workspace");
     assert_eq!(
         fs::read(workspace.join("restored.txt")).assert_value(),
-        b"durable cloud bytes"
+        b"durable platform bytes"
     );
     assert!(capsule.checkpoints.is_some());
     capsule
@@ -243,7 +244,7 @@ async fn dispatch_comment(
 struct QuietCommentPreparation;
 
 #[async_trait::async_trait]
-impl crate::native_v2_cloud::PreparationProgress for QuietCommentPreparation {
+impl crate::native_v2_platform::PreparationProgress for QuietCommentPreparation {
     async fn log(&self, _line: &str) -> Result<(), CapsuleAllocationUnavailable> {
         Ok(())
     }
@@ -258,12 +259,12 @@ async fn allocate_comment(fixture: &CheckoutFixture) -> AllocatedCapsule {
     .assert_value();
     let result = fixture
         .allocator
-        .allocate(crate::native_v2_cloud::CapsuleAllocationRequest {
+        .allocate(crate::native_v2_platform::CapsuleAllocationRequest {
             run_id: &fixture.run_id,
             admitted: &fixture.admitted,
             github_token: Some(CHECKOUT_TOKEN),
             git_credentials: None,
-            preparation: crate::native_v2_cloud::CapsulePreparation {
+            preparation: crate::native_v2_platform::CapsulePreparation {
                 environment,
                 progress: Arc::new(QuietCommentPreparation),
             },

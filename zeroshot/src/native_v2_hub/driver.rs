@@ -35,6 +35,9 @@ pub(crate) trait HubDriver: Send + Sync {
     }
     /// Capability kinds advertised by a named target's discovery document.
     async fn capabilities(&self, member: &str) -> Result<Vec<String>, HubError>;
+    /// Complete standard output of a read-only run command (`report`, `status`, `watch`,
+    /// `logs`) routed to `member`, for the archive kept before a pool server is deleted.
+    async fn capture(&self, member: &str, arguments: Vec<String>) -> Result<String, HubError>;
 }
 
 /// Delegates to this executable (or `ZEROSHOT_HUB_EXECUTABLE`) in a child process, so every hub
@@ -42,6 +45,8 @@ pub(crate) trait HubDriver: Send + Sync {
 pub(crate) struct ProcessDriver {
     executable: PathBuf,
     timeout: Duration,
+    /// Limit of one archive capture: a full watch or log replay of a finished run.
+    capture_timeout: Duration,
     registry: FileTargetRegistry,
     client: reqwest::Client,
 }
@@ -67,6 +72,7 @@ impl ProcessDriver {
         Ok(Self {
             executable,
             timeout,
+            capture_timeout: timeout.saturating_mul(10),
             registry: FileTargetRegistry::new(registry_path),
             client,
         })
@@ -76,6 +82,15 @@ impl ProcessDriver {
         &self,
         arguments: Vec<String>,
         cwd: Option<&PathBuf>,
+    ) -> Result<String, HubError> {
+        self.call_within(arguments, cwd, self.timeout).await
+    }
+
+    async fn call_within(
+        &self,
+        arguments: Vec<String>,
+        cwd: Option<&PathBuf>,
+        timeout: Duration,
     ) -> Result<String, HubError> {
         let mut command = Command::new(&self.executable);
         command
@@ -89,7 +104,7 @@ impl ProcessDriver {
             command.current_dir(cwd);
         }
         let operation = arguments.first().cloned().unwrap_or_default();
-        let output = tokio::time::timeout(self.timeout, command.output())
+        let output = tokio::time::timeout(timeout, command.output())
             .await
             .map_err(|_| HubError::Unanswered(format!("zeroshot {operation} timed out")))?
             .map_err(|error| {
@@ -208,6 +223,12 @@ impl HubDriver for ProcessDriver {
             .await
             .map_err(|error| target_error(format!("discovery {url} is not JSON: {error}"), None))?;
         Ok(discovery_capabilities(&document))
+    }
+
+    async fn capture(&self, member: &str, mut arguments: Vec<String>) -> Result<String, HubError> {
+        arguments.extend(route(member));
+        self.call_within(arguments, None, self.capture_timeout)
+            .await
     }
 }
 

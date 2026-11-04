@@ -614,21 +614,17 @@ fn a_verifier_channel_fills_absent_output_and_signals_with_contract_defaults() {
 }
 
 #[test]
-fn an_absent_verifier_diagnostic_stays_absent_and_fails_the_inner_contract() {
+fn an_absent_verifier_diagnostic_takes_the_declared_null_default() {
     let contract = verifier_contract(PayloadType::Null, PayloadType::Null);
     let response =
         resolve_agent_response(&contract, r#"{"signals":{"verdict":"rejected"}}"#).assert_value();
-    let AgentResponse::Correction {
-        kind, diagnostic, ..
-    } = response
-    else {
-        panic!("an absent verifier diagnostic must remain absent");
-    };
-    assert_eq!(kind, AgentCorrectionKind::Contract);
-    assert!(
-        diagnostic.to_string().contains("diagnostic"),
-        "{diagnostic}"
-    );
+    assert!(matches!(
+        response,
+        AgentResponse::Complete(WorkerOutcome::Verifier {
+            diagnostic,
+            ..
+        }) if diagnostic == Value::Null
+    ));
 }
 
 #[test]
@@ -754,6 +750,35 @@ async fn three_format_corrections_do_not_consume_the_contract_budget() {
     ));
     assert_eq!(state.format_corrections, 3);
     assert_eq!(state.contract_corrections, 0);
+}
+
+#[tokio::test]
+async fn a_format_correction_with_a_model_controlled_nul_is_published_safely() {
+    let (_cancel, control, mut durable) = crate::native_v2_runner::test_support::control();
+    let mut state = AgentResponseState::new("initial prompt".to_owned());
+    let response = resolve_agent_response(&worker_contract(), r#"{"\u0000": 1}"#).assert_value();
+    assert!(matches!(
+        response,
+        AgentResponse::Correction {
+            kind: AgentCorrectionKind::Format,
+            ..
+        }
+    ));
+    assert!(
+        state
+            .accept("test", &control, response)
+            .await
+            .assert_value()
+            .is_none()
+    );
+    let record = durable.recv_output().await.assert_value();
+    assert_eq!(record.stream, LiveOutputStream::System);
+    assert!(!record.text.contains('\0'), "{}", record.text);
+    assert!(
+        record.text.contains("format correction 1/3"),
+        "{}",
+        record.text
+    );
 }
 
 #[tokio::test]

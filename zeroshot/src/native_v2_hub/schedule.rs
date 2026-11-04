@@ -8,15 +8,21 @@ use super::driver::{HubDriver, SubmitRequest};
 use super::error::HubError;
 use super::model::{HubState, Job, JobError, JobErrorKind, JobState, LOCAL_MEMBER, Member, MemberState};
 use super::usage::JobUsage;
-use super::placement::{Load, Placement, place};
+use super::placement::{Load, Placement, Reachability, place};
+#[cfg(test)]
+use super::pool::{self, PoolPhase};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
-/// Consecutive failed member probes, one per dispatcher interval, after which a job placed on
-/// that member is failed as `target_lost`. A single failed probe, or a member that flaps below
-/// this threshold, keeps the job running.
+/// Consecutive *decisive* unreachable member probes, one per dispatcher interval, after which a
+/// job placed on that member is considered for `target_lost`. A single failed probe, an
+/// inconclusive probe, or a member that flaps below this threshold keeps the job running.
 pub(crate) const UNREACHABLE_REAP_THRESHOLD: u32 = 3;
 /// Discovered capabilities are refreshed after this age by placement passes.
 pub(crate) const CAPABILITY_TTL_MS: u64 = 5 * 60 * 1000;
+/// A failed discovery backs off from one minute, doubling to half an hour, so a dead member is
+/// not probed on every pass while it stays registered.
+const CAPABILITY_RETRY_BASE_MS: u64 = 60 * 1000;
+const CAPABILITY_RETRY_MAX_MS: u64 = 30 * 60 * 1000;
 
 /// Outcome of one dispatcher pass.
 #[derive(Debug, Default)]
@@ -89,17 +95,17 @@ pub(crate) async fn probe(
         let result = tokio::time::timeout(PROBE_TIMEOUT, driver.list_runs(&member.name)).await;
         let load = match result {
             Ok(Ok(runs)) => Load {
-                reachable: true,
+                reachability: Reachability::Reachable,
                 active: active_runs(&runs),
                 error: None,
             },
             Ok(Err(error)) => Load {
-                reachable: false,
+                reachability: classify_probe_error(&error),
                 active: 0,
                 error: Some(error.to_string()),
             },
             Err(_) => Load {
-                reachable: false,
+                reachability: Reachability::Inconclusive,
                 active: 0,
                 error: Some("probe timed out".to_owned()),
             },
@@ -124,8 +130,54 @@ pub(crate) async fn probe(
     loads
 }
 
+/// Classify a failed probe. Only decisive transport evidence may count toward a member's
+/// failure streak; a timeout, rate limit, busy target, or rejected credential is inconclusive,
+/// since it says nothing about whether the member is still there.
+pub(crate) fn classify_probe_error(error: &HubError) -> Reachability {
+    let text = error.to_string().to_ascii_lowercase();
+    if [
+        "timed out",
+        "timeout",
+        "rate limit",
+        "rate_limit",
+        "rate_limited",
+        "too many requests",
+        " 429",
+        "busy",
+        "connection reset",
+        "connection aborted",
+        "temporarily unavailable",
+        "status_unavailable",
+        "authentication",
+        "unauthorized",
+        "forbidden",
+        "permission denied",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+    {
+        return Reachability::Inconclusive;
+    }
+    if [
+        "connection refused",
+        "no route to host",
+        "unknown host",
+        "name or service not known",
+        "nodename nor servname",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+    {
+        return Reachability::Unreachable;
+    }
+    // Anything else is not proof: keep the job running until a decisive signal, the provider,
+    // or a direct endpoint check confirms the member is gone.
+    Reachability::Inconclusive
+}
+
 /// Record load probes on members and on the jobs placed there. A successful probe resets the
-/// member's failure streak and refreshes the last success on the member and its running jobs.
+/// member's failure streak and refreshes the last success on the member and its running jobs;
+/// only decisive failures extend the streak.
 pub(crate) fn record_health(
     members: &mut [Member],
     jobs: &mut [Job],
@@ -136,31 +188,92 @@ pub(crate) fn record_health(
         let Some(load) = loads.get(&member.name) else {
             continue;
         };
-        if load.reachable {
-            member.unreachable_probes = 0;
-            member.last_probe_ok_at_ms = Some(now_ms);
-        } else {
-            member.unreachable_probes = member.unreachable_probes.saturating_add(1);
+        match load.reachability {
+            Reachability::Reachable => {
+                member.unreachable_probes = 0;
+                member.last_probe_ok_at_ms = Some(now_ms);
+            }
+            Reachability::Unreachable => {
+                member.unreachable_probes = member.unreachable_probes.saturating_add(1);
+            }
+            Reachability::Inconclusive => {}
         }
     }
     for job in jobs.iter_mut().filter(|job| job.state == JobState::Running) {
         let Some(target) = job.target.as_deref() else {
             continue;
         };
-        if loads.get(target).is_some_and(|load| load.reachable) {
+        if loads.get(target).is_some_and(Load::reachable) {
             job.target_last_ok_at_ms = Some(now_ms);
+            // A successful load probe says nothing about a failed status read. Keep that
+            // retryable warning until a later status read succeeds and clears it.
+            if !job
+                .error
+                .as_ref()
+                .is_some_and(|error| error.kind == JobErrorKind::StatusUnavailable)
+            {
+                job.reaper = None;
+            }
         }
     }
 }
 
-/// A running job whose member left the hub or stayed unreachable for too many probes.
+/// A completed `status` read is direct proof that the member is alive and still serving this
+/// job, so it must clear the same failure streak a successful load probe clears. Without this,
+/// a member that answers status but not `list` is reaped while the hub is actively observing it.
+pub(crate) fn record_target_health(state: &mut HubState, target: &str, now_ms: u64) {
+    if let Some(member) = state
+        .members
+        .iter_mut()
+        .find(|member| member.name == target)
+    {
+        member.unreachable_probes = 0;
+        member.last_probe_ok_at_ms = Some(now_ms);
+    }
+    for job in state
+        .jobs
+        .iter_mut()
+        .filter(|job| job.state == JobState::Running && job.target.as_deref() == Some(target))
+    {
+        job.target_last_ok_at_ms = Some(now_ms);
+        if !job
+            .error
+            .as_ref()
+            .is_some_and(|error| error.kind == JobErrorKind::StatusUnavailable)
+        {
+            job.reaper = None;
+        }
+    }
+}
+
+/// A running job whose member left the hub or failed too many decisive probes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LostTarget {
     pub job_id: String,
     pub member: String,
-    /// Consecutive failed probes; `None` when the member is no longer a hub member.
+    /// Consecutive decisive failures; `None` when the member is no longer a hub member.
     pub unreachable_probes: Option<u32>,
     pub last_probe_ok_at_ms: Option<u64>,
+    /// The deciding confirmation, such as a provider saying the pool server is gone.
+    pub evidence: Option<String>,
+    /// Which observation failed the job: `member_absent`, `provider_confirmed_absent`,
+    /// `endpoint_refused`, or `probe_unreachable`. Set with `evidence`, and recorded on the job
+    /// so its terminal record says what the hub actually saw.
+    pub classification: Option<&'static str>,
+}
+
+/// The decisive observations that fail a lost-target job by themselves.
+pub(crate) const CLASSIFIED_MEMBER_ABSENT: &str = "member_absent";
+pub(crate) const CLASSIFIED_PROVIDER_ABSENT: &str = "provider_confirmed_absent";
+pub(crate) const CLASSIFIED_ENDPOINT_REFUSED: &str = "endpoint_refused";
+pub(crate) const CLASSIFIED_STALLED: &str = "stalled";
+
+/// A lost-target candidate the reaper kept running, with the reason it withheld action.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WithheldTarget {
+    pub job_id: String,
+    pub member: String,
+    pub reason: String,
 }
 
 /// Running jobs that can no longer be observed because their member is gone or unreachable.
@@ -177,6 +290,8 @@ pub(crate) fn lost_targets(state: &HubState) -> Vec<LostTarget> {
                     member: name.to_owned(),
                     unreachable_probes: None,
                     last_probe_ok_at_ms: job.target_last_ok_at_ms,
+                    evidence: None,
+                    classification: Some(CLASSIFIED_MEMBER_ABSENT),
                 }),
                 Some(member) if member.unreachable_probes >= UNREACHABLE_REAP_THRESHOLD => {
                     Some(LostTarget {
@@ -186,6 +301,8 @@ pub(crate) fn lost_targets(state: &HubState) -> Vec<LostTarget> {
                         last_probe_ok_at_ms: member
                             .last_probe_ok_at_ms
                             .or(job.target_last_ok_at_ms),
+                        evidence: None,
+                        classification: None,
                     })
                 }
                 Some(_) => None,
@@ -219,22 +336,130 @@ pub(crate) fn settle_lost_targets(
             ),
             None => format!("{} is no longer a hub member ({last})", target.member),
         };
-        job.state = JobState::Failed;
-        job.finished_at_ms = Some(now_ms);
-        job.failure_reason = Some("target_lost".to_owned());
-        job.error = Some(JobError::new(
-            JobErrorKind::TargetLost,
-            format!("{detail}; the hub cannot observe or stop its run"),
+        let detail = match &target.evidence {
+            Some(evidence) => format!("{detail}; {evidence}"),
+            None => detail,
+        };
+        failed.push(fail_job(
+            job,
+            now_ms,
+            target.classification.unwrap_or("unclassified"),
+            detail,
         ));
-        failed.push(json!({
-            "jobId": job.job_id,
-            "state": job.display_state(now_ms),
-            "target": job.target,
-            "runId": job.run_id,
-            "reason": "target_lost",
-        }));
     }
     failed
+}
+
+/// Fail the runs still placing on a lease that the hub gave up: its pool was removed and the
+/// provider confirmed its server is gone, so nothing can observe, stop or archive them any more.
+pub(crate) fn settle_orphaned_lease(
+    jobs: &mut [Job],
+    now_ms: u64,
+    member: &str,
+    evidence: &str,
+) -> Vec<Value> {
+    let mut failed = Vec::new();
+    for job in jobs.iter_mut() {
+        if job.state != JobState::Running || job.target.as_deref() != Some(member) {
+            continue;
+        }
+        failed.push(fail_job(
+            job,
+            now_ms,
+            CLASSIFIED_PROVIDER_ABSENT,
+            format!("{evidence}; {member} is retired"),
+        ));
+    }
+    failed
+}
+
+/// Record one target-lost failure, naming the observation that decided it. `detail` explains
+/// what the hub saw; `classification` says which observation it was.
+fn fail_job(job: &mut Job, now_ms: u64, classification: &str, detail: String) -> Value {
+    job.reaper = None;
+    job.state = JobState::Failed;
+    job.finished_at_ms = Some(now_ms);
+    job.failure_reason = Some("target_lost".to_owned());
+    job.failure_classification = Some(classification.to_owned());
+    job.error = Some(JobError::new(
+        JobErrorKind::TargetLost,
+        format!("{detail}; the hub cannot observe or stop its run ({classification})"),
+    ));
+    json!({
+        "jobId": job.job_id,
+        "state": job.display_state(now_ms),
+        "target": job.target,
+        "runId": job.run_id,
+        "reason": "target_lost",
+        "classification": job.failure_classification,
+    })
+}
+
+/// The deciding observation when only a failed load probe proves a member is gone.
+#[cfg(test)]
+pub(crate) const CLASSIFIED_PROBE_UNREACHABLE: &str = "probe_unreachable";
+
+/// Keep only candidates whose current probe is decisive, or whose member already left. All
+/// others stay running with a reaper note naming why no action was taken.
+///
+/// The test-only [`tick`] uses this probe-only policy. Production `service::pass` uses the
+/// provider or direct-TCP confirmation of `service::confirm_lost_targets` instead.
+#[cfg(test)]
+pub(crate) fn confirm_lost_by_probe(
+    lost: Vec<LostTarget>,
+    loads: &BTreeMap<String, Load>,
+) -> (Vec<LostTarget>, Vec<WithheldTarget>) {
+    let mut confirmed = Vec::new();
+    let mut withheld = Vec::new();
+    for mut target in lost {
+        let Some(count) = target.unreachable_probes else {
+            confirmed.push(target);
+            continue;
+        };
+        match loads.get(&target.member) {
+            Some(load) if matches!(load.reachability, Reachability::Unreachable) => {
+                target.evidence = Some(format!(
+                    "the load probe could not connect to the member: {}",
+                    load.error.as_deref().unwrap_or("connection failed")
+                ));
+                target.classification = Some(CLASSIFIED_PROBE_UNREACHABLE);
+                confirmed.push(target);
+            }
+            Some(load) => withheld.push(WithheldTarget {
+                job_id: target.job_id,
+                member: target.member.clone(),
+                reason: format!(
+                    "{} probe after {count} failures was {}: inconclusive, job kept running",
+                    target.member,
+                    match load.reachability {
+                        Reachability::Reachable => "successful",
+                        Reachability::Unreachable | Reachability::Inconclusive => "inconclusive",
+                    }
+                ),
+            }),
+            None => withheld.push(WithheldTarget {
+                job_id: target.job_id,
+                member: target.member.clone(),
+                reason: format!(
+                    "{} was not probed after {count} failures: inconclusive, job kept running",
+                    target.member
+                ),
+            }),
+        }
+    }
+    (confirmed, withheld)
+}
+
+/// Record reaper notes on running jobs; `hub.warning` surfaces them.
+pub(crate) fn note_withheld(jobs: &mut [Job], withheld: &[WithheldTarget]) {
+    for note in withheld {
+        if let Some(job) = jobs.iter_mut().find(|job| job.job_id == note.job_id) {
+            if job.state == JobState::Running && job.target.as_deref() == Some(note.member.as_str())
+            {
+                job.reaper = Some(note.reason.clone());
+            }
+        }
+    }
 }
 
 /// Refresh discovery capabilities of named, non-disabled members older than `max_age_ms`.
@@ -250,9 +475,11 @@ pub(crate) async fn discover(
         .enumerate()
         .filter(|(_, member)| member.name != LOCAL_MEMBER && member.state != MemberState::Disabled)
         .filter(|(_, member)| {
-            member
-                .capabilities_at_ms
-                .is_none_or(|at| now_ms.saturating_sub(at) >= max_age_ms)
+            let retry_ready = member.capability_retry_at_ms.is_none_or(|at| now_ms >= at);
+            retry_ready
+                && member
+                    .capabilities_at_ms
+                    .is_none_or(|at| now_ms.saturating_sub(at) >= max_age_ms)
         })
         .map(|(index, member)| (index, member.name.clone()))
         .collect::<Vec<_>>();
@@ -268,11 +495,23 @@ pub(crate) async fn discover(
                 member.capabilities = Some(capabilities);
                 member.capabilities_at_ms = Some(now_ms);
                 member.capability_error = None;
+                member.capability_failures = 0;
+                member.capability_retry_at_ms = None;
             }
-            Ok(Err(error)) => member.capability_error = Some(error.to_string()),
-            Err(_) => member.capability_error = Some("discovery timed out".to_owned()),
+            Ok(Err(error)) => back_off_discovery(member, now_ms, error.to_string()),
+            Err(_) => back_off_discovery(member, now_ms, "discovery timed out".to_owned()),
         }
     }
+}
+
+fn back_off_discovery(member: &mut Member, now_ms: u64, error: String) {
+    member.capability_error = Some(error);
+    member.capability_failures = member.capability_failures.saturating_add(1);
+    let shift = member.capability_failures.saturating_sub(1).min(5);
+    let delay = CAPABILITY_RETRY_BASE_MS
+        .saturating_mul(1u64 << shift)
+        .min(CAPABILITY_RETRY_MAX_MS);
+    member.capability_retry_at_ms = Some(now_ms.saturating_add(delay));
 }
 
 /// Unconfirmed submissions a job may have before it fails, unless the daemon sets another
@@ -373,6 +612,9 @@ pub(crate) fn record_cursor(job: &mut Job, status: &Value, now_ms: u64) {
         .or_else(|| status.pointer("/status/atCursor"))
         .and_then(Value::as_str);
     let Some(cursor) = cursor else {
+        // A successful status read without a cursor still proves the run was observed, so it
+        // resets the stall clock without inventing a cursor value.
+        job.last_cursor_at_ms = Some(now_ms);
         return;
     };
     if job.last_cursor.as_deref() == Some(cursor) {
@@ -422,11 +664,22 @@ pub(crate) fn apply_refresh(
 ) -> Option<Value> {
     match result {
         Ok(status) => {
+            job.reaper = None;
+            if job
+                .error
+                .as_ref()
+                .is_some_and(|error| error.kind == JobErrorKind::StatusUnavailable)
+            {
+                job.error = None;
+            }
             record_cursor(job, &status, now_ms);
             apply_status(job, &status, now_ms);
             Some(status)
         }
         Err(error) => {
+            job.reaper = Some(format!(
+                "status probe was unavailable ({error}): job kept running"
+            ));
             job.error = Some(JobError::new(
                 JobErrorKind::StatusUnavailable,
                 error.to_string(),
@@ -489,6 +742,9 @@ pub(crate) fn apply_polls(
 ) -> Vec<Value> {
     let mut finished = Vec::new();
     for (poll, result) in results {
+        if result.is_ok() {
+            record_target_health(state, &poll.target, now_ms);
+        }
         let Some(job) = state.jobs.iter_mut().find(|job| {
             job.job_id == poll.job_id
                 && job.state == JobState::Running
@@ -516,6 +772,8 @@ pub(crate) fn merge_capabilities(members: &mut [Member], discovered: &[Member]) 
             member.capabilities.clone_from(&found.capabilities);
             member.capabilities_at_ms = found.capabilities_at_ms;
             member.capability_error.clone_from(&found.capability_error);
+            member.capability_failures = found.capability_failures;
+            member.capability_retry_at_ms = found.capability_retry_at_ms;
         }
     }
 }
@@ -765,6 +1023,7 @@ pub(crate) fn settle_stalled(jobs: &mut [Job], settlement: StallSettlement<'_>) 
         job.state = JobState::Failed;
         job.finished_at_ms = Some(now_ms);
         job.failure_reason = Some("stalled".to_owned());
+        job.failure_classification = Some(CLASSIFIED_STALLED.to_owned());
         job.error = Some(JobError::new(
             JobErrorKind::Stalled,
             format!("stalled: {detail}; the hub stopped it"),
@@ -820,14 +1079,21 @@ pub(crate) async fn tick(state: &mut HubState, driver: &dyn HubDriver, now_ms: u
     let members = state.members.iter().collect::<Vec<_>>();
     let mut loads = probe(&members, &state.jobs, driver).await;
     record_health(&mut state.members, &mut state.jobs, &loads, now_ms);
-    let lost = lost_targets(state);
+    let (lost, withheld) = confirm_lost_by_probe(lost_targets(state), &loads);
+    note_withheld(&mut state.jobs, &withheld);
     report.target_lost = settle_lost_targets(&mut state.jobs, now_ms, &lost);
     for (job_id, member) in placing(state) {
         if let Some(job) = state.jobs.iter_mut().find(|job| job.job_id == job_id) {
             let dispatched =
                 dispatch(job, &member, driver, (now_ms, DEFAULT_UNCONFIRMED_LIMIT)).await;
+            let placed = matches!(dispatched, Dispatched::Placed);
             let job = job.clone();
             record_dispatch(&mut report, &job, &dispatched);
+            if placed {
+                if let Some(member) = job.target.as_deref() {
+                    pool::record_member_phase(state, member, PoolPhase::InUse, now_ms);
+                }
+            }
         }
     }
     if due_jobs(&state.jobs, now_ms).is_empty() {
@@ -839,8 +1105,14 @@ pub(crate) async fn tick(state: &mut HubState, driver: &dyn HubDriver, now_ms: u
             continue;
         };
         let dispatched = dispatch(job, &member, driver, (now_ms, DEFAULT_UNCONFIRMED_LIMIT)).await;
+        let placed = matches!(dispatched, Dispatched::Placed);
         let job = job.clone();
         record_dispatch(&mut report, &job, &dispatched);
+        if placed {
+            if let Some(member) = job.target.as_deref() {
+                pool::record_member_phase(state, member, PoolPhase::InUse, now_ms);
+            }
+        }
     }
     report.loads = Some(loads);
     report

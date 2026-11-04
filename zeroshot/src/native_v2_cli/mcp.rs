@@ -6,7 +6,7 @@
 #[path = "mcp/args.rs"]
 mod args;
 #[path = "mcp/events.rs"]
-mod events;
+pub(crate) mod events;
 #[path = "mcp/host.rs"]
 mod host;
 #[path = "mcp/http.rs"]
@@ -21,4 +21,4 @@ mod tools;
 mod tests;
 
 pub use host::{McpFailure, McpHost, WatchStream};
-pub use http::{McpServer, serve_http, serve_http_listener};
+pub use http::{McpActivity, McpServer, McpStats, serve_http, serve_http_listener};

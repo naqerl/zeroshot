@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::model::{Job, MemberState, Schedule};
+use super::pool::Provider;
 
 /// `POST /v1/hub/members`.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -15,6 +16,51 @@ pub(crate) struct AddMember {
     pub slots: u32,
     #[serde(default)]
     pub priority: i32,
+}
+
+/// `POST /v1/hub/pools`. Paths are absolute paths on the hub host.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct AddPool {
+    pub name: String,
+    pub provider: Provider,
+    /// Server types, best first.
+    pub server_types: Vec<String>,
+    /// Locations, in order; empty means every location offering one of the types.
+    #[serde(default)]
+    pub locations: Vec<String>,
+    #[serde(default)]
+    pub multi_arch: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_max_ms: Option<u64>,
+    pub image: String,
+    pub target_image: String,
+    pub max: u32,
+    pub slots: u32,
+    pub idle_ms: u64,
+    pub tags: Vec<String>,
+    pub ssh_key: std::path::PathBuf,
+    pub ssh_from: Vec<String>,
+}
+
+/// `PUT /v1/hub/pools/{name}/tags/{tag}`: the machines a pool creates for jobs with a tag.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct SetTagProfile {
+    /// Server types, best first; empty means the pool's types that meet the minimum.
+    #[serde(default)]
+    pub server_types: Vec<String>,
+    /// Locations in order; empty means the pool's.
+    #[serde(default)]
+    pub locations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_cores: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_memory_gb: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slots: Option<u32>,
+    #[serde(default)]
+    pub priority: u32,
 }
 
 /// `PATCH /v1/hub/members/{name}`.
@@ -53,13 +99,11 @@ pub(crate) struct JobFile {
     pub content: String,
 }
 
-/// `POST /v1/hub/jobs`: place now; queue when busy only with `queue`.
+/// `POST /v1/hub/jobs`: place now.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct SubmitJob {
     pub job: Job,
-    #[serde(default)]
-    pub queue: bool,
     #[serde(default)]
     pub files: Vec<JobFile>,
 }
@@ -82,10 +126,11 @@ pub(crate) struct CreateSchedule {
     pub files: Vec<JobFile>,
 }
 
-/// `POST /v1/hub/jobs/query`.
+/// `POST /v1/hub/jobs/query` and `POST /v1/hub/jobs/history`.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct JobQuery {
+    /// A state filter (`active`, `queued`, ..., `all`), shared by `hub ps` and job history.
     pub state: String,
     #[serde(default)]
     pub target: Option<String>,
@@ -93,6 +138,10 @@ pub(crate) struct JobQuery {
     pub labels: Vec<(String, String)>,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Only jobs submitted at or after this instant; resolved by the client from `--since`.
+    /// Kept outside the listing shape so `ps` reads the same records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<u64>,
 }
 
 /// `POST /v1/hub/stats`. Times are already resolved by the client.

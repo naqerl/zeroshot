@@ -27,6 +27,11 @@ struct StreamCancel {
     handle: AbortHandle,
 }
 
+struct JobCancel {
+    requests: Vec<String>,
+    handle: AbortHandle,
+}
+
 struct StreamLease {
     active: Rc<Cell<usize>>,
     alive: Arc<AtomicBool>,
@@ -60,7 +65,11 @@ pub(super) struct StreamRequest<W> {
 pub(super) struct SessionState {
     initialized: bool,
     cancellations: HashMap<String, StreamCancel>,
+    jobs: HashMap<u64, JobCancel>,
     active_streams: Rc<Cell<usize>>,
+    /// Monotone per-session occurrence counter shared by `events/poll` calls, so a client
+    /// polling the same MCP session sees `sequence: 1, 2, 3...` across responses.
+    event_sequence: Rc<Cell<u64>>,
 }
 
 impl SessionState {
@@ -77,22 +86,61 @@ impl SessionState {
     }
 
     pub(super) fn reset_for_initialize(&mut self) {
-        self.shutdown();
+        // The initialize request is itself an in-flight job; resetting a session cancels its
+        // streams but must never abort the job that is answering the reset.
+        self.shutdown_streams();
         self.initialized = false;
     }
 
     pub(super) fn handle_notification(&mut self, message: &Value) {
-        handle_notification(message, &mut self.cancellations);
+        let Some(method) = message.get("method").and_then(Value::as_str) else {
+            return;
+        };
+        if method != "notifications/cancelled" {
+            return;
+        }
+        let Some(request_id) = message.pointer("/params/requestId") else {
+            return;
+        };
+        self.cancel_request(request_id);
     }
 
     pub(super) fn unsubscribe(&mut self, request_id: &Value) -> bool {
-        let Some(cancel) = self.cancellations.remove(&id_key(request_id)) else {
-            return false;
-        };
-        let stopped = cancel.alive.swap(false, Ordering::Relaxed);
-        cancel.flag.store(true, Ordering::Relaxed);
-        cancel.handle.abort();
+        self.cancel_request(request_id)
+    }
+
+    /// Cancel the stream or in-flight job answering this request id.
+    fn cancel_request(&mut self, request_id: &Value) -> bool {
+        let key = id_key(request_id);
+        let mut stopped = false;
+        if let Some(cancel) = self.cancellations.remove(&key) {
+            stopped = cancel.alive.swap(false, Ordering::Relaxed);
+            cancel.flag.store(true, Ordering::Relaxed);
+            cancel.handle.abort();
+        }
+        let jobs = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| job.requests.iter().any(|request| request == &key))
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for id in jobs {
+            if let Some(job) = self.jobs.remove(&id) {
+                if !job.handle.is_finished() {
+                    stopped = true;
+                }
+                job.handle.abort();
+            }
+        }
         stopped
+    }
+
+    pub(super) fn track_job(&mut self, id: u64, requests: Vec<String>, handle: AbortHandle) {
+        // Completed jobs are harmless but would accumulate for a long-lived session. Prune them
+        // whenever a new job is tracked; in-flight jobs remain cancellable for DELETE,
+        // notifications/cancelled, and events/unsubscribe.
+        self.jobs.retain(|_, job| !job.handle.is_finished());
+        self.jobs.insert(id, JobCancel { requests, handle });
     }
 
     pub(super) fn spawn_stream<W>(&mut self, request: StreamRequest<W>)
@@ -110,12 +158,24 @@ impl SessionState {
         self.active_streams.get() > 0
     }
 
-    pub(super) fn shutdown(&mut self) {
+    pub(super) fn event_sequence(&self) -> Rc<Cell<u64>> {
+        Rc::clone(&self.event_sequence)
+    }
+
+    fn shutdown_streams(&mut self) {
         for cancel in self.cancellations.values() {
             cancel.flag.store(true, Ordering::Relaxed);
             cancel.handle.abort();
         }
         self.cancellations.clear();
+    }
+
+    pub(super) fn shutdown(&mut self) {
+        self.shutdown_streams();
+        for job in self.jobs.values() {
+            job.handle.abort();
+        }
+        self.jobs.clear();
     }
 }
 
@@ -227,10 +287,13 @@ where
             Ok(result) => Action::Reply(result),
             Err(error) => event_failure(error),
         },
-        "events/poll" => match events::poll(host, feed, &params).await {
-            Ok(result) => Action::Reply(result),
-            Err(error) => event_failure(error),
-        },
+        "events/poll" => {
+            let sequence = session.borrow().event_sequence();
+            match events::poll(host, feed, &params, sequence.as_ref()).await {
+                Ok(result) => Action::Reply(result),
+                Err(error) => event_failure(error),
+            }
+        }
         "events/stream" => match events::prepare(host, feed, &params).await {
             Ok(prepared) => Action::Stream(Box::new(prepared)),
             Err(error) => event_failure(error),
@@ -254,22 +317,6 @@ where
             message: "Method not found",
             data: None,
         },
-    }
-}
-
-fn handle_notification(message: &Value, cancellations: &mut HashMap<String, StreamCancel>) {
-    let Some(method) = message.get("method").and_then(Value::as_str) else {
-        return;
-    };
-    if method != "notifications/cancelled" {
-        return;
-    }
-    let Some(request_id) = message.pointer("/params/requestId") else {
-        return;
-    };
-    if let Some(cancel) = cancellations.remove(&id_key(request_id)) {
-        cancel.flag.store(true, Ordering::Relaxed);
-        cancel.handle.abort();
     }
 }
 
@@ -323,7 +370,7 @@ pub(super) fn valid_id(id: &Value) -> bool {
     id.is_number() || id.is_string()
 }
 
-fn id_key(id: &Value) -> String {
+pub(super) fn id_key(id: &Value) -> String {
     serde_json::to_string(id).unwrap_or_default()
 }
 

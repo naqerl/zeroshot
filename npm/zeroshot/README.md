@@ -1,6 +1,11 @@
 # `@the-open-engine-company/zeroshot`
 
-Installer for the canonical `zeroshot` executable and agent skills. The package selects the release
+Zeroshot enforces your team's QA process on coding agents. You define the process as a graph:
+which agents implement, which reviewers and tests a change must pass, where failures go for repair,
+and where a run stops. Every task runs through it, and no agent can skip a step. It works with
+Codex, Claude Code, GitHub Copilot and Pi.
+
+This package is the installer for the canonical `zeroshot` executable and agent skills. The package selects the release
 archive for the current Node platform and architecture, verifies it against that release's
 `SHA256SUMS`, and installs the executable.
 
@@ -9,7 +14,8 @@ runtime configuration, targets, and CLI reference.
 
 The product site is [zeroshot.sh](https://zeroshot.sh/?utm_source=npm&utm_medium=readme&utm_campaign=zeroshot).
 
-The `zeroshot` and `zeroshot-memory-init` managed skills share one source each across hosts.
+The `zeroshot`, `zeroshot-memory-init`, and `zeroshot-graph-design` managed skills share one source
+each across hosts.
 They install for Codex, GitHub Copilot, and Pi at `$HOME/.agents/skills/<name>/SKILL.md`, and for
 Claude Code at `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/<name>/SKILL.md`. Reinstalling updates an unchanged
 managed copy. A conflicting or edited skill is preserved; installation fails with the exact path so

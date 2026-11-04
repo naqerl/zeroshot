@@ -1,3 +1,7 @@
+---
+description: "Current documentation follows main. Each release minor has its own documentation, updated to the latest patch with exact source provenance."
+---
+
 # Documentation versions
 
 **Current** follows `main` and is the default. It may describe changes that have not shipped yet.
@@ -71,7 +75,7 @@ redirect: GitHub Pages cannot redirect JSON clients with its HTML redirect pages
 an exact historical patch manifest must use the site's Git history. Do not treat a minor manifest
 as proof that the docs match an older patch exactly.
 
-## Linking from Zeroshot Cloud
+## Linking from Zeroshot Platform
 
 For a deployed product version `X.Y.Z`, fetch `vX.Y/manifest.json` and require schema 2. Confirm that
 `productVersion` belongs to the deployed major/minor line, then resolve a logical route against
@@ -80,7 +84,7 @@ Callers should label this as minor-version documentation and account for feature
 installed patch. Compare source commits only when the documented and deployed product versions match.
 
 If the minor has no docs, offer an explicitly labelled Current link. Current may contain unreleased
-behavior. Cloud owns instructions for accounts, organization policy, OAuth, GitHub Apps, and capacity;
+behavior. Platform owns instructions for accounts, organization policy, OAuth, GitHub Apps, and capacity;
 core graph, runtime, CLI, protocol, and SDK material stays here.
 
 ## Publication and recovery

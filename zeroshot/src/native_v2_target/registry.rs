@@ -99,6 +99,20 @@ impl FileTargetRegistry {
         }
         Ok(result)
     }
+
+    /// Register a direct target, as `zeroshot target add NAME --url URL --direct` does.
+    pub fn add_direct(&self, name: &str, url: &str) -> Result<(), TargetConnectorError> {
+        self.insert(prepare_target(TargetAdd {
+            name: name.to_owned(),
+            url: url.to_owned(),
+            direct: true,
+        })?)
+    }
+
+    /// Forget a target. Returns whether it was registered.
+    pub fn remove(&self, name: &str) -> Result<bool, TargetConnectorError> {
+        self.with_state(true, |state| Ok(state.targets.remove(name).is_some()))
+    }
 }
 
 impl TargetRegistry for FileTargetRegistry {
@@ -378,15 +392,15 @@ pub(super) fn lock_registry(lock: &File, exclusive: bool) -> Result<(), TargetCo
 
 fn initialize_registry(path: &Path) -> Result<(RegistryState, bool), TargetConnectorError> {
     let mut state = read_registry(path)?;
-    let missing_cloud = !state.targets.contains_key("cloud");
-    let initialized = state.version == LEGACY_REGISTRY_VERSION || missing_cloud;
-    if missing_cloud {
-        let cloud = prepare_target(TargetAdd {
-            name: "cloud".to_owned(),
-            url: "https://api.cloud.zeroshot.sh".to_owned(),
+    let missing_platform = !state.targets.contains_key("platform");
+    let initialized = state.version == LEGACY_REGISTRY_VERSION || missing_platform;
+    if missing_platform {
+        let platform = prepare_target(TargetAdd {
+            name: "platform".to_owned(),
+            url: "https://api.app.zeroshot.sh".to_owned(),
             direct: false,
         })?;
-        state.targets.insert(cloud.name.clone(), cloud);
+        state.targets.insert(platform.name.clone(), platform);
     }
     Ok((state, initialized))
 }

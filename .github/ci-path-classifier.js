@@ -56,9 +56,13 @@ const MULTI_LANE_PATHS = new Map([
   ['docs/zeroshot-cli.html', ['native', 'docs']],
   ['docs/zeroshot-cli.md', ['native', 'docs']],
   ['eslint.config.mjs', ['tooling', 'npm']],
+  // docs-agent-contract.test.js checks the package's product description and README.
+  ['npm/zeroshot/README.md', ['npm', 'docs']],
+  ['npm/zeroshot/package.json', ['npm', 'docs']],
   ['package-lock.json', ['tooling', 'npm']],
   ['package.json', ['tooling', 'npm']],
   ['scripts/distribution.js', ['native', 'npm']],
+  ['tests/tooling/docs-agent-contract.test.js', ['tooling', 'docs']],
   ['tests/tooling/distribution.test.js', ['npm']],
   ['tests/tooling/npm-package-install.test.js', ['npm']],
   ['tests/tooling/npm-shim.test.js', ['npm']],

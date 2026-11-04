@@ -42,6 +42,11 @@ pub enum HubCommand {
     Submit(Box<HubSubmit>),
     Enqueue(Box<HubEnqueue>),
     Ps(HubPs),
+    /// Job history: a newest-first page with each job's state, labels, pinned revision,
+    /// attempts, last durable cursor, timestamps, and terminal failure reason.
+    Jobs(HubJobHistory),
+    /// The same events the MCP subscription carries, as NDJSON.
+    Events(HubEvents),
     Status {
         job: String,
     },
@@ -75,6 +80,71 @@ pub enum HubCommand {
     Uninstall(HubUninstall),
     /// Evaluation suites, cases, runs, and reports.
     Eval(HubEvalCommand),
+    /// On-demand cloud server pools.
+    Pool(HubPoolCommand),
+}
+
+/// `hub pool`: on-demand cloud server pools whose servers become hub members.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HubPoolCommand {
+    Add(Box<HubPoolAdd>),
+    List,
+    Remove {
+        name: String,
+    },
+    /// List the provider's server types with prices.
+    Types,
+    /// Clear a blocked, capacity-waiting or boot-paused pool so it starts servers again.
+    Resume {
+        name: String,
+    },
+    /// Set the machines a pool creates for jobs with a tag.
+    TagSet(Box<HubPoolTag>),
+    /// List a pool's tag profiles.
+    TagList {
+        name: String,
+    },
+    /// Remove a tag profile; jobs with the tag fall back to the pool's types.
+    TagRemove {
+        name: String,
+        tag: String,
+    },
+}
+
+/// `hub pool tag set`: the machines a pool creates for jobs carrying `tag`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HubPoolTag {
+    pub pool: String,
+    pub tag: String,
+    /// Server types, best first; empty means the pool's types that meet the minimum.
+    pub server_types: Vec<String>,
+    /// Locations in order; empty means the pool's locations.
+    pub locations: Vec<String>,
+    pub min_cores: Option<u32>,
+    pub min_memory_gb: Option<u32>,
+    pub slots: Option<u32>,
+    pub priority: u32,
+}
+
+/// `hub pool add`. Durations stay text until the client parses them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HubPoolAdd {
+    pub name: String,
+    pub provider: String,
+    /// Server types, best first.
+    pub server_types: Vec<String>,
+    /// Locations in order; empty means every location offering one of the types.
+    pub locations: Vec<String>,
+    pub multi_arch: bool,
+    pub wait_max: Option<String>,
+    pub image: String,
+    pub target_image: String,
+    pub max: u32,
+    pub slots: u32,
+    pub idle: String,
+    pub tags: Vec<String>,
+    pub ssh_key: PathBuf,
+    pub ssh_from: Vec<String>,
 }
 
 /// `hub daemon run` options.
@@ -98,6 +168,8 @@ pub struct HubApiOptions {
     /// Submissions a target may leave unconfirmed before the job fails; `None` uses the
     /// daemon's default.
     pub unconfirmed_limit: Option<u32>,
+    /// Hetzner Cloud API token file for pool servers; `None` reads `HCLOUD_TOKEN`.
+    pub hetzner_token_file: Option<PathBuf>,
     /// Stop a running job whose watch cursor does not advance for this long; `None` disables it.
     pub max_stall: Option<String>,
 }
@@ -219,8 +291,8 @@ pub struct HubJobSpec {
     pub environment: bool,
     pub cwd: Option<PathBuf>,
     pub submission_key: Option<String>,
-    /// Hub jobs: stop this job's run when its watch cursor does not advance for this long,
-    /// overriding the hub daemon's `--max-stall` for this job only.
+    /// Stop this job's run after this many milliseconds without cursor movement, overriding
+    /// the hub daemon's `--max-stall` for this job only.
     pub max_stall_ms: Option<u64>,
 }
 
@@ -229,8 +301,6 @@ pub struct HubJobSpec {
 pub struct HubSubmit {
     pub job: HubJobSpec,
     pub detach: bool,
-    pub wait: Option<Option<String>>,
-    pub queue: bool,
 }
 
 /// Deferred placement: once (`at`) or recurring (`cron`).
@@ -252,6 +322,31 @@ pub struct HubPs {
     pub target: Option<String>,
     pub labels: Vec<(String, String)>,
     pub limit: Option<usize>,
+}
+
+/// One newest-first page of hub job history: the terminal outcome and progress facts of jobs,
+/// without the run arguments a job was submitted with.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HubJobHistory {
+    /// State filter; `all` (the default) keeps every state.
+    pub state: String,
+    pub labels: Vec<(String, String)>,
+    /// Only jobs submitted at or after this instant: a duration such as `24h`, or a timestamp.
+    /// Kept as text so the client resolves it against its own clock.
+    pub since: Option<String>,
+    pub limit: Option<usize>,
+}
+
+/// Hub event feed filters. An omitted filter keeps every kind/state/phase.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HubEvents {
+    pub json: bool,
+    pub after: Option<String>,
+    pub job: Option<String>,
+    pub target: Option<String>,
+    pub states: Vec<String>,
+    pub phases: Vec<String>,
+    pub labels: Vec<(String, String)>,
 }
 
 /// Log passthrough for one hub job.

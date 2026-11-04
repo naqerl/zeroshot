@@ -7,9 +7,10 @@ use super::convert::validate_review_source;
 mod eval;
 use crate::native_v2_cli::NativeV2CliError;
 use crate::native_v2_cli::hub::{
-    HubApiOptions, HubCommand, HubContextCommand, HubDaemonRun, HubEnqueue, HubInstall, HubJobSpec,
-    HubLogs, HubManager, HubMemberAdd, HubMemberState, HubMemberUpdate, HubPs, HubStats,
-    HubStrategy, HubSubmit, HubTokenSource, HubUninstall,
+    HubApiOptions, HubCommand, HubContextCommand, HubDaemonRun, HubEnqueue, HubEvents, HubInstall,
+    HubJobHistory, HubJobSpec, HubLogs, HubManager, HubMemberAdd, HubMemberState, HubMemberUpdate,
+    HubPs, HubPoolAdd, HubPoolCommand, HubPoolTag, HubStats, HubStrategy, HubSubmit,
+    HubTokenSource, HubUninstall,
 };
 
 #[derive(Debug, Subcommand)]
@@ -45,7 +46,7 @@ ranked by --strategy. Hub documents carry a `schema` field.
 EXIT CODES
   0  success
   1  error (ZEROSHOT_ERROR_FORMAT=json writes a zeroshot.error/v1 diagnostic)
-  3  no capacity: matching members are busy or unreachable, or --wait timed out (retryable)
+  3  no capacity: matching members are busy or unreachable (retryable)
   4  no eligible target: no active member matches the placement, or none supports the run
      (not retryable; details.rejected lists each member's reason)
   5  hub.unreachable: the selected hub context's daemon does not answer
@@ -82,8 +83,10 @@ pub(super) enum HubCliCommand {
 
     /// Place a run on a free member now.
     ///
-    /// Fails with exit code 3 when every matching member is busy, unless --wait or --queue is
-    /// given. Without --detach, follows the placed run's events as NDJSON.
+    /// A job a pool serves is parked as queued, as `hub enqueue` does, because the pool starts a
+    /// server for it. It fails with exit code 3 and the `hub.no_capacity` diagnostic only when no
+    /// free member and no pool can take the job now. Use `hub enqueue` to queue a job when no
+    /// pool serves it.
     Submit(Box<HubSubmitArgs>),
 
     /// Accept a run into the hub queue for later placement, once or on a cron schedule.
@@ -97,6 +100,20 @@ pub(super) enum HubCliCommand {
     /// List hub jobs as JSON.
     #[command(name = "ps")]
     Ps(HubPsArgs),
+
+    /// Print one newest-first page of job history as JSON.
+    ///
+    /// Each job carries its ID, state, labels, pinned revision, attempts, last durable cursor,
+    /// creation and update times, and, once terminal, its failure reason. Jobs are never
+    /// dropped: history of finished and in-flight jobs is the same durable state `hub ps` reads.
+    Jobs(HubJobsArgs),
+
+    /// Print the hub event feed as NDJSON.
+    ///
+    /// These are the same events the MCP subscription carries: a bootstrap `hub.job` per
+    /// known job when no cursor is given, every later status/phase transition, and exactly one
+    /// terminal `hub.job` per job. Each event carries a monotone per-subscription `sequence`.
+    Events(HubEventsArgs),
 
     /// Read one hub job with its run status as JSON.
     Status(HubJobArgs),
@@ -154,6 +171,259 @@ pub(super) enum HubCliCommand {
     /// Capture tasks as eval cases, rerun them under variants, judge, and compare.
     #[command(subcommand)]
     Eval(eval::HubEvalCliCommand),
+
+    /// Manage on-demand cloud server pools whose servers join the hub as members.
+    ///
+    /// A pool with no live server still counts as eligible, so a matching job queues and the
+    /// daemon creates a server for it (up to --max). Each server runs the pinned target image
+    /// behind an SSH tunnel from the hub, is archived before it is deleted, and is torn down
+    /// only after --idle without jobs. Servers are billed while they exist.
+    #[command(subcommand)]
+    Pool(HubPoolCliCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum HubPoolCliCommand {
+    /// Add a pool. The daemon needs a provider token (--hetzner-token-file or HCLOUD_TOKEN).
+    Add(Box<HubPoolAddArgs>),
+
+    /// List pools and their servers as JSON.
+    #[command(visible_alias = "ls")]
+    List,
+
+    /// Remove a pool that has no servers left.
+    #[command(visible_alias = "rm")]
+    Remove(HubPoolNameArgs),
+
+    /// List the provider's current server types as JSON: vCPUs, memory, disk, architecture,
+    /// gross price per hour by location, and the locations that can create each one now.
+    ///
+    /// Asks the hub daemon, which reads the provider's catalog with its token.
+    Types,
+
+    /// Let a pool start servers again after it stopped on an account limit or a rejected
+    /// request, and retry a capacity shortage or a failed-boot pause now.
+    Resume(HubPoolNameArgs),
+
+    /// Prefer machines per job tag: set, list or remove a pool's tag profiles.
+    ///
+    /// A job's machine comes from, in order: its own --server-type/--min-vcpu/--min-ram, the
+    /// profile of one of its tags, then the pool's --type list. Among several profiled tags the
+    /// highest --priority wins, then the larger minimum vCPU, then memory; profiles that would
+    /// tie are rejected. A job runs on any live pool server at least as large as its profile
+    /// asks before a new one is created.
+    #[command(subcommand)]
+    Tag(HubPoolTagCliCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum HubPoolTagCliCommand {
+    /// Set (or replace) the machines the pool creates for jobs with TAG.
+    Set(Box<HubPoolTagArgs>),
+
+    /// List the pool's tag profiles as JSON.
+    #[command(visible_alias = "ls")]
+    List(HubPoolNameArgs),
+
+    /// Remove a tag profile; jobs with the tag fall back to the pool's types.
+    #[command(visible_alias = "rm")]
+    Remove(HubPoolTagNameArgs),
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubPoolTagNameArgs {
+    /// Pool name.
+    #[arg(value_name = "POOL")]
+    pool: String,
+
+    /// Job tag.
+    #[arg(value_name = "TAG")]
+    tag: String,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubPoolTagArgs {
+    /// Pool name.
+    #[arg(value_name = "POOL")]
+    pool: String,
+
+    /// Job tag the profile applies to; pool servers join with it.
+    #[arg(value_name = "TAG")]
+    tag: String,
+
+    /// Server types to create for the tag, best first, comma-separated; each a current type
+    /// from `hub pool types`. Default: the pool's types that meet --min-vcpu/--min-ram.
+    #[arg(long = "type", value_name = "TYPE,...",
+          action = clap::ArgAction::Append, value_delimiter = ',')]
+    server_types: Vec<String>,
+
+    /// Locations to try, in order, for each type, comma-separated. Default: the pool's.
+    #[arg(long = "location", value_name = "LOCATION,...",
+          action = clap::ArgAction::Append, value_delimiter = ',')]
+    locations: Vec<String>,
+
+    /// Least vCPUs a server for the tag needs; existing servers this large are reused.
+    /// Default: the smallest of the profile's types.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    min_vcpu: Option<u32>,
+
+    /// Least memory a server for the tag needs, in GB, such as 16 or 16G. Default: the
+    /// smallest of the profile's types.
+    #[arg(long, value_name = "SIZE", value_parser = memory_gb)]
+    min_ram: Option<u32>,
+
+    /// Concurrent runs per server created for the tag. Default: the pool's --slots.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=1024))]
+    slots: Option<u32>,
+
+    /// Wins over lower priorities when a job carries several profiled tags.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    priority: u32,
+}
+
+/// A memory size in GB: `16`, `16G` or `16GB`, any case.
+fn memory_gb(value: &str) -> Result<u32, String> {
+    let upper = value.trim().to_ascii_uppercase();
+    let digits = upper
+        .strip_suffix("GB")
+        .or_else(|| upper.strip_suffix('G'))
+        .unwrap_or(&upper);
+    match digits.parse::<u32>() {
+        Ok(gb) if gb > 0 => Ok(gb),
+        _ => Err(format!(
+            "{value:?} is not a memory size in GB, such as 16 or 16G"
+        )),
+    }
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubPoolNameArgs {
+    /// Pool name.
+    #[arg(value_name = "NAME")]
+    name: String,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubPoolAddArgs {
+    /// Pool name; servers are named zs-<job>.
+    #[arg(value_name = "NAME")]
+    name: String,
+
+    /// Cloud provider.
+    #[arg(long, value_name = "PROVIDER", default_value = "hetzner")]
+    provider: String,
+
+    /// Server types to create, best first, comma-separated. A job gets the first type that
+    /// fits its size request (`hub submit --server-type/--min-vcpu/--min-ram`) or its tag
+    /// profile (`hub pool tag set`). Each must be a current type from `hub pool types`; ARM
+    /// types need --multi-arch.
+    #[arg(long = "type", value_name = "TYPE,...", required = true,
+          action = clap::ArgAction::Append, value_delimiter = ',')]
+    server_types: Vec<String>,
+
+    /// Locations to try, in order, for each type, comma-separated. When a location has no
+    /// capacity the next one is tried, then the next type. Default: every location offering
+    /// one of the types.
+    #[arg(long = "location", value_name = "LOCATION,...",
+          action = clap::ArgAction::Append, value_delimiter = ',')]
+    locations: Vec<String>,
+
+    /// The target image runs on arm64 as well as amd64, so ARM server types are allowed.
+    #[arg(long)]
+    multi_arch: bool,
+
+    /// Expire a queued job this pool serves once it has waited this long for a server, such as
+    /// 30m; its error kind is pool_wait_timeout. Default: wait until the job's own expiry.
+    #[arg(long, value_name = "DURATION")]
+    wait_max: Option<String>,
+
+    /// Server image: a snapshot id or a system image such as docker-ce.
+    #[arg(long, value_name = "IMAGE")]
+    image: String,
+
+    /// Pinned zeroshot target container image (a digest or a tag other than latest).
+    #[arg(long, value_name = "IMAGE")]
+    target_image: String,
+
+    /// Most servers alive at once.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=100))]
+    max: u32,
+
+    /// Concurrent runs per server.
+    #[arg(long, value_name = "N", default_value_t = 1,
+          value_parser = clap::value_parser!(u32).range(1..=1024))]
+    slots: u32,
+
+    /// Tear a server down after this long without jobs.
+    #[arg(long, value_name = "DURATION", default_value = "10m")]
+    idle: String,
+
+    /// Placement tag servers join with. Repeat for several.
+    #[arg(long = "tag", visible_alias = "tags", value_name = "TAG",
+          action = clap::ArgAction::Append, value_delimiter = ',')]
+    tags: Vec<String>,
+
+    /// Private SSH key on the hub host; its .pub sibling is installed on servers.
+    #[arg(long, value_name = "FILE")]
+    ssh_key: std::path::PathBuf,
+
+    /// CIDR allowed to reach servers over SSH (the hub's public address). Repeat for several.
+    #[arg(long, value_name = "CIDR", required = true, action = clap::ArgAction::Append)]
+    ssh_from: Vec<String>,
+}
+
+impl HubPoolCliCommand {
+    fn into_command(self) -> Result<HubPoolCommand, NativeV2CliError> {
+        Ok(match self {
+            Self::Add(args) => {
+                let args = *args;
+                HubPoolCommand::Add(Box::new(HubPoolAdd {
+                    name: member_name(args.name)?,
+                    provider: args.provider,
+                    server_types: args.server_types,
+                    locations: args.locations,
+                    multi_arch: args.multi_arch,
+                    wait_max: args.wait_max,
+                    image: args.image,
+                    target_image: args.target_image,
+                    max: args.max,
+                    slots: args.slots,
+                    idle: args.idle,
+                    tags: tags(args.tags)?,
+                    ssh_key: args.ssh_key,
+                    ssh_from: args.ssh_from,
+                }))
+            }
+            Self::List => HubPoolCommand::List,
+            Self::Remove(args) => HubPoolCommand::Remove {
+                name: member_name(args.name)?,
+            },
+            Self::Types => HubPoolCommand::Types,
+            Self::Resume(args) => HubPoolCommand::Resume {
+                name: member_name(args.name)?,
+            },
+            Self::Tag(HubPoolTagCliCommand::Set(args)) => {
+                let args = *args;
+                HubPoolCommand::TagSet(Box::new(HubPoolTag {
+                    pool: member_name(args.pool)?,
+                    tag: profile_tag(args.tag)?,
+                    server_types: args.server_types,
+                    locations: args.locations,
+                    min_cores: args.min_vcpu,
+                    min_memory_gb: args.min_ram,
+                    slots: args.slots,
+                    priority: args.priority,
+                }))
+            }
+            Self::Tag(HubPoolTagCliCommand::List(args)) => HubPoolCommand::TagList {
+                name: member_name(args.name)?,
+            },
+            Self::Tag(HubPoolTagCliCommand::Remove(args)) => HubPoolCommand::TagRemove {
+                name: member_name(args.pool)?,
+                tag: profile_tag(args.tag)?,
+            },
+        })
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -210,6 +480,11 @@ pub(super) struct HubApiArgs {
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     unconfirmed_limit: Option<u32>,
 
+    /// Hetzner Cloud API token file for pool servers [default: the HCLOUD_TOKEN environment
+    /// variable]. The token is never logged or stored in hub state.
+    #[arg(long, value_name = "FILE")]
+    hetzner_token_file: Option<std::path::PathBuf>,
+
     /// Stop a running job whose watch cursor does not advance for DURATION, such as 30m. The
     /// run is force-stopped and the job fails with error kind stalled. Disabled by default.
     #[arg(long, value_name = "DURATION")]
@@ -231,6 +506,7 @@ impl HubApiArgs {
             metrics_listen: self.metrics_listen,
             metrics_labels: self.metrics_labels,
             unconfirmed_limit: self.unconfirmed_limit,
+            hetzner_token_file: self.hetzner_token_file,
             max_stall: self.max_stall,
         })
     }
@@ -427,6 +703,21 @@ pub(super) struct HubPlacementArgs {
     #[arg(long, value_name = "TAG", action = clap::ArgAction::Append)]
     tag: Vec<String>,
 
+    /// Pool jobs: run on this server type (one the pool or a tag profile lists); overrides tag
+    /// profiles. Same as --tag server-type=TYPE.
+    #[arg(long, value_name = "TYPE")]
+    server_type: Option<String>,
+
+    /// Pool jobs: run on a server with at least N vCPUs; overrides tag profiles. Same as
+    /// --tag min-vcpu=N.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    min_vcpu: Option<u32>,
+
+    /// Pool jobs: run on a server with at least this much memory in GB, such as 16 or 16G;
+    /// overrides tag profiles. Same as --tag min-ram-gb=N.
+    #[arg(long, value_name = "SIZE", value_parser = memory_gb)]
+    min_ram: Option<u32>,
+
     /// Choice among free matching members.
     #[arg(
         long,
@@ -449,14 +740,6 @@ pub(super) struct HubPlacementArgs {
 pub(super) struct HubSubmitArgs {
     #[command(flatten)]
     placement: HubPlacementArgs,
-
-    /// Wait for a free member, optionally up to DURATION such as 10m.
-    #[arg(long, value_name = "DURATION", num_args = 0..=1, conflicts_with = "queue")]
-    wait: Option<Option<String>>,
-
-    /// Queue the job when every matching member is busy instead of failing.
-    #[arg(long)]
-    queue: bool,
 
     #[command(flatten)]
     run: RunArgs,
@@ -517,6 +800,57 @@ pub(super) struct HubPsArgs {
     /// Return at most this many of the newest matching jobs.
     #[arg(long, value_name = "N")]
     limit: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubJobsArgs {
+    /// Job state filter: active (queued, scheduled, running), queued, scheduled, running,
+    /// succeeded, failed, dequeued, or all.
+    #[arg(long, value_name = "STATE", default_value = "all")]
+    state: String,
+
+    /// Only jobs carrying this label. Repeat for several, or combine with --since.
+    #[arg(long, value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
+    label: Vec<String>,
+
+    /// Only jobs created at or after this time: a duration such as 24h or 7d, or a timestamp.
+    #[arg(long, value_name = "WHEN")]
+    since: Option<String>,
+
+    /// Return at most this many of the newest matching jobs [default: 20].
+    #[arg(long, value_name = "N")]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubEventsArgs {
+    /// Print JSON NDJSON (the only format; accepted for symmetry with other commands).
+    #[arg(long)]
+    json: bool,
+
+    /// Resume strictly after this durable hub cursor.
+    #[arg(long, value_name = "CURSOR")]
+    after: Option<String>,
+
+    /// Only this hub job ID.
+    #[arg(long, value_name = "JOB_ID")]
+    job: Option<String>,
+
+    /// Only jobs placed on this member.
+    #[arg(long, value_name = "NAME")]
+    target: Option<String>,
+
+    /// Only these job states. Repeat or comma-separate.
+    #[arg(long, value_name = "STATE", action = clap::ArgAction::Append, value_delimiter = ',')]
+    states: Vec<String>,
+
+    /// Only these run/lease phases. Repeat or comma-separate.
+    #[arg(long, value_name = "PHASE", action = clap::ArgAction::Append, value_delimiter = ',')]
+    phases: Vec<String>,
+
+    /// Only jobs and runs carrying this label. Repeat for several.
+    #[arg(long, value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
+    label: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -598,6 +932,13 @@ impl HubCliCommand {
             Self::Submit(args) => Ok(HubCommand::Submit(Box::new(args.into_submit()?))),
             Self::Enqueue(args) => Ok(HubCommand::Enqueue(Box::new(args.into_enqueue()?))),
             Self::Ps(args) => ps_command(args),
+            Self::Jobs(args) => Ok(HubCommand::Jobs(HubJobHistory {
+                state: args.state,
+                labels: labels(args.label)?,
+                since: args.since,
+                limit: args.limit,
+            })),
+            Self::Events(args) => events_command(args),
             Self::Status(args) => Ok(HubCommand::Status { job: args.job }),
             Self::Watch(args) => Ok(HubCommand::Watch {
                 job: args.job,
@@ -625,6 +966,7 @@ impl HubCliCommand {
                 dry_run: args.dry_run,
             })),
             Self::Eval(command) => Ok(HubCommand::Eval(command.into_command()?)),
+            Self::Pool(command) => Ok(HubCommand::Pool(command.into_command()?)),
         }
     }
 }
@@ -656,6 +998,54 @@ fn ps_command(args: HubPsArgs) -> Result<HubCommand, NativeV2CliError> {
         labels: labels(args.label)?,
         limit: args.limit,
     }))
+}
+
+fn events_command(args: HubEventsArgs) -> Result<HubCommand, NativeV2CliError> {
+    Ok(HubCommand::Events(HubEvents {
+        json: args.json,
+        after: args.after,
+        job: args.job,
+        target: args.target,
+        states: states(args.states)?,
+        phases: phases(args.phases)?,
+        labels: labels(args.label)?,
+    }))
+}
+
+fn states(values: Vec<String>) -> Result<Vec<String>, NativeV2CliError> {
+    let mut states = Vec::new();
+    for value in values {
+        for state in value.split(',') {
+            let state = state.trim();
+            if state.is_empty() {
+                return Err(usage("--states entries must not be empty"));
+            }
+            if !crate::native_v2_cli::mcp::events::JOB_STATES.contains(&state) {
+                return Err(usage(format!("unknown job state {state}")));
+            }
+            states.push(state.to_owned());
+        }
+    }
+    Ok(states)
+}
+
+fn phases(values: Vec<String>) -> Result<Vec<String>, NativeV2CliError> {
+    let mut phases = Vec::new();
+    for value in values {
+        for phase in value.split(',') {
+            let phase = phase.trim();
+            if phase.is_empty() {
+                return Err(usage("--phases entries must not be empty"));
+            }
+            if !crate::native_v2_cli::mcp::events::PHASES.contains(&phase)
+                && !crate::native_v2_cli::mcp::events::POOL_PHASES.contains(&phase)
+            {
+                return Err(usage(format!("unknown phase {phase}")));
+            }
+            phases.push(phase.to_owned());
+        }
+    }
+    Ok(phases)
 }
 
 fn stats_command(args: HubStatsArgs) -> HubCommand {
@@ -750,8 +1140,6 @@ impl HubSubmitArgs {
         Ok(HubSubmit {
             job: job_spec(self.run, self.placement)?,
             detach,
-            wait: self.wait,
-            queue: self.queue,
         })
     }
 }
@@ -790,7 +1178,7 @@ fn job_spec(run: RunArgs, placement: HubPlacementArgs) -> Result<HubJobSpec, Nat
         title: run.title.clone(),
         run_args: run_arguments(&run)?,
         target,
-        tags: tags(placement.tag)?,
+        tags: tags(placement_tags(&placement))?,
         strategy: match placement.strategy {
             HubStrategyArg::FirstFree => HubStrategy::FirstFree,
             HubStrategyArg::LeastLoaded => HubStrategy::LeastLoaded,
@@ -806,6 +1194,24 @@ fn job_spec(run: RunArgs, placement: HubPlacementArgs) -> Result<HubJobSpec, Nat
         submission_key: run.submission_key.clone(),
         max_stall_ms: run.max_stall_ms,
     })
+}
+
+/// The job's tags, with size requests for pool servers added as size tags.
+fn placement_tags(placement: &HubPlacementArgs) -> Vec<String> {
+    let mut tags = placement.tag.clone();
+    tags.extend(
+        placement
+            .server_type
+            .iter()
+            .map(|name| format!("server-type={name}")),
+    );
+    tags.extend(placement.min_vcpu.map(|cores| format!("min-vcpu={cores}")));
+    tags.extend(
+        placement
+            .min_ram
+            .map(|memory| format!("min-ram-gb={memory}")),
+    );
+    tags
 }
 
 /// Rebuild the `zeroshot run` arguments that do not depend on placement.
@@ -895,6 +1301,20 @@ fn tags(values: Vec<String>) -> Result<Vec<String>, NativeV2CliError> {
     unique.sort();
     unique.dedup();
     Ok(unique)
+}
+
+/// A tag a pool profile applies to: an ordinary tag, not a size request.
+fn profile_tag(value: String) -> Result<String, NativeV2CliError> {
+    if ["server-type=", "min-vcpu=", "min-ram-gb="]
+        .iter()
+        .any(|prefix| value.starts_with(prefix))
+    {
+        return Err(usage(format!(
+            "{value:?} is a size request; profile an ordinary job tag"
+        )));
+    }
+    let mut checked = tags(vec![value])?;
+    Ok(checked.remove(0))
 }
 
 fn labels(values: Vec<String>) -> Result<Vec<(String, String)>, NativeV2CliError> {

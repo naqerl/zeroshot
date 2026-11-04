@@ -29,24 +29,6 @@ on:
         required: true
         default: true
         type: boolean
-  workflow_call:
-    inputs:
-      action:
-        required: true
-        type: string
-      zeroshot_version:
-        required: true
-        type: string
-      sdk_revision:
-        required: true
-        type: number
-      release_commit:
-        required: true
-        type: string
-      publish_pypi:
-        required: false
-        default: true
-        type: boolean
 
 permissions:
   contents: read
@@ -490,6 +472,6 @@ jobs:
 
       - name: Publish Python SDK with trusted publishing
         if: inputs.publish_pypi && steps.pypi.outputs.exists == 'false'
-        uses: pypa/gh-action-pypi-publish@ec4db0b4ddc65acdf4bff5fa45ac92d78b56bdf0 # v1.9.0
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: sdk-release/

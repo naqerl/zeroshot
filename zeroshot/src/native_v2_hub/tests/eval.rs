@@ -531,6 +531,7 @@ async fn hub_with(driver: FakeDriver) -> Hub {
         token: TOKEN.to_owned(),
         heartbeat: Arc::new(Mutex::new(json!({}))),
         executable: None,
+        mcp: None,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1264,6 +1265,7 @@ async fn the_daemon_measures_finished_eval_samples() {
     let options = HubDaemonRun {
         interval: "1s".to_owned(),
         api: HubApiOptions {
+            hetzner_token_file: None,
             listen: Some("127.0.0.1:0".to_owned()),
             token_file: Some(folder.join("daemon-token")),
             metrics_listen: None,
