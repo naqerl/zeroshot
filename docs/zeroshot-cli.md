@@ -1350,6 +1350,9 @@ Options:
       --submission-key <KEY>
           Stable idempotency key for safely retrying submission
 
+      --max-stall-ms <MS>
+          Hub jobs: stop the run when its watch cursor does not advance for this many milliseconds, such as 7200000 for two hours. Overrides the hub daemon's --max-stall for this job only; local runs have no stall limit
+
   -d, --detach
           Return after submission instead of following NDJSON run events
 
@@ -1570,6 +1573,9 @@ Options:
 
       --submission-key <KEY>
           Stable idempotency key for safely retrying submission
+
+      --max-stall-ms <MS>
+          Hub jobs: stop the run when its watch cursor does not advance for this many milliseconds, such as 7200000 for two hours. Overrides the hub daemon's --max-stall for this job only; local runs have no stall limit
 
       --delivery <MODE>
           Template delivery mode. Defaults to pull_request for software-change, comment for issue-review and pr-review, otherwise none
@@ -2482,6 +2488,9 @@ Options:
       --submission-key <KEY>
           Stable idempotency key for safely retrying submission
 
+      --max-stall-ms <MS>
+          Hub jobs: stop the run when its watch cursor does not advance for this many milliseconds, such as 7200000 for two hours. Overrides the hub daemon's --max-stall for this job only; local runs have no stall limit
+
       --delivery <MODE>
           Template delivery mode. Defaults to pull_request for software-change, comment for issue-review and pr-review, otherwise none
 
@@ -3238,6 +3247,9 @@ Options:
 
       --submission-key <KEY>
           Stable idempotency key for safely retrying submission
+
+      --max-stall-ms <MS>
+          Hub jobs: stop the run when its watch cursor does not advance for this many milliseconds, such as 7200000 for two hours. Overrides the hub daemon's --max-stall for this job only; local runs have no stall limit
 
   -d, --detach
           Return after submission instead of following NDJSON run events

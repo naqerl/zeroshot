@@ -9,7 +9,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures_util::future::join_all;
 use serde_json::{Value, json};
@@ -21,14 +20,11 @@ use super::driver::{HubDriver, force_stop_arguments, route};
 use super::error::HubError;
 use super::metrics::Metrics;
 use super::model::{
-    HubState, Job, JobError, JobErrorKind, JobState, LOCAL_MEMBER, Member, MemberState,
-    PlacementSpec, Requirements, Schedule, ScheduleState,
+    HubState, Job, JobError, JobErrorKind, JobState, LOCAL_MEMBER, Member, MemberState, Schedule,
+    ScheduleState,
 };
-use super::placement::{Fit, Placement, Rejection, describe, fit, matching_members, place, rejections};
-use super::lease::{PoolReport, PoolRuntime};
-use super::pool;
-use super::profile;
-use super::schedule::{self, Dispatched, LostTarget, TickReport, WithheldTarget};
+use super::placement::{Fit, Placement, describe, fit, matching_members, place, rejections};
+use super::schedule::{self, Dispatched, TickReport};
 use super::stats;
 use super::store::HubStore;
 use super::wire::{
@@ -59,16 +55,28 @@ pub(crate) struct HubService {
     max_stall_ms: Option<u64>,
     /// Eval work in progress, so the worker never runs one piece twice at once.
     eval_claims: std::sync::Mutex<std::collections::BTreeSet<String>>,
-    /// Provider and tunnel effects of pools; `None` without a provider token.
-    pools: Option<PoolRuntime>,
 }
 
 pub(crate) fn member_document(member: &Member) -> Value {
     json!({ "schema": "zeroshot.hub.member/v1", "member": member.view() })
 }
 
-pub(crate) fn job_document(job: &Job, now: u64) -> Value {
-    json!({ "schema": "zeroshot.hub.job/v1", "job": job.view(now) })
+pub(crate) fn job_document(job: &Job, now: u64, hub_max_stall_ms: Option<u64>) -> Value {
+    json!({
+        "schema": "zeroshot.hub.job/v1",
+        "job": job_view(job, now, hub_max_stall_ms),
+    })
+}
+
+/// A job view with the stall limit that actually applies to it, resolved from the job override and
+/// then the hub's `--max-stall`.
+pub(crate) fn job_view(job: &Job, now: u64, hub_max_stall_ms: Option<u64>) -> Value {
+    let mut view = job.view(now);
+    let limit = schedule::StallLimit::for_job(job, hub_max_stall_ms);
+    view["jobMaxStallMs"] = json!(job.max_stall_ms);
+    view["maxStallMs"] = json!(limit.map(|limit| limit.max_stall_ms));
+    view["maxStallSource"] = json!(limit.map(|limit| limit.source.as_str()));
+    view
 }
 
 pub(crate) fn schedule_document(schedule: &Schedule) -> Value {
@@ -100,7 +108,6 @@ impl HubService {
             unconfirmed_limit: schedule::DEFAULT_UNCONFIRMED_LIMIT,
             max_stall_ms: None,
             eval_claims: std::sync::Mutex::default(),
-            pools: None,
         })
     }
 
@@ -116,25 +123,6 @@ impl HubService {
     pub(crate) fn with_unconfirmed_limit(mut self, limit: Option<u32>) -> Self {
         self.unconfirmed_limit = limit.unwrap_or(self.unconfirmed_limit);
         self
-    }
-
-    /// Create, tunnel to and delete pool servers with this runtime.
-    #[must_use]
-    pub(crate) fn with_pools(mut self, runtime: PoolRuntime) -> Self {
-        self.pools = Some(runtime);
-        self
-    }
-
-    pub(super) fn pool_runtime(&self) -> Option<&PoolRuntime> {
-        self.pools.as_ref()
-    }
-
-    pub(super) fn registry(&self) -> &FileTargetRegistry {
-        &self.registry
-    }
-
-    pub(super) async fn placement_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.placement.lock().await
     }
 
     /// Stop running jobs whose watch cursor does not advance for this long (`None` disables it).
@@ -312,7 +300,7 @@ impl HubService {
             let probed = state
                 .members
                 .iter()
-                .filter(|member| query.tags.iter().all(|tag| member.has_tag(tag)))
+                .filter(|member| query.tags.iter().all(|tag| member.tags.contains(tag)))
                 .filter(|member| member.state != MemberState::Disabled)
                 .collect::<Vec<_>>();
             let loads = schedule::probe(&probed, &state.jobs, self.driver()).await;
@@ -325,7 +313,7 @@ impl HubService {
         let targets = state
             .members
             .iter()
-            .filter(|member| query.tags.iter().all(|tag| member.has_tag(tag)))
+            .filter(|member| query.tags.iter().all(|tag| member.tags.contains(tag)))
             .map(|member| {
                 let mut view = member.view();
                 let (kind, origin) = self.member_kind(&member.name);
@@ -355,7 +343,7 @@ impl HubService {
                 view["queuedMatching"] = json!(matching);
                 view["rejects"] = json!(rejects);
                 if let Some(load) = loads.as_ref().and_then(|loads| loads.get(&member.name)) {
-                    view["health"] = json!(if load.reachable() {
+                    view["health"] = json!(if load.reachable {
                         "ready"
                     } else {
                         "unreachable"
@@ -415,11 +403,12 @@ impl HubService {
     pub(crate) async fn submit(
         &self,
         mut job: Job,
+        queue: bool,
         files: Vec<JobFile>,
     ) -> Result<Value, HubError> {
         let _placing = self.placement.lock().await;
         if let Some(existing) = idempotent(&self.snapshot().await, &job) {
-            return Ok(job_document(&existing, now_ms()));
+            return Ok(job_document(&existing, now_ms(), self.max_stall_ms));
         }
         self.spool(&mut job, files)?;
         let mut members = self.snapshot().await.members;
@@ -436,9 +425,7 @@ impl HubService {
                 Ok(state.clone())
             })
             .await?;
-        job.requirements.machine =
-            profile::machine_for(&state.pools, &job.placement, &job.requirements);
-        if let Some(rejected) = unplaceable(&state, &job.placement, &job.requirements) {
+        if let Some(rejected) = rejections(&state.members, &job.placement, &job.requirements) {
             self.metrics.record_rejection(Some(&rejected));
             return Err(HubError::no_eligible(describe(&job.placement), rejected));
         }
@@ -446,9 +433,6 @@ impl HubService {
         let loads = schedule::probe(&matching, &state.jobs, self.driver()).await;
         self.metrics.record_loads(&loads);
         let now = now_ms();
-        // A pool that serves the job starts a server for it once it is queued, so a job a
-        // pool can serve is parked exactly as `enqueue` parks it.
-        let pool_serves = pool::serving(&state.pools, &job.placement, &job.requirements).is_some();
         match place(&state.members, &job.placement, &job.requirements, &loads) {
             Placement::Place(member) => {
                 job.state = JobState::Running;
@@ -459,18 +443,23 @@ impl HubService {
                 })
                 .await?;
                 let (job, dispatched) = self.dispatch(&job.job_id, &member, now).await?;
-                self.note_placed(&job, &dispatched).await?;
                 if let Dispatched::Rejected(error) = dispatched {
                     return Err(error);
                 }
-                Ok(job_document(&job, now))
+                Ok(job_document(&job, now, self.max_stall_ms))
             }
-            Placement::NoEligible { rejected } if !pool_serves => {
+            Placement::NoEligible { rejected } => {
                 self.metrics.record_rejection(Some(&rejected));
                 Err(HubError::no_eligible(describe(&job.placement), rejected))
             }
-            Placement::NoEligible { .. } => self.park(job, now).await,
-            Placement::Busy { .. } if pool_serves => self.park(job, now).await,
+            Placement::Busy { .. } if queue => {
+                self.mutate(|state| {
+                    state.jobs.push(job.clone());
+                    Ok(())
+                })
+                .await?;
+                Ok(job_document(&job, now, self.max_stall_ms))
+            }
             Placement::Busy { .. } => {
                 self.metrics.record_rejection(None);
                 Err(HubError::NoCapacity(describe(&job.placement)))
@@ -502,33 +491,6 @@ impl HubService {
             .into_iter()
             .filter_map(|(job_id, result)| result.err().map(|error| (job_id, error.to_string())))
             .collect()
-    }
-
-    /// Keep a job for later placement, as `enqueue` does, and return it as queued.
-    async fn park(&self, job: Job, now: u64) -> Result<Value, HubError> {
-        self.mutate(|state| {
-            state.jobs.push(job.clone());
-            Ok(())
-        })
-        .await?;
-        Ok(job_document(&job, now))
-    }
-
-    /// Mark a pool member as busy once a target confirmed the run, so the lease reports
-    /// `in_use` only for a job that actually started.
-    async fn note_placed(&self, job: &Job, dispatched: &Dispatched) -> Result<(), HubError> {
-        if !matches!(dispatched, Dispatched::Placed) {
-            return Ok(());
-        }
-        let Some(member) = job.target.clone() else {
-            return Ok(());
-        };
-        let at = now_ms();
-        self.mutate(|state| {
-            pool::record_member_phase(state, &member, pool::PoolPhase::InUse, at);
-            Ok(())
-        })
-        .await
     }
 
     /// Submit a job already marked as placing on `member`, outside the state lock, and record
@@ -581,20 +543,18 @@ impl HubService {
     ) -> Result<Value, HubError> {
         let now = now_ms();
         if let Some(existing) = idempotent(&self.snapshot().await, &job) {
-            return Ok(job_document(&existing, now));
+            return Ok(job_document(&existing, now, self.max_stall_ms));
         }
         self.spool(&mut job, files)?;
         self.mutate(|state| {
             if let Some(existing) = idempotent(state, &job) {
-                return Ok(job_document(&existing, now));
+                return Ok(job_document(&existing, now, self.max_stall_ms));
             }
-            job.requirements.machine =
-                profile::machine_for(&state.pools, &job.placement, &job.requirements);
-            if let Some(rejected) = unplaceable(state, &job.placement, &job.requirements) {
+            if let Some(rejected) = rejections(&state.members, &job.placement, &job.requirements) {
                 self.metrics.record_rejection(Some(&rejected));
                 return Err(HubError::no_eligible(describe(&job.placement), rejected));
             }
-            let document = job_document(&job, now);
+            let document = job_document(&job, now, self.max_stall_ms);
             state.jobs.push(job);
             Ok(document)
         })
@@ -628,7 +588,8 @@ impl HubService {
                 return Ok(schedule_document(&existing));
             }
             let template = &schedule.template;
-            if let Some(rejected) = unplaceable(state, &template.placement, &template.requirements)
+            if let Some(rejected) =
+                rejections(&state.members, &template.placement, &template.requirements)
             {
                 self.metrics.record_rejection(Some(&rejected));
                 return Err(HubError::no_eligible(
@@ -644,7 +605,24 @@ impl HubService {
     }
 
     pub(crate) async fn ps(&self, query: JobQuery) -> Result<Value, HubError> {
-        validate_job_state(&query.state)?;
+        const STATES: [&str; 9] = [
+            "active",
+            "all",
+            "recurring",
+            "queued",
+            "scheduled",
+            "running",
+            "succeeded",
+            "failed",
+            "dequeued",
+        ];
+        if !STATES.contains(&query.state.as_str()) {
+            return Err(HubError::Usage(format!(
+                "invalid --state {:?}: use one of {}",
+                query.state,
+                STATES.join(", ")
+            )));
+        }
         let state = self.snapshot().await;
         let now = now_ms();
         let mut selected = state
@@ -666,7 +644,10 @@ impl HubService {
         if query.state == "recurring" {
             selected.clear();
         }
-        let views = selected.iter().map(|job| job.view(now)).collect::<Vec<_>>();
+        let views = selected
+            .iter()
+            .map(|job| job_view(job, now, self.max_stall_ms))
+            .collect::<Vec<_>>();
         let schedules = state
             .schedules
             .iter()
@@ -689,60 +670,6 @@ impl HubService {
         Ok(json!({ "schema": "zeroshot.hub.jobs/v1", "jobs": views, "schedules": schedules }))
     }
 
-    /// One newest-first page of job history: the progress and terminal facts of matching jobs,
-    /// without their run arguments. An empty page is a page, not an error.
-    pub(crate) async fn job_history(&self, query: JobQuery) -> Result<Value, HubError> {
-        validate_job_state(&query.state)?;
-        if query.state == "recurring" {
-            return Err(HubError::Usage(
-                "invalid --state \"recurring\": job history lists jobs; recurring schedules are \
-                 listed by --state all or active on `hub ps`"
-                    .to_owned(),
-            ));
-        }
-        let limit = query.limit.unwrap_or(JOB_HISTORY_PAGE);
-        let state = self.snapshot().await;
-        let now = now_ms();
-        let mut matching = state
-            .jobs
-            .iter()
-            .filter(|job| state_matches(job, &query.state, now))
-            .filter(|job| {
-                query
-                    .since_ms
-                    .is_none_or(|since| job.submitted_at_ms >= since)
-            })
-            .filter(|job| {
-                query
-                    .labels
-                    .iter()
-                    .all(|(key, value)| job.labels.get(key) == Some(value))
-            })
-            .collect::<Vec<_>>();
-        matching.sort_by(|left, right| {
-            right
-                .submitted_at_ms
-                .cmp(&left.submitted_at_ms)
-                .then_with(|| right.job_id.cmp(&left.job_id))
-        });
-        matching.truncate(limit);
-        let jobs = matching
-            .iter()
-            .map(|job| job.history_view(now))
-            .collect::<Vec<_>>();
-        let mut filters = json!({"state": query.state, "labels": query.labels});
-        if let Some(since) = query.since_ms {
-            filters["since"] = json!(clock::rfc3339(since));
-        }
-        Ok(json!({
-            "schema": "zeroshot.hub.job-history/v1",
-            "filters": filters,
-            "limit": limit,
-            "returned": jobs.len(),
-            "jobs": jobs,
-        }))
-    }
-
     /// One job with its live run status, read from the target outside the state lock.
     pub(crate) async fn status(&self, job_id: &str) -> Result<Value, HubError> {
         let job = self.job(job_id).await?;
@@ -753,9 +680,6 @@ impl HubService {
                 let run_id = run_id.clone();
                 let job = self
                     .mutate(|state| {
-                        if result.is_ok() {
-                            schedule::record_target_health(state, target, now);
-                        }
                         let job = state
                             .jobs
                             .iter_mut()
@@ -771,13 +695,13 @@ impl HubService {
                         Ok((job.clone(), status))
                     })
                     .await?;
-                let mut document = job_document(&job.0, now);
+                let mut document = job_document(&job.0, now, self.max_stall_ms);
                 document["run"] = job.1.unwrap_or(Value::Null);
                 return Ok(document);
             }
             _ => Value::Null,
         };
-        let mut document = job_document(&job, now_ms());
+        let mut document = job_document(&job, now_ms(), self.max_stall_ms);
         document["run"] = run;
         Ok(document)
     }
@@ -794,6 +718,7 @@ impl HubService {
     }
 
     pub(crate) async fn dequeue(&self, job_id: &str) -> Result<Value, HubError> {
+        let max_stall_ms = self.max_stall_ms;
         self.mutate(|state| {
             if let Some(schedule) = state
                 .schedules
@@ -817,7 +742,7 @@ impl HubService {
                 .find(|job| job.job_id == job_id)
                 .ok_or_else(|| HubError::JobNotFound(job_id.to_owned()))?;
             if job.is_placing() {
-                return Ok(dequeue_placing(job, now));
+                return Ok(dequeue_placing(job, now, max_stall_ms));
             }
             if job.state != JobState::Queued {
                 return Err(HubError::InvalidState(format!(
@@ -833,7 +758,7 @@ impl HubService {
             }
             job.state = JobState::Dequeued;
             job.finished_at_ms = Some(now);
-            Ok(job_document(job, now))
+            Ok(job_document(job, now, max_stall_ms))
         })
         .await
     }
@@ -919,19 +844,7 @@ impl HubService {
     /// discovery, probes, and submissions run between phases.
     pub(crate) async fn pass(&self) -> Result<(TickReport, Value), HubError> {
         let started = std::time::Instant::now();
-        let result = match self.pass_phases().await {
-            Ok((report, mut view)) => match self.pool_pass().await {
-                Ok(pools) => {
-                    self.metrics.record_pool_pass(&pools);
-                    if pools != PoolReport::default() {
-                        view["pools"] = pools.view();
-                    }
-                    Ok((report, view))
-                }
-                Err(error) => Err(error),
-            },
-            Err(error) => Err(error),
-        };
+        let result = self.pass_phases().await;
         self.metrics
             .record_pass(started.elapsed().as_secs_f64(), result.is_err());
         result
@@ -956,10 +869,15 @@ impl HubService {
             finished,
             ..TickReport::default()
         };
-        if let Some(max_stall_ms) = self.max_stall_ms {
+        {
+            let hub_max_stall_ms = self.max_stall_ms;
             let now = now_ms();
             let stalled = self
-                .mutate(|state| Ok(schedule::stalled_runs(&state.jobs, now, max_stall_ms)))
+                .mutate(|state| {
+                    Ok(schedule::stalled_runs(&state.jobs, now, |job| {
+                        schedule::StallLimit::for_job(job, hub_max_stall_ms)
+                    }))
+                })
                 .await?;
             let stopped = self
                 .stop_runs(stalled.iter().map(|run| {
@@ -976,7 +894,6 @@ impl HubService {
                         &mut state.jobs,
                         schedule::StallSettlement {
                             now_ms: now,
-                            max_stall_ms,
                             stalled: &stalled,
                             stop_errors: &stopped,
                         },
@@ -991,25 +908,16 @@ impl HubService {
         let mut loads = schedule::probe(&probed, &snapshot.jobs, self.driver()).await;
         self.metrics.record_loads(&loads);
         let now = now_ms();
-        let lost = self
+        report.target_lost = self
             .mutate(|state| {
                 schedule::record_health(&mut state.members, &mut state.jobs, &loads, now);
-                Ok(schedule::lost_targets(state))
+                let lost = schedule::lost_targets(state);
+                Ok(schedule::settle_lost_targets(&mut state.jobs, now, &lost))
             })
             .await?;
-        if !lost.is_empty() {
-            let (lost, withheld) = self.confirm_lost_targets(lost, &loads).await;
-            report.target_lost = self
-                .mutate(|state| {
-                    schedule::note_withheld(&mut state.jobs, &withheld);
-                    Ok(schedule::settle_lost_targets(&mut state.jobs, now, &lost))
-                })
-                .await?;
-        }
         let placing = schedule::placing(&self.snapshot().await);
         for (job_id, member) in placing {
             let (job, dispatched) = self.dispatch(&job_id, &member, now).await?;
-            self.note_placed(&job, &dispatched).await?;
             schedule::record_dispatch(&mut report, &job, &dispatched);
         }
         let due = !schedule::due_jobs(&self.snapshot().await.jobs, now_ms()).is_empty();
@@ -1033,7 +941,6 @@ impl HubService {
                 .await?;
             for (job_id, member) in chosen {
                 let (job, dispatched) = self.dispatch(&job_id, &member, now).await?;
-                self.note_placed(&job, &dispatched).await?;
                 schedule::record_dispatch(&mut report, &job, &dispatched);
             }
             report.loads = Some(loads);
@@ -1043,243 +950,10 @@ impl HubService {
     }
 }
 
-/// Require decisive confirmation before failing a lost-target job. A pool member is checked
-/// against the provider; a named member gets a direct TCP check of its endpoint. An inconclusive
-/// probe, a rate-limited provider check, or an endpoint that still answers keeps the job running.
-impl HubService {
-    async fn confirm_lost_targets(
-        &self,
-        lost: Vec<LostTarget>,
-        loads: &BTreeMap<String, super::placement::Load>,
-    ) -> (Vec<LostTarget>, Vec<WithheldTarget>) {
-        let state = self.snapshot().await;
-        let mut confirmed = Vec::new();
-        let mut withheld = Vec::new();
-        for mut target in lost {
-            let Some(count) = target.unreachable_probes else {
-                confirmed.push(target);
-                continue;
-            };
-            if loads
-                .get(&target.member)
-                .is_some_and(super::placement::Load::reachable)
-            {
-                withheld.push(withhold(
-                    &target,
-                    count,
-                    "a probe succeeded: job kept running".to_owned(),
-                ));
-                continue;
-            }
-            let Some(member) = state.member(&target.member) else {
-                confirmed.push(target);
-                continue;
-            };
-            if member.pool.is_some() {
-                let lease = state
-                    .leases
-                    .iter()
-                    .find(|lease| lease.name == target.member);
-                let Some(lease) = lease else {
-                    withheld.push(withhold(
-                        &target,
-                        count,
-                        "no pool lease record is available to confirm the server: inconclusive, \
-                         job kept running"
-                            .to_owned(),
-                    ));
-                    continue;
-                };
-                let label = lease
-                    .server_id
-                    .map_or_else(|| lease.name.clone(), |id| id.to_string());
-                let Some(pools) = &self.pools else {
-                    withheld.push(withhold(
-                        &target,
-                        count,
-                        format!(
-                            "pool lease {label} cannot be checked without a provider token: \
-                             inconclusive, job kept running"
-                        ),
-                    ));
-                    continue;
-                };
-                let Some(hub_id) = state.hub_id.as_deref() else {
-                    withheld.push(withhold(
-                        &target,
-                        count,
-                        format!(
-                            "pool lease {label} has no hub label to check: inconclusive, job kept \
-                             running"
-                        ),
-                    ));
-                    continue;
-                };
-                match pools.server_exists(hub_id, lease).await {
-                    Ok(false) => {
-                        target.evidence = Some(format!(
-                            "pool lease {label} no longer exists (provider confirmed)"
-                        ));
-                        target.classification = Some(schedule::CLASSIFIED_PROVIDER_ABSENT);
-                        confirmed.push(target);
-                    }
-                    Ok(true) => withheld.push(withhold(
-                        &target,
-                        count,
-                        format!(
-                            "pool lease {label} still exists (provider confirmed): job kept running"
-                        ),
-                    )),
-                    Err(error) => withheld.push(withhold(
-                        &target,
-                        count,
-                        format!(
-                            "pool lease {label} could not be confirmed ({error}): inconclusive, \
-                             job kept running"
-                        ),
-                    )),
-                }
-                continue;
-            }
-            let endpoint = self.endpoint_check(&target.member).await;
-            match endpoint {
-                EndpointCheck::Alive(at) => withheld.push(withhold(
-                    &target,
-                    count,
-                    format!(
-                        "target endpoint {at} still accepts TCP connections: inconclusive, job kept \
-                         running"
-                    ),
-                )),
-                EndpointCheck::Refused(why) => {
-                    target.evidence = Some(format!(
-                        "target endpoint {} is not reachable: {why}",
-                        target.member
-                    ));
-                    target.classification = Some(schedule::CLASSIFIED_ENDPOINT_REFUSED);
-                    confirmed.push(target);
-                }
-                EndpointCheck::Unknown(why) => withheld.push(withhold(
-                    &target,
-                    count,
-                    format!(
-                        "the target endpoint could not be checked ({why}): inconclusive, job kept \
-                         running"
-                    ),
-                )),
-            }
-        }
-        (confirmed, withheld)
-    }
-
-    async fn endpoint_check(&self, member: &str) -> EndpointCheck {
-        let Ok(record) = self.registry.get(member) else {
-            return EndpointCheck::Unknown("no stored target endpoint".to_owned());
-        };
-        let Ok(url) = reqwest::Url::parse(&record.origin) else {
-            return EndpointCheck::Unknown("the stored target origin is not a URL".to_owned());
-        };
-        let Some(port) = url.port_or_known_default() else {
-            return EndpointCheck::Unknown("the stored target origin has no port".to_owned());
-        };
-        // URL hosts keep IPv6 brackets in `host_str`, which `lookup_host` cannot resolve. Match
-        // the typed host instead: IP literals connect directly and only domain names are looked up.
-        let (host, at) = match url.host() {
-            Some(url::Host::Domain(name)) => (url::Host::Domain(name), format!("{name}:{port}")),
-            Some(url::Host::Ipv4(ip)) => (url::Host::Ipv4(ip), format!("{ip}:{port}")),
-            Some(url::Host::Ipv6(ip)) => (url::Host::Ipv6(ip), format!("[{ip}]:{port}")),
-            None => {
-                return EndpointCheck::Unknown("the stored target origin has no host".to_owned());
-            }
-        };
-        let addresses = match host {
-            url::Host::Ipv4(ip) => vec![std::net::SocketAddr::from((ip, port))],
-            url::Host::Ipv6(ip) => vec![std::net::SocketAddr::from((ip, port))],
-            url::Host::Domain(name) => {
-                let resolved = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    tokio::net::lookup_host((name, port)),
-                )
-                .await;
-                match resolved {
-                    Ok(Ok(addresses)) => {
-                        let addresses = addresses.collect::<Vec<_>>();
-                        if addresses.is_empty() {
-                            return EndpointCheck::Unknown(format!("{at} resolved to no address"));
-                        }
-                        addresses
-                    }
-                    Ok(Err(error)) => {
-                        return EndpointCheck::Unknown(format!(
-                            "{at} could not be resolved: {error}"
-                        ));
-                    }
-                    Err(_) => {
-                        return EndpointCheck::Unknown(format!("resolving {at} timed out"));
-                    }
-                }
-            }
-        };
-        let mut refused = Vec::new();
-        let mut other = Vec::new();
-        let mut timed_out = false;
-        for address in addresses {
-            match tokio::time::timeout(
-                Duration::from_secs(5),
-                tokio::net::TcpStream::connect(address),
-            )
-            .await
-            {
-                Ok(Ok(_)) => return EndpointCheck::Alive(at),
-                Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
-                    refused.push(format!("{address}: {error}"));
-                }
-                Ok(Err(error)) => other.push(format!("{address}: {error}")),
-                Err(_) => timed_out = true,
-            }
-        }
-        // Only an actual TCP refusal is proof. A lookup, timeout or other connect error says
-        // nothing about whether the member is gone, and a mixed answer is not decisive.
-        if refused.is_empty() {
-            return EndpointCheck::Unknown(if timed_out {
-                format!("connecting to {at} timed out")
-            } else {
-                format!("connecting to {at} failed: {}", other.join("; "))
-            });
-        }
-        if timed_out || !other.is_empty() {
-            let mut why = Vec::new();
-            if timed_out {
-                why.push(format!("connecting to {at} timed out"));
-            }
-            if !other.is_empty() {
-                why.push(format!("{at}: {}", other.join("; ")));
-            }
-            why.push(format!("refused: {}", refused.join("; ")));
-            return EndpointCheck::Unknown(why.join("; "));
-        }
-        EndpointCheck::Refused(refused.join("; "))
-    }
-}
-
-fn withhold(target: &LostTarget, count: u32, reason: String) -> WithheldTarget {
-    WithheldTarget {
-        job_id: target.job_id.clone(),
-        member: target.member.clone(),
-        reason: format!("{} probe {count}x failed: {reason}", target.member),
-    }
-}
-
-enum EndpointCheck {
-    Alive(String),
-    Refused(String),
-    Unknown(String),
-}
-
 /// Dequeue a job placing on its member. The target may hold a run under the job's submission key
 /// (the submission was unconfirmed or still in flight); the hub records that and stops placing
 /// the job, but never follows or adopts such a run.
-fn dequeue_placing(job: &mut Job, now: u64) -> Value {
+fn dequeue_placing(job: &mut Job, now: u64, hub_max_stall_ms: Option<u64>) -> Value {
     let member = job.target.clone().unwrap_or_default();
     job.state = JobState::Dequeued;
     job.finished_at_ms = Some(now);
@@ -1292,33 +966,7 @@ fn dequeue_placing(job: &mut Job, now: u64) -> Value {
             job.attempts + 1
         ),
     ));
-    job_document(job, now)
-}
-
-/// The state filters `hub ps` and `hub jobs` accept.
-const JOB_STATES: [&str; 9] = [
-    "active",
-    "all",
-    "recurring",
-    "queued",
-    "scheduled",
-    "running",
-    "succeeded",
-    "failed",
-    "dequeued",
-];
-
-/// Jobs one history page returns when the caller sets no `--limit`.
-pub(crate) const JOB_HISTORY_PAGE: usize = 20;
-
-fn validate_job_state(filter: &str) -> Result<(), HubError> {
-    if JOB_STATES.contains(&filter) {
-        return Ok(());
-    }
-    Err(HubError::Usage(format!(
-        "invalid --state {filter:?}: use one of {}",
-        JOB_STATES.join(", ")
-    )))
+    job_document(job, now, hub_max_stall_ms)
 }
 
 fn state_matches(job: &Job, filter: &str, now: u64) -> bool {
@@ -1338,18 +986,6 @@ fn idempotent(state: &HubState, job: &Job) -> Option<Job> {
         .iter()
         .find(|existing| existing.submission_key.as_ref() == Some(key))
         .cloned()
-}
-
-/// Why no member can ever take a job, or `None` when a member or a pool can.
-fn unplaceable(
-    state: &HubState,
-    spec: &PlacementSpec,
-    requirements: &Requirements,
-) -> Option<Vec<Rejection>> {
-    if pool::serving(&state.pools, spec, requirements).is_some() {
-        return None;
-    }
-    rejections(&state.members, spec, requirements)
 }
 
 pub(crate) fn create_private_directory(path: &Path) -> Result<(), HubError> {

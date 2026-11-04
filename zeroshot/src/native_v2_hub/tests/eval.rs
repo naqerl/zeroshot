@@ -635,6 +635,7 @@ async fn eval_runs_baseline_and_variant_through_the_hub_and_reports_deltas() {
         environment: false,
         cwd: None,
         submission_key: None,
+        max_stall_ms: None,
     };
     let add_case = |name: &str| {
         HubCommand::Eval(HubEvalCommand::CaseAdd(Box::new(HubEvalCaseAdd {
@@ -841,6 +842,7 @@ async fn zeroshot_judges_run_as_hub_jobs_and_their_output_is_the_verdict() {
         environment: false,
         cwd: None,
         submission_key: None,
+        max_stall_ms: None,
     };
     spec.labels.push(("task".to_owned(), "judge".to_owned()));
     let case = json_call(
@@ -1107,6 +1109,7 @@ async fn zeroshot_judged_run(
         environment: false,
         cwd: None,
         submission_key: None,
+        max_stall_ms: None,
     };
     let case = json_call(
         &hub.client,
