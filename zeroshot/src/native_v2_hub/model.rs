@@ -211,6 +211,8 @@ pub(crate) enum JobState {
     Succeeded,
     Failed,
     Dequeued,
+    /// Stopped by `hub stop` while running; distinct from a run that failed on its own.
+    Cancelled,
 }
 
 impl JobState {
@@ -241,6 +243,8 @@ pub(crate) enum JobErrorKind {
     /// The job's member left the hub or stayed unreachable for too many consecutive probes, so
     /// the hub cannot observe or stop its run.
     TargetLost,
+    /// An operator stopped the job's run through `hub stop` while it was running.
+    Cancelled,
     /// Recorded as plain text by an earlier hub, or a kind this hub no longer produces.
     Unclassified,
 }
@@ -259,6 +263,7 @@ impl<'de> Deserialize<'de> for JobErrorKind {
             "dequeued_while_placing" => Self::DequeuedWhilePlacing,
             "stalled" => Self::Stalled,
             "target_lost" => Self::TargetLost,
+            "cancelled" => Self::Cancelled,
             _ => Self::Unclassified,
         })
     }
@@ -352,6 +357,14 @@ pub(crate) struct Job {
     pub finished_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
+    /// When `hub stop` ended a running job, and the operator's reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    /// Workspace evidence and the captured log tail retained after a stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<JobArtifacts>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<JobUsage>,
     /// The hub's own problem with this job, apart from its run's `failure_reason`.
@@ -381,6 +394,7 @@ impl Job {
             JobState::Succeeded => "succeeded",
             JobState::Failed => "failed",
             JobState::Dequeued => "dequeued",
+            JobState::Cancelled => "cancelled",
         }
     }
 
@@ -419,11 +433,28 @@ impl Job {
             "lastCursorAt": time(self.last_cursor_at_ms),
             "finishedAt": time(self.finished_at_ms),
             "failureReason": self.failure_reason,
+            "stoppedAt": time(self.stopped_at_ms),
+            "stopReason": self.stop_reason,
+            "artifacts": self.artifacts,
             "tokenUsage": self.token_usage,
             "error": self.error.as_ref().map(|error| &error.message),
             "errorKind": self.error.as_ref().map(|error| error.kind),
         })
     }
+}
+
+/// Evidence retained after a stop: the run's workspace and its last log records.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct JobArtifacts {
+    /// Private hub folder holding this job's retained evidence.
+    pub directory: PathBuf,
+    /// Workspace the run used; it is retained, never deleted by a stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<PathBuf>,
+    /// File with the last captured run-log lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs: Option<PathBuf>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]

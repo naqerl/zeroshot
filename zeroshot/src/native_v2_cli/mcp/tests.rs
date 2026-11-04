@@ -691,6 +691,7 @@ async fn handshake_lists_cli_tools() {
             "hub_logs",
             "hub_daemon_status",
             "hub_dequeue",
+            "hub_stop",
             "hub_add",
             "hub_update",
             "hub_remove",
@@ -725,6 +726,7 @@ fn hub_tools_are_listed_and_map_arguments() {
         .collect::<Vec<_>>();
     for name in [
         "hub_dequeue",
+        "hub_stop",
         "hub_add",
         "hub_update",
         "hub_remove",
@@ -742,6 +744,15 @@ fn hub_tools_are_listed_and_map_arguments() {
     assert_eq!(
         super::tools::argv_for_test("hub_dequeue", &arguments).expect("hub_dequeue argv"),
         ["hub", "dequeue", "hj_1"]
+    );
+
+    let arguments = json!({"job": "hj_1", "reason": "runaway"})
+        .as_object()
+        .expect("arguments object")
+        .clone();
+    assert_eq!(
+        super::tools::argv_for_test("hub_stop", &arguments).expect("hub_stop argv"),
+        ["hub", "stop", "hj_1", "--reason", "runaway"]
     );
 
     let arguments = json!({"title": "Review", "taskFrom": "https://github.com/acme/repo/pull/1"})
@@ -1283,6 +1294,52 @@ async fn hub_subscription_opens_before_any_job_and_follows_its_lifecycle() {
     assert_eq!(sequences, sorted);
     sequences.dedup();
     assert_eq!(sequences.len(), job_events.len());
+}
+
+#[tokio::test]
+async fn hub_job_event_reports_cancelled_not_failed_or_stalled() {
+    let mut cancelled = hub_lifecycle_job("hj_stop", "cancelled", Some("run-stop"));
+    cancelled["failureReason"] = json!("cancelled");
+    let host = HubLifecycleHost::new(
+        vec![
+            vec![hub_lifecycle_job("hj_stop", "running", Some("run-stop"))],
+            vec![cancelled.clone()],
+            vec![cancelled],
+        ],
+        vec![hub_member("builder")],
+        HashMap::new(),
+    );
+    let mut session = Session::spawn(host);
+    initialize(&mut session).await;
+    let response = session
+        .start_stream(&json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "events/stream",
+            "params": {"arguments": {}}
+        }))
+        .await;
+    let frames = collect_stream(response, Duration::from_secs(4), |frames| {
+        hub_event_states(frames, "hj_stop")
+            .iter()
+            .any(|state| state == "cancelled")
+    })
+    .await;
+    let states = hub_event_states(&frames, "hj_stop");
+    assert!(
+        states.iter().any(|state| state == "cancelled"),
+        "{states:?}"
+    );
+    assert!(!states.iter().any(|state| state == "failed"), "{states:?}");
+    assert!(!states.iter().any(|state| state == "stalled"), "{states:?}");
+    let cancelled = stream_notifications(&frames)
+        .into_iter()
+        .find(|frame| {
+            frame["params"]["name"] == json!("hub.job")
+                && frame["params"]["data"]["state"] == json!("cancelled")
+        })
+        .expect("a cancelled hub.job event");
+    assert_eq!(cancelled["params"]["data"]["reason"], json!("cancelled"));
 }
 
 #[tokio::test]

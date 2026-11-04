@@ -11,9 +11,10 @@ use super::super::api::{ApiState, EXIT_CODE_HEADER, router, token_matches};
 use super::super::client::{HubClient, execute};
 use super::super::context::{ContextFile, Contexts, Resolved, TokenRef, select};
 use super::super::error::HubError;
+use super::super::model::JobState;
 use super::super::service::HubService;
 use super::super::store::HubStore;
-use super::FakeDriver;
+use super::{FakeDriver, job};
 use crate::native_v2_target::FileTargetRegistry;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
@@ -527,5 +528,63 @@ fn context_files_and_commands_reject_bad_records() {
     assert!(
         unreadable.to_string().contains("could not be read"),
         "{unreadable}"
+    );
+}
+
+#[tokio::test]
+async fn stop_route_cancels_a_running_job_and_reports_the_reason() {
+    let hub = hub().await;
+    let mut running = job("hj_stop", 0);
+    running.state = JobState::Running;
+    running.target = Some("box".to_owned());
+    running.run_id = Some("run-stop".to_owned());
+    hub.service
+        .mutate(|state| {
+            state.jobs.push(running);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+    let stopped = run(
+        &client(&hub, TOKEN),
+        HubCommand::Stop {
+            job: "hj_stop".to_owned(),
+            reason: Some("runaway".to_owned()),
+        },
+    )
+    .await
+    .expect("stop route");
+    assert_eq!(stopped["job"]["state"], json!("cancelled"));
+    assert_eq!(stopped["job"]["stopReason"], json!("runaway"));
+    assert_eq!(stopped["job"]["errorKind"], json!("cancelled"));
+}
+
+#[tokio::test]
+async fn stop_route_refuses_a_finished_job_with_409() {
+    let hub = hub().await;
+    let mut finished = job("hj_done", 0);
+    finished.state = JobState::Succeeded;
+    hub.service
+        .mutate(|state| {
+            state.jobs.push(finished);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/hub/jobs/hj_done/stop", hub.url))
+        .bearer_auth(TOKEN)
+        .json(&json!({ "reason": null }))
+        .send()
+        .await
+        .expect("stop request");
+    assert_eq!(response.status().as_u16(), 409);
+    let body = response.json::<Value>().await.expect("diagnostic");
+    assert_eq!(body["code"], json!("hub.invalid_state"));
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("already finished")),
+        "{body}"
     );
 }

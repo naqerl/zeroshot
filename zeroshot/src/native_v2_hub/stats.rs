@@ -86,6 +86,7 @@ struct Row {
     succeeded: u64,
     failed: u64,
     dequeued: u64,
+    cancelled: u64,
     usage: UsageTotals,
     cost: f64,
     unpriced: u64,
@@ -102,6 +103,7 @@ impl Row {
             JobState::Succeeded => self.succeeded += 1,
             JobState::Failed => self.failed += 1,
             JobState::Dequeued => self.dequeued += 1,
+            JobState::Cancelled => self.cancelled += 1,
         }
         if let Some(dispatched) = job.dispatched_at_ms {
             let ready = job.not_before_ms.unwrap_or(0).max(job.submitted_at_ms);
@@ -134,6 +136,7 @@ impl Row {
             "succeeded": self.succeeded,
             "failed": self.failed,
             "dequeued": self.dequeued,
+            "cancelled": self.cancelled,
             "queueWaitMs": percentiles(&self.queue_wait),
             "runDurationMs": percentiles(&self.duration),
         });

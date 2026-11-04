@@ -110,6 +110,14 @@ pub(crate) struct StatsRequest {
     pub prices: Option<Value>,
 }
 
+/// `POST /v1/hub/jobs/{id}/stop`: the optional operator reason.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct StopJob {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 /// `POST /v1/hub/jobs/{id}/stream`: the observation or stop command to proxy.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase", tag = "op")]

@@ -317,6 +317,14 @@ async fn request_document(client: &HubClient, command: HubCommand) -> Result<Val
                 .call(Method::DELETE, &["v1", "hub", "jobs", &job], None::<&Value>)
                 .await
         }
+        HubCommand::Stop { job, reason } => {
+            client
+                .post(
+                    &["v1", "hub", "jobs", &job, "stop"],
+                    &json!({ "reason": reason }),
+                )
+                .await
+        }
         HubCommand::Dispatch => client.post(&["v1", "hub", "dispatch"], &json!({})).await,
         HubCommand::Stats(request) => client.post(&["v1", "hub", "stats"], &stats(request)?).await,
         _ => Err(local_only()),

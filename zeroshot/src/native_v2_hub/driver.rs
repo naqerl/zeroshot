@@ -33,6 +33,10 @@ pub(crate) trait HubDriver: Send + Sync {
     async fn stop(&self, _member: &str, _run_id: &str) -> Result<(), HubError> {
         Ok(())
     }
+    /// The run's durable log lines, used to retain a bounded tail when a job is stopped.
+    async fn log_tail(&self, _member: &str, _run_id: &str) -> Result<Vec<String>, HubError> {
+        Ok(Vec::new())
+    }
     /// Capability kinds advertised by a named target's discovery document.
     async fn capabilities(&self, member: &str) -> Result<Vec<String>, HubError>;
 }
@@ -177,6 +181,17 @@ impl HubDriver for ProcessDriver {
         self.call(force_stop_arguments(member, run_id), None)
             .await?;
         Ok(())
+    }
+
+    async fn log_tail(&self, member: &str, run_id: &str) -> Result<Vec<String>, HubError> {
+        let mut arguments = vec!["logs".to_owned(), run_id.to_owned()];
+        arguments.extend(route(member));
+        let stdout = self.call(arguments, None).await?;
+        Ok(stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_owned)
+            .collect())
     }
 
     async fn capabilities(&self, member: &str) -> Result<Vec<String>, HubError> {

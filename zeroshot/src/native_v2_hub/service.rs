@@ -7,7 +7,7 @@
 //! placement decisions (dispatcher passes and `submit`), so a job is never placed twice.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures_util::future::join_all;
@@ -20,8 +20,8 @@ use super::driver::{HubDriver, force_stop_arguments, route};
 use super::error::HubError;
 use super::metrics::Metrics;
 use super::model::{
-    HubState, Job, JobError, JobErrorKind, JobState, LOCAL_MEMBER, Member, MemberState, Schedule,
-    ScheduleState,
+    HubState, Job, JobArtifacts, JobError, JobErrorKind, JobState, LOCAL_MEMBER, Member,
+    MemberState, Schedule, ScheduleState,
 };
 use super::placement::{Fit, Placement, describe, fit, matching_members, place, rejections};
 use super::schedule::{self, Dispatched, TickReport};
@@ -31,6 +31,9 @@ use super::wire::{
     AddMember, JobFile, JobQuery, MemberQuery, StatsRequest, StreamRequest, UpdateMember,
 };
 use crate::native_v2_target::{FileTargetRegistry, TargetAccess, TargetRegistry};
+
+/// Lines of run log retained as a stopped job's evidence; at least the operator-facing 200.
+pub(crate) const STOP_LOG_TAIL_LINES: usize = 200;
 
 /// Run arguments whose value is a file the client uploads with the job.
 pub(crate) const FILE_FLAGS: [&str; 5] = [
@@ -605,7 +608,7 @@ impl HubService {
     }
 
     pub(crate) async fn ps(&self, query: JobQuery) -> Result<Value, HubError> {
-        const STATES: [&str; 9] = [
+        const STATES: [&str; 10] = [
             "active",
             "all",
             "recurring",
@@ -615,6 +618,7 @@ impl HubService {
             "succeeded",
             "failed",
             "dequeued",
+            "cancelled",
         ];
         if !STATES.contains(&query.state.as_str()) {
             return Err(HubError::Usage(format!(
@@ -761,6 +765,95 @@ impl HubService {
             Ok(job_document(job, now, max_stall_ms))
         })
         .await
+    }
+
+    /// Stop a job without deleting its member. Queued and placing jobs dequeue exactly as
+    /// before; a running job is force-stopped and settled as `cancelled` with its workspace and
+    /// last log records retained under the hub's artifacts folder.
+    pub(crate) async fn stop(
+        &self,
+        job_id: &str,
+        reason: Option<String>,
+    ) -> Result<Value, HubError> {
+        let job = self.job(job_id).await?;
+        let now = now_ms();
+        if job.state.is_terminal() {
+            return Err(HubError::InvalidState(format!(
+                "hub job {job_id} already finished ({}); nothing to stop",
+                job.display_state(now)
+            )));
+        }
+        if job.state == JobState::Queued || job.is_placing() {
+            return self.dequeue(job_id).await;
+        }
+        let Some(target) = job.target.as_deref() else {
+            return Err(HubError::InvalidState(format!(
+                "hub job {job_id} is running without a member to stop it on"
+            )));
+        };
+        let Some(run_id) = job.run_id.as_deref() else {
+            return Err(HubError::InvalidState(format!(
+                "hub job {job_id} is running without a run to stop"
+            )));
+        };
+        self.driver().stop(target, run_id).await?;
+        let logs = self
+            .driver()
+            .log_tail(target, run_id)
+            .await
+            .unwrap_or_default();
+        let artifacts = self.capture_artifacts(&job, &logs);
+        let stop_reason = reason
+            .map(|reason| reason.trim().to_owned())
+            .filter(|reason| !reason.is_empty());
+        let detail = stop_reason
+            .clone()
+            .unwrap_or_else(|| "operator requested stop".to_owned());
+        let now = now_ms();
+        self.mutate(|state| {
+            let job = state
+                .jobs
+                .iter_mut()
+                .find(|job| job.job_id == job_id)
+                .ok_or_else(|| HubError::JobNotFound(job_id.to_owned()))?;
+            if job.state != JobState::Running || job.run_id.as_deref() != Some(run_id) {
+                return Ok(job_document(job, now, self.max_stall_ms));
+            }
+            job.state = JobState::Cancelled;
+            job.finished_at_ms = Some(now);
+            job.stopped_at_ms = Some(now);
+            job.failure_reason = Some("cancelled".to_owned());
+            job.stop_reason = stop_reason;
+            job.artifacts = artifacts;
+            job.error = Some(JobError::new(
+                JobErrorKind::Cancelled,
+                format!("cancelled: {detail}; the workspace and log tail are retained"),
+            ));
+            Ok(job_document(job, now, self.max_stall_ms))
+        })
+        .await
+    }
+
+    /// Retain the job's workspace path and the last [`STOP_LOG_TAIL_LINES`] log lines. Evidence
+    /// capture is best effort: a stop must not fail because its diagnostics could not be written.
+    fn capture_artifacts(&self, job: &Job, logs: &[String]) -> Option<JobArtifacts> {
+        let directory = self.store.directory().join("artifacts").join(&job.job_id);
+        create_private_directory(&directory).ok()?;
+        let mut artifacts = JobArtifacts {
+            directory: directory.clone(),
+            workspace: Some(workspace_path(job)),
+            logs: None,
+        };
+        if !logs.is_empty() {
+            let start = logs.len().saturating_sub(STOP_LOG_TAIL_LINES);
+            let mut text = logs[start..].join("\n");
+            text.push('\n');
+            let path = directory.join("logs.tail");
+            if replace_private(&path, text.as_bytes()).is_ok() {
+                artifacts.logs = Some(path);
+            }
+        }
+        Some(artifacts)
     }
 
     pub(crate) async fn stats(&self, request: StatsRequest) -> Result<Value, HubError> {
@@ -953,6 +1046,20 @@ impl HubService {
 /// Dequeue a job placing on its member. The target may hold a run under the job's submission key
 /// (the submission was unconfirmed or still in flight); the hub records that and stops placing
 /// the job, but never follows or adopts such a run.
+/// The folder a stopped run used: `--cwd` joined to its invoking folder, else the invoking folder itself.
+fn workspace_path(job: &Job) -> PathBuf {
+    let selected = job
+        .run_args
+        .windows(2)
+        .find(|pair| pair.first().is_some_and(|flag| flag == "--cwd"))
+        .map(|pair| PathBuf::from(&pair[1]));
+    match selected {
+        Some(path) if path.is_absolute() => path,
+        Some(path) => job.cwd.join(path),
+        None => job.cwd.clone(),
+    }
+}
+
 fn dequeue_placing(job: &mut Job, now: u64, hub_max_stall_ms: Option<u64>) -> Value {
     let member = job.target.clone().unwrap_or_default();
     job.state = JobState::Dequeued;

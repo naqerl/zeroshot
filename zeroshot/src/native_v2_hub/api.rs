@@ -26,8 +26,8 @@ use super::error::HubError;
 use super::eval::{AddCase, AddSuite, CaseQuery, CreateRun, ReportRequest, RunQuery};
 use super::service::HubService;
 use super::wire::{
-    AddMember, CreateSchedule, EnqueueJob, JobQuery, MemberQuery, StatsRequest, StreamFrame,
-    StreamRequest, SubmitJob, UpdateMember,
+    AddMember, CreateSchedule, EnqueueJob, JobQuery, MemberQuery, StatsRequest, StopJob,
+    StreamFrame, StreamRequest, SubmitJob, UpdateMember,
 };
 
 /// Response header carrying the CLI exit code of an error.
@@ -67,6 +67,7 @@ pub(crate) fn router_with_mcp(state: Arc<ApiState>, mcp: Option<Router>) -> Rout
         .route("/v1/hub/jobs", post(submit))
         .route("/v1/hub/jobs/query", post(ps))
         .route("/v1/hub/jobs/{id}", get(status).delete(dequeue))
+        .route("/v1/hub/jobs/{id}/stop", post(stop))
         .route("/v1/hub/jobs/{id}/stream", post(stream))
         .route("/v1/hub/queue", post(enqueue))
         .route("/v1/hub/schedules", post(create_schedule))
@@ -296,6 +297,23 @@ async fn status(State(state): State<Arc<ApiState>>, Path(id): Path<String>) -> R
 
 async fn dequeue(State(state): State<Arc<ApiState>>, Path(id): Path<String>) -> Response {
     reply(state.service.dequeue(&id).await)
+}
+
+async fn stop(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    bytes: Bytes,
+) -> Response {
+    let result = async {
+        let request = if bytes.is_empty() {
+            StopJob::default()
+        } else {
+            body::<StopJob>(&bytes)?
+        };
+        state.service.stop(&id, request.reason).await
+    }
+    .await;
+    reply(result)
 }
 
 async fn dispatch(State(state): State<Arc<ApiState>>) -> Response {

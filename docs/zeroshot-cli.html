@@ -79,6 +79,7 @@ section { margin-block: 2.5rem; }
 <li><a href="#zeroshot-hub-logs"><code>zeroshot hub logs</code></a></li>
 <li><a href="#zeroshot-hub-attach"><code>zeroshot hub attach</code></a></li>
 <li><a href="#zeroshot-hub-force-stop"><code>zeroshot hub force-stop</code></a></li>
+<li><a href="#zeroshot-hub-stop"><code>zeroshot hub stop</code></a></li>
 <li><a href="#zeroshot-hub-dequeue"><code>zeroshot hub dequeue</code></a></li>
 <li><a href="#zeroshot-hub-dispatch"><code>zeroshot hub dispatch</code></a></li>
 <li><a href="#zeroshot-hub-stats"><code>zeroshot hub stats</code></a></li>
@@ -1009,6 +1010,7 @@ Commands:
   logs        Follow a placed job&#39;s run logs as NDJSON
   attach      Attach to an execution of a placed job as NDJSON
   force-stop  Force a placed job&#39;s run to stop
+  stop        Stop a job and keep its workspace and log evidence
   dequeue     Remove a queued or scheduled job before it is placed, a placing job its target has not confirmed, or a recurring schedule (`hs_…`)
   dispatch    Ask the hub daemon to run one dispatcher pass now and print its summary
   stats       Aggregate job outcomes and provider-reported tokens as JSON
@@ -1590,7 +1592,7 @@ Options:
           Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
 
       --state &lt;STATE&gt;
-          Job state filter: active (queued, scheduled, running), queued, scheduled, running, succeeded, failed, dequeued, recurring (schedules only), or all. Active schedules are listed with active and recurring; all schedules with all
+          Job state filter: active (queued, scheduled, running), queued, scheduled, running, succeeded, failed, dequeued, cancelled, recurring (schedules only), or all. Active schedules are listed with active and recurring; all schedules with all
 
           [default: active]
 
@@ -1692,6 +1694,26 @@ Options:
 
   -h, --help
           Print help</code></pre></section>
+<section id="zeroshot-hub-stop"><h4><code>zeroshot hub stop</code></h4>
+<pre><code>Stop a job and keep its workspace and log evidence.
+
+A queued or placing job is dequeued. A running job is force-stopped and settled as cancelled, with the reason, stoppedAt, and the retained workspace and log tail linked from the job record; the member becomes free for the next job. A finished job answers 409.
+
+Usage: zeroshot hub stop [OPTIONS] &lt;JOB_ID&gt;
+
+Arguments:
+  &lt;JOB_ID&gt;
+          Hub job ID
+
+Options:
+      --hub &lt;CONTEXT&gt;
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+      --reason &lt;REASON&gt;
+          Why the job is being stopped; recorded with the cancelled job
+
+  -h, --help
+          Print help (see a summary with &#39;-h&#39;)</code></pre></section>
 <section id="zeroshot-hub-dequeue"><h4><code>zeroshot hub dequeue</code></h4>
 <pre><code>Remove a queued or scheduled job before it is placed, a placing job its target has not confirmed, or a recurring schedule (`hs_…`).
 
@@ -2529,6 +2551,7 @@ Commands:
   logs        Follow a placed job&#39;s run logs as NDJSON
   attach      Attach to an execution of a placed job as NDJSON
   force-stop  Force a placed job&#39;s run to stop
+  stop        Stop a job and keep its workspace and log evidence
   dequeue     Remove a queued or scheduled job before it is placed, a placing job its target has not confirmed, or a recurring schedule (`hs_…`)
   dispatch    Ask the hub daemon to run one dispatcher pass now and print its summary
   stats       Aggregate job outcomes and provider-reported tokens as JSON

@@ -875,7 +875,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   with `--max-stall-ms` on `hub submit`/`hub enqueue`; the job value wins over the hub's
   `--max-stall`, and the diagnostic and `hub status` name the effective limit and its source.
   `hub dequeue` also removes placing jobs
-  (`dequeued_while_placing`); a run the target accepts under their key is noted, never adopted. Jobs placing when a daemon stops stay on their member as unconfirmed. Hub-side job problems
+  (`dequeued_while_placing`); a run the target accepts under their key is noted, never adopted. Jobs placing when a daemon stops stay on their member as unconfirmed. `POST /v1/hub/jobs/{id}/stop` (CLI `hub stop`, MCP `hub_stop`) dequeues a queued or placing job and force-stops a running run, settling it as `cancelled` with error kind `cancelled`, the operator reason, `stoppedAt`, and retained workspace plus a bounded (200-line) log tail under the hub artifacts folder; the member stays available and a finished job answers 409. Hub-side job problems
   are a typed `JobError` (plain strings from older state load as `unclassified`). API errors carry the
   `zeroshot.error/v1` diagnostic plus `x-zeroshot-exit-code`; logs, watch, attach, and force-stop
   stream NDJSON frames from a `zeroshot` child on the hub host. Every other hub command is a client
@@ -947,8 +947,8 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   are `status`, `logs`, `watch`, `list`, `report`, `hub_list`, `hub_ps`, `hub_stats`, `hub_logs`,
   and `hub_daemon_status`. `watch`, `logs`, and `hub_logs` follow until the stream ends; live run
   events use the events extension. `run`, `resume`, `hub_submit`, and `hub_enqueue` submit work.
-- Destructive commands such as `zeroshot force-stop` require explicit user intent. The MCP
-  `force-stop` tool is that command.
+- Destructive commands such as `zeroshot force-stop` and `zeroshot hub stop` require explicit user
+  intent. The MCP `force-stop` and `hub_stop` tools are those commands.
 
 ## Where to look
 

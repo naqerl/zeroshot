@@ -57,6 +57,11 @@ pub enum HubCommand {
     ForceStop {
         job: String,
     },
+    /// Stop a queued, placing, or running job without deleting its member.
+    Stop {
+        job: String,
+        reason: Option<String>,
+    },
     /// Remove a queued job (`hj_…`) or a recurring schedule (`hs_…`).
     Dequeue {
         job: String,

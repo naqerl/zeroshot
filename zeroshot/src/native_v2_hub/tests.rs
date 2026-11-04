@@ -39,6 +39,8 @@ mod mcp;
 mod metrics;
 #[path = "tests/paths.rs"]
 mod paths;
+#[path = "tests/stop.rs"]
+mod stop;
 #[path = "tests/usage.rs"]
 mod usage;
 
@@ -79,6 +81,9 @@ pub(super) fn job(id: &str, submitted_at_ms: u64) -> Job {
         target_last_ok_at_ms: None,
         finished_at_ms: None,
         failure_reason: None,
+        stopped_at_ms: None,
+        stop_reason: None,
+        artifacts: None,
         token_usage: None,
         error: None,
         schedule_id: None,
@@ -832,6 +837,8 @@ pub(super) struct FakeDriver {
     pub stops: Mutex<Vec<(String, String)>>,
     /// Makes every `force-stop` fail.
     pub fail_stops: std::sync::atomic::AtomicBool,
+    /// Durable log lines returned by `log_tail`.
+    pub logs: Vec<String>,
 }
 
 impl FakeDriver {
@@ -941,7 +948,16 @@ impl HubDriver for FakeDriver {
                 diagnostic: None,
             });
         }
+        if let Some(runs) = self.runs.lock().expect("fake lock").get_mut(member) {
+            if let Some((_, phase)) = runs.iter_mut().find(|(id, _)| id == run_id) {
+                *phase = "finished";
+            }
+        }
         Ok(())
+    }
+
+    async fn log_tail(&self, _member: &str, _run_id: &str) -> Result<Vec<String>, HubError> {
+        Ok(self.logs.clone())
     }
 
     async fn capabilities(&self, member: &str) -> Result<Vec<String>, HubError> {

@@ -113,6 +113,13 @@ pub(super) enum HubCliCommand {
     /// Force a placed job's run to stop.
     ForceStop(HubJobArgs),
 
+    /// Stop a job and keep its workspace and log evidence.
+    ///
+    /// A queued or placing job is dequeued. A running job is force-stopped and settled as
+    /// cancelled, with the reason, stoppedAt, and the retained workspace and log tail linked
+    /// from the job record; the member becomes free for the next job. A finished job answers 409.
+    Stop(HubStopArgs),
+
     /// Remove a queued or scheduled job before it is placed, a placing job its target has not
     /// confirmed, or a recurring schedule (`hs_…`).
     ///
@@ -501,8 +508,8 @@ pub(super) struct HubEnqueueArgs {
 #[derive(Debug, Args)]
 pub(super) struct HubPsArgs {
     /// Job state filter: active (queued, scheduled, running), queued, scheduled, running,
-    /// succeeded, failed, dequeued, recurring (schedules only), or all. Active schedules are
-    /// listed with active and recurring; all schedules with all.
+    /// succeeded, failed, dequeued, cancelled, recurring (schedules only), or all. Active
+    /// schedules are listed with active and recurring; all schedules with all.
     #[arg(long, value_name = "STATE", default_value = "active")]
     state: String,
 
@@ -524,6 +531,17 @@ pub(super) struct HubJobArgs {
     /// Hub job ID.
     #[arg(value_name = "JOB_ID")]
     job: String,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubStopArgs {
+    /// Hub job ID.
+    #[arg(value_name = "JOB_ID")]
+    job: String,
+
+    /// Why the job is being stopped; recorded with the cancelled job.
+    #[arg(long, value_name = "REASON")]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -613,6 +631,10 @@ impl HubCliCommand {
                 execution: args.execution,
             }),
             Self::ForceStop(args) => Ok(HubCommand::ForceStop { job: args.job }),
+            Self::Stop(args) => Ok(HubCommand::Stop {
+                job: args.job,
+                reason: args.reason,
+            }),
             Self::Dequeue(args) => Ok(HubCommand::Dequeue { job: args.job }),
             Self::Dispatch => Ok(HubCommand::Dispatch),
             Self::Stats(args) => Ok(stats_command(args)),
