@@ -3,26 +3,29 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncWrite;
-use tokio::sync::{Mutex, Notify, broadcast};
+use tokio::sync::{Mutex, broadcast};
 
-use super::args::{integer_prop, object_schema, optional_string, reject_unknown, string_prop};
+use super::args::{
+    bool_prop, object_schema, optional_string, reject_unknown, string_array_prop, string_prop,
+};
 use super::host::{parse_cli, McpFailure, McpHost, WatchStream};
-use super::super::hub::{HubCommand, HubPoolCommand, HubRequest};
+use super::super::hub::{HubCommand, HubRequest};
 use super::super::{NativeV2CliCommand, RunWatchCommand};
 
 pub(super) const EXTENSION_ID: &str = "io.modelcontextprotocol/events";
 const EVENT_NAME: &str = "run.event";
 const HUB_JOB: &str = "hub.job";
 const HUB_RUN: &str = "hub.run";
+const HUB_RUN_DETAIL: &str = "hub.run.detail";
 const HUB_POOL: &str = "hub.pool";
 const HUB_WARNING: &str = "hub.warning";
-const HUB_EVENTS: &[&str] = &[HUB_JOB, HUB_RUN, HUB_POOL, HUB_WARNING];
+const HUB_EVENTS: &[&str] = &[HUB_JOB, HUB_RUN, HUB_RUN_DETAIL, HUB_POOL, HUB_WARNING];
 const SUBSCRIPTION_META: &str = "io.modelcontextprotocol/subscriptionId";
 const FIRST_WAIT: Duration = Duration::from_secs(2);
 const IDLE_WAIT: Duration = Duration::from_millis(50);
@@ -36,50 +39,9 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HUB_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const HUB_WARNING_INTERVAL: Duration = Duration::from_secs(60 * 60);
-/// A watch that failed is retried after this cooldown instead of being tombstoned forever.
-const WATCH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const HUB_LOG_LIMIT: usize = 4096;
-/// Bootstrap and every per-job book retain only the newest job views. This keeps those maps
-/// bounded independently of how much terminal history the daemon has accumulated.
-const HUB_RECENT_JOBS: usize = 512;
-/// Every delivered cursor is either a durable `hub:<sequence>` position or the resumable
-/// bootstrap progress identity `hub:snapshot:<delivered>:<start>` synthesized before the first
-/// occurrence. Advertised schemas must accept both, because bootstrap records carry the latter
-/// as their `eventId` and `data.cursor`.
-const HUB_CURSOR_PATTERN: &str = "^hub:(snapshot:[0-9]+:[0-9]+|[0-9]+)$";
 const HUB_BROADCAST_LIMIT: usize = 1024;
-pub(crate) const PHASES: &[&str] = &["admitted", "running", "stopping", "finished"];
-/// Phases a pool lease or pool record can carry; the CLI hub event filter also accepts these.
-pub(crate) const POOL_PHASES: &[&str] = &[
-    "requested",
-    "creating",
-    "booting",
-    "preparing",
-    "ready",
-    "in_use",
-    "idle",
-    "draining",
-    "deleted",
-    "failed",
-    "added",
-    "removed",
-    "paused",
-    "resumed",
-    "blocked",
-    "shortage",
-];
-/// The states a `hub.job` occurrence can carry; the CLI hub event filter accepts this vocabulary.
-pub(crate) const JOB_STATES: &[&str] = &[
-    "submitted",
-    "queued",
-    "scheduled",
-    "placing",
-    "running",
-    "succeeded",
-    "failed",
-    "dequeued",
-    "cancelled",
-];
+const PHASES: &[&str] = &["admitted", "running", "stopping", "finished"];
 /// The hub's built-in local member is the default local backend, not a named target.
 const LOCAL_HUB_MEMBER: &str = "local";
 
@@ -92,6 +54,7 @@ type HubSnapshot = (
 
 pub(super) struct Prepared {
     subscription: HubSubscription,
+    filters: Filters,
 }
 
 struct HubSubscription {
@@ -103,29 +66,20 @@ struct HubSubscription {
     selector: Selector,
     target: Option<String>,
     kinds: Option<Vec<String>>,
-    stream: String,
 }
 
 pub(super) enum EventError {
     Invalid(McpFailure),
-    /// A narrowing argument was supplied to the hub type, which carries every hub event.
-    Filtered(&'static str),
     NotFound,
     Failed(McpFailure),
 }
 
 struct PollRequest {
-    /// The name the client subscribed with (`hub` when omitted). Every hub occurrence carries it
-    /// as its envelope `name`, because MCP events clients match an occurrence to its subscription
-    /// by name; the carried kind travels in `data.kind`.
-    stream: String,
     selector: Selector,
     target: Option<String>,
     cursor: Option<String>,
     max_events: usize,
-    /// The kind implied by a kind-named subscription (`hub.job`, ...). A hub subscription by
-    /// name or alias carries every kind. This is subscription identity, not a narrowing argument.
-    kinds: Option<Vec<String>>,
+    filters: Filters,
     hub: bool,
 }
 
@@ -144,38 +98,58 @@ impl Selector {
 
 struct JobSnapshot {
     view: Value,
-    run: Option<Value>,
     run_id: Option<String>,
     target: Option<String>,
 }
 
-/// Narrowing arguments that used to filter a `hub` subscription. They are rejected in this
-/// fixed order so the reported argument is deterministic.
-const NARROWING_ARGUMENTS: [&str; 7] = [
-    "kinds",
-    "states",
-    "phases",
-    "nodes",
-    "labels",
-    "terminalOnly",
-    "verbose",
-];
-const NARROWING_MESSAGES: [&str; 7] = [
-    "the hub event type carries every event; \"kinds\" is not supported",
-    "the hub event type carries every event; \"states\" is not supported",
-    "the hub event type carries every event; \"phases\" is not supported",
-    "the hub event type carries every event; \"nodes\" is not supported",
-    "the hub event type carries every event; \"labels\" is not supported",
-    "the hub event type carries every event; \"terminalOnly\" is not supported",
-    "the hub event type carries every event; \"verbose\" is not supported",
-];
+#[derive(Clone, Default)]
+struct Filters {
+    phases: Option<Vec<String>>,
+    nodes: Option<Vec<String>>,
+    kinds: Option<Vec<String>>,
+    terminal_only: bool,
+    verbose: bool,
+    detail: bool,
+}
 
-/// The first narrowing argument the subscription supplied, if any.
-fn narrowing_argument(arguments: &Map<String, Value>) -> Option<&'static str> {
-    NARROWING_ARGUMENTS
-        .iter()
-        .copied()
-        .find(|name| arguments.contains_key(*name))
+impl Filters {
+    fn accepts(&self, data: &Value, terminal: bool) -> bool {
+        if self.terminal_only && !terminal {
+            return false;
+        }
+        if let Some(phases) = &self.phases {
+            let phase = data
+                .pointer("/status/phase")
+                .or_else(|| data.get("state"))
+                .or_else(|| data.get("phase"))
+                .and_then(Value::as_str);
+            if !phase.is_some_and(|phase| phases.iter().any(|allowed| allowed == phase)) {
+                return false;
+            }
+        }
+        if let Some(nodes) = &self.nodes {
+            // A terminal record carries no active executions, so a node filter would
+            // otherwise swallow the one event that tells the caller the run ended.
+            if data.get("status").is_none() {
+                return true;
+            }
+            let matched = data
+                .pointer("/status/activeExecutions")
+                .and_then(Value::as_array)
+                .is_some_and(|executions| {
+                    executions.iter().any(|execution| {
+                        execution
+                            .get("node")
+                            .and_then(Value::as_str)
+                            .is_some_and(|node| nodes.iter().any(|allowed| allowed == node))
+                    })
+                });
+            if !matched && !terminal {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 struct Batch {
@@ -185,16 +159,9 @@ struct Batch {
     has_more: bool,
 }
 
-/// Where a hub poll record came from. Bootstrap progress needs its own resumable cursor because
-/// synthesized snapshots do not occupy durable feed sequences.
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum HubPosition {
-    Snapshot(usize),
-    Durable(u64),
-}
-
 /// One event published on the hub-wide stream. The sequence is the hub cursor; it is
 /// deliberately independent from the sparse per-run `v2:` watch cursors.
+#[derive(Clone)]
 pub(super) struct HubEvent {
     sequence: u64,
     name: &'static str,
@@ -205,12 +172,20 @@ pub(super) struct HubEvent {
     target: Option<String>,
     phase: Option<String>,
     terminal: bool,
-    /// A bootstrap state synthesized when a subscription starts without a cursor. It is sent
-    /// before live work but is never appended to the durable log or counted as a new cursor.
-    snapshot: bool,
-    /// Distinct resumable identity for a synthesized bootstrap record. Durable occurrences leave
-    /// this absent and use their feed sequence.
-    snapshot_cursor: Option<String>,
+    /// A stored per-cursor record that starts a new node or ends the running phase. Delivery
+    /// exposes it as the collapsed `hub.run` kind unless the subscriber opted into detail.
+    transition: bool,
+}
+
+#[derive(Default)]
+struct RunDeliveryState {
+    seen: bool,
+    node: Option<String>,
+    node_key: Option<String>,
+    phase: Option<String>,
+    node_changed_at: Option<String>,
+    node_changed_at_ms: u64,
+    cursors_since_last_event: u64,
 }
 
 struct HubLog {
@@ -225,133 +200,11 @@ pub(super) struct HubFeed {
     snapshot: RefCell<Vec<Arc<HubEvent>>>,
     sender: broadcast::Sender<Arc<HubEvent>>,
     started: Cell<bool>,
-    /// The first poll waits until the subscribing bootstrap has taken its snapshot. That keeps
-    /// synthetic bootstrap records and the poller's first observation from racing, while live
-    /// transitions after the subscription still arrive normally.
-    start: Notify,
-    warnings: RefCell<WarningBook>,
-    /// Latest durable run record per job, used to carry delivery facts into the one terminal
-    /// `hub.job` occurrence.
-    run_facts: RefCell<HashMap<String, Value>>,
-    /// Labels of the latest job view, so every job-derived record carries them.
-    job_labels: RefCell<HashMap<String, Value>>,
-    /// Jobs whose terminal occurrence this feed already published. A late subscriber gets that
-    /// final state in its bootstrap snapshot instead of waiting for an event it missed.
-    terminal_jobs: RefCell<HashSet<String>>,
-    /// The immediately previous `hub.run` occurrence per job. Comparing against only that
-    /// occurrence keeps a shrinking active set (A,B -> A) a real transition instead of a
-    /// historical duplicate, and carries the job attempt into the identity.
-    run_seen: RefCell<HashMap<String, String>>,
-}
-
-/// Facts the warning publisher keeps between intervals for each running job: the execution it
-/// last observed and when that execution first appeared, plus the cursor the previous warning
-/// announced. It lives beside the feed rather than on `Job`, so no hub state schema moves.
-#[derive(Default)]
-struct WarningBook {
-    jobs: HashMap<String, WarningEntry>,
-}
-
-#[derive(Default)]
-struct WarningEntry {
-    node: Option<String>,
-    execution: Option<String>,
-    execution_since_ms: Option<u64>,
-    announced_cursor: Option<String>,
-}
-
-/// Which runs currently have a live watch, and when a failed one may be retried.
-#[derive(Default)]
-struct WatchBook {
-    active: HashSet<String>,
-    retry_at: HashMap<String, Instant>,
-}
-
-impl WatchBook {
-    fn blocked(&self, run_id: &str, now: Instant) -> bool {
-        self.active.contains(run_id)
-            || self
-                .retry_at
-                .get(run_id)
-                .is_some_and(|retry_at| *retry_at > now)
-    }
-
-    fn started(&mut self, run_id: String) {
-        self.retry_at.remove(&run_id);
-        self.active.insert(run_id);
-    }
-
-    fn retry(&mut self, run_id: &str, now: Instant) {
-        self.active.remove(run_id);
-        self.retry_at
-            .insert(run_id.to_owned(), now + WATCH_RETRY_INTERVAL);
-    }
-
-    fn finished(&mut self, run_id: &str) {
-        self.active.remove(run_id);
-    }
-
-    fn retain_live(&mut self, live: &HashSet<String>) {
-        self.retry_at.retain(|run_id, _| live.contains(run_id));
-    }
-}
-
-impl WarningBook {
-    /// Learn the current execution from a run event. An empty `activeExecutions` means the run
-    /// is between executions, so the next one starts its own clock.
-    fn observe(&mut self, job_id: &str, event: &Value, now: u64) {
-        if event.pointer("/status/phase").and_then(Value::as_str) == Some("finished") {
-            self.jobs.remove(job_id);
-            return;
-        }
-        let Some(executions) = event
-            .pointer("/status/activeExecutions")
-            .and_then(Value::as_array)
-        else {
-            return;
-        };
-        let current = executions.first();
-        let execution = current
-            .and_then(|execution| execution.get("execution"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let node = current
-            .and_then(|execution| execution.get("node"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let entry = self.jobs.entry(job_id.to_owned()).or_default();
-        if entry.execution != execution {
-            entry.execution_since_ms = execution.as_ref().map(|_| now);
-            entry.execution = execution;
-            entry.node = node;
-        } else if node.is_some() {
-            entry.node = node;
-        }
-    }
-
-    fn retain_running(&mut self, running: &HashSet<String>) {
-        self.jobs.retain(|job_id, _| running.contains(job_id));
-    }
+    /// Delivery state per run, so collapse is decided once for every subscriber and replay.
+    runs: RefCell<HashMap<String, RunDeliveryState>>,
 }
 
 impl HubFeed {
-    /// Drop per-job books whose job is no longer visible, so a long-lived daemon does not grow
-    /// with every job it has ever seen.
-    fn retain_jobs(&self, live: &HashSet<String>) {
-        self.run_facts
-            .borrow_mut()
-            .retain(|job_id, _| live.contains(job_id));
-        self.job_labels
-            .borrow_mut()
-            .retain(|job_id, _| live.contains(job_id));
-        self.terminal_jobs
-            .borrow_mut()
-            .retain(|job_id| live.contains(job_id));
-        self.run_seen
-            .borrow_mut()
-            .retain(|job_id, _| live.contains(job_id));
-    }
-
     pub(super) fn new() -> Self {
         let (sender, _) = broadcast::channel(HUB_BROADCAST_LIMIT);
         Self {
@@ -362,12 +215,7 @@ impl HubFeed {
             snapshot: RefCell::new(Vec::new()),
             sender,
             started: Cell::new(false),
-            start: Notify::new(),
-            warnings: RefCell::new(WarningBook::default()),
-            run_facts: RefCell::new(HashMap::new()),
-            job_labels: RefCell::new(HashMap::new()),
-            terminal_jobs: RefCell::new(HashSet::new()),
-            run_seen: RefCell::new(HashMap::new()),
+            runs: RefCell::new(HashMap::new()),
         }
     }
 
@@ -380,26 +228,11 @@ impl HubFeed {
         }
         let feed = Rc::clone(self);
         tokio::task::spawn_local(async move {
-            feed.start.notified().await;
             hub_poller(host, feed).await;
         });
     }
 
-    /// Let the resident poller make its first observation after the bootstrap snapshot.
-    pub(super) fn release_poller(&self) {
-        self.start.notify_one();
-    }
-
     fn publish(&self, mut event: HubEvent) {
-        // Run and warning records describe a job, so carry the job's labels on every
-        // job-derived kind, not only on `hub.job`.
-        if event.name != HUB_JOB
-            && let Some(job_id) = &event.job_id
-            && let Some(labels) = self.job_labels.borrow().get(job_id).cloned()
-            && let Some(map) = event.data.as_object_mut()
-        {
-            map.entry("labels").or_insert(labels);
-        }
         let mut log = self.log.borrow_mut();
         event.sequence = log.next_sequence;
         log.next_sequence = log.next_sequence.saturating_add(1);
@@ -475,19 +308,11 @@ impl HubFeed {
 fn snapshot_key(event: &HubEvent) -> Option<(&'static str, String)> {
     match event.name {
         HUB_JOB => event.job_id.clone().map(|key| ("job", key)),
+        // Only a transition record is the run's observable state. A non-transition detail
+        // record is an intermediate cursor, never the snapshot a late subscriber needs.
+        HUB_RUN_DETAIL if event.transition => event.run_id.clone().map(|key| ("run", key)),
         HUB_RUN => event.run_id.clone().map(|key| ("run", key)),
-        HUB_POOL => event
-            .data
-            .get("leaseId")
-            .and_then(Value::as_str)
-            .map(|key| ("lease", key.to_owned()))
-            .or_else(|| {
-                event
-                    .data
-                    .get("pool")
-                    .and_then(Value::as_str)
-                    .map(|key| ("pool", key.to_owned()))
-            }),
+        HUB_POOL => event.target.clone().map(|key| ("pool", key)),
         _ => None,
     }
 }
@@ -511,35 +336,11 @@ impl HubLog {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HubCursor {
-    /// A durable feed occurrence.
-    Durable(u64),
-    /// Bootstrap progress: `delivered` synthesized records have been sent from a batch whose
-    /// original durable boundary is `start`.
-    Snapshot { delivered: usize, start: u64 },
-}
-
 fn hub_cursor(sequence: u64) -> String {
     format!("hub:{sequence}")
 }
 
-fn snapshot_cursor(delivered: usize, start: u64) -> String {
-    format!("hub:snapshot:{delivered}:{start}")
-}
-
-/// The durable feed sequence carried by a plain `hub:<n>` cursor. A bootstrap-progress cursor
-/// is not a durable position and never advances a resumed feed by itself.
 fn cursor_sequence(cursor: &str) -> Option<u64> {
-    let rest = cursor.strip_prefix("hub:")?;
-    if rest.is_empty() || !rest.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    rest.parse().ok()
-}
-
-/// A per-run watch cursor (`v2:<n>`) used for warning progress, not a hub feed position.
-fn watch_cursor_sequence(cursor: &str) -> Option<u64> {
     cursor.rsplit_once(':')?.1.parse().ok()
 }
 
@@ -548,23 +349,6 @@ fn truncated_range(from: u64, to: u64) -> Value {
         return json!(false);
     }
     json!({"from": hub_cursor(from), "to": hub_cursor(to)})
-}
-
-/// A resume cursor from before a daemon restart can sit beyond the new feed head. Clamp it to
-/// the head so live work is still delivered, and report the vanished range as truncation.
-fn clamp_resume(feed: &HubFeed, after: Option<u64>) -> (Option<u64>, Value) {
-    let head = feed.head();
-    match after {
-        Some(after) if after > head => (Some(head), truncated_range(head.saturating_add(1), after)),
-        _ => (after, json!(false)),
-    }
-}
-
-fn merge_truncated(current: Value, lost: Value) -> Value {
-    match truncation_bounds(&lost) {
-        (Some(from), Some(to)) => merge_truncation(current, from, to),
-        _ => current,
-    }
 }
 
 fn merge_truncation(current: Value, from: u64, to: u64) -> Value {
@@ -604,20 +388,37 @@ pub(super) fn list(params: &Value) -> Result<Value, EventError> {
     if paged {
         return Ok(json!({"resultType": "complete", "events": []}));
     }
-    let descriptions = [(
-        "hub",
-        "everything in the hub: jobs, runs, pool leases, and warnings. Every notification is \
-         named after the subscription (hub) and carries its kind, one of hub.job, hub.run, \
-         hub.pool, or hub.warning, in data.kind, so a client can branch on the kind or ignore it \
-         and read the stream.",
-    )];
+    let descriptions = [
+        (
+            HUB_JOB,
+            "A hub job lifecycle event for every submitted, queued, scheduled, placing, running, \
+             succeeded, failed, dequeued, or cancelled job.",
+        ),
+        (
+            HUB_RUN,
+            "A collapsed run occurrence published when the run changes node or leaves the running \
+             phase. It carries the liveness evidence for the cursor advances it collapses.",
+        ),
+        (
+            HUB_RUN_DETAIL,
+            "Every durable per-cursor run record, delivered only to subscribers that ask for detail \
+             with arguments.detail or the hub.run.detail kind.",
+        ),
+        (
+            HUB_POOL,
+            "A pool lease lifecycle event: provisioning, active, draining, deleted, or failed.",
+        ),
+        (
+            HUB_WARNING,
+            "An hourly warning for a running job, or a run-watch and stream failure.",
+        ),
+    ];
     let events = descriptions
         .into_iter()
         .map(|(name, description)| {
             json!({
                 "name": name,
                 "description": description,
-                "names": HUB_EVENTS,
                 "delivery": ["poll", "push"],
                 "inputSchema": input_schema(name),
                 "payloadSchema": payload_schema(name),
@@ -661,14 +462,13 @@ pub(super) async fn poll<H>(
     host: &Rc<H>,
     feed: &Rc<HubFeed>,
     params: &Value,
-    sequence: &Cell<u64>,
 ) -> Result<Value, EventError>
 where
     H: McpHost + 'static,
 {
     let request = parse_subscription(params, true)?;
     if request.hub {
-        return hub_poll(host, feed, &request, sequence).await;
+        return hub_poll(host, feed, &request).await;
     }
     let (batch, job) = match request.selector.clone() {
         Selector::Hub => {
@@ -723,10 +523,10 @@ where
     H: McpHost + 'static,
 {
     let request = parse_subscription(params, false)?;
-    prepare_hub(host, feed, &request).await
+    prepare_hub(host, feed, &request)
 }
 
-async fn prepare_hub<H>(
+fn prepare_hub<H>(
     host: &Rc<H>,
     feed: &Rc<HubFeed>,
     request: &PollRequest,
@@ -735,34 +535,12 @@ where
     H: McpHost + 'static,
 {
     feed.ensure_started(Rc::clone(host));
-    let (after, snapshot_skip, bootstrap) = match request.cursor.as_deref() {
-        Some(cursor) => match parse_hub_cursor(cursor)? {
-            HubCursor::Durable(sequence) => (Some(sequence), 0, false),
-            HubCursor::Snapshot { delivered, start } => (Some(start), delivered, true),
-        },
-        None => (None, 0, true),
+    let after = match request.cursor.as_deref() {
+        Some(cursor) => Some(parse_hub_cursor(cursor)?),
+        None => None,
     };
-    let (after, stale) = clamp_resume(feed, after);
-    let start = after.unwrap_or_else(|| feed.head());
-    let (receiver, mut replay, truncated, cursor) = feed.snapshot(after);
-    let mut truncated = merge_truncated(truncated, stale);
-    if bootstrap && let Some(snapshots) = snapshot_events(host.as_ref(), feed, request, start).await
-    {
-        // Bootstrap records lead the batch. Everything published while this snapshot was
-        // built still follows, so neither the bootstrap terminal's own publication nor an
-        // unrelated live transition is skipped. The stream drops only repeated job states.
-        let (live, lost) = feed.after(start);
-        replay.retain(|event| event.sequence <= start);
-        replay.extend(live);
-        truncated = merge_truncated(truncated, lost);
-        let mut combined = snapshots
-            .into_iter()
-            .skip(snapshot_skip)
-            .collect::<Vec<_>>();
-        combined.extend(replay);
-        replay = combined;
-    }
-    let prepared = Prepared {
+    let (receiver, replay, truncated, cursor) = feed.snapshot(after);
+    Ok(Prepared {
         subscription: HubSubscription {
             feed: Rc::clone(feed),
             receiver,
@@ -771,12 +549,10 @@ where
             truncated,
             selector: request.selector.clone(),
             target: request.target.clone(),
-            kinds: request.kinds.clone(),
-            stream: request.stream.clone(),
+            kinds: request.filters.kinds.clone(),
         },
-    };
-    feed.release_poller();
-    Ok(prepared)
+        filters: request.filters.clone(),
+    })
 }
 
 pub(super) struct StreamOutput<W> {
@@ -799,11 +575,18 @@ pub(super) async fn drive<W>(prepared: Prepared, output: StreamOutput<W>) -> std
 where
     W: AsyncWrite + Unpin + Send,
 {
-    let Prepared { subscription } = prepared;
-    drive_hub(subscription, output).await
+    let Prepared {
+        subscription,
+        filters,
+    } = prepared;
+    drive_hub(subscription, filters, output).await
 }
 
-async fn drive_hub<W>(subscription: HubSubscription, output: StreamOutput<W>) -> std::io::Result<()>
+async fn drive_hub<W>(
+    subscription: HubSubscription,
+    filters: Filters,
+    output: StreamOutput<W>,
+) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin + Send,
 {
@@ -816,7 +599,6 @@ where
         selector,
         target,
         kinds,
-        stream,
     } = subscription;
     let StreamOutput {
         id,
@@ -826,46 +608,6 @@ where
     if cancelled.load(Ordering::Relaxed) {
         return Ok(());
     }
-    let filter = HubFilter {
-        selector: &selector,
-        target: &target,
-        kinds: &kinds,
-        stream: &stream,
-    };
-    let mut sequence = 0u64;
-    let mut job_states = HashMap::new();
-    for event in replay {
-        if cancelled.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        if !repeated_job_state(&event, &job_states) {
-            let next = sequence.saturating_add(1);
-            if let Some(value) = hub_event_value(
-                &event,
-                &filter,
-                Stamp {
-                    replayed: true,
-                    sequence: next,
-                    id: Some(&id),
-                },
-            ) {
-                write_notification(&writer, "notifications/events/event", value).await?;
-                sequence = next;
-                remember_job_state(&event, &mut job_states);
-            }
-        }
-        if !event.snapshot
-            && cursor
-                .as_deref()
-                .and_then(cursor_sequence)
-                .is_none_or(|current| event.sequence > current)
-        {
-            cursor = Some(hub_cursor(event.sequence));
-        }
-    }
-    // Advertise the cursor after the replayed prefix drains. A pre-replay active frame would
-    // leave a reconnect at the subscription start even though this stream already delivered the
-    // whole batch, causing a second bootstrap.
     write_active(
         &writer,
         &id,
@@ -877,6 +619,27 @@ where
         },
     )
     .await?;
+    let filter = HubFilter {
+        selector: &selector,
+        target: &target,
+        kinds: &kinds,
+        filters: &filters,
+    };
+    for event in replay {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if let Some(value) = hub_event_value(&event, &filter, true, Some(&id)) {
+            write_notification(&writer, "notifications/events/event", value).await?;
+        }
+        if cursor
+            .as_deref()
+            .and_then(cursor_sequence)
+            .is_none_or(|current| event.sequence > current)
+        {
+            cursor = Some(hub_cursor(event.sequence));
+        }
+    }
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
@@ -899,28 +662,10 @@ where
                             .and_then(cursor_sequence)
                             .is_none_or(|current| event.sequence > current);
                         if fresh {
-                            if !repeated_job_state(&event, &job_states) {
-                                let next = sequence.saturating_add(1);
-                                if let Some(value) =
-                                    hub_event_value(
-                                        &event,
-                                        &filter,
-                                        Stamp {
-                                            replayed: false,
-                                            sequence: next,
-                                            id: Some(&id),
-                                        },
-                                    )
-                                {
-                                    write_notification(&writer, "notifications/events/event", value)
-                                        .await?;
-                                    sequence = next;
-                                    remember_job_state(&event, &mut job_states);
-                                }
+                            if let Some(value) = hub_event_value(&event, &filter, false, Some(&id)) {
+                                write_notification(&writer, "notifications/events/event", value)
+                                    .await?;
                             }
-                            // Advance even when a repeated state or the subscription's kind
-                            // suppressed delivery; the cursor is durable feed position, not a
-                            // delivered-event count.
                             cursor = Some(hub_cursor(event.sequence));
                         }
                     }
@@ -946,24 +691,9 @@ where
                         )
                         .await?;
                         for event in missed {
-                            if !repeated_job_state(&event, &job_states) {
-                                let next = sequence.saturating_add(1);
-                                if let Some(value) =
-                                    hub_event_value(
-                                        &event,
-                                        &filter,
-                                        Stamp {
-                                            replayed: false,
-                                            sequence: next,
-                                            id: Some(&id),
-                                        },
-                                    )
-                                {
-                                    write_notification(&writer, "notifications/events/event", value)
-                                        .await?;
-                                    sequence = next;
-                                    remember_job_state(&event, &mut job_states);
-                                }
+                            if let Some(value) = hub_event_value(&event, &filter, false, Some(&id)) {
+                                write_notification(&writer, "notifications/events/event", value)
+                                    .await?;
                             }
                             cursor = Some(hub_cursor(event.sequence));
                         }
@@ -982,19 +712,36 @@ struct HubFilter<'a> {
     selector: &'a Selector,
     target: &'a Option<String>,
     kinds: &'a Option<Vec<String>>,
-    stream: &'a str,
+    filters: &'a Filters,
 }
 
-/// One delivery's position: replay state, monotone sequence, and the enclosing request ID.
-struct Stamp<'a> {
+fn delivered_name(event: &HubEvent, detail: bool) -> Option<&'static str> {
+    if event.name != HUB_RUN_DETAIL {
+        return Some(event.name);
+    }
+    if detail {
+        // An explicit opt-in keeps every cursor, including the one that changed the node.
+        return Some(HUB_RUN_DETAIL);
+    }
+    // Default subscribers only see the node transitions; the intermediate cursors stay in the
+    // durable log for readers that ask for them.
+    event.transition.then_some(HUB_RUN)
+}
+
+fn hub_event_value(
+    event: &HubEvent,
+    filter: &HubFilter<'_>,
     replayed: bool,
-    sequence: u64,
-    id: Option<&'a Value>,
-}
-
-fn hub_event_value(event: &HubEvent, filter: &HubFilter<'_>, stamp: Stamp<'_>) -> Option<Value> {
+    id: Option<&Value>,
+) -> Option<Value> {
+    let detail = filter.filters.detail
+        || filter
+            .kinds
+            .as_ref()
+            .is_some_and(|kinds| kinds.iter().any(|kind| kind == HUB_RUN_DETAIL));
+    let name = delivered_name(event, detail)?;
     if let Some(kinds) = filter.kinds {
-        if !kinds.iter().any(|kind| kind == event.name) {
+        if !kinds.iter().any(|kind| kind == name) {
             return None;
         }
     }
@@ -1016,16 +763,16 @@ fn hub_event_value(event: &HubEvent, filter: &HubFilter<'_>, stamp: Stamp<'_>) -
             return None;
         }
     }
-    let event_cursor = event
-        .snapshot_cursor
-        .clone()
-        .unwrap_or_else(|| hub_cursor(event.sequence));
-    let mut data = if event.name == HUB_RUN {
-        event_data(&event.data, false)
+    let is_run = matches!(name, HUB_RUN | HUB_RUN_DETAIL);
+    let mut data = if is_run {
+        event_data(&event.data, filter.filters.verbose)
     } else {
         event.data.clone()
     };
-    let summary = if event.name == HUB_RUN {
+    if !filter.filters.accepts(&data, event.terminal) {
+        return None;
+    }
+    let summary = if is_run {
         summary(&data)
     } else {
         json!({
@@ -1038,26 +785,22 @@ fn hub_event_value(event: &HubEvent, filter: &HubFilter<'_>, stamp: Stamp<'_>) -
     if let Some(map) = data.as_object_mut() {
         // hub.run carries a durable v2: watch cursor in its recorded data. Keep that
         // provenance while data.cursor remains the hub-wide resume cursor.
-        if event.name == HUB_RUN {
+        if is_run {
             if let Some(run_cursor) = map.get("cursor").cloned() {
                 map.insert("runCursor".to_owned(), run_cursor);
             }
         }
-        map.insert("kind".to_owned(), json!(event.name));
-        map.insert("cursor".to_owned(), json!(&event_cursor));
+        map.insert("kind".to_owned(), json!(name));
+        map.insert("cursor".to_owned(), json!(hub_cursor(event.sequence)));
         map.insert("summary".to_owned(), summary);
-        map.insert("replayed".to_owned(), json!(stamp.replayed));
-        map.insert("sequence".to_owned(), json!(stamp.sequence));
-        if event.snapshot {
-            map.insert("snapshot".to_owned(), json!(true));
-        }
+        map.insert("replayed".to_owned(), json!(replayed));
     }
     let value = json!({
-        "eventId": event_cursor,
-        "name": filter.stream,
+        "eventId": hub_cursor(event.sequence),
+        "name": name,
         "timestamp": event.timestamp,
         "data": data,
-        "_meta": stamp.id.map(meta).unwrap_or_else(|| json!({})),
+        "_meta": id.map(meta).unwrap_or_else(|| json!({})),
     });
     Some(value)
 }
@@ -1076,20 +819,7 @@ fn truncation_bounds(value: &Value) -> (Option<u64>, Option<u64>) {
 pub(super) fn rpc_error(error: EventError) -> (i64, &'static str, Value) {
     match error {
         EventError::Invalid(failure) => (-32602, "Invalid params", failure_data(failure)),
-        EventError::Filtered(argument) => {
-            let index = NARROWING_ARGUMENTS
-                .iter()
-                .position(|name| *name == argument)
-                .expect("a narrowing argument has a fixed message");
-            (
-                -32602,
-                NARROWING_MESSAGES[index],
-                json!({"code": "mcp.events.filtered", "argument": argument}),
-            )
-        }
-        // An unknown event name is a bad subscription parameter, not a missing session: a
-        // client can correct the typo without restarting the MCP session.
-        EventError::NotFound => (-32602, "Invalid params", json!({"kind": "event"})),
+        EventError::NotFound => (-32023, "NotFound", json!({"kind": "event"})),
         EventError::Failed(failure) if failure.code == "run.not_found" => (
             -32023,
             "NotFound",
@@ -1136,7 +866,7 @@ fn parse_subscription(params: &Value, capped: bool) -> Result<PollRequest, Event
         None => None,
         Some(EVENT_NAME) => None,
         Some(name) if HUB_EVENTS.contains(&name) => Some(vec![name.to_owned()]),
-        Some("hub") | Some("hub.event") => None,
+        Some("hub.event") => None,
         Some(_) => return Err(EventError::NotFound),
     };
     // Watch records have no occurrence time, so maxAgeMs is accepted and not applied.
@@ -1187,23 +917,148 @@ fn parse_subscription(params: &Value, capped: bool) -> Result<PollRequest, Event
         || name.is_none()
         || selector.is_hub()
         || name_kinds.is_some()
-        || matches!(name.as_deref(), Some("hub") | Some("hub.event"));
+        || matches!(name.as_deref(), Some("hub.event"));
     let target = optional_string(arguments, "target").map_err(EventError::Invalid)?;
-    if let Some(argument) = narrowing_argument(arguments) {
-        return Err(EventError::Filtered(argument));
+    let mut filters = parse_filters(arguments)?;
+    if filters.kinds.is_none() {
+        filters.kinds = name_kinds.or_else(|| {
+            (hub && name.as_deref() == Some(EVENT_NAME)).then(|| vec![HUB_RUN.to_owned()])
+        });
     }
-    reject_unknown(arguments, &["runId", "jobId", "target"]).map_err(EventError::Invalid)?;
-    let kinds = name_kinds
-        .or_else(|| (hub && name.as_deref() == Some(EVENT_NAME)).then(|| vec![HUB_RUN.to_owned()]));
+    if filters
+        .kinds
+        .as_ref()
+        .is_some_and(|kinds| kinds.iter().any(|kind| kind == HUB_RUN_DETAIL))
+    {
+        filters.detail = true;
+    }
+    if filters.detail {
+        if let Some(kinds) = filters.kinds.as_mut() {
+            // `detail: true` swaps the collapsed run kind for the raw trail. Without this a
+            // `run.event` subscription would opt in and then filter its own detail records out.
+            for kind in kinds.iter_mut() {
+                if kind == HUB_RUN {
+                    *kind = HUB_RUN_DETAIL.to_owned();
+                }
+            }
+            let mut seen = HashSet::new();
+            kinds.retain(|kind| seen.insert(kind.clone()));
+        }
+    }
     Ok(PollRequest {
-        stream: name.unwrap_or_else(|| "hub".to_owned()),
         selector,
         target,
         cursor,
         max_events,
-        kinds,
+        filters,
         hub,
     })
+}
+
+fn parse_filters(arguments: &Map<String, Value>) -> Result<Filters, EventError> {
+    reject_unknown(
+        arguments,
+        &[
+            "runId",
+            "jobId",
+            "target",
+            "kinds",
+            "phases",
+            "nodes",
+            "terminalOnly",
+            "verbose",
+            "detail",
+        ],
+    )
+    .map_err(EventError::Invalid)?;
+    let phases = match arguments.get("phases") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(values)) => {
+            let mut phases = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(phase) = value.as_str() else {
+                    return Err(EventError::Invalid(McpFailure::invalid(
+                        "phases must be an array of strings",
+                    )));
+                };
+                if !PHASES.contains(&phase) {
+                    return Err(EventError::Invalid(McpFailure::invalid(format!(
+                        "unknown phase {phase}"
+                    ))));
+                }
+                phases.push(phase.to_owned());
+            }
+            Some(phases)
+        }
+        Some(_) => {
+            return Err(EventError::Invalid(McpFailure::invalid(
+                "phases must be an array of strings",
+            )));
+        }
+    };
+    let nodes = match arguments.get("nodes") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(values)) => {
+            let mut nodes = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(node) = value.as_str() else {
+                    return Err(EventError::Invalid(McpFailure::invalid(
+                        "nodes must be an array of strings",
+                    )));
+                };
+                nodes.push(node.to_owned());
+            }
+            Some(nodes)
+        }
+        Some(_) => {
+            return Err(EventError::Invalid(McpFailure::invalid(
+                "nodes must be an array of strings",
+            )));
+        }
+    };
+    let kinds = match arguments.get("kinds") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(values)) => {
+            let mut kinds = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(kind) = value.as_str() else {
+                    return Err(EventError::Invalid(McpFailure::invalid(
+                        "kinds must be an array of hub event names",
+                    )));
+                };
+                if !HUB_EVENTS.contains(&kind) {
+                    return Err(EventError::Invalid(McpFailure::invalid(format!(
+                        "unknown hub event kind {kind}"
+                    ))));
+                }
+                kinds.push(kind.to_owned());
+            }
+            Some(kinds)
+        }
+        Some(_) => {
+            return Err(EventError::Invalid(McpFailure::invalid(
+                "kinds must be an array of hub event names",
+            )));
+        }
+    };
+    Ok(Filters {
+        phases,
+        nodes,
+        kinds,
+        terminal_only: optional_bool(arguments, "terminalOnly")?,
+        verbose: optional_bool(arguments, "verbose")?,
+        detail: optional_bool(arguments, "detail")?,
+    })
+}
+
+fn optional_bool(arguments: &Map<String, Value>, key: &str) -> Result<bool, EventError> {
+    match arguments.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(EventError::Invalid(McpFailure::invalid(format!(
+            "{key} must be a boolean"
+        )))),
+    }
 }
 
 fn max_events(map: &Map<String, Value>) -> Result<usize, EventError> {
@@ -1290,7 +1145,7 @@ async fn collect_after(
             continue;
         }
         cursor = event_cursor;
-        if let Some(occurrence) = occurrence(&event, false).map_err(classify)? {
+        if let Some(occurrence) = occurrence(&event, &request.filters, false).map_err(classify)? {
             events.push(occurrence);
         }
     }
@@ -1328,7 +1183,6 @@ async fn job_status(host: &impl McpHost, job_id: &str) -> Result<JobSnapshot, Ev
         .await
         .map_err(classify)?;
     let document: Value = serde_json::from_str(output.trim()).map_err(invalid_hub_response)?;
-    let run = document.get("run").cloned().filter(|run| !run.is_null());
     let view = match document.get("job") {
         Some(view @ Value::Object(_)) => view.clone(),
         None if document.get("jobId").is_some() => document,
@@ -1351,7 +1205,6 @@ async fn job_status(host: &impl McpHost, job_id: &str) -> Result<JobSnapshot, Ev
             .filter(|target| *target != LOCAL_HUB_MEMBER)
             .map(str::to_owned),
         view,
-        run,
         run_id,
     })
 }
@@ -1367,183 +1220,74 @@ async fn hub_poll<H>(
     host: &Rc<H>,
     feed: &Rc<HubFeed>,
     request: &PollRequest,
-    sequence: &Cell<u64>,
 ) -> Result<Value, EventError>
 where
     H: McpHost + 'static,
 {
     feed.ensure_started(Rc::clone(host));
     tokio::task::yield_now().await;
-    let (after, snapshot_skip, bootstrap) = match request.cursor.as_deref() {
-        Some(cursor) => match parse_hub_cursor(cursor)? {
-            HubCursor::Durable(sequence) => (Some(sequence), 0, false),
-            HubCursor::Snapshot { delivered, start } => (Some(start), delivered, true),
-        },
-        None => (None, 0, true),
+    let after = match request.cursor.as_deref() {
+        Some(cursor) => Some(parse_hub_cursor(cursor)?),
+        None => None,
     };
-    let (after, stale) = clamp_resume(feed, after);
-    let start = after.unwrap_or_else(|| feed.head());
-    let (receiver, mut replay, truncated, _) = feed.snapshot(after);
+    let (receiver, replay, truncated, _) = feed.snapshot(after);
     drop(receiver);
-    let mut truncated = merge_truncated(truncated, stale);
+    let head = feed.head();
     let filter = HubFilter {
         selector: &request.selector,
         target: &request.target,
-        kinds: &request.kinds,
-        stream: &request.stream,
+        kinds: &request.filters.kinds,
+        filters: &request.filters,
     };
-    let mut job_states = HashMap::new();
-    let snapshots = if bootstrap {
-        snapshot_events(host.as_ref(), feed, request, start).await
-    } else {
-        None
-    };
-    if bootstrap {
-        // Bootstrap may publish an already-terminal job's durable occurrence while it awaits
-        // host reads. Replay everything published since the initial head so that publication
-        // advances the cursor without skipping unrelated live events.
-        let (live, lost) = feed.after(start);
-        replay.retain(|event| event.sequence <= start);
-        replay.extend(live);
-        truncated = merge_truncated(truncated, lost);
-    }
-    let mut selected = Vec::new();
-    if let Some(snapshots) = snapshots.as_ref() {
-        for (index, event) in snapshots.iter().enumerate() {
-            let position = index.saturating_add(1);
-            if position <= snapshot_skip || repeated_job_state(event, &job_states) {
-                continue;
-            }
-            if let Some(value) = hub_event_value(
-                event,
-                &filter,
-                Stamp {
-                    replayed: false,
-                    sequence: 0,
-                    id: None,
-                },
-            ) {
-                selected.push((HubPosition::Snapshot(position), value));
-                remember_job_state(event, &mut job_states);
-            }
-        }
-    }
-    for event in &replay {
-        if repeated_job_state(event, &job_states) {
-            continue;
-        }
-        if let Some(value) = hub_event_value(
-            event,
-            &filter,
-            Stamp {
-                replayed: true,
-                sequence: 0,
-                id: None,
-            },
-        ) {
-            selected.push((HubPosition::Durable(event.sequence), value));
-            remember_job_state(event, &mut job_states);
-        }
-    }
+    let mut selected = replay
+        .iter()
+        .filter_map(|event| {
+            hub_event_value(event, &filter, true, None).map(|value| (event.sequence, value))
+        })
+        .collect::<Vec<_>>();
     let mut has_more = false;
-    // A fresh poll starts at the head after any bootstrap terminal publication, so the
-    // caller never replays an occurrence it already received as a snapshot.
-    let mut cursor = after.unwrap_or_else(|| feed.head());
-    let mut cursor_position = HubPosition::Durable(cursor);
+    let mut cursor = after.unwrap_or(head);
     if selected.len() > request.max_events {
         selected.truncate(request.max_events);
-        if let Some((position, _)) = selected.last() {
-            cursor_position = *position;
+        if let Some((sequence, _)) = selected.last() {
+            cursor = *sequence;
         }
         // A maxEvents clip is resumable from the returned cursor, so it is hasMore
-        // rather than truncation. Bootstrap snapshots share that bound instead of being
-        // prepended for free; otherwise a hub that knows thousands of jobs sends them all
-        // in one frame and reports hasMore: false.
+        // rather than truncation. Only replay or backpressure can permanently lose events.
         has_more = true;
-    } else {
-        // A kind-named subscription can hide every replay record while the cursor still has
-        // to advance past it.
-        if let Some(last) = replay.last()
-            && last.sequence > cursor
-        {
-            cursor = last.sequence;
-            cursor_position = HubPosition::Durable(cursor);
-        }
-        if let Some((HubPosition::Durable(sequence), _)) = selected.last()
-            && *sequence > cursor
-        {
+    } else if let Some((sequence, _)) = selected.last() {
+        if *sequence > cursor {
             cursor = *sequence;
-            cursor_position = HubPosition::Durable(cursor);
         }
-    }
-
-    // Assign the per-caller sequence only after clipping, so a delivered batch is contiguous
-    // and starts at 1 even when a kind-named subscription or maxEvents skipped occurrences.
-    for (_, value) in &mut selected {
-        let next = sequence.get().saturating_add(1);
-        sequence.set(next);
-        if let Some(map) = value.get_mut("data").and_then(Value::as_object_mut) {
-            map.insert("sequence".to_owned(), json!(next));
-        }
+    } else if !replay.is_empty() && cursor < head {
+        cursor = head;
     }
     let events = selected
         .into_iter()
         .map(|(_, value)| value)
         .collect::<Vec<_>>();
-    let response_cursor = match cursor_position {
-        HubPosition::Snapshot(delivered) => snapshot_cursor(delivered, start),
-        HubPosition::Durable(sequence) => hub_cursor(sequence),
-    };
-    feed.release_poller();
     Ok(json!({
         "resultType": "complete",
         "events": events,
-        "cursor": response_cursor,
+        "cursor": hub_cursor(cursor),
         "truncated": truncated,
         "hasMore": has_more,
         "nextPollMs": NEXT_POLL_MS,
     }))
 }
 
-fn parse_hub_cursor(cursor: &str) -> Result<HubCursor, EventError> {
+fn parse_hub_cursor(cursor: &str) -> Result<u64, EventError> {
     let Some(rest) = cursor.strip_prefix("hub:") else {
         return Err(EventError::Invalid(McpFailure::invalid(
             "hub events use a hub:<sequence> cursor",
         )));
     };
-    if let Some(progress) = rest.strip_prefix("snapshot:") {
-        let Some((delivered, start)) = progress.split_once(':') else {
-            return Err(EventError::Invalid(McpFailure::invalid(
-                "hub snapshot cursor must be hub:snapshot:<count>:<sequence>",
-            )));
-        };
-        if delivered.is_empty()
-            || start.is_empty()
-            || !delivered.bytes().all(|byte| byte.is_ascii_digit())
-            || !start.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return Err(EventError::Invalid(McpFailure::invalid(
-                "hub snapshot cursor must be hub:snapshot:<count>:<sequence>",
-            )));
-        }
-        let delivered = delivered.parse::<usize>().map_err(|_| {
-            EventError::Invalid(McpFailure::invalid(
-                "hub snapshot cursor count is out of range",
-            ))
-        })?;
-        let start = start.parse::<u64>().map_err(|_| {
-            EventError::Invalid(McpFailure::invalid(
-                "hub snapshot cursor sequence is out of range",
-            ))
-        })?;
-        return Ok(HubCursor::Snapshot { delivered, start });
-    }
     if rest.is_empty() || !rest.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(EventError::Invalid(McpFailure::invalid(
             "hub cursor must be hub:<sequence>",
         )));
     }
-    rest.parse().map(HubCursor::Durable).map_err(|_| {
+    rest.parse().map_err(|_| {
         EventError::Invalid(McpFailure::invalid("hub cursor sequence is out of range"))
     })
 }
@@ -1553,8 +1297,8 @@ where
     H: McpHost + 'static,
 {
     let mut jobs: HashMap<String, String> = HashMap::new();
-    let mut pool_sequence: u64 = 0;
-    let watched = Rc::new(RefCell::new(WatchBook::default()));
+    let mut members: HashMap<String, String> = HashMap::new();
+    let mut watched: HashSet<String> = HashSet::new();
     let mut poll = tokio::time::interval(HUB_POLL_INTERVAL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut warning = tokio::time::interval(HUB_WARNING_INTERVAL);
@@ -1563,8 +1307,8 @@ where
     loop {
         tokio::select! {
             _ = poll.tick() => {
-                poll_jobs(host.as_ref(), &feed, &mut jobs, &watched).await;
-                poll_pools(host.as_ref(), &feed, &mut pool_sequence).await;
+                poll_jobs(host.as_ref(), &feed, &mut jobs, &mut watched).await;
+                poll_members(host.as_ref(), &feed, &mut members).await;
             }
             _ = warning.tick() => {
                 publish_warnings(host.as_ref(), &feed).await;
@@ -1584,7 +1328,7 @@ where
                 state: "all".to_owned(),
                 target: None,
                 labels: Vec::new(),
-                limit: Some(HUB_RECENT_JOBS),
+                limit: None,
             }),
         }))
         .await
@@ -1597,311 +1341,29 @@ where
         .unwrap_or_default())
 }
 
-/// Remember the latest job state one subscriber has actually delivered. A bootstrap and the
-/// poller's concurrent first look can report the same or an older state; only a real transition
-/// should reach the client. Records elsewhere in the stream are not remembered, so a later
-/// transition in a kind-named subscription is not mistaken for a repeat.
-fn repeated_job_state(event: &HubEvent, states: &HashMap<String, String>) -> bool {
-    if event.name != HUB_JOB {
-        return false;
-    }
-    let Some(job_id) = event.data.get("jobId").and_then(Value::as_str) else {
-        return false;
-    };
-    let Some(state) = event.data.get("state").and_then(Value::as_str) else {
-        return false;
-    };
-    let Some(seen) = states.get(job_id) else {
-        return false;
-    };
-    seen == state || job_state_rank(seen) > job_state_rank(state)
-}
-
-fn remember_job_state(event: &HubEvent, states: &mut HashMap<String, String>) {
-    if event.name != HUB_JOB {
-        return;
-    }
-    let Some(job_id) = event.data.get("jobId").and_then(Value::as_str) else {
-        return;
-    };
-    let Some(state) = event.data.get("state").and_then(Value::as_str) else {
-        return;
-    };
-    states.insert(job_id.to_owned(), state.to_owned());
-}
-
-fn job_state_rank(state: &str) -> u8 {
-    match state {
-        "submitted" => 0,
-        // `scheduled` is only a future-dated `queued`; when the job becomes due it is still a
-        // real transition and must not be suppressed as an older state.
-        "queued" | "scheduled" => 1,
-        "placing" => 2,
-        "running" => 3,
-        "succeeded" | "failed" | "dequeued" | "cancelled" => 4,
-        _ => 3,
-    }
-}
-
-/// The bootstrap state of every job a client can already observe. It is synthesized per
-/// subscription, so it neither enters the resident log nor advances the durable hub cursor.
-async fn snapshot_events<H>(
-    host: &H,
-    feed: &Rc<HubFeed>,
-    request: &PollRequest,
-    start: u64,
-) -> Option<Vec<Arc<HubEvent>>>
-where
-    H: McpHost + 'static,
-{
-    let mut views = hub_job_views(host).await.ok()?;
-    views.sort_by(|left, right| {
-        let left_at = left
-            .get("submittedAt")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let right_at = right
-            .get("submittedAt")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        left_at
-            .cmp(right_at)
-            .then_with(|| left_job_id(left).cmp(&left_job_id(right)))
-    });
-    let filter = HubFilter {
-        selector: &request.selector,
-        target: &request.target,
-        kinds: &request.kinds,
-        stream: &request.stream,
-    };
-    let mut events = Vec::with_capacity(views.len());
-    for mut view in views {
-        let job_id = left_job_id(&view);
-        if job_id.is_empty() {
-            continue;
-        }
-        if let Some(labels) = view.get("labels") {
-            feed.job_labels
-                .borrow_mut()
-                .insert(job_id.clone(), labels.clone());
-        }
-        let state = hub_job_state(&view);
-        let terminal = matches!(
-            state.as_str(),
-            "succeeded" | "failed" | "dequeued" | "cancelled"
-        );
-        let mut run = feed.run_facts.borrow().get(&job_id).cloned();
-        let needs_facts = terminal
-            && !matches!(
-                run.as_ref()
-                    .and_then(find_delivery_facts)
-                    .or_else(|| find_delivery_facts(&view)),
-                Some((Some(_), Some(_)))
-            );
-        if (run.is_none() || needs_facts)
-            && view.get("runId").and_then(Value::as_str).is_some()
-            && let Ok(snapshot) = job_status(host, &job_id).await
-        {
-            view = snapshot.view;
-            run = snapshot.run;
-        }
-        if let Some(run) = run.as_ref() {
-            feed.run_facts
-                .borrow_mut()
-                .insert(job_id.clone(), run.clone());
-        }
-        let mut event = HubEvent {
-            // Synthetic bootstrap records start before every durable occurrence, so they can
-            // neither advance the durable feed cursor nor be mistaken for replayed history.
-            sequence: 0,
-            name: HUB_JOB,
-            timestamp: now_rfc3339(),
-            data: job_snapshot_data(&view, run.as_ref(), terminal),
-            run_id: view.get("runId").and_then(Value::as_str).map(str::to_owned),
-            job_id: Some(job_id.clone()),
-            target: view
-                .get("target")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            phase: Some(state.clone()),
-            terminal,
-            snapshot: true,
-            snapshot_cursor: None,
-        };
-        if hub_event_value(
-            &event,
-            &filter,
-            Stamp {
-                replayed: false,
-                sequence: 0,
-                id: None,
-            },
-        )
-        .is_some()
-        {
-            event.snapshot_cursor = Some(snapshot_cursor(events.len() + 1, start));
-            if terminal {
-                // A job discovered already terminal still owes the durable feed its one
-                // terminal occurrence; the poller will then suppress its own copy. The run
-                // record fetched for this snapshot supplies the delivery facts.
-                publish_job(
-                    host,
-                    feed,
-                    JobPublication {
-                        job_id: &job_id,
-                        view: &view,
-                        state: &state,
-                    },
-                )
-                .await;
-            }
-            events.push(Arc::new(event));
-        }
-    }
-    Some(events)
-}
-
-fn left_job_id(view: &Value) -> String {
-    view.get("jobId")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned()
-}
-
-fn job_snapshot_data(view: &Value, run: Option<&Value>, terminal: bool) -> Value {
-    let status = run
-        .and_then(|run| run.get("status"))
-        .map(|status| {
-            let mut trimmed = Map::new();
-            if let Some(phase) = status.get("phase") {
-                trimmed.insert("phase".to_owned(), phase.clone());
-            }
-            if let Some(executions) = status
-                .get("activeExecutions")
-                .and_then(Value::as_array)
-            {
-                trimmed.insert(
-                    "activeExecutions".to_owned(),
-                    Value::Array(
-                        executions
-                            .iter()
-                            .map(|execution| {
-                                json!({
-                                    "execution": execution.get("execution").cloned().unwrap_or(Value::Null),
-                                    "node": execution.get("node").cloned().unwrap_or(Value::Null),
-                                })
-                            })
-                            .collect(),
-                    ),
-                );
-            }
-            Value::Object(trimmed)
-        })
-        .unwrap_or(Value::Null);
-    let mut data = json!({
-        "jobId": view.get("jobId").cloned().unwrap_or(Value::Null),
-        "title": view.get("title").cloned().unwrap_or(Value::Null),
-        "state": hub_job_state(view),
-        "target": view.get("target").cloned().unwrap_or(Value::Null),
-        "project": view.get("project").cloned().unwrap_or(Value::Null),
-        "runId": view.get("runId").cloned().unwrap_or(Value::Null),
-        "attempts": view.get("attempts").cloned().unwrap_or_else(|| json!(0)),
-        "pinnedRevision": view.get("pinnedRevision").cloned().unwrap_or(Value::Null),
-        "labels": view.get("labels").cloned().unwrap_or_else(|| json!({})),
-        "submittedAt": view.get("submittedAt").cloned().unwrap_or(Value::Null),
-        "finishedAt": view.get("finishedAt").cloned().unwrap_or(Value::Null),
-        "failureReason": view.get("failureReason").cloned().unwrap_or(Value::Null),
-        "errorKind": view.get("errorKind").cloned().unwrap_or(Value::Null),
-        "reason": view
-            .get("failureReason")
-            .or_else(|| view.get("error"))
-            .cloned()
-            .unwrap_or(Value::Null),
-        "at": view
-            .get("finishedAt")
-            .or_else(|| view.get("dispatchedAt"))
-            .or_else(|| view.get("submittedAt"))
-            .cloned()
-            .unwrap_or_else(|| json!(now_rfc3339())),
-        "status": status,
-        "terminal": terminal,
-    });
-    if terminal {
-        if let Some((branch, revision)) =
-            find_delivery_facts(run.unwrap_or(&Value::Null)).or_else(|| find_delivery_facts(view))
-        {
-            if let Some(map) = data.as_object_mut() {
-                if let Some(branch) = branch {
-                    map.insert("headBranch".to_owned(), json!(branch));
-                }
-                if let Some(revision) = revision {
-                    map.insert("headRevision".to_owned(), json!(revision));
-                }
-            }
-        }
-    }
-    data
-}
-
 async fn poll_jobs<H>(
     host: &H,
     feed: &Rc<HubFeed>,
     jobs: &mut HashMap<String, String>,
-    watched: &Rc<RefCell<WatchBook>>,
+    watched: &mut HashSet<String>,
 ) where
     H: McpHost + 'static,
 {
     let Ok(views) = hub_job_views(host).await else {
         return;
     };
-    let mut live_jobs = HashSet::new();
-    let mut running_jobs = HashSet::new();
-    let mut live_runs = HashSet::new();
     for view in views {
         let Some(job_id) = view.get("jobId").and_then(Value::as_str).map(str::to_owned) else {
             continue;
         };
-        live_jobs.insert(job_id.clone());
-        if !matches!(
-            hub_job_state(&view).as_str(),
-            "succeeded" | "failed" | "dequeued" | "cancelled"
-        ) {
-            running_jobs.insert(job_id.clone());
-        }
         let state = hub_job_state(&view);
-        if let Some(labels) = view.get("labels") {
-            feed.job_labels
-                .borrow_mut()
-                .insert(job_id.clone(), labels.clone());
-        }
         let previous = jobs.get(&job_id).cloned();
         if previous.is_none() {
-            // The first observation is the job's current state, not a synthetic `submitted`
-            // that the next record would immediately supersede. A synthetic intermediate is
-            // never truthful for a job that was already running before the feed started.
-            publish_job(
-                host,
-                feed,
-                JobPublication {
-                    job_id: &job_id,
-                    view: &view,
-                    state: &state,
-                },
-            )
-            .await;
-            jobs.insert(job_id.clone(), state.clone());
+            publish_job(feed, &job_id, &view, "submitted");
+            jobs.insert(job_id.clone(), "submitted".to_owned());
         }
         if jobs.get(&job_id) != Some(&state) {
-            publish_job(
-                host,
-                feed,
-                JobPublication {
-                    job_id: &job_id,
-                    view: &view,
-                    state: &state,
-                },
-            )
-            .await;
+            publish_job(feed, &job_id, &view, &state);
             jobs.insert(job_id.clone(), state.clone());
         }
         let Some(run_id) = view
@@ -1912,13 +1374,7 @@ async fn poll_jobs<H>(
         else {
             continue;
         };
-        if !running_jobs.contains(&job_id) {
-            watched.borrow_mut().finished(&run_id);
-            continue;
-        }
-        live_runs.insert(run_id.clone());
-        let now = Instant::now();
-        if watched.borrow().blocked(&run_id, now) {
+        if !watched.insert(run_id.clone()) {
             continue;
         }
         let target = view
@@ -1930,7 +1386,6 @@ async fn poll_jobs<H>(
             Ok(command) => command,
             Err(failure) => {
                 feed.publish_warning(&job_id, &run_id, json!({"message": rpc_error(failure).1}));
-                watched.borrow_mut().retry(&run_id, now);
                 continue;
             }
         };
@@ -1938,14 +1393,11 @@ async fn poll_jobs<H>(
             Ok(stream) => stream,
             Err(failure) => {
                 feed.publish_warning(&job_id, &run_id, json!({"message": failure.message}));
-                watched.borrow_mut().retry(&run_id, Instant::now());
                 continue;
             }
         };
         let feed = Rc::clone(feed);
-        let watched_book = Rc::clone(watched);
         let watched_run = run_id.clone();
-        watched.borrow_mut().started(run_id);
         tokio::task::spawn_local(async move {
             while let Some(item) = stream.recv().await {
                 match item {
@@ -1967,15 +1419,8 @@ async fn poll_jobs<H>(
                     }
                 }
             }
-            watched_book
-                .borrow_mut()
-                .retry(&watched_run, Instant::now());
         });
     }
-    jobs.retain(|job_id, _| live_jobs.contains(job_id));
-    feed.retain_jobs(&live_jobs);
-    feed.warnings.borrow_mut().retain_running(&running_jobs);
-    watched.borrow_mut().retain_live(&live_runs);
 }
 
 fn hub_job_state(view: &Value) -> String {
@@ -1990,42 +1435,7 @@ fn hub_job_state(view: &Value) -> String {
     }
 }
 
-struct JobPublication<'a> {
-    job_id: &'a str,
-    view: &'a Value,
-    state: &'a str,
-}
-
-async fn publish_job<H>(host: &H, feed: &HubFeed, job: JobPublication<'_>)
-where
-    H: McpHost,
-{
-    let JobPublication {
-        job_id,
-        view,
-        state,
-    } = job;
-    // A job that already produced its terminal occurrence never publishes again, even when a
-    // later poll or snapshot still sees the same stable terminal state.
-    if feed.terminal_jobs.borrow().contains(job_id) {
-        return;
-    }
-    let terminal = matches!(state, "succeeded" | "failed" | "dequeued" | "cancelled");
-    if terminal {
-        if !matches!(delivery_facts(feed, job_id, view), Some((Some(_), Some(_))))
-            && view.get("runId").and_then(Value::as_str).is_some()
-            && let Ok(snapshot) = job_status(host, job_id).await
-            && let Some(run) = snapshot.run
-        {
-            feed.run_facts.borrow_mut().insert(job_id.to_owned(), run);
-        }
-        // Reserve the one terminal only after the last await, so publication is atomic. A
-        // bootstrap or poller that loses this race already sees the winner's durable record:
-        // no subscriber can be left waiting on a reservation whose publisher was cancelled.
-        if !feed.terminal_jobs.borrow_mut().insert(job_id.to_owned()) {
-            return;
-        }
-    }
+fn publish_job(feed: &HubFeed, job_id: &str, view: &Value, state: &str) {
     let reason = view
         .get("failureReason")
         .or_else(|| view.get("error"))
@@ -2037,38 +1447,15 @@ where
         .or_else(|| view.get("submittedAt"))
         .cloned()
         .unwrap_or_else(|| json!(now_rfc3339()));
-    let mut data = json!({
+    let data = json!({
         "jobId": job_id,
         "title": view.get("title").cloned().unwrap_or(Value::Null),
         "state": state,
         "target": view.get("target").cloned().unwrap_or(Value::Null),
         "project": view.get("project").cloned().unwrap_or(Value::Null),
-        "runId": view.get("runId").cloned().unwrap_or(Value::Null),
-        "attempts": view.get("attempts").cloned().unwrap_or_else(|| json!(0)),
-        "pinnedRevision": view.get("pinnedRevision").cloned().unwrap_or(Value::Null),
-        "labels": view.get("labels").cloned().unwrap_or_else(|| json!({})),
-        "submittedAt": view.get("submittedAt").cloned().unwrap_or(Value::Null),
-        "finishedAt": view.get("finishedAt").cloned().unwrap_or(Value::Null),
-        "failureReason": view.get("failureReason").cloned().unwrap_or(Value::Null),
-        "errorKind": view.get("errorKind").cloned().unwrap_or(Value::Null),
         "reason": reason,
         "at": at,
     });
-    if terminal {
-        if let Some((branch, revision)) = delivery_facts(feed, job_id, view) {
-            if let Some(map) = data.as_object_mut() {
-                if let Some(branch) = branch {
-                    map.insert("headBranch".to_owned(), json!(branch));
-                }
-                if let Some(revision) = revision {
-                    map.insert("headRevision".to_owned(), json!(revision));
-                }
-            }
-        }
-        if let Some(map) = data.as_object_mut() {
-            map.insert("terminal".to_owned(), json!(true));
-        }
-    }
     feed.publish(HubEvent {
         sequence: 0,
         name: HUB_JOB,
@@ -2081,89 +1468,22 @@ where
             .and_then(Value::as_str)
             .map(str::to_owned),
         phase: Some(state.to_owned()),
-        terminal,
-        snapshot: false,
-        snapshot_cursor: None,
+        terminal: matches!(state, "succeeded" | "failed" | "dequeued" | "cancelled"),
+        transition: false,
     });
 }
 
-/// Delivery facts from the job's latest run record, then from its own view. The search is
-/// deliberately limited to the two published receipt fields, so unrelated `headRevision`
-/// values in a request or review context cannot be mistaken for a landing.
-fn delivery_facts(
-    feed: &HubFeed,
-    job_id: &str,
-    view: &Value,
-) -> Option<(Option<String>, Option<String>)> {
-    let stored = feed.run_facts.borrow().get(job_id).cloned();
-    let from_run = stored.as_ref().and_then(find_delivery_facts);
-    let from_view = find_delivery_facts(view);
-    match (from_run, from_view) {
-        (Some((mut branch, mut revision)), Some((view_branch, view_revision))) => {
-            if branch.is_none() {
-                branch = view_branch;
-            }
-            if revision.is_none() {
-                revision = view_revision;
-            }
-            Some((branch, revision))
-        }
-        (Some(facts), None) | (None, Some(facts)) => Some(facts),
-        (None, None) => None,
-    }
-}
-
-fn find_delivery_facts(value: &Value) -> Option<(Option<String>, Option<String>)> {
-    let mut branch = None;
-    let mut revision = None;
-    find_delivery_fields(value, &mut branch, &mut revision);
-    (branch.is_some() || revision.is_some()).then_some((branch, revision))
-}
-
-fn find_delivery_fields(value: &Value, branch: &mut Option<String>, revision: &mut Option<String>) {
-    match value {
-        Value::Object(map) => {
-            for (key, value) in map {
-                match key.as_str() {
-                    "headBranch" => {
-                        if branch.is_none() {
-                            *branch = value
-                                .as_str()
-                                .filter(|text| !text.is_empty())
-                                .map(str::to_owned);
-                        }
-                    }
-                    "headRevision" => {
-                        if revision.is_none() {
-                            *revision = value
-                                .as_str()
-                                .filter(|text| !text.is_empty())
-                                .map(str::to_owned);
-                        }
-                    }
-                    _ => find_delivery_fields(value, branch, revision),
-                }
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                find_delivery_fields(value, branch, revision);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Poll the hub's recorded pool transitions. The daemon performs every transition and keeps
-/// the bounded log, so this reader publishes each record once, in sequence order.
-async fn poll_pools<H>(host: &H, feed: &HubFeed, sequence: &mut u64)
+async fn poll_members<H>(host: &H, feed: &HubFeed, members: &mut HashMap<String, String>)
 where
     H: McpHost + 'static,
 {
     let output = match host
         .execute(NativeV2CliCommand::Hub(HubRequest {
             context: None,
-            command: HubCommand::Pool(HubPoolCommand::List),
+            command: HubCommand::List {
+                tags: Vec::new(),
+                probe: false,
+            },
         }))
         .await
     {
@@ -2173,73 +1493,86 @@ where
     let Ok(document) = serde_json::from_str::<Value>(output.trim()) else {
         return;
     };
-    let records = document
-        .get("events")
+    let mut current = HashMap::new();
+    for member in document
+        .get("targets")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let newest = records
-        .iter()
-        .filter_map(|record| record.get("sequence").and_then(Value::as_u64))
-        .max();
-    if let Some(newest) = newest {
-        if newest < *sequence {
-            // A restarted hub numbers its log from the start again.
-            *sequence = 0;
-        }
-    }
-    for record in records {
-        let Some(record_sequence) = record.get("sequence").and_then(Value::as_u64) else {
+        .into_iter()
+        .flatten()
+    {
+        let Some(name) = member
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
             continue;
         };
-        if record_sequence <= *sequence {
-            continue;
+        let phase = member_phase(member);
+        current.insert(name.clone(), phase.to_owned());
+        let first = members.get(&name).is_none();
+        if first && phase != "provisioning" {
+            publish_member(feed, &name, member, "provisioning");
         }
-        publish_pool(feed, &record);
-        *sequence = record_sequence;
+        if first || members.get(&name) != Some(&phase.to_owned()) {
+            publish_member(feed, &name, member, phase);
+        }
+    }
+    for (name, phase) in members.iter() {
+        if !current.contains_key(name) && phase != "deleted" {
+            publish_member(
+                feed,
+                name,
+                &json!({"name": name, "state": "deleted"}),
+                "deleted",
+            );
+        }
+    }
+    *members = current;
+}
+
+fn member_phase(member: &Value) -> &'static str {
+    match member.get("state").and_then(Value::as_str) {
+        Some("active") => "active",
+        Some("drain") => "draining",
+        Some("disabled") => "failed",
+        Some("deleted") => "deleted",
+        _ => "provisioning",
     }
 }
 
-fn publish_pool(feed: &HubFeed, record: &Value) {
-    let phase = record
-        .get("phase")
-        .and_then(Value::as_str)
-        .unwrap_or("failed")
-        .to_owned();
-    let at = record
-        .get("at")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(now_rfc3339);
-    let pool = record.get("pool").and_then(Value::as_str);
-    let lease = record.get("leaseId").and_then(Value::as_str);
-    let member = record.get("memberId").and_then(Value::as_str);
-    let terminal = matches!(phase.as_str(), "deleted" | "failed" | "removed");
-    let target = member.or(lease).or(pool).map(str::to_owned);
+fn publish_member(feed: &HubFeed, name: &str, member: &Value, phase: &str) {
+    let reason = member
+        .get("probeError")
+        .or_else(|| member.get("error"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let at = member
+        .get("probedAt")
+        .cloned()
+        .unwrap_or_else(|| json!(now_rfc3339()));
     let data = json!({
-        "scope": record.get("kind").cloned().unwrap_or_else(|| json!("lease")),
-        "pool": pool,
-        "leaseId": record.get("leaseId").cloned().unwrap_or(Value::Null),
-        "serverId": record.get("serverId").cloned().unwrap_or(Value::Null),
-        "memberId": record.get("memberId").cloned().unwrap_or(Value::Null),
-        "machine": record.get("machine").cloned().unwrap_or(Value::Null),
+        "pool": member
+            .get("pool")
+            .cloned()
+            .unwrap_or_else(|| json!(name)),
+        "leaseId": member.get("leaseId").cloned().unwrap_or_else(|| json!(name)),
+        "serverId": member.get("serverId").cloned().unwrap_or(Value::Null),
+        "machine": member.get("machine").cloned().unwrap_or_else(|| json!(name)),
         "phase": phase,
-        "previousPhase": record.get("previousPhase").cloned().unwrap_or(Value::Null),
+        "reason": reason,
         "at": at,
-        "reason": record.get("reason").cloned().unwrap_or(Value::Null),
     });
     feed.publish(HubEvent {
         sequence: 0,
         name: HUB_POOL,
-        timestamp: at,
+        timestamp: now_rfc3339(),
         data,
         run_id: None,
         job_id: None,
-        target,
-        phase: Some(phase),
-        terminal,
-        snapshot: false,
-        snapshot_cursor: None,
+        target: Some(name.to_owned()),
+        phase: Some(phase.to_owned()),
+        terminal: matches!(phase, "deleted" | "failed"),
+        transition: false,
     });
 }
 
@@ -2250,10 +1583,8 @@ where
     let Ok(views) = hub_job_views(host).await else {
         return;
     };
-    let now = now_ms();
-    let mut running = HashSet::new();
-    for view in &views {
-        if hub_job_state(view) != "running" {
+    for view in views {
+        if hub_job_state(&view) != "running" {
             continue;
         }
         let Some(job_id) = view.get("jobId").and_then(Value::as_str) else {
@@ -2262,11 +1593,12 @@ where
         let Some(run_id) = view.get("runId").and_then(Value::as_str) else {
             continue;
         };
-        running.insert(job_id.to_owned());
-        let data = feed.warning_data(view, now);
-        feed.publish_warning(job_id, run_id, data);
+        feed.publish_warning(
+            job_id,
+            run_id,
+            json!({"message": "run has been in progress for an hour"}),
+        );
     }
-    feed.warnings.borrow_mut().retain_running(&running);
 }
 
 struct RunOrigin<'a> {
@@ -2275,181 +1607,170 @@ struct RunOrigin<'a> {
     target: Option<String>,
 }
 
+fn now_stamp() -> (String, u64) {
+    let now = OffsetDateTime::now_utc();
+    let millis = u64::try_from(now.unix_timestamp_nanos() / 1_000_000).unwrap_or(0);
+    (
+        now.format(&Rfc3339)
+            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned()),
+        millis,
+    )
+}
+
+fn terminal_phase(phase: &str) -> bool {
+    matches!(phase, "finished" | "succeeded" | "failed" | "cancelled")
+}
+
+/// The node the run currently reports, plus a stable identity for the whole active node set.
+/// Parallel branches expose one active execution each; `node` is the first one for the payload,
+/// while `key` lets a shrinking set (A,B -> A) count as a real node change.
+fn active_nodes(event: &Value) -> (Option<String>, Option<String>) {
+    let mut nodes = event
+        .pointer("/status/activeExecutions")
+        .and_then(Value::as_array)
+        .map(|executions| {
+            executions
+                .iter()
+                .filter_map(|execution| execution.get("node").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let first = nodes.first().map(|node| (*node).to_owned());
+    nodes.sort_unstable();
+    nodes.dedup();
+    let key = (!nodes.is_empty()).then(|| nodes.join(","));
+    (first, key)
+}
+
+fn terminal_reason(event: &Value) -> Value {
+    event
+        .pointer("/status/terminalResult/reason")
+        .or_else(|| event.get("reason"))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
 impl HubFeed {
+    /// Store every watch record, but mark only node changes and phase exits from `running` as
+    /// collapsed transitions. The raw record (with its cursor) is still appended to the log, so
+    /// `hub ps` history and detail subscribers keep the complete trail.
     fn publish_run(&self, origin: RunOrigin<'_>, mut event: Value) {
+        let (at, now_ms) = now_stamp();
         let phase = event
             .pointer("/status/phase")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let terminal = phase.as_deref() == Some("finished");
-        self.warnings
-            .borrow_mut()
-            .observe(origin.job_id, &event, now_ms());
+        let terminal = phase.as_deref().is_some_and(terminal_phase);
         if let Some(map) = event.as_object_mut() {
             map.entry("runId").or_insert_with(|| json!(origin.run_id));
         }
-        self.run_facts
-            .borrow_mut()
-            .insert(origin.job_id.to_owned(), event.clone());
-        let phase_name = phase.as_deref().unwrap_or("running");
-        let mut keys = Vec::new();
-        if let Some(executions) = event
-            .pointer("/status/activeExecutions")
-            .and_then(Value::as_array)
-            .filter(|executions| !executions.is_empty())
-        {
-            for execution in executions {
-                let node = execution.get("node").and_then(Value::as_str).unwrap_or("");
-                let id = execution
-                    .get("execution")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                keys.push(format!("{}|{phase_name}|{node}|{id}", origin.job_id));
-            }
-        } else {
-            keys.push(format!("{}|{phase_name}||", origin.job_id));
-        }
-        // One run occurrence covers every execution that was active at that moment, so the
-        // identity of the occurrence is the whole ordered set. Watching individual tuples would
-        // miss a shrinking active set whose remaining tuple was already seen.
-        keys.sort();
-        let attempt = event
-            .pointer("/attempt")
-            .or_else(|| event.pointer("/status/attempt"))
-            .or_else(|| event.pointer("/status/attempts"))
-            .and_then(Value::as_u64)
-            .map(|attempt| attempt.to_string())
-            .unwrap_or_default();
-        let occurrence = format!("{attempt}|{}", keys.join(";"));
-        // Compare only with the immediately previous occurrence, not everything the job has
-        // ever reported: A,B -> A is a real node finish even though A alone was seen before.
-        let fresh = {
-            let mut seen = self.run_seen.borrow_mut();
-            if seen
-                .get(origin.job_id)
-                .is_some_and(|previous| previous == &occurrence)
-            {
-                false
+        let (node, node_key) = active_nodes(&event);
+        let run_cursor = event
+            .get("cursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let reason = terminal_reason(&event);
+        let (transition, previous_node, cursors_since_last_event, node_changed_at, elapsed) = {
+            let mut runs = self.runs.borrow_mut();
+            let entry = runs.entry(origin.job_id.to_owned()).or_default();
+            let first = !entry.seen;
+            // The node set identifies a transition: a parallel run that shrinks from A,B to A
+            // really did finish a node even though its first active node is unchanged.
+            let node_changed = !first && entry.node_key != node_key;
+            let node_moved = first || node_changed;
+            let current_phase = phase.as_deref();
+            // Leaving `running` ends the progress window. Later non-running phases (stopping ->
+            // finished) still announce their own transition, so the terminal event is never lost
+            // when a subscriber first observes the run already stopping.
+            let left_running = current_phase.is_some_and(|phase| phase != "running")
+                && entry.phase.as_deref() != current_phase;
+            let transition = node_moved || left_running;
+            let previous_node = entry.node.clone();
+            // The current record is itself a cursor observation, so it counts toward the gap
+            // between collapsed events. The very first event has no previous cursor to count.
+            let cursors_since_last_event = if first {
+                0
+            } else if transition {
+                entry.cursors_since_last_event.saturating_add(1)
             } else {
-                seen.insert(origin.job_id.to_owned(), occurrence);
-                true
+                entry.cursors_since_last_event
+            };
+            if transition {
+                entry.cursors_since_last_event = 0;
+            } else {
+                entry.cursors_since_last_event = entry.cursors_since_last_event.saturating_add(1);
             }
+            // Only a real node change starts a new quiet window. A phase-only transition keeps the
+            // retained node start, so `elapsedMsInNode` measures the time the node stayed the same.
+            if node_moved {
+                entry.node = node.clone();
+                entry.node_key = node_key;
+                entry.node_changed_at = Some(at.clone());
+                entry.node_changed_at_ms = now_ms;
+            }
+            entry.phase = phase.clone();
+            entry.seen = true;
+            (
+                transition,
+                previous_node,
+                cursors_since_last_event,
+                entry.node_changed_at.clone(),
+                now_ms.saturating_sub(entry.node_changed_at_ms),
+            )
         };
-        // The public status can change metadata, warnings, and delivery facts without a new
-        // phase, attempt, execution, or active node. Those changes update `run_facts` and the
-        // warning book but must not produce look-alike phase transitions on the feed.
-        if !fresh {
-            return;
+        if let Some(map) = event.as_object_mut() {
+            if transition {
+                // The collapsed event is the whole liveness answer: a reader can tell from it
+                // and the clock whether the run moved, how long the node has been unchanged, and
+                // whether the run ended. Non-transition records keep the plain watch record.
+                map.insert(
+                    "node".to_owned(),
+                    node.map(Value::String).unwrap_or(Value::Null),
+                );
+                map.insert(
+                    "previousNode".to_owned(),
+                    previous_node.map(Value::String).unwrap_or(Value::Null),
+                );
+                map.insert(
+                    "phase".to_owned(),
+                    phase.clone().map(Value::String).unwrap_or(Value::Null),
+                );
+                map.insert(
+                    "runCursor".to_owned(),
+                    run_cursor.map(Value::String).unwrap_or(Value::Null),
+                );
+                map.insert("lastCursorAt".to_owned(), json!(at.clone()));
+                map.insert(
+                    "cursorsSinceLastEvent".to_owned(),
+                    json!(cursors_since_last_event),
+                );
+                map.insert("elapsedMsInNode".to_owned(), json!(elapsed));
+                map.insert(
+                    "nodeChangedAt".to_owned(),
+                    node_changed_at.map(Value::String).unwrap_or(Value::Null),
+                );
+                map.insert("terminal".to_owned(), json!(terminal));
+                map.insert("reason".to_owned(), reason);
+            }
         }
         self.publish(HubEvent {
             sequence: 0,
-            name: HUB_RUN,
-            timestamp: now_rfc3339(),
+            name: HUB_RUN_DETAIL,
+            timestamp: at,
             data: event,
             run_id: Some(origin.run_id.to_owned()),
             job_id: Some(origin.job_id.to_owned()),
             target: origin.target,
             phase,
             terminal,
-            snapshot: false,
-            snapshot_cursor: None,
+            transition,
         });
-    }
-
-    /// Facts the hub already knows about one running job, keeping the payload additive: every
-    /// earlier `jobId`/`runId`/`message`/`at` field keeps its meaning.
-    fn warning_data(&self, view: &Value, now: u64) -> Value {
-        let job_id = view
-            .get("jobId")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let run_id = view
-            .get("runId")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let cursor = view
-            .get("lastCursor")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let (previous_cursor, node, execution, execution_since_ms) = {
-            let mut book = self.warnings.borrow_mut();
-            let entry = book.jobs.entry(job_id.to_owned()).or_default();
-            let previous = std::mem::replace(&mut entry.announced_cursor, cursor.clone());
-            (
-                previous,
-                entry.node.clone(),
-                entry.execution.clone(),
-                entry.execution_since_ms,
-            )
-        };
-        let dispatched_at_ms = view
-            .get("dispatchedAt")
-            .and_then(Value::as_str)
-            .and_then(parse_rfc3339_ms);
-        let elapsed_ms = dispatched_at_ms.map(|at| now.saturating_sub(at));
-        let unchanged_ms = execution_since_ms.map(|at| now.saturating_sub(at));
-        let cursor_delta = match (&previous_cursor, &cursor) {
-            (Some(previous), Some(current)) => watch_cursor_sequence(current)
-                .zip(watch_cursor_sequence(previous))
-                .and_then(|(current, previous)| current.checked_sub(previous)),
-            _ => None,
-        };
-
-        let mut message = format!(
-            "job {job_id} run {run_id} has been running for {}",
-            elapsed_ms.map_or_else(|| "an unknown time".to_owned(), human_duration)
-        );
-        match (&node, &execution) {
-            (Some(node), Some(execution)) => {
-                message.push_str(&format!(" at node {node}"));
-                message.push_str(&format!(" (execution {execution} unchanged for "));
-                message.push_str(
-                    &unchanged_ms.map_or_else(|| "an unknown time".to_owned(), human_duration),
-                );
-                message.push(')');
-            }
-            _ => message.push_str("; no active execution was reported"),
-        }
-        match (&previous_cursor, cursor_delta) {
-            (Some(_), Some(delta)) => message.push_str(&format!(
-                "; {delta} cursor event{} since the previous warning",
-                if delta == 1 { "" } else { "s" }
-            )),
-            (Some(_), None) => {
-                message.push_str("; the cursor did not advance since the previous warning")
-            }
-            (None, _) => {
-                let at = cursor.as_deref().unwrap_or("unknown");
-                message.push_str(&format!("; first warning, cursor {at}"));
-            }
-        }
-        if let Some(reason) = view.get("reaper").and_then(Value::as_str) {
-            message.push_str("; reaper withheld action: ");
-            message.push_str(reason);
-        }
-
-        json!({
-            "message": message,
-            "at": now_rfc3339(),
-            "elapsedMs": elapsed_ms,
-            "elapsed": elapsed_ms.map(human_duration),
-            "dispatchedAt": view.get("dispatchedAt").cloned().unwrap_or(Value::Null),
-            "node": node,
-            "execution": execution,
-            "executionUnchangedMs": unchanged_ms,
-            "executionUnchanged": unchanged_ms.map(human_duration),
-            "runCursor": cursor,
-            "previousRunCursor": previous_cursor,
-            "cursorDelta": cursor_delta,
-        })
     }
 
     fn publish_warning(&self, job_id: &str, run_id: &str, facts: Value) {
         let mut data = Map::new();
         data.insert("jobId".to_owned(), json!(job_id));
         data.insert("runId".to_owned(), json!(run_id));
-        // Every warning the hub already emitted carried `at`, including watch failures that
-        // supply only a message.
         data.insert("at".to_owned(), json!(now_rfc3339()));
         if let Value::Object(facts) = facts {
             data.extend(facts);
@@ -2464,37 +1785,60 @@ impl HubFeed {
             target: None,
             phase: None,
             terminal: false,
-            snapshot: false,
-            snapshot_cursor: None,
+            transition: false,
         });
     }
 }
 
-/// Human-readable duration for warnings: `6h 12m`, `3m`, `45s`.
-fn human_duration(ms: u64) -> String {
-    let total = ms / 1000;
-    let days = total / 86_400;
-    let hours = (total % 86_400) / 3_600;
-    let minutes = (total % 3_600) / 60;
-    let seconds = total % 60;
-    if days > 0 {
-        format!("{days}d {hours}h")
-    } else if hours > 0 {
-        format!("{hours}h {minutes}m")
-    } else if minutes > 0 {
-        format!("{minutes}m")
-    } else {
-        format!("{seconds}s")
+#[cfg(test)]
+impl HubFeed {
+    pub(super) fn test_publish_run(&self, run_id: &str, job_id: &str, event: Value) {
+        self.publish_run(
+            RunOrigin {
+                run_id,
+                job_id,
+                target: None,
+            },
+            event,
+        );
     }
-}
 
-fn parse_rfc3339_ms(text: &str) -> Option<u64> {
-    let instant = OffsetDateTime::parse(text, &Rfc3339).ok()?;
-    u64::try_from(instant.unix_timestamp_nanos() / 1_000_000).ok()
-}
+    pub(super) fn test_publish_warning(&self, job_id: &str, run_id: &str, facts: Value) {
+        self.publish_warning(job_id, run_id, facts);
+    }
 
-fn now_ms() -> u64 {
-    u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).unwrap_or(0)
+    /// Deliver the stored log through the same subscription parser and filter the real poll and
+    /// stream paths use, without an HTTP round trip.
+    pub(super) fn test_deliver(&self, name: Option<&str>, arguments: Value) -> Vec<Value> {
+        let mut params = json!({"arguments": arguments});
+        if let Some(name) = name {
+            params["name"] = json!(name);
+        }
+        let Ok(request) = parse_subscription(&params, false) else {
+            panic!("test subscription parses");
+        };
+        let filter = HubFilter {
+            selector: &request.selector,
+            target: &request.target,
+            kinds: &request.filters.kinds,
+            filters: &request.filters,
+        };
+        self.log
+            .borrow()
+            .events
+            .iter()
+            .filter_map(|event| hub_event_value(event, &filter, false, None))
+            .collect()
+    }
+
+    pub(super) fn test_log_records(&self) -> Vec<(u64, &'static str, bool)> {
+        self.log
+            .borrow()
+            .events
+            .iter()
+            .map(|event| (event.sequence, event.name, event.transition))
+            .collect()
+    }
 }
 
 fn watch_command(
@@ -2586,7 +1930,7 @@ fn summary(data: &Value) -> Value {
         .pointer("/status/phase")
         .cloned()
         .unwrap_or(Value::Null);
-    let terminal = phase.as_str() == Some("finished");
+    let terminal = phase.as_str().is_some_and(terminal_phase);
     let node = data
         .pointer("/status/activeExecutions")
         .and_then(Value::as_array)
@@ -2609,10 +1953,18 @@ fn summary(data: &Value) -> Value {
     })
 }
 
-fn occurrence(event: &Value, replayed: bool) -> Result<Option<Value>, McpFailure> {
+fn occurrence(
+    event: &Value,
+    filters: &Filters,
+    replayed: bool,
+) -> Result<Option<Value>, McpFailure> {
     let cursor = watch_cursor(event)?;
     let run_id = event.get("runId").and_then(Value::as_str).unwrap_or("run");
-    let mut data = event_data(event, false);
+    let mut data = event_data(event, filters.verbose);
+    let terminal = data.pointer("/status/phase").and_then(Value::as_str) == Some("finished");
+    if !filters.accepts(&data, terminal) {
+        return Ok(None);
+    }
     let summary = summary(&data);
     if let Some(map) = data.as_object_mut() {
         map.insert("summary".to_owned(), summary);
@@ -2651,30 +2003,61 @@ fn input_schema(name: &str) -> Value {
         &[],
         vec![
             (
-                "cursor",
-                string_prop("Resume from this hub:<sequence> cursor."),
-            ),
-            (
-                "maxAgeMs",
-                integer_prop(
-                    "Accepted for MCP compatibility but not applied; watch records carry no \
-                     occurrence time.",
+                "runId",
+                string_prop(
+                    "Only emit events for this run. Omit it and jobId to receive the whole hub.",
                 ),
             ),
             (
-                "maxEvents",
-                integer_prop("Bound the events returned by one poll from 1 to 1000."),
+                "jobId",
+                string_prop("Only emit events for this hub job and its run."),
+            ),
+            (
+                "target",
+                string_prop("Only emit events for this named target."),
+            ),
+            (
+                "kinds",
+                string_array_prop(
+                    "Only emit these event names: hub.job, hub.run, hub.run.detail, hub.pool, or \
+                     hub.warning.",
+                ),
+            ),
+            (
+                "phases",
+                string_array_prop(
+                    "Only emit events whose run phase or job state is one of admitted, running, \
+                     stopping, or finished.",
+                ),
+            ),
+            (
+                "nodes",
+                string_array_prop(
+                    "Only emit run events with an active execution at one of these graph nodes.",
+                ),
+            ),
+            ("terminalOnly", bool_prop("Only emit terminal events.")),
+            (
+                "verbose",
+                bool_prop("Keep the full recorded failure array on terminal run events."),
+            ),
+            (
+                "detail",
+                bool_prop(
+                    "Deliver every raw per-cursor run record as hub.run.detail instead of the \
+                     collapsed hub.run occurrences.",
+                ),
             ),
         ],
     );
     schema["description"] = json!(format!(
-        "Long-lived {name} subscription. Every occurrence carries one of hub.job, hub.run, \
-         hub.pool, or hub.warning in data.kind; narrowing arguments are refused because one \
-         subscription must carry every hub event. Optional runId, jobId, or target selectors \
-         choose which subscription this is. The stream stays open after terminal run events and \
-         idle periods; stop it with events/unsubscribe, session end, or cancellation. Resume \
-         with the hub:N cursor from notifications/events/active. maxAgeMs is accepted but not \
-         applied because durable watch records carry no occurrence time."
+        "Long-lived {name} subscription. Omit runId and jobId to receive every hub.job, \
+         hub.run, hub.pool, and hub.warning event on one stream. hub.run is collapsed to node and \
+         phase transitions; pass arguments.detail to receive every raw record as hub.run.detail. \
+         The stream stays open after terminal run events and idle periods; stop it with \
+         events/unsubscribe, session end, or cancellation. Resume with the hub:N cursor from \
+         notifications/events/active. maxAgeMs is accepted but not applied because durable watch \
+         records carry no occurrence time."
     ));
     schema
 }
@@ -2682,14 +2065,27 @@ fn input_schema(name: &str) -> Value {
 fn payload_schema(name: &str) -> Value {
     let run_data = json!({
         "type": "object",
-        "description": "Trimmed durable run watch record. data.cursor is the hub cursor; data.runCursor keeps the run's v2: cursor.",
+        "description": "Collapsed run transition with the liveness evidence for hidden cursors. data.cursor is the hub cursor; data.runCursor keeps the current raw v2: cursor.",
         "additionalProperties": true,
-        "required": ["kind", "runId", "cursor", "status", "summary", "replayed"],
+        "required": [
+            "kind", "runId", "cursor", "runCursor", "node", "previousNode", "phase", "lastCursorAt",
+            "cursorsSinceLastEvent", "elapsedMsInNode", "nodeChangedAt", "terminal", "reason",
+            "status", "summary", "replayed"
+        ],
         "properties": {
             "kind": {"const": HUB_RUN},
             "runId": {"type": "string"},
             "cursor": {"type": "string", "pattern": "^hub:[0-9]+$"},
-            "runCursor": {"type": "string", "pattern": "^v2:[0-9]+$"},
+            "runCursor": {"type": ["string", "null"], "pattern": "^v2:[0-9]+$"},
+            "node": {"type": ["string", "null"]},
+            "previousNode": {"type": ["string", "null"]},
+            "phase": {"type": ["string", "null"]},
+            "lastCursorAt": {"type": ["string", "null"], "format": "date-time"},
+            "cursorsSinceLastEvent": {"type": "integer", "minimum": 0},
+            "elapsedMsInNode": {"type": "integer", "minimum": 0},
+            "nodeChangedAt": {"type": ["string", "null"], "format": "date-time"},
+            "terminal": {"type": "boolean"},
+            "reason": {"type": ["string", "null"]},
             "status": {
                 "type": "object",
                 "description": "Public run status. status.metadata is present only when phase is finished.",
@@ -2705,33 +2101,42 @@ fn payload_schema(name: &str) -> Value {
                 }
             },
             "summary": {"type": "object"},
-            "replayed": {"type": "boolean"},
-            "sequence": {"type": "integer", "minimum": 1}
+            "replayed": {"type": "boolean"}
+        }
+    });
+    let run_detail_data = json!({
+        "type": "object",
+        "description": "One raw per-cursor run record. data.cursor is the hub cursor; data.runCursor keeps the run's v2: cursor. Transition records also carry the collapsed-event evidence.",
+        "additionalProperties": true,
+        "required": ["kind", "runId", "cursor", "runCursor", "status", "summary", "replayed"],
+        "properties": {
+            "kind": {"const": HUB_RUN_DETAIL},
+            "runId": {"type": "string"},
+            "cursor": {"type": "string", "pattern": "^hub:[0-9]+$"},
+            "runCursor": {"type": ["string", "null"], "pattern": "^v2:[0-9]+$"},
+            "node": {"type": ["string", "null"]},
+            "previousNode": {"type": ["string", "null"]},
+            "phase": {"type": ["string", "null"]},
+            "lastCursorAt": {"type": ["string", "null"], "format": "date-time"},
+            "cursorsSinceLastEvent": {"type": "integer", "minimum": 0},
+            "elapsedMsInNode": {"type": "integer", "minimum": 0},
+            "nodeChangedAt": {"type": ["string", "null"], "format": "date-time"},
+            "terminal": {"type": "boolean"},
+            "reason": {"type": ["string", "null"]},
+            "status": {"type": "object", "additionalProperties": true},
+            "summary": {"type": "object"},
+            "replayed": {"type": "boolean"}
         }
     });
     let job_data = json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["kind", "jobId", "title", "state", "target", "project", "runId", "attempts", "pinnedRevision", "labels", "submittedAt", "finishedAt", "failureReason", "errorKind", "reason", "at", "cursor", "summary", "replayed", "sequence"],
+        "required": ["jobId", "title", "state", "target", "project", "reason", "at", "cursor", "summary", "replayed"],
         "properties": {
             "kind": {"const": HUB_JOB},
             "jobId": {"type": "string"},
-            "cursor": {"type": "string", "pattern": HUB_CURSOR_PATTERN, "description": "Durable hub:<sequence> cursor, or hub:snapshot:<delivered>:<start> for a bootstrap record."},
-            "sequence": {"type": "integer", "minimum": 1},
-            "snapshot": {"type": "boolean", "description": "Bootstrap state, not replayed history."},
-            "terminal": {"type": "boolean", "description": "The one terminal occurrence for this job."},
+            "cursor": {"type": "string", "pattern": "^hub:[0-9]+$"},
             "title": {"type": ["string", "null"]},
-            "runId": {"type": ["string", "null"]},
-            "attempts": {"type": "integer"},
-            "pinnedRevision": {"type": ["string", "null"]},
-            "labels": {"type": "object", "additionalProperties": {"type": "string"}},
-            "submittedAt": {"type": ["string", "null"]},
-            "finishedAt": {"type": ["string", "null"]},
-            "failureReason": {"type": ["string", "null"]},
-            "errorKind": {"type": ["string", "null"]},
-            "headBranch": {"type": ["string", "null"]},
-            "headRevision": {"type": ["string", "null"]},
-            "status": {"type": ["object", "null"]},
             "state": {
                 "type": "string",
                 "enum": ["submitted", "queued", "scheduled", "placing", "running", "succeeded", "failed", "dequeued", "cancelled"]
@@ -2747,41 +2152,25 @@ fn payload_schema(name: &str) -> Value {
     let pool_data = json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["kind", "scope", "pool", "leaseId", "serverId", "memberId", "machine", "phase", "previousPhase", "at", "reason", "cursor", "summary", "replayed"],
+        "required": ["pool", "leaseId", "serverId", "machine", "phase", "reason", "at", "cursor", "summary", "replayed"],
         "properties": {
             "kind": {"const": HUB_POOL},
-            "scope": {"type": "string", "enum": ["lease", "pool"], "description": "Whether the transition is one lease's or the pool's own."},
             "pool": {"type": "string"},
             "cursor": {"type": "string", "pattern": "^hub:[0-9]+$"},
-            "leaseId": {"type": ["string", "null"]},
+            "leaseId": {"type": "string"},
             "serverId": {"type": ["integer", "string", "null"]},
-            "memberId": {"type": ["string", "null"]},
-            "machine": {
-                "type": ["object", "null"],
-                "additionalProperties": true,
-                "properties": {
-                    "cores": {"type": "integer"},
-                    "memoryMb": {"type": "integer"},
-                    "location": {"type": "string"},
-                    "serverType": {"type": "string"}
-                }
-            },
-            "phase": {
-                "type": "string",
-                "enum": ["requested", "creating", "booting", "preparing", "ready", "in_use", "idle", "draining", "deleted", "failed", "added", "removed", "paused", "resumed", "blocked", "shortage"]
-            },
-            "previousPhase": {"type": ["string", "null"]},
+            "machine": {"type": ["string", "null"]},
+            "phase": {"type": "string", "enum": ["provisioning", "active", "draining", "deleted", "failed"]},
             "reason": {"type": ["string", "null"]},
             "at": {"type": "string"},
             "summary": {"type": "object"},
-            "replayed": {"type": "boolean"},
-            "sequence": {"type": "integer", "minimum": 1}
+            "replayed": {"type": "boolean"}
         }
     });
     let warning_data = json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["kind", "jobId", "runId", "message", "at", "cursor", "summary", "replayed"],
+        "required": ["jobId", "runId", "message", "at", "cursor", "summary", "replayed"],
         "properties": {
             "kind": {"const": HUB_WARNING},
             "jobId": {"type": "string"},
@@ -2790,16 +2179,16 @@ fn payload_schema(name: &str) -> Value {
             "message": {"type": "string"},
             "at": {"type": "string"},
             "summary": {"type": "object"},
-            "replayed": {"type": "boolean"},
-            "sequence": {"type": "integer", "minimum": 1}
+            "replayed": {"type": "boolean"}
         }
     });
     let data = match name {
         HUB_JOB => job_data,
         HUB_RUN => run_data,
+        HUB_RUN_DETAIL => run_detail_data,
         HUB_POOL => pool_data,
         HUB_WARNING => warning_data,
-        _ => json!({"oneOf": [job_data, run_data, pool_data, warning_data]}),
+        _ => json!({"oneOf": [job_data, run_data, pool_data, warning_data, run_detail_data]}),
     };
     json!({
         "type": "object",
@@ -2808,12 +2197,12 @@ fn payload_schema(name: &str) -> Value {
         "properties": {
             "eventId": {
                 "type": "string",
-                "pattern": HUB_CURSOR_PATTERN,
-                "description": "The record's resume cursor: durable hub:<sequence>, or hub:snapshot:<delivered>:<start> for a bootstrap snapshot record."
+                "description": "hub:<sequence>; the same monotonic cursor spans every run, job, and pool event."
             },
             "name": {
-                "const": name,
-                "description": "The subscribed event name. A subscription by kind or alias carries that name instead; data.kind names the carried kind."
+                "type": "string",
+                "description": "Event name carried by this multiplexed subscription.",
+                "enum": HUB_EVENTS
             },
             "timestamp": {"type": "string", "format": "date-time"},
             "data": data,
@@ -2886,113 +2275,4 @@ where
         &json!({"jsonrpc": "2.0", "method": method, "params": params}),
     )
     .await
-}
-
-#[cfg(test)]
-mod warning_tests {
-    use super::*;
-
-    #[test]
-    fn hub_warnings_name_the_execution_and_cursor_delta() {
-        let feed = HubFeed::new();
-        let now = parse_rfc3339_ms("2024-01-01T06:12:00Z").expect("time");
-        let observed_at = now - 12 * 60_000;
-        feed.warnings.borrow_mut().observe(
-            "hj_1",
-            &json!({
-                "status": {
-                    "phase": "running",
-                    "activeExecutions": [{"node": "worker", "execution": "exec-7"}],
-                },
-            }),
-            observed_at,
-        );
-        let mut view = json!({
-            "jobId": "hj_1",
-            "runId": "run-1",
-            "dispatchedAt": "2024-01-01T00:00:00Z",
-            "lastCursor": "v2:15",
-        });
-
-        let first = feed.warning_data(&view, now);
-        assert_eq!(first["elapsed"], json!("6h 12m"));
-        assert_eq!(first["node"], json!("worker"));
-        assert_eq!(first["execution"], json!("exec-7"));
-        assert_eq!(first["executionUnchanged"], json!("12m"));
-        assert_eq!(first["cursorDelta"], Value::Null);
-        assert!(
-            first["message"]
-                .as_str()
-                .expect("message")
-                .contains("first warning")
-        );
-
-        view["lastCursor"] = json!("v2:20");
-        let second = feed.warning_data(&view, now + 60_000);
-        assert_eq!(second["previousRunCursor"], json!("v2:15"));
-        assert_eq!(second["cursorDelta"], json!(5));
-        assert!(
-            second["message"]
-                .as_str()
-                .expect("message")
-                .contains("5 cursor events")
-        );
-    }
-
-    fn job_event(state: &str, snapshot: bool) -> HubEvent {
-        HubEvent {
-            sequence: 0,
-            name: HUB_JOB,
-            timestamp: "2024-01-01T00:00:00Z".to_owned(),
-            data: json!({"jobId": "hj_1", "state": state}),
-            run_id: None,
-            job_id: Some("hj_1".to_owned()),
-            target: None,
-            phase: None,
-            terminal: false,
-            snapshot,
-            snapshot_cursor: None,
-        }
-    }
-
-    #[test]
-    fn a_stale_initial_poll_cannot_repeat_the_bootstrap_state() {
-        let mut states = HashMap::new();
-        let scheduled = job_event("scheduled", true);
-        assert!(!repeated_job_state(&scheduled, &states));
-        remember_job_state(&scheduled, &mut states);
-        // A stale poll cannot walk a scheduled bootstrap back to submitted.
-        assert!(repeated_job_state(&job_event("submitted", false), &states));
-        // Becoming due is a real scheduled -> queued transition, not a repeat.
-        let queued = job_event("queued", false);
-        assert!(!repeated_job_state(&queued, &states));
-        remember_job_state(&queued, &mut states);
-        assert!(repeated_job_state(&queued, &states));
-        let running = job_event("running", false);
-        assert!(!repeated_job_state(&running, &states));
-        remember_job_state(&running, &mut states);
-        let dequeued = job_event("dequeued", false);
-        assert!(!repeated_job_state(&dequeued, &states));
-        remember_job_state(&dequeued, &mut states);
-        assert!(repeated_job_state(&dequeued, &states));
-    }
-
-    #[test]
-    fn a_filtered_job_state_is_not_remembered() {
-        let mut states = HashMap::new();
-        // The snapshot was filtered out, so the same state arriving live is still deliverable.
-        assert!(!repeated_job_state(&job_event("running", true), &states));
-        assert!(!repeated_job_state(&job_event("running", false), &states));
-        remember_job_state(&job_event("running", false), &mut states);
-        assert!(repeated_job_state(&job_event("running", false), &states));
-    }
-
-    #[test]
-    fn hub_warning_durations_stay_readable() {
-        assert_eq!(human_duration(0), "0s");
-        assert_eq!(human_duration(45_000), "45s");
-        assert_eq!(human_duration(3 * 60_000), "3m");
-        assert_eq!(human_duration((6 * 60 + 12) * 60_000), "6h 12m");
-        assert_eq!(human_duration((2 * 24 + 3) * 3_600_000), "2d 3h");
-    }
 }

@@ -1192,6 +1192,7 @@ fn job_spec(run: RunArgs, placement: HubPlacementArgs) -> Result<HubJobSpec, Nat
         environment: run.environment.is_some(),
         cwd: run.cwd.clone(),
         submission_key: run.submission_key.clone(),
+        max_stall_ms: run.max_stall_ms,
     })
 }
 

@@ -582,6 +582,7 @@ impl HubService {
             project: case.project.clone(),
             models,
             submission_key: None,
+            max_stall_ms: None,
             submitted_at_ms: now_ms(),
             not_before_ms: None,
             attempts: 0,

@@ -108,11 +108,8 @@ pub(super) fn software_input_type(
     record_type(fields)
 }
 
-pub(super) fn change_manifest_type() -> Result<PayloadType, BuiltinTemplateError> {
-    record_type(vec![
-        (TITLE_FIELD, PayloadType::String, true),
-        (DESCRIPTION_FIELD, PayloadType::String, true),
-    ])
+pub(super) fn change_title_type() -> Result<PayloadType, BuiltinTemplateError> {
+    record_type(vec![(TITLE_FIELD, PayloadType::String, true)])
 }
 
 pub(super) fn delivery_input_type() -> Result<PayloadType, BuiltinTemplateError> {
