@@ -854,7 +854,74 @@ pub(crate) fn recover_placing(state: &mut HubState) -> usize {
     recovered
 }
 
-/// A running job whose watch cursor stayed unchanged for the daemon's `--max-stall`.
+/// Where a job's effective stall limit came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StallLimitSource {
+    /// The job's own `maxStallMs`.
+    Job,
+    /// The hub daemon's `--max-stall`.
+    Hub,
+    /// A built-in fallback, when one is configured.
+    Default,
+}
+
+impl StallLimitSource {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Job => "job",
+            Self::Hub => "hub",
+            Self::Default => "default",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Job => "job",
+            Self::Hub => "hub default",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// The stall limit that applies to one job and where it was configured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StallLimit {
+    pub max_stall_ms: u64,
+    pub source: StallLimitSource,
+}
+
+impl StallLimit {
+    /// Job `maxStallMs` first, then the hub daemon's `--max-stall`.
+    pub(crate) fn for_job(job: &Job, hub_max_stall_ms: Option<u64>) -> Option<Self> {
+        Self::resolve(job, hub_max_stall_ms, None)
+    }
+
+    fn resolve(
+        job: &Job,
+        hub_max_stall_ms: Option<u64>,
+        built_in_default: Option<u64>,
+    ) -> Option<Self> {
+        job.max_stall_ms
+            .map(|max_stall_ms| Self {
+                max_stall_ms,
+                source: StallLimitSource::Job,
+            })
+            .or_else(|| {
+                hub_max_stall_ms.map(|max_stall_ms| Self {
+                    max_stall_ms,
+                    source: StallLimitSource::Hub,
+                })
+            })
+            .or_else(|| {
+                built_in_default.map(|max_stall_ms| Self {
+                    max_stall_ms,
+                    source: StallLimitSource::Default,
+                })
+            })
+    }
+}
+
+/// A running job whose watch cursor stayed unchanged past its effective stall limit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StalledRun {
     pub job_id: String,
@@ -862,17 +929,26 @@ pub(crate) struct StalledRun {
     pub run_id: String,
     pub cursor: String,
     pub still_ms: u64,
+    pub max_stall_ms: u64,
+    pub limit_source: StallLimitSource,
 }
 
-/// Running jobs whose cursor has stayed unchanged for at least `max_stall_ms`.
+/// Running jobs whose cursor has stayed unchanged for at least their own effective limit.
 ///
-/// A run that has not produced a cursor yet is still stalled once it has sat at dispatch for the
-/// same budget; otherwise `--max-stall` silently does nothing for a run that never starts
-/// watching. Missing identity fields stay empty rather than excluding the job from the check.
-pub(crate) fn stalled_runs(jobs: &[Job], now_ms: u64, max_stall_ms: u64) -> Vec<StalledRun> {
+/// `limit_for` resolves the job override before the hub-wide limit, so one job may wait longer
+/// than the rest of the sweep. A run that has not produced a cursor yet is still stalled once it
+/// has sat at dispatch for the same budget; otherwise the limit silently does nothing for a run
+/// that never starts watching. Missing identity fields stay empty rather than excluding the job
+/// from the check.
+pub(crate) fn stalled_runs(
+    jobs: &[Job],
+    now_ms: u64,
+    limit_for: impl Fn(&Job) -> Option<StallLimit>,
+) -> Vec<StalledRun> {
     jobs.iter()
         .filter(|job| job.state == JobState::Running)
         .filter_map(|job| {
+            let limit = limit_for(job)?;
             // Prefer the cursor clock, then the last successful contact (a status read without
             // `atCursor` or a load probe), and only then placement. A reachable member whose
             // status omits its cursor is observed work, not a silent run.
@@ -881,12 +957,14 @@ pub(crate) fn stalled_runs(jobs: &[Job], now_ms: u64, max_stall_ms: u64) -> Vec<
                 .or(job.target_last_ok_at_ms)
                 .or(job.dispatched_at_ms)?;
             let still_ms = now_ms.saturating_sub(at);
-            (still_ms >= max_stall_ms).then_some(StalledRun {
+            (still_ms >= limit.max_stall_ms).then_some(StalledRun {
                 job_id: job.job_id.clone(),
                 target: job.target.clone().unwrap_or_default(),
                 run_id: job.run_id.clone().unwrap_or_default(),
                 cursor: job.last_cursor.clone().unwrap_or_default(),
                 still_ms,
+                max_stall_ms: limit.max_stall_ms,
+                limit_source: limit.source,
             })
         })
         .collect()
@@ -895,16 +973,15 @@ pub(crate) fn stalled_runs(jobs: &[Job], now_ms: u64, max_stall_ms: u64) -> Vec<
 /// The daemon policy and evidence for settling stalled jobs in one pass.
 pub(crate) struct StallSettlement<'a> {
     pub now_ms: u64,
-    pub max_stall_ms: u64,
     pub stalled: &'a [StalledRun],
     pub stop_errors: &'a BTreeMap<String, String>,
 }
 
-/// Fail stalled jobs after their runs were stopped, naming the cursor and how long it was still.
+/// Fail stalled jobs after their runs were stopped, naming the limit, its source, the cursor, and
+/// how long the cursor was still.
 pub(crate) fn settle_stalled(jobs: &mut [Job], settlement: StallSettlement<'_>) -> Vec<Value> {
     let StallSettlement {
         now_ms,
-        max_stall_ms,
         stalled,
         stop_errors,
     } = settlement;
@@ -919,21 +996,6 @@ pub(crate) fn settle_stalled(jobs: &mut [Job], settlement: StallSettlement<'_>) 
         {
             continue;
         }
-        if let Some(error) = stop_errors.get(&run.job_id) {
-            job.error = Some(JobError::new(
-                JobErrorKind::Stalled,
-                format!(
-                    "run {} on {} stayed at cursor {} for {}ms (max stall {}ms); stopping it \
-                     failed: {error}; the hub will retry",
-                    run.run_id, run.target, run.cursor, run.still_ms, max_stall_ms
-                ),
-            ));
-            continue;
-        }
-        job.state = JobState::Failed;
-        job.finished_at_ms = Some(now_ms);
-        job.failure_reason = Some("stalled".to_owned());
-        job.failure_classification = Some(CLASSIFIED_STALLED.to_owned());
         let run_label = if run.run_id.is_empty() {
             "the run".to_owned()
         } else {
@@ -944,12 +1006,27 @@ pub(crate) fn settle_stalled(jobs: &mut [Job], settlement: StallSettlement<'_>) 
         } else {
             format!("cursor {}", run.cursor)
         };
+        let detail = format!(
+            "no cursor movement for {}ms (limit {}ms from {}); {run_label} on {} at {cursor_label}",
+            run.still_ms,
+            run.max_stall_ms,
+            run.limit_source.description(),
+            run.target,
+        );
+        if let Some(error) = stop_errors.get(&run.job_id) {
+            job.error = Some(JobError::new(
+                JobErrorKind::Stalled,
+                format!("stalled: {detail}; stopping it failed: {error}; the hub will retry"),
+            ));
+            continue;
+        }
+        job.state = JobState::Failed;
+        job.finished_at_ms = Some(now_ms);
+        job.failure_reason = Some("stalled".to_owned());
+        job.failure_classification = Some(CLASSIFIED_STALLED.to_owned());
         job.error = Some(JobError::new(
             JobErrorKind::Stalled,
-            format!(
-                "{run_label} on {} stayed at {cursor_label} for {}ms (max stall {}ms); the hub stopped it",
-                run.target, run.still_ms, max_stall_ms
-            ),
+            format!("stalled: {detail}; the hub stopped it"),
         ));
         failed.push(json!({
             "jobId": job.job_id,
@@ -958,6 +1035,8 @@ pub(crate) fn settle_stalled(jobs: &mut [Job], settlement: StallSettlement<'_>) 
             "runId": job.run_id,
             "cursor": run.cursor,
             "stillMs": run.still_ms,
+            "maxStallMs": run.max_stall_ms,
+            "maxStallSource": run.limit_source.as_str(),
         }));
     }
     failed

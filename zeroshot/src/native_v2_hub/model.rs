@@ -417,6 +417,10 @@ pub(crate) struct Job {
     pub models: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission_key: Option<String>,
+    /// Stop this job's run when its watch cursor does not advance for this long, overriding the
+    /// hub daemon's `--max-stall` for this job only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_stall_ms: Option<u64>,
     pub submitted_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before_ms: Option<u64>,
@@ -560,6 +564,7 @@ impl Job {
             "pinnedRevision": self.pinned_revision,
             "attempts": self.attempts,
             "unconfirmedSubmissions": self.unconfirmed_submissions,
+            "maxStallMs": self.max_stall_ms,
             "submittedAt": rfc3339(self.submitted_at_ms),
             "notBefore": time(self.not_before_ms),
             "dispatchedAt": time(self.dispatched_at_ms),

@@ -356,7 +356,10 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   defaults and an unused `artifacts` member is ignored), while workers still require the envelope. A
   format fault (unreadable envelope or unknown top-level shape) has its own three-correction budget
   per node visit, does not consume the contract-correction budget, and publishes a debug record
-  naming its count and reason.
+  naming its count and reason. An exhausted correction publishes exactly one terminal failure
+  diagnostic carrying the last validation error and the bounded raw rejected output, after provider
+  credential redaction has run, so a truncated envelope is distinguishable from a reviewer verdict
+  in the durable failure record; the settlement note itself stays non-diagnostic.
 - Provider continuation is bounded: Claude continues once after `system/api_retry`; Codex continues
   once after a terminal execution error. Both send literal `Continue` in the same session when one
   exists. Structured output that violates a valid envelope receives at most two correction turns
@@ -647,9 +650,14 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   returns through both existing reviewers before delivery. CLI uniform runtimes without an explicit
   session scope and new UI templates use `node_instance` for this worker and `execution` for
   reviewers; exact runtime plans and explicit session scopes remain caller-owned. Saved graphs are
-  unchanged. The final rejected round fails without starting an unreviewable extra repair.
+  unchanged. A rejected verdict still continues through repair; an unreadable reviewer output fails
+  as `review_output_invalid` and a reviewer refusal as `review_refused`, keeping both distinct from a
+  crash and from a genuine rejection. The final rejected round fails without starting an
+  unreviewable extra repair, and the failed run retains its workspace for recovery.
 - Delivery-enabled software-change templates make the acceptance verifier the sole author of the
-  current change title and description after every review pass. Git delivery uses that manifest for
+  current change title and description after every review pass. Reviewer output stays small: the
+  title is structural output and the prospective description plus actionable findings travel through
+  the free-text diagnostic channel. Git delivery uses that manifest for
   commits and reviews, refreshes only its marker-delimited body section while preserving surrounding
   text. Verifier guidance reserves closing references for delivery, which appends them only from
   caller-owned issue input.
@@ -782,16 +790,21 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   executor. Tool parameters for graph, initial input, exact or uniform runtime, and environment
   definitions are inline JSON values materialized into private temporary files for the command's
   lifetime. The `io.modelcontextprotocol/events` extension exposes one session-spanning hub
-  subscription carrying `hub.job`, `hub.run`, `hub.pool`, and `hub.warning` over one monotonic
-  `hub:<sequence>` cursor. Omitting selectors subscribes to the whole hub; `runId`, `jobId`,
-  `target`, and other filters narrow that feed without binding it, and single-kind names select
-  one event kind (`run.event` is the `hub.run` alias). Occurrences keep the flattened five-field
-  envelope (`eventId`, `name`, `timestamp`, `data`, `_meta`). The envelope `name` is always the
-  name the client subscribed with (`hub` when omitted), because MCP events clients route and
-  validate occurrences by it; the carried kind is `data.kind` (`hub.pool` records keep their
-  lease-or-pool discriminator as `data.scope`). `summary`, `replayed`, and the hub
-  `cursor` live inside `data`, while run records retain their durable `v2:` cursor as
-  `data.runCursor`. `replayed` is true only for records drained at subscribe time. Terminal events
+  subscription carrying `hub.job`, `hub.run`, `hub.run.detail`, `hub.pool`, and `hub.warning` over
+  one monotonic `hub:<sequence>` cursor. Omitting selectors subscribes to the whole hub; `runId`,
+  `jobId`, and `target` select a narrower subscription without filtering the hub type, and
+  single-kind names select one event kind (`run.event` is the `hub.run` alias). Other narrowing
+  arguments are refused. `hub.run` is collapsed to node changes and phase exits from `running`;
+  every watch record still lands in the log as `hub.run.detail` and is delivered only when a
+  subscription opts in with `detail: true` or the `hub.run.detail` name. A collapsed event carries
+  `node`, `previousNode`, `phase`, `runCursor`, `lastCursorAt`, `cursorsSinceLastEvent`,
+  `elapsedMsInNode`, `nodeChangedAt`, `terminal`, and `reason`, so one event plus the clock answers
+  whether the run is moving. Occurrences keep the flattened five-field envelope (`eventId`, `name`,
+  `timestamp`, `data`, `_meta`). The envelope `name` is always the name the client subscribed with
+  (`hub` when omitted), because MCP events clients route and validate occurrences by it; the
+  carried kind is `data.kind` (`hub.pool` records keep their lease-or-pool discriminator as
+  `data.scope`). `summary`, `replayed`, and the hub `cursor` live inside `data`, while run records
+  retain their durable `v2:` cursor as `data.runCursor`. `replayed` is true only for records drained at subscribe time. Terminal events
   are ordinary events and heartbeats continue while idle; only unsubscribe, session end, or
   cancellation closes a stream. `events/poll` and `events/stream` both replay from the same hub
   log. `truncated` is false unless replay shortfall or backpressure permanently lost events, and
@@ -875,7 +888,10 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   opt-in `hub daemon run --max-stall` persists each running job's watch cursor and cursor-change
   time, resets both when the cursor advances, and force-stops a run whose cursor stayed unchanged for
   the configured duration, failing it with reason and error kind `stalled`. Its heartbeat reports
-  the duration as `maxStallMs` (`null` when disabled). `hub dequeue` also removes placing jobs
+  the duration as `maxStallMs` (`null` when disabled). A job may override that budget for itself
+  with `--max-stall-ms` on `hub submit`/`hub enqueue`; the job value wins over the hub's
+  `--max-stall`, and the diagnostic and `hub status` name the effective limit and its source.
+  `hub dequeue` also removes placing jobs
   (`dequeued_while_placing`); a run the target accepts under their key is noted, never adopted. Jobs placing when a daemon stops stay on their member as unconfirmed. Hub-side job problems
   are a typed `JobError` (plain strings from older state load as `unclassified`). API errors carry the
   `zeroshot.error/v1` diagnostic plus `x-zeroshot-exit-code`; logs, watch, attach, and force-stop

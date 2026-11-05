@@ -184,17 +184,48 @@ impl NodeResponseContract {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct NodeResponseError(Box<str>);
+pub(crate) struct NodeResponseError {
+    message: Box<str>,
+    rejected_output: Option<Box<str>>,
+}
 
 impl NodeResponseError {
     fn new(message: String) -> Self {
         // Keep original text transiently until the provider can redact credentials. Display
         // bounds correction prompts; public diagnostics are bounded only after redaction.
-        Self(message.into_boxed_str())
+        Self {
+            message: message.into_boxed_str(),
+            rejected_output: None,
+        }
     }
 
-    fn redact(self, redact: impl FnOnce(&str) -> String) -> Self {
-        Self::new(redact(&self.0))
+    fn redact(self, redact: impl Fn(&str) -> String) -> Self {
+        Self {
+            message: redact(&self.message).into_boxed_str(),
+            rejected_output: self
+                .rejected_output
+                .map(|raw| redact(&raw).into_boxed_str()),
+        }
+    }
+
+    fn with_rejected_output(self, response: &str) -> Self {
+        Self {
+            rejected_output: Some(response.into()),
+            ..self
+        }
+    }
+
+    /// Redaction has already run at the provider boundary, so this is the only place the raw text
+    /// is bounded. Bounding earlier could split a credential and defeat redaction.
+    fn terminal_detail(&self) -> String {
+        match &self.rejected_output {
+            Some(raw) => format!(
+                "{}; rejected output: {}",
+                self.message,
+                bounded_raw_response(raw)
+            ),
+            None => self.message.to_string(),
+        }
     }
 }
 
@@ -218,13 +249,13 @@ impl AgentResponse {
         match self {
             Self::Correction { diagnostic, .. } => Some(NodeRunnerError::DriverDetail(format!(
                 "final output rejected: {}",
-                diagnostic.0
+                diagnostic.terminal_detail()
             ))),
             Self::Complete(_) => None,
         }
     }
 
-    pub(crate) fn redact_diagnostic(self, redact: impl FnOnce(&str) -> String) -> AgentResponse {
+    pub(crate) fn redact_diagnostic(self, redact: impl Fn(&str) -> String) -> AgentResponse {
         match self {
             Self::Correction {
                 kind,
@@ -233,7 +264,7 @@ impl AgentResponse {
             } => Self::Correction {
                 kind,
                 prompt,
-                diagnostic: diagnostic.redact(redact),
+                diagnostic: diagnostic.redact(&redact),
             },
             Self::Complete(outcome) => Self::Complete(outcome),
         }
@@ -286,14 +317,21 @@ impl AgentResponseState {
         match response {
             AgentResponse::Complete(outcome) => Ok(Some(outcome)),
             AgentResponse::Correction { kind, .. } if self.exhausted(kind) => {
-                let message = match kind {
-                    AgentCorrectionKind::Format => format!(
-                        "{provider} final output remained malformed after {MAX_FORMAT_CORRECTIONS} format corrections"
-                    ),
-                    AgentCorrectionKind::Contract => format!(
-                        "{provider} final output remained malformed after {MAX_OUTPUT_CORRECTIONS} corrections"
-                    ),
+                let budget = match kind {
+                    AgentCorrectionKind::Format => {
+                        format!("{MAX_FORMAT_CORRECTIONS} format corrections")
+                    }
+                    AgentCorrectionKind::Contract => {
+                        format!("{MAX_OUTPUT_CORRECTIONS} contract corrections")
+                    }
                 };
+                // The provider's report_correction already publishes the terminal failure with the
+                // redacted raw output. Keep this settlement note non-diagnostic so one failed turn
+                // has exactly one terminal failure record.
+                let message = format!(
+                    "{provider} final output remained malformed after {budget}; the run workspace \
+                     is retained for recovery instead of publishing a reviewed branch"
+                );
                 control
                     .emit(LiveOutput::new(LiveOutputStream::System, message)?)
                     .await?;
@@ -303,6 +341,7 @@ impl AgentResponseState {
                 kind,
                 prompt,
                 diagnostic,
+                ..
             } => {
                 match kind {
                     AgentCorrectionKind::Format => {
@@ -401,7 +440,7 @@ fn resolve_agent_response_rendering(
             AgentResponse::Correction {
                 kind,
                 prompt,
-                diagnostic: error,
+                diagnostic: error.with_rejected_output(response),
             }
         }
     })
@@ -430,6 +469,20 @@ fn parse_provider_envelope(
         return Ok(materialize_verifier_channel_response(object));
     }
     Err(invalid_envelope_shape(contract, &value))
+}
+
+fn bounded_raw_response(response: &str) -> Box<str> {
+    let mut end = response
+        .len()
+        .min(MAX_RESPONSE_ERROR_BYTES.saturating_sub(3));
+    while !response.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == response.len() {
+        response.into()
+    } else {
+        format!("{}...", &response[..end]).into_boxed_str()
+    }
 }
 
 fn parse_json_with_recovery(response: &str) -> Result<Value, serde_json::Error> {
@@ -582,14 +635,15 @@ fn json_value_kind(value: &Value) -> &'static str {
 
 impl fmt::Display for NodeResponseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.0.len() <= MAX_RESPONSE_ERROR_BYTES {
-            return formatter.write_str(&self.0);
+        let message = &self.message;
+        if message.len() <= MAX_RESPONSE_ERROR_BYTES {
+            return formatter.write_str(message);
         }
         let mut end = MAX_RESPONSE_ERROR_BYTES.saturating_sub(3);
-        while !self.0.is_char_boundary(end) {
+        while !message.is_char_boundary(end) {
             end -= 1;
         }
-        formatter.write_str(&self.0[..end])?;
+        formatter.write_str(&message[..end])?;
         formatter.write_str("...")
     }
 }

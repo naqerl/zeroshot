@@ -144,15 +144,16 @@ A filter that matches nothing is an empty `jobs` array, not an error.
 
 The server advertises `io.modelcontextprotocol/events` (SEP-3415). One subscription covers the
 whole hub. `events/list` reports one event type, `hub`, described as everything in the hub, with
-`delivery` `poll` and `push`. It also lists, as `names`, the four kinds a notification may
+`delivery` `poll` and `push`. It also lists, as `names`, the five kinds a notification may
 carry in `data.kind`:
 
-| Kind          | Data                                                                                             |
-| ------------- | ------------------------------------------------------------------------------------------------ |
-| `hub.job`     | `kind`, `jobId`, `title`, `state`, `target`, `project`, `runId`, `attempts`, `pinnedRevision`, `labels`, `submittedAt`, `finishedAt`, `failureReason`, `failureClassification`, `errorKind`, `headBranch`, `headRevision`, `status`, `terminal`, `snapshot`, `reason`, `at`, `cursor`, `summary`, `replayed`, `sequence` |
-| `hub.run`     | `kind` and the durable run watch record: `runId`, `cursor`, `runCursor`, `status`, `summary`, `replayed`    |
-| `hub.pool`    | `kind`, `scope`, `pool`, `leaseId`, `serverId`, `memberId`, `machine`, `phase`, `previousPhase`, `reason`, `at`, `cursor`, `summary`, `replayed` |
-| `hub.warning` | `kind`, `jobId`, `runId`, `message`, `at`, `cursor`, `summary`, `replayed`                              |
+| Kind             | Data                                                                                             |
+| ---------------- | ------------------------------------------------------------------------------------------------ |
+| `hub.job`        | `kind`, `jobId`, `title`, `state`, `target`, `project`, `runId`, `attempts`, `pinnedRevision`, `labels`, `submittedAt`, `finishedAt`, `failureReason`, `failureClassification`, `errorKind`, `headBranch`, `headRevision`, `status`, `terminal`, `snapshot`, `reason`, `at`, `cursor`, `summary`, `replayed`, `sequence` |
+| `hub.run`        | `kind`, `runId`, `cursor`, `runCursor`, `node`, `previousNode`, `phase`, `lastCursorAt`, `cursorsSinceLastEvent`, `elapsedMsInNode`, `nodeChangedAt`, `terminal`, `reason`, `status`, `summary`, `replayed` |
+| `hub.run.detail` | `kind` and one raw per-cursor run watch record: `runId`, `cursor`, `runCursor`, `status`, `summary`, `replayed` |
+| `hub.pool`       | `kind`, `scope`, `pool`, `leaseId`, `serverId`, `memberId`, `machine`, `phase`, `previousPhase`, `reason`, `at`, `cursor`, `summary`, `replayed` |
+| `hub.warning`    | `kind`, `jobId`, `runId`, `message`, `at`, `cursor`, `summary`, `replayed`                              |
 
 Every occurrence's envelope `name` is the name the client subscribed with: `hub` for a
 subscription without a `name`, otherwise the requested name (`hub.job`, `hub.event`, …). MCP events
@@ -168,10 +169,20 @@ events/subscribe {}
 {"eventId": "hub:42", "name": "hub", "timestamp": "RFC3339", "data": {"kind": "hub.run"}, "_meta": {}}
 ```
 
-`summary`, `replayed`, and the hub cursor live inside `data`. `data.cursor` is the same
-`hub:<sequence>` value as `eventId`. The sequence is monotonic across jobs, runs, pools, and
-warnings, so a client can keep one cursor and resume the whole feed. A `hub.run` record keeps its
-original durable `v2:<sequence>` watch cursor as `data.runCursor`.
+`summary`, `replayed`, the carried kind in `data.kind`, and the hub cursor live inside `data`.
+`data.cursor` is the same `hub:<sequence>` value as `eventId`. The sequence is monotonic across
+jobs, runs, pools, and warnings, so a client can keep one cursor and resume the whole feed. A
+`hub.run` or `hub.run.detail` record keeps its original durable `v2:<sequence>` watch cursor as
+`data.runCursor`.
+
+`hub.run` is collapsed to the moments that matter: the run's node changes or its phase leaves
+`running`. Cursor advances inside one node emit nothing. Every collapsed event carries the
+liveness evidence, so a reader can answer "is this run moving?" from one event plus the clock:
+`cursorsSinceLastEvent` counts the cursors between the previous collapsed event and this one,
+`lastCursorAt` records when the current cursor was observed, and `nodeChangedAt` plus
+`elapsedMsInNode` bound how long the current node has been unchanged. The raw per-cursor trail is
+never deleted: every watch record stays in the log as `hub.run.detail` and is delivered only to
+subscriptions that opt in with `detail: true` or with the `hub.run.detail` name.
 
 Every occurrence also carries `data.sequence`, a monotone counter owned by one subscription (or one
 `events/poll` caller). It starts at 1 for the first delivered event, including bootstrap snapshots,
@@ -183,18 +194,15 @@ Subscription arguments are all optional filters:
 - Omit `name` to subscribe to the whole hub. This is the normal form and needs no other field.
 - `runId` narrows to that run, its job, and its warnings. `jobId` narrows to that job, its run,
   and that run's warnings. Supplying both is invalid params (`-32602`).
-- `name` still selects one carried kind: `hub.job`, `hub.run`, `hub.pool`, or `hub.warning`, and
-  its occurrences carry that `name`. `hub` and `hub.event` are aliases for every hub event; `run.event` is the legacy run-watch
-  form. An unknown name is invalid params (`-32602`), like any other bad subscription field.
-  There is no wildcard syntax.
-- `target`, `kinds` (`hub.job`, `hub.run`, `hub.pool`, `hub.warning`), `states`, `phases`,
-  `labels`, `nodes`, `terminalOnly`, and `verbose` further filter occurrences.
-- `states` accepts `submitted`, `queued`, `scheduled`, `placing`, `running`, `succeeded`, `failed`,
-  `dequeued`, and `cancelled`, and applies to `hub.job` records. Any other value is invalid params.
-- `phases` accepts the run phases `admitted`, `running`, `stopping`, and `finished` plus every
-  lease/pool phase below. Any other value is invalid params. `nodes` applies only to run records.
-- `labels` is an object of string values; a job or run must carry all of them. An unknown state,
-  phase, or non-string label is invalid params (`-32602`).
+- `name` still selects one carried kind: `hub.job`, `hub.run`, `hub.run.detail`, `hub.pool`,
+  or `hub.warning`, and its occurrences carry that `name`. `hub` and `hub.event` are aliases for
+  every hub event; `run.event` is the legacy run-watch form. An unknown name is invalid params
+  (`-32602`), like any other bad subscription field. There is no wildcard syntax.
+- `detail: true` delivers the raw per-cursor trail as `hub.run.detail` instead of the collapsed
+  `hub.run` transitions. Explicitly naming `hub.run.detail` is the same opt-in.
+- `target` selects one named target. `kinds`, `states`, `phases`, `labels`, `nodes`,
+  `terminalOnly`, and `verbose` are refused because one subscription must carry every hub event;
+  the `name` field selects a kind.
 - `maxAgeMs` is accepted and not applied because watch records carry no occurrence time.
 
 `events/poll` returns occurrences after an opaque `hub:<sequence>` cursor:
@@ -261,11 +269,11 @@ warnings on one stream.
 
 `hub.job` follows the same hub record as `hub_status`, including `submitted`, `queued`,
 `scheduled`, `placing`, `running`, `succeeded`, `failed`, `dequeued`, and `cancelled`. A job that
-fails or is cancelled before it runs still produces its one terminal `hub.job` event. Phase
-transitions are not sampled away: every new run status transition publishes a `hub.run` with a
-fresh active-execution set. A status is deduplicated only against the job's immediately previous
-occurrence, using its attempt and complete active-execution set, so `{A, B}` to `{A}` still
-publishes A's finish. `hub.pool`
+fails or is cancelled before it runs still produces its one terminal `hub.job` event. Run events
+are collapsed: `hub.run` fires only when the active node changes (including a shrinking parallel
+set) or the phase leaves `running`, and cursor advances inside one node publish nothing to default
+subscribers. The complete per-cursor trail is still durable and is delivered as `hub.run.detail`
+only to subscribers that ask for it by `detail: true` or by name. `hub.pool`
 reports each lease as `requested`, `creating`, `booting`, `preparing`, `ready`, `in_use`, `idle`,
 `draining`, `deleted`, or `failed`, with `previousPhase` chaining its transitions. Pool-level
 records use `scope: "pool"` (lease records `scope: "lease"`) and the phases `added`, `removed`, `paused`, `resumed`, `blocked`,
@@ -281,7 +289,7 @@ zeroshot hub events --json
 zeroshot hub events --json --after hub:42 --states running,failed --phases running
 ```
 
-`zeroshot hub events` prints one NDJSON occurrence per line with the same four names, fields,
+`zeroshot hub events` prints one NDJSON occurrence per line with the same five names, fields,
 bootstrap snapshots, sequence counter, cursor semantics, and `--job`/`--target`/`--label` filters.
 `--json` is accepted for symmetry with other hub commands; NDJSON is the only format. A request
 without `--after` prints the bootstrap snapshot and then follows live occurrences; a request with

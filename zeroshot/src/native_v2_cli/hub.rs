@@ -291,6 +291,9 @@ pub struct HubJobSpec {
     pub environment: bool,
     pub cwd: Option<PathBuf>,
     pub submission_key: Option<String>,
+    /// Hub jobs: stop this job's run when its watch cursor does not advance for this long,
+    /// overriding the hub daemon's `--max-stall` for this job only.
+    pub max_stall_ms: Option<u64>,
 }
 
 /// Immediate placement.

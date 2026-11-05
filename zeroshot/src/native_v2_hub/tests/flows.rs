@@ -119,6 +119,7 @@ pub(super) fn spec(folder: &Path, title: &str, target: Option<&str>) -> HubJobSp
         environment: false,
         cwd: Some(folder.to_path_buf()),
         submission_key: None,
+        max_stall_ms: None,
     }
 }
 

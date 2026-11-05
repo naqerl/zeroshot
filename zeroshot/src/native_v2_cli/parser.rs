@@ -638,6 +638,12 @@ struct RunArgs {
     #[arg(long, value_name = "KEY")]
     submission_key: Option<String>,
 
+    /// Hub jobs: stop the run when its watch cursor does not advance for this many
+    /// milliseconds, such as 7200000 for two hours. Overrides the hub daemon's --max-stall
+    /// for this job only; local runs have no stall limit.
+    #[arg(long, value_name = "MS", value_parser = clap::value_parser!(u64).range(1..))]
+    max_stall_ms: Option<u64>,
+
     /// Return after submission instead of following NDJSON run events.
     #[arg(short = 'd', long)]
     detach: bool,
