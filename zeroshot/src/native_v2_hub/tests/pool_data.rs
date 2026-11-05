@@ -49,6 +49,9 @@ fn user_data_installs_a_strict_idempotent_btrfs_boot_script() {
     assert!(!script.contains("DATA_SIZE_GB"));
     assert!(!script.contains("/dev/disk/by-id/scsi-0HC_Volume_"));
     assert!(script.contains("OPTIONS='noatime,compress=zstd:1'"));
+    assert!(script.contains("--network host"));
+    assert!(script.contains("--listen \"127.0.0.1:8080\""));
+    assert!(!script.contains("--publish"));
     // The steps run in order and the target starts only after the btrfs checks.
     let order = [
         "command -v docker",

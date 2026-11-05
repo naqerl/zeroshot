@@ -31,7 +31,9 @@ pub(crate) struct Boot<'a> {
 /// The server's boot script, run once by cloud-init and safe to rerun: it installs Docker and
 /// btrfs-progs when missing, pulls the target image, formats and mounts the btrfs data file on
 /// the free local disk, adds it to `/etc/fstab`, proves a subvolume snapshot and a reflink copy
-/// on it, and only then starts the target with the data folder as its `/var/lib/zeroshot`. Any
+/// on it, and only then starts the target on the server's loopback with the data folder as its
+/// `/var/lib/zeroshot`. The target shares the server's network namespace, so the hub's SSH tunnel
+/// reaches it directly without Docker's published-port proxy. Any
 /// failure stops the script before the target starts and leaves the reason in
 /// `BOOT_STATUS/failed`, which the hub's health check reports. Existing data is never
 /// reformatted.
@@ -137,8 +139,8 @@ if docker container inspect zeroshot-target >/dev/null 2>&1; then
   docker start zeroshot-target >/dev/null
 else
   docker run --detach --restart unless-stopped --name zeroshot-target \
-    --publish "127.0.0.1:{port}:{port}" --volume "$DATA:/var/lib/zeroshot" \
-    "$IMAGE" target serve --listen "0.0.0.0:{port}" --public-origin "$ORIGIN" \
+    --network host --volume "$DATA:/var/lib/zeroshot" \
+    "$IMAGE" target serve --listen "127.0.0.1:{port}" --public-origin "$ORIGIN" \
     --storage /var/lib/zeroshot/native-v2 >/dev/null
 fi
 touch "$STATUS/ok"

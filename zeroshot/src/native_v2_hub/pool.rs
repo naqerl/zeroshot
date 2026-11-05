@@ -285,6 +285,8 @@ pub(crate) enum LeasePhase {
 pub(crate) enum TeardownReason {
     Idle,
     BootTimeout,
+    /// The job's `--wait-max` expired while its server was still starting.
+    WaitExpired,
     /// The provider reported the server failed or gone while it booted.
     BootFailed,
     PoolRemoved,
@@ -699,9 +701,12 @@ pub(crate) fn teardown_due(state: &HubState, now: u64) -> Vec<(String, TeardownR
         let reason = match lease.phase {
             LeasePhase::Draining | LeasePhase::Deleting => None,
             _ if pool.is_none() => Some(TeardownReason::PoolRemoved),
-            LeasePhase::Creating | LeasePhase::Booting | LeasePhase::Connecting => (now
-                >= lease.created_at_ms.saturating_add(BOOT_DEADLINE_MS))
-            .then_some(TeardownReason::BootTimeout),
+            LeasePhase::Creating | LeasePhase::Booting | LeasePhase::Connecting => {
+                lease.reason.or_else(|| {
+                    (now >= lease.created_at_ms.saturating_add(BOOT_DEADLINE_MS))
+                        .then_some(TeardownReason::BootTimeout)
+                })
+            }
             LeasePhase::Active => {
                 let idle_ms = pool.map_or(0, |pool| pool.idle_ms);
                 state

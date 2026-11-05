@@ -141,8 +141,10 @@ job waits until its own expiry.
    The server is named `zs-<job>` and labelled `zeroshot/hub`, `zeroshot/lease`,
    `zeroshot/server-type` and `zeroshot/location`, with no secrets.
 3. **Boot.** cloud-init runs the boot script: it installs Docker and btrfs-progs if needed, pulls
-   the target image, mounts the btrfs data folder at `/mnt/zs`, and runs the target on
-   `127.0.0.1:8080` with `/mnt/zs` as its state. Nothing on the server shuts it down on a timer.
+   the target image, mounts the btrfs data folder at `/mnt/zs`, and runs the target on the server's
+   host network bound to `127.0.0.1:8080` with `/mnt/zs` as its state, so the hub's tunnel reaches
+   the target itself and not a Docker-published port. Nothing on the server shuts it down on a
+   timer.
 4. **Join.** The hub opens `ssh -N -L` to the server and runs the data health check over SSH.
    Then it reads target discovery through the tunnel,
    registers the target, and adds it as a member with the pool's and its profiles' tags. A dropped tunnel is

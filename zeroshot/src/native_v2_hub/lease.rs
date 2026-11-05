@@ -416,6 +416,21 @@ impl HubService {
         self.mutate(|state| {
             pool::update_idle(state, now);
             let expired = capacity::note_waiting(state, now);
+            // A job whose --wait-max expired while its server was still starting must not leave
+            // a lease silently connecting: mark the lease so the next teardown pass names the
+            // reason and deletes the box.
+            for job_id in &expired {
+                let id = pool::lease_id(job_id);
+                if let Some(lease) = state.leases.iter_mut().find(|lease| lease.id == id)
+                    && matches!(
+                        lease.phase,
+                        LeasePhase::Creating | LeasePhase::Booting | LeasePhase::Connecting
+                    )
+                    && lease.reason.is_none()
+                {
+                    lease.reason = Some(TeardownReason::WaitExpired);
+                }
+            }
             let mut started = Vec::new();
             for ((pool_name, job_id, spec), port) in
                 pool::scale_up(state, now).into_iter().zip(ports)
@@ -1035,18 +1050,25 @@ fn begin_teardown(state: &mut HubState, name: &str, reason: TeardownReason) {
             LeasePhase::Connecting => Some("preparing"),
             _ => None,
         };
-        if reason == TeardownReason::BootTimeout {
-            if let Some(step) = failed_step {
-                pool::record_lease_phase(
-                    state,
-                    &mut lease,
-                    pool::PoolPhaseChange {
-                        phase: PoolPhase::Failed,
-                        reason: Some(format!("{step}: the machine did not become ready in time")),
-                        at,
-                    },
-                );
-            }
+        if matches!(
+            reason,
+            TeardownReason::BootTimeout | TeardownReason::WaitExpired
+        ) && let Some(step) = failed_step
+        {
+            let detail = if reason == TeardownReason::WaitExpired {
+                "the job's --wait-max expired before the target was reachable"
+            } else {
+                "the machine did not become ready in time"
+            };
+            pool::record_lease_phase(
+                state,
+                &mut lease,
+                pool::PoolPhaseChange {
+                    phase: PoolPhase::Failed,
+                    reason: Some(format!("{step}: {detail}")),
+                    at,
+                },
+            );
         }
         lease.reason = Some(reason);
         lease.drain_started_ms = Some(at);

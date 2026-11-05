@@ -187,8 +187,8 @@ pub(crate) trait Provisioner: Send + Sync {
 }
 
 /// The cloud-init document of a lease's server. It runs the boot script of
-/// [`data::boot_script`]: Docker, a btrfs data folder, and the pinned target image bound to the
-/// server's loopback with its public origin set to the hub's end of the tunnel. The hub alone
+/// [`data::boot_script`]: Docker, a btrfs data folder, and the pinned target image on the
+/// server's loopback with its public origin set to the hub's end of the SSH tunnel. The hub alone
 /// decides when the server is deleted, so no clock shuts it down. It carries the hub's public
 /// key only: no provider token, API token or credential.
 pub(crate) fn user_data(pool: &Pool, lease: &Lease, public_key: &str) -> Result<String, HubError> {

@@ -941,8 +941,12 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   and also writes it plus a non-expiring login in user data; key-registration failures remain
   distinct from server create/delete errors. No secret enters either. `data.rs` owns the btrfs
   data folder: an automatically sized file on the server's local disk and the idempotent, strict
-  boot script (mkfs.btrfs, fstab, snapshot and reflink probe, then the target). `health.rs` is the
-  SSH check run in Connecting before registration; its failure is a failed boot, and a joined
+  boot script (mkfs.btrfs, fstab, snapshot and reflink probe, then the target). The target shares
+  the server's network namespace bound to `127.0.0.1`, so the hub's SSH tunnel reaches it directly
+  without Docker's published-port proxy; a job whose `--wait-max` expires while its lease is still
+  starting tears that lease down with reason `wait_expired` instead of leaving it silently
+  connecting. `health.rs` is the SSH check run in Connecting before registration; its failure is a
+  failed boot, and a joined
   member reports the observed `data: {fs: "btrfs", mode: "file", sizeBytes: N}` in `hub list` and
   `hub pool list`. zeroshot itself needs only reflinks (`FICLONE`). Pools take
   ordered `--type`/`--location` lists with no default type, checked against the provider catalog

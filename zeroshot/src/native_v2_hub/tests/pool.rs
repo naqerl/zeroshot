@@ -646,7 +646,9 @@ async fn a_queued_job_creates_a_server_that_joins_as_a_member_and_runs_it() {
     assert_eq!(request.labels[LABEL_HUB], hub_id);
     assert_eq!(request.labels[LABEL_LEASE], "one");
     assert!(request.user_data.contains(IMAGE));
-    assert!(request.user_data.contains("127.0.0.1:8080:8080"));
+    assert!(request.user_data.contains("--network host"));
+    assert!(request.user_data.contains("--listen \"127.0.0.1:8080\""));
+    assert!(!request.user_data.contains("--publish"));
     assert!(request.user_data.contains("DATA='/mnt/zs'"));
     assert!(request.user_data.contains("\"$DATA:/var/lib/zeroshot\""));
     assert!(!request.user_data.contains("shutdown"));
@@ -1752,6 +1754,46 @@ async fn a_boot_timeout_and_a_removed_pool_tear_leases_down() {
     let removed = rig.service.remove_pool("burst").await.expect("remove");
     assert_eq!(removed["leasesToTearDown"], json!(1));
     assert!(rig.service.remove_pool("burst").await.is_err());
+}
+
+#[tokio::test]
+async fn a_wait_max_expiry_tears_down_its_connecting_lease_with_a_reason() {
+    let rig = rig();
+    let request = add_request(rig.directory.path(), 1);
+    rig.service.add_pool(request).await.expect("add pool");
+    rig.enqueue("hj_one").await;
+    rig.cloud
+        .with(|cloud| cloud.ready = Some(Progress::Pending));
+    rig.pass().await;
+    rig.pass().await;
+    rig.set(|state| {
+        state.pools[0].wait_max_ms = Some(60_000);
+        state.jobs[0].submitted_at_ms = now_ms().saturating_sub(120_000);
+        state.jobs[0].not_before_ms = None;
+        state.leases[0].created_at_ms = now_ms();
+        state.leases[0].phase = LeasePhase::Connecting;
+    })
+    .await;
+    let view = rig.pass().await;
+    let lease = rig.lease().await;
+    assert_eq!(lease.reason, Some(TeardownReason::WaitExpired), "{lease:?}");
+    assert!(
+        matches!(lease.phase, LeasePhase::Draining | LeasePhase::Deleting),
+        "{lease:?}"
+    );
+    let state = rig.state().await;
+    let job = job_named(&state, "hj_one");
+    assert_eq!(job.state, JobState::Failed);
+    assert!(
+        job.error
+            .as_ref()
+            .is_some_and(|error| error.message.contains("--wait-max")),
+        "{job:?}"
+    );
+    assert_eq!(
+        view["pools"]["teardowns"][0]["reason"],
+        json!("wait_expired")
+    );
 }
 
 #[tokio::test]
