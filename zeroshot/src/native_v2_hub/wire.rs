@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::model::{Job, MemberState, Schedule};
-use super::pool::Provider;
+use super::pool::{Provider, Transport};
 
 /// `POST /v1/hub/members`.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -41,6 +41,9 @@ pub(crate) struct AddPool {
     pub tags: Vec<String>,
     pub ssh_key: std::path::PathBuf,
     pub ssh_from: Vec<String>,
+    /// Data path to the target: `ssh` (default) or `tailcat`.
+    #[serde(default, deserialize_with = "super::pool::deserialize_transport")]
+    pub transport: Transport,
 }
 
 /// `PUT /v1/hub/pools/{name}/tags/{tag}`: the machines a pool creates for jobs with a tag.

@@ -23,7 +23,7 @@ use super::health::{self, DataHealth, FILE_MODE, Health};
 use super::model::{HubState, Member, MemberState};
 use super::pool::{
     self, LABEL_HUB, LABEL_LEASE, LABEL_LOCATION, LABEL_SERVER_TYPE, Lease, LeasePhase, Pool,
-    PoolPhase, Resource, ResourceKind, TeardownReason,
+    PoolPhase, Resource, ResourceKind, TeardownReason, Transport,
 };
 use super::provision::{self, Catalog, Progress, Provisioner, Refusal, ServerRequest};
 use super::schedule;
@@ -44,7 +44,11 @@ const DRAIN_MAX_ATTEMPTS: u32 = 12;
 /// Provider and tunnel effects of a hub's pools.
 pub(crate) struct PoolRuntime {
     provisioner: Arc<dyn Provisioner>,
+    /// The SSH tunnel implementation: the default data path, every script run, and the fallback.
     tunnels: Arc<dyn Tunnels>,
+    /// The tailcat data path; the same fake as `tunnels` when a test runtime has no separate
+    /// tailcat implementation.
+    tailcat: Arc<dyn Tunnels>,
     reaped_at: std::sync::Mutex<Option<u64>>,
     /// Last loss-confirmation answer per lease, so a wedged target cannot spend the provider's
     /// request budget on every dispatcher pass.
@@ -62,10 +66,18 @@ impl PoolRuntime {
     pub(crate) fn new(provisioner: Arc<dyn Provisioner>, tunnels: Arc<dyn Tunnels>) -> Self {
         Self {
             provisioner,
+            tailcat: Arc::clone(&tunnels),
             tunnels,
             reaped_at: std::sync::Mutex::new(None),
             confirmations: std::sync::Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Use a distinct tailcat implementation for `transport: tailcat` pools.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_tailcat(mut self, tailcat: Arc<dyn Tunnels>) -> Self {
+        self.tailcat = tailcat;
+        self
     }
 
     /// Whether the provider still lists the lease's server. A spent request budget, timeout or
@@ -129,8 +141,8 @@ impl PoolRuntime {
     }
 }
 
-/// The daemon's runtime: Hetzner with the configured token and SSH tunnels; `None` when no
-/// token is configured, so a hub without pools never needs one.
+/// The daemon's runtime: Hetzner with the configured token, SSH tunnels and the tailcat data
+/// path; `None` when no token is configured, so a hub without pools never needs one.
 pub(crate) fn production_runtime(
     api: &zeroshot_engine::native_v2_cli::hub::HubApiOptions,
 ) -> Result<Option<PoolRuntime>, HubError> {
@@ -143,10 +155,13 @@ pub(crate) fn production_runtime(
         return Ok(None);
     };
     let provisioner = super::hetzner::Hetzner::new(super::hetzner::API, token)?;
-    Ok(Some(PoolRuntime::new(
-        Arc::new(provisioner),
-        Arc::new(tunnel::SshTunnels::default()),
-    )))
+    Ok(Some(
+        PoolRuntime::new(
+            Arc::new(provisioner),
+            Arc::new(tunnel::SshTunnels::default()),
+        )
+        .with_tailcat(Arc::new(tunnel::TailcatTunnels::default())),
+    ))
 }
 
 /// What one pool pass did.
@@ -514,14 +529,15 @@ impl HubService {
                 self.connect(runtime, pool, &mut lease).await?;
             }
             LeasePhase::Active => {
-                if !runtime.tunnels.is_open(&lease.name) {
-                    let pool = pool.ok_or_else(|| removed(&lease))?;
-                    runtime.tunnels.open(&self.tunnel_spec(pool, &lease)?)?;
+                let pool = pool.ok_or_else(|| removed(&lease))?;
+                if !runtime.tunnels.is_open(&lease.name) && !runtime.tailcat.is_open(&lease.name) {
+                    let (tunnels, spec) = self.connect_tunnels(runtime, pool, &mut lease).await?;
+                    open_selected(runtime, &mut lease, &tunnels, &spec)?;
                 }
             }
             LeasePhase::Draining => {
                 lease.drain_started_ms.get_or_insert(now_ms());
-                let skipped = match self.drain(runtime, &lease, report).await? {
+                let skipped = match self.drain(runtime, &mut lease, report).await? {
                     Drain::Pending => return Ok(Step::Update(Box::new(lease))),
                     Drain::Done(skipped) => skipped,
                 };
@@ -799,6 +815,7 @@ impl HubService {
             })
             .await?;
             runtime.tunnels.close(&name);
+            runtime.tailcat.close(&name);
             if let Err(error) = self.registry().remove(&name) {
                 report.errors.push(format!("{name}: reconcile: {error}"));
             }
@@ -815,13 +832,14 @@ impl HubService {
         pool: &Pool,
         lease: &mut Lease,
     ) -> Result<(), HubError> {
-        let spec = self.tunnel_spec(pool, lease)?;
+        let (tunnels, spec) = self.connect_tunnels(runtime, pool, lease).await?;
         // Persist the transition before the first effect, so a failed SSH or health check
         // still leaves the lease in `preparing` and reports the step that failed.
         lease.event_phase = Some(PoolPhase::Preparing);
         self.store_lease(lease.clone()).await?;
-        runtime.tunnels.open(&spec)?;
-        let Some(data) = check_data(runtime, spec, lease).await? else {
+        open_selected(runtime, lease, &tunnels, &spec)?;
+        // Scripts, including the data health check, always run over SSH.
+        let Some(data) = check_data(Arc::clone(&runtime.tunnels), spec, lease).await? else {
             return Ok(());
         };
         let origin = format!("http://127.0.0.1:{}", lease.local_port);
@@ -886,7 +904,7 @@ impl HubService {
     async fn drain(
         &self,
         runtime: &PoolRuntime,
-        lease: &Lease,
+        lease: &mut Lease,
         report: &mut PoolReport,
     ) -> Result<Drain, HubError> {
         let state = self.snapshot().await;
@@ -913,9 +931,11 @@ impl HubService {
                 continue;
             }
             if !runtime.tunnels.is_open(&lease.name)
+                && !runtime.tailcat.is_open(&lease.name)
                 && let Some(pool) = state.pools.iter().find(|pool| pool.name == lease.pool)
             {
-                runtime.tunnels.open(&self.tunnel_spec(pool, lease)?)?;
+                let (tunnels, spec) = self.connect_tunnels(runtime, pool, lease).await?;
+                open_selected(runtime, lease, &tunnels, &spec)?;
             }
             match archive::archive(self.driver(), &root, &lease.name, job).await {
                 Ok(archived) => {
@@ -956,6 +976,7 @@ impl HubService {
                 .remove(&lease.name)
                 .map_err(target_registry)?;
             runtime.tunnels.close(&lease.name);
+            runtime.tailcat.close(&lease.name);
         }
         Ok(if removed {
             Drain::Done(skipped)
@@ -987,7 +1008,65 @@ impl HubService {
             local_port: lease.local_port,
             key: pool.ssh_key.clone(),
             known_hosts: self.store().directory().join("pool").join("known_hosts"),
+            tailcat_addr: None,
         })
+    }
+
+    /// Build the lease's tunnel spec and pick its data path. A `tailcat` lease reads the address
+    /// its server published over the SSH channel the hub already has; a missing or unusable
+    /// address falls back to SSH for the rest of the lease instead of failing it.
+    async fn connect_tunnels(
+        &self,
+        runtime: &PoolRuntime,
+        pool: &Pool,
+        lease: &mut Lease,
+    ) -> Result<(Arc<dyn Tunnels>, TunnelSpec), HubError> {
+        let mut spec = self.tunnel_spec(pool, lease)?;
+        let addr = if lease.transport == Transport::Tailcat {
+            let ssh = Arc::clone(&runtime.tunnels);
+            let read = spec.clone();
+            let output =
+                tokio::task::spawn_blocking(move || ssh.run(&read, &tunnel::tailcat_addr_script()))
+                    .await
+                    .map_err(|error| {
+                        HubError::Unanswered(format!("the tailcat address read stopped: {error}"))
+                    })?;
+            let addr = match output {
+                Ok(output) => tunnel::read_tailcat_addr(&output),
+                Err(error) => {
+                    eprintln!(
+                        "zeroshot hub: pool {}: lease {}: the tailcat address could not be read ({error})",
+                        pool.name, lease.name
+                    );
+                    None
+                }
+            };
+            if addr.is_none() {
+                eprintln!(
+                    "zeroshot hub: pool {}: lease {}: no tailcat address in {}; falling back to ssh",
+                    pool.name,
+                    lease.name,
+                    tunnel::TAILCAT_ADDR_FILE
+                );
+            }
+            addr
+        } else {
+            None
+        };
+        let (tunnels, transport, addr) =
+            tunnel::choose_tunnels(lease.transport, addr, &runtime.tunnels, &runtime.tailcat);
+        lease.transport = transport;
+        spec.tailcat_addr = addr;
+        if !lease.transport_logged {
+            eprintln!(
+                "zeroshot hub: pool {}: lease {} uses the {} transport",
+                pool.name,
+                lease.name,
+                transport.as_str()
+            );
+            lease.transport_logged = true;
+        }
+        Ok((tunnels, spec))
     }
 
     /// Delete labelled provider resources this hub does not hold or that outlived their lease.
@@ -1089,14 +1168,38 @@ fn begin_teardown(state: &mut HubState, name: &str, reason: TeardownReason) {
     }
 }
 
+/// Open the selected data path, falling back to SSH once when a `tailcat` proxy cannot start
+/// (no `tailcat` binary on the hub, a bad address, or a proxy that refuses its port). A failed
+/// SSH open is a real lease error.
+fn open_selected(
+    runtime: &PoolRuntime,
+    lease: &mut Lease,
+    tunnels: &Arc<dyn Tunnels>,
+    spec: &TunnelSpec,
+) -> Result<(), HubError> {
+    match tunnels.open(spec) {
+        Ok(()) => Ok(()),
+        Err(error) if lease.transport == Transport::Tailcat => {
+            eprintln!(
+                "zeroshot hub: pool {}: lease {}: the tailcat proxy failed ({error}); falling back to ssh",
+                lease.pool, lease.name
+            );
+            lease.transport = Transport::Ssh;
+            let mut fallback = spec.clone();
+            fallback.tailcat_addr = None;
+            runtime.tunnels.open(&fallback)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Run the data health check on the lease's server. `None` while its boot script runs, or once
 /// the check failed, which fails the boot: the lease drains and its server is deleted.
 async fn check_data(
-    runtime: &PoolRuntime,
+    tunnels: Arc<dyn Tunnels>,
     spec: TunnelSpec,
     lease: &mut Lease,
 ) -> Result<Option<DataHealth>, HubError> {
-    let tunnels = Arc::clone(&runtime.tunnels);
     let script = health::health_script(provision::DATA_FOLDER);
     let output = tokio::task::spawn_blocking(move || tunnels.run(&spec, &script))
         .await
@@ -1345,6 +1448,7 @@ impl HubService {
             tags: request.tags,
             ssh_key: request.ssh_key,
             ssh_from: request.ssh_from,
+            transport: request.transport,
             created_at_ms: now_ms(),
             boot_failures: 0,
             paused_until_ms: None,

@@ -204,6 +204,7 @@ pub(crate) fn user_data(pool: &Pool, lease: &Lease, public_key: &str) -> Result<
         public_origin: &origin,
         data_folder: DATA_FOLDER,
         target_port: TARGET_PORT,
+        transport: pool.transport,
     })?;
     let mut document = format!(
         "#cloud-config\n\

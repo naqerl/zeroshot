@@ -2929,6 +2929,11 @@ Options:
       --ssh-from <CIDR>
           CIDR allowed to reach servers over SSH (the hub's public address). Repeat for several
 
+      --transport <TRANSPORT>
+          Data path to the target: `ssh` (default) keeps the whole job on the SSH tunnel; `tailcat` carries job traffic over a WireGuard tunnel and keeps SSH only for the server's address read and control-plane scripts. A tailcat server needs the pinned `tailcat` CLI on the hub's PATH; a missing address falls back to SSH
+
+          [default: ssh]
+
   -h, --help
           Print help
 ```

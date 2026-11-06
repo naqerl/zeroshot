@@ -231,6 +231,7 @@ fn ssh_runs_a_script_on_standard_input_and_reports_failures() {
         local_port: 40123,
         key: directory.path().join("key"),
         known_hosts: directory.path().join("pool/known_hosts"),
+        tailcat_addr: None,
     };
     let tunnels = SshTunnels::with_program(fake);
     let output = tunnels

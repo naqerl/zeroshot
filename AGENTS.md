@@ -956,8 +956,17 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   lists. `capacity.rs` owns catalog validation, candidate order, create-error classes, per-spec
   shortages (30 s doubling to 10 min, separate from the boot pause), blocking (quota/invalid until
   `hub pool resume`) and `--wait-max`. `placement.rs` never places a tag-profile job on an
-  undersized member. Tests use the fake provisioner in `tests/pool.rs`, `tests/pool_capacity.rs`
-  `tests/pool_profiles.rs`, `tests/pool_data.rs` and `tests/pool_health.rs`, and a local mock API in `tests/hetzner.rs`. Never call the real
+  undersized member. A pool's `transport` is `ssh` (default) or `tailcat`: `tunnel.rs` keeps
+  `SshTunnels` as the script path and fallback, and adds `TailcatTunnels`, which runs
+  `tailcat forward` as the job data path. A tailcat pool's boot script downloads the pinned
+  tailcat release, verifies its checksum, and starts `tailcat serve 8080` beside the target with
+  `TAILCAT_ADDR_FILE=/run/zeroshot/tailcat.addr`; the hub reads that one address over SSH. The
+  address is derived from the server's node key, PSK, and DERP region, but the hub does not
+  reimplement tailcat's unstable CBOR format. A missing address or a proxy that cannot start
+  falls back to `SshTunnels` for that lease with a warning; `ssh` behaviour is unchanged. Tests
+  use the fake provisioner in `tests/pool.rs`, `tests/pool_capacity.rs`
+  `tests/pool_profiles.rs`, `tests/pool_data.rs` and `tests/pool_health.rs`, `tests/tunnel.rs` for
+  the tailcat proxy and transport choice, and a local mock API in `tests/hetzner.rs`. Never call the real
   API from tests.
 - `zeroshot/src/private_file.rs` owns owner-only file replacement for the shipped CLI: a random
   `create_new` sibling with mode `0600`, fsync, rename over the destination, and cleanup on failure,

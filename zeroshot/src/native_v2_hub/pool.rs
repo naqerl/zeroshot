@@ -92,6 +92,55 @@ pub(crate) enum Provider {
     Hetzner,
 }
 
+/// How the hub reaches a pooled target's data path: the SSH tunnel it has always used, or a
+/// tailcat WireGuard tunnel whose only SSH use is the one-time address read and control-plane
+/// scripts.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Transport {
+    /// `ssh -N -L`, the default and the fallback for every lease.
+    #[default]
+    Ssh,
+    /// A tailcat proxy on a loopback port; SSH remains for scripts and the address read.
+    Tailcat,
+}
+
+impl Transport {
+    /// The pool value of this transport.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ssh => "ssh",
+            Self::Tailcat => "tailcat",
+        }
+    }
+
+    /// Parse a pool's `transport` value, naming the field and the value when it is unknown.
+    pub(crate) fn parse(value: &str) -> Result<Self, super::error::HubError> {
+        match value {
+            "ssh" => Ok(Self::Ssh),
+            "tailcat" => Ok(Self::Tailcat),
+            other => Err(super::error::HubError::Usage(format!(
+                "pool transport {other:?} is unknown; use \"ssh\" or \"tailcat\""
+            ))),
+        }
+    }
+}
+
+/// Deserialize a pool transport from a string so an unknown value names the field, unlike a
+/// derived enum error that would only list the variants.
+pub(crate) fn deserialize_transport<'de, D>(deserializer: D) -> Result<Transport, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    Transport::parse(&value).map_err(|error| {
+        serde::de::Error::custom(match error {
+            super::error::HubError::Usage(message) => message,
+            other => other.to_string(),
+        })
+    })
+}
+
 /// One `hub pool add` configuration.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -121,6 +170,9 @@ pub(crate) struct Pool {
     pub ssh_key: PathBuf,
     /// Source CIDRs the server firewall admits on port 22: the hub's address.
     pub ssh_from: Vec<String>,
+    /// Data path to the target: `ssh` (default) or `tailcat`.
+    #[serde(default, deserialize_with = "deserialize_transport")]
+    pub transport: Transport,
     pub created_at_ms: u64,
     /// Boots that failed or timed out in a row; reset when a server joins.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -240,6 +292,7 @@ impl Pool {
             "tags": self.tags,
             "sshKey": self.ssh_key,
             "sshFrom": self.ssh_from,
+            "transport": self.transport,
             "createdAt": rfc3339(self.created_at_ms),
             "bootFailures": self.boot_failures,
             "pausedUntil": self.paused_until_ms.map(rfc3339),
@@ -302,8 +355,15 @@ pub(crate) struct Lease {
     pub name: String,
     pub pool: String,
     pub phase: LeasePhase,
-    /// Hub-side port of the SSH tunnel to the target.
+    /// Hub-side port of the tunnel to the target.
     pub local_port: u16,
+    /// The data path this lease settled on; `tailcat` falls back to `ssh` for its lifetime
+    /// when the server publishes no address.
+    #[serde(default)]
+    pub transport: Transport,
+    /// Whether the chosen transport was logged, so an operator sees it once per lease.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transport_logged: bool,
     pub created_at_ms: u64,
     /// When the lease entered draining, so archive retries are bounded even when a target
     /// never answers again.
@@ -503,6 +563,8 @@ impl Lease {
             pool: pool.name.clone(),
             phase: LeasePhase::Creating,
             local_port,
+            transport: pool.transport,
+            transport_logged: false,
             created_at_ms: now,
             drain_started_ms: None,
             server_id: None,
@@ -559,6 +621,7 @@ impl Lease {
             "eventPhase": self.event_phase,
             "serverId": self.server_id,
             "localPort": self.local_port,
+            "transport": self.transport,
             "createdAt": rfc3339(self.created_at_ms),
             "reason": self.reason,
             "attempts": self.attempts,

@@ -17,9 +17,9 @@ use super::super::error::{EXIT_NO_CAPACITY, EXIT_NO_ELIGIBLE_TARGET, HubError};
 use super::super::lease::{PoolRuntime, REAP_INTERVAL_MS, production_runtime};
 use super::super::model::{HubState, Job, JobState, MemberState, STATE_VERSION, Strategy};
 use super::super::pool::{
-    self, BOOT_DEADLINE_MS, FIRST_PAUSE_MS, MAX_PAUSE_MS, LABEL_HUB, LABEL_LEASE, LABEL_LOCATION,
-    LABEL_SERVER_TYPE, Lease, LeasePhase, Pool, PoolEventKind, PoolPhase, Provider, Resource,
-    ResourceKind, TeardownReason,
+    self, BOOT_DEADLINE_MS, FIRST_PAUSE_MS, LABEL_HUB, LABEL_LEASE, LABEL_LOCATION,
+    LABEL_SERVER_TYPE, Lease, LeasePhase, MAX_PAUSE_MS, Pool, PoolEventKind, PoolPhase, Provider,
+    Resource, ResourceKind, TeardownReason, Transport,
 };
 use super::super::provision::{
     self, Architecture, Catalog, Created, Failure, Location, Progress, Provisioner, Refusal,
@@ -404,6 +404,7 @@ pub(super) fn add_request(folder: &Path, max: u32) -> AddPool {
         tags: vec![TAG.to_owned()],
         ssh_key: key,
         ssh_from: vec!["198.51.100.7/32".to_owned()],
+        transport: Transport::Ssh,
     }
 }
 
@@ -1867,6 +1868,7 @@ async fn pool_config_is_validated_listed_and_unique() {
     assert_eq!(listed["schema"], json!("zeroshot.hub.pools/v1"));
     assert_eq!(listed["pools"][0]["name"], json!("burst"));
     assert_eq!(listed["pools"][0]["targetImage"], json!(IMAGE));
+    assert_eq!(listed["pools"][0]["transport"], json!("ssh"));
     let data = &listed["pools"][0]["data"];
     assert_eq!(data["fs"], json!("btrfs"), "{data}");
     assert_eq!(data["mode"], json!("file"), "{data}");
@@ -2077,6 +2079,7 @@ fn tunnel_fixture(name: &str) -> TunnelSpec {
         local_port: 40123,
         key: PathBuf::from("/hub/id_ed25519"),
         known_hosts: PathBuf::from("/hub/pool/known_hosts"),
+        tailcat_addr: None,
     }
 }
 
@@ -2172,6 +2175,7 @@ pub(super) fn pool_fixture() -> Pool {
         tags: vec![TAG.to_owned()],
         ssh_key: PathBuf::from("/hub/id_ed25519"),
         ssh_from: vec!["198.51.100.7/32".to_owned()],
+        transport: Transport::Ssh,
         created_at_ms: 0,
         boot_failures: 0,
         paused_until_ms: None,
@@ -2205,6 +2209,7 @@ fn ssh_tunnels_start_restart_and_stop_their_process() {
         local_port: free_port().expect("port"),
         key: directory.path().join("key"),
         known_hosts: directory.path().join("pool/known_hosts"),
+        tailcat_addr: None,
     };
     let started = |count: usize| {
         for _ in 0..500 {

@@ -39,6 +39,11 @@ The type names above are only an example. There is no default type.
 - `--ssh-key` is a private key on the hub host. Only its `.pub` sibling goes to the server.
 - `--ssh-from` is the hub's public address. The server firewall allows SSH from it and nothing
   else.
+- `--transport` picks the job data path. `ssh` (the default) keeps the `ssh -N -L` tunnel the
+  hub has always used. `tailcat` runs a pinned
+  [tailcat](https://github.com/tailscale/tailcat) server on the box and reaches the target over
+  its WireGuard tunnel; SSH remains only for the one-time address read and control-plane
+  scripts. See [Reach a target over tailcat](#reach-a-target-over-tailcat).
 
 The pool's `.pub` key is also registered with the provider and attached to the server by its
 provider key ID. Cloud-init alone is not enough: a key written only to `ssh_authorized_keys` leaves
@@ -49,6 +54,35 @@ session works.
 The daemon needs an API token, from `hub daemon run --hetzner-token-file FILE` or `HCLOUD_TOKEN`
 in the daemon's environment. The token is sent only to the Hetzner API. It is never stored in hub
 state, labels, user data, or logs.
+
+## Reach a target over tailcat
+
+`--transport tailcat` removes SSH from the job data path. The boot script downloads the pinned
+`tailcat` v0.7.0 Linux binary for the server's architecture, verifies the release checksum, and
+starts `tailcat serve 8080` in a container beside the target. tailcat writes its address to
+`/run/zeroshot/tailcat.addr`; the hub reads that one file over the SSH channel it already has,
+then forwards each lease's loopback port to port 8080 through `tailcat forward`. Job traffic never
+crosses the SSH session.
+
+The address is derived from the server's node key, pre-shared key, and DERP region, but deriving
+it on the hub would mean reimplementing tailcat's unstable CBOR address format; reading the file
+is the smaller surface. The server key lives on the box's root disk and its region is pinned once,
+so a restarted tailcat server keeps the same address.
+
+Requirements and fallbacks:
+
+- The hub host needs the matching `tailcat` CLI on its `PATH` (v0.7.0). Without it, the lease
+  logs a warning and uses the SSH tunnel.
+- A server that publishes no address, for example because the download, checksum, key
+  generation, or container start failed, also falls back to SSH. A tailcat problem never fails a
+  lease that SSH can serve.
+- `--transport ssh` is the default and behaves exactly as before. Existing pools and saved state
+  load as `ssh`.
+
+Smoke test the live path on a real hub with a provider token: create a pool with
+`--transport tailcat`, submit one job, confirm the lease's `transport` is `tailcat` in
+`hub pool list` (and the daemon log says so once for that lease), and confirm the run succeeds.
+This repository's build has no Docker socket or Hetzner token, so the live path is unproven here.
 
 ## Choose a machine per job
 

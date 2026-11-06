@@ -145,6 +145,8 @@ pub struct HubPoolAdd {
     pub tags: Vec<String>,
     pub ssh_key: PathBuf,
     pub ssh_from: Vec<String>,
+    /// `ssh` (default) or `tailcat`.
+    pub transport: String,
 }
 
 /// `hub daemon run` options.

@@ -47,6 +47,9 @@ mod usage;
 #[path = "tests/pool.rs"]
 mod pool;
 
+#[path = "tests/tunnel.rs"]
+mod tunnel;
+
 #[path = "tests/pool_capacity.rs"]
 mod pool_capacity;
 

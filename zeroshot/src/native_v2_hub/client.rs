@@ -20,7 +20,7 @@ use super::cron;
 use super::error::HubError;
 use super::jobs;
 use super::model::{Job, Schedule, ScheduleState};
-use super::pool::Provider;
+use super::pool::{Provider, Transport};
 use super::service::FILE_FLAGS;
 use super::wire::{
     AddMember, AddPool, CreateSchedule, SetTagProfile, EnqueueJob, JobFile, JobQuery, MemberQuery,
@@ -821,5 +821,6 @@ pub(crate) fn add_pool(request: HubPoolAdd) -> Result<AddPool, HubError> {
         tags: request.tags,
         ssh_key: super::paths::absolute(&request.ssh_key)?,
         ssh_from: request.ssh_from,
+        transport: Transport::parse(&request.transport)?,
     })
 }

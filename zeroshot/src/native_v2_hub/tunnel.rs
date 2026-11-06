@@ -11,10 +11,12 @@
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use ring::hmac;
 
 use super::error::HubError;
+use super::pool::Transport;
 
 /// One tunnel to open.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,6 +26,33 @@ pub(crate) struct TunnelSpec {
     pub local_port: u16,
     pub key: PathBuf,
     pub known_hosts: PathBuf,
+    /// The tailcat address a `tailcat` lease dials; `None` for SSH tunnels and for a lease
+    /// that fell back because the server published no address.
+    pub tailcat_addr: Option<String>,
+}
+
+/// Where a `tailcat` pool server writes its address for the hub to read over SSH. The tailcat
+/// CLI writes it itself (mode 0600); the hub reads it as root.
+pub(crate) const TAILCAT_ADDR_FILE: &str = "/run/zeroshot/tailcat.addr";
+
+/// The SSH script that reads a tailcat server's address. A missing file is an empty answer, not
+/// a failed run, so an old image falls back to SSH instead of failing its lease.
+pub(crate) fn tailcat_addr_script() -> String {
+    format!("cat {TAILCAT_ADDR_FILE} 2>/dev/null || true\n")
+}
+
+/// Parse the address printed by a tailcat server: one `tc...` token and nothing else. Anything
+/// unexpected is treated as no address, so a broken image falls back instead of dialing junk.
+pub(crate) fn read_tailcat_addr(output: &str) -> Option<String> {
+    let addr = output.trim();
+    if addr.is_empty()
+        || addr.len() > 4096
+        || !addr.starts_with("tc")
+        || addr.chars().any(|character| character.is_whitespace())
+    {
+        return None;
+    }
+    Some(addr.to_owned())
 }
 
 pub(crate) trait Tunnels: Send + Sync {
@@ -340,6 +369,201 @@ impl Drop for SshTunnels {
     fn drop(&mut self) {
         let names = self
             .children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for name in names {
+            self.close(&name);
+        }
+    }
+}
+
+/// The data path a lease should use: the requested transport when it is usable, otherwise the
+/// SSH fallback. A `tailcat` pool whose server published no address runs on SSH for the rest of
+/// its lease, with the caller warning about it.
+pub(crate) fn choose_tunnels(
+    requested: Transport,
+    tailcat_addr: Option<String>,
+    ssh: &Arc<dyn Tunnels>,
+    tailcat: &Arc<dyn Tunnels>,
+) -> (Arc<dyn Tunnels>, Transport, Option<String>) {
+    match (requested, tailcat_addr) {
+        (Transport::Tailcat, Some(addr)) => (Arc::clone(tailcat), Transport::Tailcat, Some(addr)),
+        _ => (Arc::clone(ssh), Transport::Ssh, None),
+    }
+}
+
+/// A proxy that forwards one loopback port to a port on a tailcat server.
+pub(crate) trait TailcatProxy: Send + Sync {
+    /// Start forwarding `127.0.0.1:local_port` to `remote_port` on `addr`.
+    fn start(
+        &self,
+        addr: &str,
+        local_port: u16,
+        remote_port: u16,
+    ) -> Result<Box<dyn ProxyHandle>, HubError>;
+}
+
+/// A running proxy. `is_alive` must be false once its process or thread has exited, so a dead
+/// data path can never be reported open.
+pub(crate) trait ProxyHandle: Send {
+    fn is_alive(&mut self) -> bool;
+    fn stop(&mut self);
+}
+
+/// The production proxy: `tailcat forward --bind 127.0.0.1 ADDR LOCAL:REMOTE`, one child per
+/// lease. tailcat owns the WireGuard handshake, NAT traversal, DERP fallback, and the loopback
+/// listener; SSH is not on the job data path at all.
+struct ForwardProxy {
+    program: PathBuf,
+}
+
+impl Default for ForwardProxy {
+    fn default() -> Self {
+        Self {
+            program: PathBuf::from("tailcat"),
+        }
+    }
+}
+
+impl TailcatProxy for ForwardProxy {
+    fn start(
+        &self,
+        addr: &str,
+        local_port: u16,
+        remote_port: u16,
+    ) -> Result<Box<dyn ProxyHandle>, HubError> {
+        let mut child = std::process::Command::new(&self.program)
+            .args([
+                "--key=new",
+                "forward",
+                "--bind",
+                "127.0.0.1",
+                addr,
+                &format!("{local_port}:{remote_port}"),
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| HubError::storage("tailcat could not be started", error))?;
+        // `tailcat forward` binds its listener immediately; a child that is already gone (bad
+        // address, wrong binary) must fail the open so the lease falls back to SSH instead of
+        // retrying discovery through a dead port.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(HubError::Unanswered(format!(
+                "tailcat exited with {status} before its proxy was ready"
+            )));
+        }
+        Ok(Box::new(ForwardHandle { child }))
+    }
+}
+
+struct ForwardHandle {
+    child: std::process::Child,
+}
+
+impl ProxyHandle for ForwardHandle {
+    fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Tunnels whose data path is a tailcat proxy and whose script path stays SSH. A lease that
+/// cannot start its proxy is the caller's cue to fall back to [`SshTunnels`].
+pub(crate) struct TailcatTunnels {
+    ssh: SshTunnels,
+    proxy: Box<dyn TailcatProxy>,
+    proxies: Mutex<std::collections::BTreeMap<String, Box<dyn ProxyHandle>>>,
+}
+
+impl Default for TailcatTunnels {
+    fn default() -> Self {
+        Self::with_proxy(Box::new(ForwardProxy::default()))
+    }
+}
+
+impl TailcatTunnels {
+    /// Tailcat tunnels with `proxy` in place of the `tailcat` child, for tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_proxy(proxy: Box<dyn TailcatProxy>) -> Self {
+        Self {
+            ssh: SshTunnels::default(),
+            proxy,
+            proxies: Mutex::default(),
+        }
+    }
+}
+
+impl Tunnels for TailcatTunnels {
+    fn open(&self, spec: &TunnelSpec) -> Result<(), HubError> {
+        let mut proxies = self
+            .proxies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if proxies
+            .get_mut(&spec.name)
+            .is_some_and(|handle| handle.is_alive())
+        {
+            return Ok(());
+        }
+        if let Some(mut dead) = proxies.remove(&spec.name) {
+            dead.stop();
+        }
+        let addr = spec
+            .tailcat_addr
+            .as_deref()
+            .filter(|addr| !addr.trim().is_empty())
+            .ok_or_else(|| {
+                HubError::Usage(format!(
+                    "lease {} has no tailcat address; use the ssh transport",
+                    spec.name
+                ))
+            })?;
+        let handle = self
+            .proxy
+            .start(addr, spec.local_port, super::provision::TARGET_PORT)?;
+        proxies.insert(spec.name.clone(), handle);
+        Ok(())
+    }
+
+    fn is_open(&self, name: &str) -> bool {
+        self.proxies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(name)
+            .is_some_and(|handle| handle.is_alive())
+    }
+
+    fn close(&self, name: &str) {
+        let handle = self
+            .proxies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(name);
+        if let Some(mut handle) = handle {
+            handle.stop();
+        }
+    }
+
+    fn run(&self, spec: &TunnelSpec, script: &str) -> Result<String, HubError> {
+        // Control-plane scripts still need the root shell the hub already has.
+        self.ssh.run(spec, script)
+    }
+}
+
+impl Drop for TailcatTunnels {
+    fn drop(&mut self) {
+        let names = self
+            .proxies
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .keys()

@@ -5,6 +5,7 @@
 //! server joins.
 
 use super::error::HubError;
+use super::pool::Transport;
 
 /// Local disk kept free beside the data file for Docker layers, container writes and logs, in
 /// GB.
@@ -19,6 +20,15 @@ pub(crate) const BOOT_STATUS: &str = "/var/lib/zeroshot-boot";
 pub(crate) const DATA_FILE: &str = "/var/lib/zeroshot-data.btrfs";
 /// btrfs mount options of the data folder.
 pub(crate) const MOUNT_OPTIONS: &str = "noatime,compress=zstd:1";
+/// Pinned tailcat CLI the boot script installs for a `tailcat` pool.
+pub(crate) const TAILCAT_VERSION: &str = "0.7.0";
+/// Checksums from that release's `checksums.txt`, for the architectures the target supports.
+pub(crate) const TAILCAT_AMD64_SHA256: &str =
+    "23c0b1887a5ec422f0d18a9c52b4f5357815febdaae738a1eb54036d10bd9ee6";
+pub(crate) const TAILCAT_ARM64_SHA256: &str =
+    "bbb1ab50f24f00effe1e1fd86d0501803fb80793a90785a2a16ff3428f03d8ef";
+/// Persistent tailcat server key, so a restarted server keeps its address.
+pub(crate) const TAILCAT_KEY: &str = "/var/lib/zeroshot-tailcat/tailcat.private.json";
 
 /// What the boot script needs to know about one server.
 pub(crate) struct Boot<'a> {
@@ -26,6 +36,7 @@ pub(crate) struct Boot<'a> {
     pub public_origin: &'a str,
     pub data_folder: &'a str,
     pub target_port: u16,
+    pub transport: Transport,
 }
 
 /// The server's boot script, run once by cloud-init and safe to rerun: it installs Docker and
@@ -42,6 +53,10 @@ pub(crate) fn boot_script(boot: &Boot<'_>) -> Result<String, HubError> {
     let origin = shell_word(boot.public_origin)?;
     let data = boot.data_folder;
     let port = boot.target_port;
+    let tailcat = match boot.transport {
+        Transport::Ssh => String::new(),
+        Transport::Tailcat => tailcat_boot(boot.target_port),
+    };
     Ok(format!(
         r#"#!/bin/sh
 # zeroshot pool server boot, written by the hub: a btrfs data folder, then the pinned target.
@@ -65,6 +80,7 @@ fail() {{
   echo "zeroshot boot failed: $*"
   exit 1
 }}
+warn() {{ echo "zeroshot boot warning: $*"; }}
 trap 'code=$?; if [ "$code" -ne 0 ] && [ ! -e "$STATUS/failed" ]; then printf "%s failed with exit code %s\n" "$step" "$code" >"$STATUS/failed"; fi' EXIT
 
 step='installing Docker'
@@ -143,10 +159,87 @@ else
     "$IMAGE" target serve --listen "127.0.0.1:{port}" --public-origin "$ORIGIN" \
     --storage /var/lib/zeroshot/native-v2 >/dev/null
 fi
-touch "$STATUS/ok"
+{tailcat}touch "$STATUS/ok"
 echo 'zeroshot boot finished'
 "#
     ))
+}
+
+/// The boot steps that install and start the pinned tailcat server beside the target. Every
+/// failure is a warning: the hub then finds no address and uses its SSH tunnel, so a tailcat
+/// problem never fails a lease that SSH can still serve. The server key lives on the root disk
+/// and its region is pinned once, so a restarted server keeps the same address.
+fn tailcat_boot(port: u16) -> String {
+    let version = TAILCAT_VERSION;
+    let addr = super::tunnel::TAILCAT_ADDR_FILE;
+    let key = TAILCAT_KEY;
+    format!(
+        r#"step='installing tailcat'
+mkdir -p /run/zeroshot /var/lib/zeroshot-tailcat
+TAILCAT=''
+case "$(uname -m)" in
+  x86_64|amd64) asset="tailcat_{version}_linux_amd64.tar.gz"; sum='{amd64}' ;;
+  aarch64|arm64) asset="tailcat_{version}_linux_arm64.tar.gz"; sum='{arm64}' ;;
+  *) asset=''; sum='' ;;
+esac
+if [ -z "$asset" ]; then
+  warn "tailcat has no build for $(uname -m); the hub will use the ssh tunnel"
+elif [ -x /usr/local/bin/tailcat ]; then
+  TAILCAT=/usr/local/bin/tailcat
+else
+  url="https://github.com/tailscale/tailcat/releases/download/v{version}/$asset"
+  if ! command -v curl >/dev/null 2>&1; then
+    warn 'curl is missing; the hub will use the ssh tunnel'
+  elif curl -fsSL "$url" -o /run/zeroshot/tailcat.tar.gz; then
+    if echo "$sum  /run/zeroshot/tailcat.tar.gz" | sha256sum -c - >/dev/null 2>&1; then
+      if tar -xzf /run/zeroshot/tailcat.tar.gz -C /usr/local/bin tailcat; then
+        chmod 0755 /usr/local/bin/tailcat
+        TAILCAT=/usr/local/bin/tailcat
+      else
+        warn 'tailcat could not be unpacked; the hub will use the ssh tunnel'
+      fi
+    else
+      warn 'tailcat failed its pinned checksum; the hub will use the ssh tunnel'
+    fi
+    rm -f /run/zeroshot/tailcat.tar.gz
+  else
+    warn 'tailcat could not be downloaded; the hub will use the ssh tunnel'
+  fi
+fi
+step='starting tailcat'
+if [ -n "$TAILCAT" ] && [ ! -s '{key}' ]; then
+  if ! "$TAILCAT" genkey --key='{key}' --fixed-region >/dev/null 2>&1; then
+    warn 'tailcat could not generate a server key; the hub will use the ssh tunnel'
+    TAILCAT=''
+  fi
+fi
+if [ -n "$TAILCAT" ]; then
+  docker rm -f zeroshot-tailcat >/dev/null 2>&1 || true
+  if ! docker run --detach --restart unless-stopped --name zeroshot-tailcat \
+    --network host \
+    --volume "$TAILCAT:/usr/local/bin/tailcat:ro" \
+    --volume /var/lib/zeroshot-tailcat:/var/lib/zeroshot-tailcat:ro \
+    --volume /run/zeroshot:/run/zeroshot \
+    --env TAILCAT_ADDR_FILE={addr} \
+    --entrypoint /usr/local/bin/tailcat \
+    "$IMAGE" --key='{key}' serve {port} >/dev/null; then
+    warn 'tailcat did not start; the hub will use the ssh tunnel'
+  fi
+  # The hub reads the address as soon as the health check passes, so do not report `ok`
+  # before the server has published it.
+  tries=0
+  while [ ! -s /run/zeroshot/tailcat.addr ] && [ "$tries" -lt 20 ]; do
+    sleep 1
+    tries=$((tries + 1))
+  done
+  if [ ! -s /run/zeroshot/tailcat.addr ]; then
+    warn 'tailcat did not publish its address; the hub will use the ssh tunnel'
+  fi
+fi
+"#,
+        amd64 = TAILCAT_AMD64_SHA256,
+        arm64 = TAILCAT_ARM64_SHA256,
+    )
 }
 
 /// A value for a single-quoted shell word: image references and URLs only.

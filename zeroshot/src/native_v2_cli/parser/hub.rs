@@ -370,6 +370,13 @@ pub(super) struct HubPoolAddArgs {
     /// CIDR allowed to reach servers over SSH (the hub's public address). Repeat for several.
     #[arg(long, value_name = "CIDR", required = true, action = clap::ArgAction::Append)]
     ssh_from: Vec<String>,
+
+    /// Data path to the target: `ssh` (default) keeps the whole job on the SSH tunnel;
+    /// `tailcat` carries job traffic over a WireGuard tunnel and keeps SSH only for the
+    /// server's address read and control-plane scripts. A tailcat server needs the pinned
+    /// `tailcat` CLI on the hub's PATH; a missing address falls back to SSH.
+    #[arg(long, value_name = "TRANSPORT", default_value = "ssh")]
+    transport: String,
 }
 
 impl HubPoolCliCommand {
@@ -392,6 +399,7 @@ impl HubPoolCliCommand {
                     tags: tags(args.tags)?,
                     ssh_key: args.ssh_key,
                     ssh_from: args.ssh_from,
+                    transport: args.transport,
                 }))
             }
             Self::List => HubPoolCommand::List,
