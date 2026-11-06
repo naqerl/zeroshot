@@ -48,6 +48,7 @@ pub(super) struct Cloud {
     pub(super) resources: BTreeMap<(ResourceKind, u64), Resource>,
     pub(super) created: Vec<ServerRequest>,
     pub(super) destroyed: Vec<(ResourceKind, u64)>,
+    pub(super) destroy_attempts: Vec<(ResourceKind, u64)>,
     pub(super) lists: Vec<String>,
     /// Readiness answer; `None` means running with an address.
     pub(super) ready: Option<Progress>,
@@ -70,6 +71,8 @@ pub(super) struct Cloud {
     pub(super) list_fails: bool,
     /// Report a deletion action as unknown (a provider 404 for an already-gone target).
     pub(super) action_gone: bool,
+    /// Refuse every destroy with this provider error, leaving the resource in place.
+    pub(super) destroy_fails: bool,
 }
 
 impl FakeCloud {
@@ -189,14 +192,22 @@ impl Provisioner for FakeCloud {
     }
 
     async fn destroy(&self, resource: &Resource) -> Result<Option<u64>, HubError> {
-        Ok(self.with(|cloud| {
+        let (failed, existed) = self.with(|cloud| {
             cloud.destroyed.push((resource.kind, resource.id));
+            cloud.destroy_attempts.push((resource.kind, resource.id));
+            if cloud.destroy_fails {
+                return (true, false);
+            }
             let existed = cloud
                 .resources
                 .remove(&(resource.kind, resource.id))
                 .is_some();
-            (existed && resource.kind == ResourceKind::Server).then_some(resource.id + 2000)
-        }))
+            (false, existed)
+        });
+        if failed {
+            return Err(HubError::Provider("provider refused the delete".to_owned()));
+        }
+        Ok((existed && resource.kind == ResourceKind::Server).then_some(resource.id + 2000))
     }
 
     async fn action(&self, _: u64) -> Result<Progress, HubError> {
@@ -396,6 +407,7 @@ pub(super) fn add_request(folder: &Path, max: u32) -> AddPool {
         locations: vec!["fsn1".to_owned(), "nbg1".to_owned()],
         multi_arch: false,
         wait_max_ms: None,
+        stale_lease_ms: pool::DEFAULT_STALE_LEASE_MS,
         image: "docker-ce".to_owned(),
         target_image: IMAGE.to_owned(),
         max,
@@ -975,6 +987,355 @@ async fn an_unconfirmed_server_check_leaves_the_orphaned_lease_draining() {
             .iter()
             .all(|(phase, _)| *phase != PoolPhase::Deleted)
     );
+}
+
+/// A lease whose server is gone while its pool still exists is retired after the grace window,
+/// instead of wedging the pool's only slot. The next pass can place again.
+#[tokio::test]
+async fn a_vanished_server_in_a_live_pool_is_reconciled_after_the_grace_window() {
+    let rig = rig();
+    let lease = rig.running_job_on_server().await;
+    let server_id = lease.server_id.expect("server id");
+    rig.cloud.with(|cloud| {
+        cloud.resources.remove(&(ResourceKind::Server, server_id));
+    });
+    rig.set(|state| {
+        state.leases[0].created_at_ms = 0;
+        state.leases[0].progress_at_ms = 0;
+        state.pools[0].stale_lease_ms = 60_000;
+    })
+    .await;
+
+    let view = rig.pass().await;
+    let reconciled = reconciled(&view);
+    assert_eq!(reconciled.len(), 1, "{view}");
+    assert_eq!(reconciled[0]["lease"], json!(lease.name));
+    let reason = reconciled[0]["reason"].as_str().expect("reason");
+    assert!(reason.contains("pool burst"), "{reason}");
+    assert!(reason.contains("in_use"), "{reason}");
+    assert!(reason.contains("no longer lists its server"), "{reason}");
+
+    let state = rig.state().await;
+    assert!(state.leases.is_empty(), "{:?}", state.leases);
+    assert!(
+        state.members.iter().all(|member| member.name != lease.name),
+        "the retired lease leaves no member"
+    );
+    let job = job_named(&state, "hj_one");
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(job.failure_reason.as_deref(), Some("target_lost"));
+    assert_eq!(
+        job.failure_classification.as_deref(),
+        Some("provider_confirmed_absent")
+    );
+    assert_eq!(job.archive_skipped.as_deref(), Some(reason));
+
+    // The pool is not wedged: its next dispatch pass can place a new job again.
+    rig.enqueue("hj_two").await;
+    for _ in 0..6 {
+        rig.pass().await;
+    }
+    let state = rig.state().await;
+    let next = job_named(&state, "hj_two");
+    assert_eq!(next.state, JobState::Running, "{next:?}");
+    let active = state
+        .leases
+        .iter()
+        .find(|lease| lease.phase == LeasePhase::Active)
+        .expect("a replacement lease");
+    assert_eq!(next.target.as_deref(), Some(active.name.as_str()));
+}
+
+/// A lease that made progress inside the grace window is untouched even when it was created
+/// long ago and its server is already gone; no provider call is spent on it.
+#[tokio::test]
+async fn a_recently_progressed_lease_with_a_gone_server_waits_out_the_grace_window() {
+    let rig = rig();
+    let lease = rig.running_job_on_server().await;
+    let server_id = lease.server_id.expect("server id");
+    rig.cloud.with(|cloud| {
+        cloud.resources.remove(&(ResourceKind::Server, server_id));
+    });
+    rig.set(|state| {
+        state.leases[0].created_at_ms = 0;
+        state.leases[0].progress_at_ms = now_ms();
+        state.pools[0].stale_lease_ms = 60_000;
+    })
+    .await;
+
+    let before = rig.cloud.with(|cloud| cloud.lists.len());
+    let view = rig.pass().await;
+    assert!(reconciled(&view).is_empty(), "{view}");
+    assert_eq!(
+        rig.cloud.with(|cloud| cloud.lists.len()),
+        before,
+        "a lease that progressed inside the grace window spends no provider call"
+    );
+    let state = rig.state().await;
+    assert_eq!(state.leases.len(), 1, "{:?}", state.leases);
+    assert_eq!(state.leases[0].phase, LeasePhase::Active);
+    assert_eq!(job_named(&state, "hj_one").state, JobState::Running);
+}
+
+/// A stale lease whose provider still lists its server is left alone, and the confirmation is
+/// cached so a later pass spends no further provider request.
+#[tokio::test]
+async fn a_warm_provider_confirmation_is_reused_by_stale_reconciliation() {
+    let rig = rig();
+    rig.running_job_on_server().await;
+    rig.set(|state| {
+        state.leases[0].created_at_ms = 0;
+        state.leases[0].progress_at_ms = 0;
+        state.pools[0].stale_lease_ms = 60_000;
+    })
+    .await;
+
+    let before = rig.cloud.with(|cloud| cloud.lists.len());
+    let view = rig.pass().await;
+    assert!(reconciled(&view).is_empty(), "{view}");
+    let checked = rig.cloud.with(|cloud| cloud.lists.len());
+    assert_eq!(
+        checked,
+        before + 1,
+        "the first stale pass checks the server"
+    );
+    assert_eq!(rig.state().await.leases.len(), 1);
+
+    let view = rig.pass().await;
+    assert!(reconciled(&view).is_empty(), "{view}");
+    assert_eq!(
+        rig.cloud.with(|cloud| cloud.lists.len()),
+        checked,
+        "a warm confirmation is reused instead of spending another provider call"
+    );
+}
+
+/// A stale lease whose provider answer is inconclusive changes nothing and reports the failed
+/// confirmation; it is never read as a gone server.
+#[tokio::test]
+async fn an_inconclusive_stale_lease_check_changes_nothing() {
+    let rig = rig();
+    let lease = rig.running_job_on_server().await;
+    rig.set(|state| {
+        state.leases[0].created_at_ms = 0;
+        state.leases[0].progress_at_ms = 0;
+        state.pools[0].stale_lease_ms = 60_000;
+    })
+    .await;
+    rig.cloud.with(|cloud| cloud.list_fails = true);
+
+    let view = rig.pass().await;
+    assert!(reconciled(&view).is_empty(), "{view}");
+    assert!(
+        first_error(&view).contains("reconcile: the provider could not confirm"),
+        "{view}"
+    );
+    let state = rig.state().await;
+    assert_eq!(state.leases.len(), 1, "{:?}", state.leases);
+    assert_eq!(state.leases[0].name, lease.name);
+    assert_eq!(job_named(&state, "hj_one").state, JobState::Running);
+}
+
+/// A connecting lease past its pool's wait-max is retired even when its server still exists, and
+/// the provider is asked to delete that server.
+#[tokio::test]
+async fn a_connecting_lease_past_wait_max_deletes_a_live_server() {
+    let rig = rig();
+    rig.add_pool(1).await;
+    rig.enqueue("hj_one").await;
+    rig.cloud
+        .with(|cloud| cloud.ready = Some(Progress::Pending));
+    rig.pass().await;
+    let lease = rig.lease().await;
+    let server_id = lease.server_id.expect("server id");
+    rig.set(|state| {
+        state.pools[0].wait_max_ms = Some(60_000);
+        state.jobs[0].submitted_at_ms = now_ms();
+        let lease = &mut state.leases[0];
+        lease.phase = LeasePhase::Connecting;
+        lease.event_phase = Some(PoolPhase::Preparing);
+        lease.created_at_ms = now_ms().saturating_sub(120_000);
+        lease.progress_at_ms = now_ms().saturating_sub(120_000);
+        lease.drain_started_ms = None;
+    })
+    .await;
+
+    let view = rig.pass().await;
+    assert!(
+        rig.cloud
+            .with(|cloud| cloud.destroyed.contains(&(ResourceKind::Server, server_id))),
+        "a live server retired by a bounded wait is deleted, not forgotten: {view}"
+    );
+    let reconciled = reconciled(&view);
+    assert_eq!(reconciled.len(), 1, "{view}");
+    let reason = reconciled[0]["reason"].as_str().expect("reason").to_owned();
+    assert!(reason.contains("pool burst"), "{reason}");
+    assert!(reason.contains("preparing"), "{reason}");
+    assert!(reason.contains("wait-max"), "{reason}");
+    let state = rig.state().await;
+    assert!(state.leases.is_empty(), "the lease is gone");
+    let phases = lease_phases(&state, &lease);
+    assert_eq!(
+        phases.last().map(|(phase, _)| *phase),
+        Some(PoolPhase::Deleted),
+        "{phases:?}"
+    );
+    assert_eq!(
+        phases.iter().rev().nth(1).map(|(phase, _)| *phase),
+        Some(PoolPhase::Draining),
+        "{phases:?}"
+    );
+    let deleted = state
+        .pool_events
+        .iter()
+        .find(|event| {
+            event.lease_id.as_deref() == Some(lease.id.as_str())
+                && event.phase == PoolPhase::Deleted
+        })
+        .expect("deleted event");
+    assert_eq!(deleted.previous_phase, Some(PoolPhase::Draining));
+    assert_eq!(deleted.reason.as_deref(), Some(reason.as_str()));
+}
+
+/// A failed delete keeps the lease draining with the provider's error, so the next pass can retry
+/// instead of leaking the running server.
+#[tokio::test]
+async fn a_failed_delete_keeps_the_stale_lease_draining() {
+    let rig = rig();
+    rig.add_pool(1).await;
+    rig.enqueue("hj_one").await;
+    rig.cloud
+        .with(|cloud| cloud.ready = Some(Progress::Pending));
+    rig.pass().await;
+    let lease = rig.lease().await;
+    let server_id = lease.server_id.expect("server id");
+    rig.set(|state| {
+        state.pools[0].wait_max_ms = Some(60_000);
+        state.jobs[0].submitted_at_ms = now_ms();
+        let lease = &mut state.leases[0];
+        lease.phase = LeasePhase::Connecting;
+        lease.event_phase = Some(PoolPhase::Preparing);
+        lease.created_at_ms = now_ms().saturating_sub(120_000);
+        lease.progress_at_ms = now_ms().saturating_sub(120_000);
+        lease.drain_started_ms = None;
+    })
+    .await;
+    rig.cloud.with(|cloud| cloud.destroy_fails = true);
+
+    let view = rig.pass().await;
+    assert!(
+        rig.cloud.with(|cloud| cloud
+            .destroy_attempts
+            .contains(&(ResourceKind::Server, server_id))),
+        "the hub attempted the delete"
+    );
+    assert!(reconciled(&view).is_empty(), "{view}");
+    assert!(
+        first_error(&view).contains("the server could not be deleted"),
+        "{view}"
+    );
+    let state = rig.state().await;
+    assert_eq!(state.leases.len(), 1, "{:?}", state.leases);
+    assert_eq!(state.leases[0].phase, LeasePhase::Draining);
+    assert!(
+        state.leases[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("provider refused the delete")),
+        "{:?}",
+        state.leases[0].error
+    );
+    let attempts = rig.cloud.with(|cloud| cloud.destroy_attempts.len());
+    rig.service.pool_pass().await.expect("backoff pass");
+    assert_eq!(
+        rig.cloud.with(|cloud| cloud.destroy_attempts.len()),
+        attempts,
+        "a failed delete backs off instead of spending another provider request every pass"
+    );
+}
+
+/// A draining lease past its deadline retires with a classification that names the retirement,
+/// not a provider absence the hub never observed.
+#[tokio::test]
+async fn a_draining_lease_past_the_deadline_retires_with_its_own_classification() {
+    let rig = rig();
+    let lease = rig.running_job_on_server().await;
+    rig.set(|state| {
+        let lease = &mut state.leases[0];
+        lease.phase = LeasePhase::Draining;
+        lease.event_phase = Some(PoolPhase::Draining);
+        lease.drain_started_ms = Some(now_ms().saturating_sub(10 * 60_000 + 1_000));
+    })
+    .await;
+
+    let view = rig.pass().await;
+    let reconciled = reconciled(&view);
+    assert_eq!(reconciled.len(), 1, "{view}");
+    let reason = reconciled[0]["reason"].as_str().expect("reason").to_owned();
+    assert!(reason.contains("drain deadline"), "{reason}");
+    let state = rig.state().await;
+    let job = job_named(&state, "hj_one");
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(job.failure_reason.as_deref(), Some("target_lost"));
+    assert_eq!(
+        job.failure_classification.as_deref(),
+        Some("lease_retired"),
+        "a bounded-wait retirement is not a provider-confirmed absence"
+    );
+    assert!(
+        job.error
+            .as_ref()
+            .is_some_and(|error| error.message.contains(&reason)),
+        "{job:?}"
+    );
+    let deleted = state
+        .pool_events
+        .iter()
+        .find(|event| {
+            event.lease_id.as_deref() == Some(lease.id.as_str())
+                && event.phase == PoolPhase::Deleted
+        })
+        .expect("deleted event");
+    assert_eq!(deleted.previous_phase, Some(PoolPhase::Draining));
+    assert_eq!(deleted.reason.as_deref(), Some(reason.as_str()));
+}
+
+/// Reconciliation keeps skipping leases that are already deleting or never had a server.
+#[tokio::test]
+async fn reconcile_skips_deleting_and_serverless_leases() {
+    let rig = rig();
+    rig.add_pool(1).await;
+    rig.pass().await;
+    let now = now_ms();
+    rig.set(|state| {
+        let pool = state.pools[0].clone();
+        let mut deleting = Lease::new(&pool, "hj_deleting", 40000, 0);
+        deleting.phase = LeasePhase::Deleting;
+        deleting.event_phase = Some(PoolPhase::Draining);
+        deleting.server_id = Some(999);
+        deleting.created_at_ms = 0;
+        deleting.progress_at_ms = 0;
+        deleting.next_attempt_ms = Some(now.saturating_add(60_000));
+        let mut serverless = Lease::new(&pool, "hj_serverless", 40001, 0);
+        serverless.phase = LeasePhase::Active;
+        serverless.event_phase = Some(PoolPhase::InUse);
+        serverless.created_at_ms = 0;
+        serverless.progress_at_ms = 0;
+        serverless.next_attempt_ms = Some(now.saturating_add(60_000));
+        state.leases.push(deleting);
+        state.leases.push(serverless);
+    })
+    .await;
+
+    let before = rig.cloud.with(|cloud| cloud.lists.len());
+    let report = rig.service.pool_pass().await.expect("pool pass");
+    assert!(report.reconciled.is_empty(), "{report:?}");
+    assert_eq!(
+        rig.cloud.with(|cloud| cloud.lists.len()),
+        before,
+        "reconcile never checks a deleting or serverless lease"
+    );
+    assert_eq!(rig.state().await.leases.len(), 2);
 }
 
 #[tokio::test]
@@ -2167,6 +2528,7 @@ pub(super) fn pool_fixture() -> Pool {
         locations: vec!["fsn1".to_owned()],
         multi_arch: false,
         wait_max_ms: None,
+        stale_lease_ms: pool::DEFAULT_STALE_LEASE_MS,
         image: "docker-ce".to_owned(),
         target_image: IMAGE.to_owned(),
         max: 1,

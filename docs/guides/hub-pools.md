@@ -235,11 +235,25 @@ and whose server the provider no longer lists records `deleted` with a `reason` 
 facts, even when a drain never finished: with no pool and no server there is nothing left to
 archive, tunnel, or delete. A run still placing on that lease fails with `target_lost` and
 `failureClassification: "provider_confirmed_absent"`, and the pool's `removed` event follows on
-the next pass. Reconciliation never deletes a server the provider still lists, never touches a
-lease whose pool still exists, and leaves a lease alone when the provider cannot confirm the
-loss — an inconclusive answer is not a deleted server, so the lease keeps draining and the pass
-reports the failed confirmation. A lease that never received a server is not reconciled either:
-there is no lost resource to report, so it keeps its pool from claiming removal.
+the next pass.
+
+A lease whose pool still exists is reconciled too. If it has made no progress for the pool's
+`staleLeaseMs` and the provider no longer lists its server, the lease records `deleted` with a
+`reason` naming the pool and the phase, and its slot is free for the next dispatch pass. A lease
+that is still advancing phases inside the grace window is left alone. The API pool body defaults
+`staleLeaseMs` to 30 minutes and is the way to tune it; `zeroshot hub pool add` uses that default.
+The same path retires a lease stuck in `connecting`/`preparing` past the pool's `--wait-max`, or
+in `draining` past the ten-minute drain deadline, even when the provider still lists the server.
+The hub records the draining intent before asking the provider to delete that server; if the
+delete fails, the lease stays `draining` with the provider's error and backs off before retrying
+instead of leaking a running box. A running job on a lease retired by a bounded wait fails with
+`failureClassification: "lease_retired"`, not `provider_confirmed_absent`.
+
+Reconciliation leaves a lease alone when the provider cannot confirm the loss — an inconclusive
+answer is not a deleted server, so the lease keeps draining and the pass reports the failed
+confirmation. A lease that never received a server is not reconciled either: there is no lost
+resource to report, so it keeps its pool from claiming removal. A lease already in `deleting`
+confirms its own deletion and is never reconciled.
 
 Every `hub.pool` record carries `kind: "hub.pool"`, like every hub event, and `scope`: `"lease"`
 for a lease transition, `"pool"` for a pool-wide one. Pool-wide changes use `scope: "pool"` and the phases `added`, `removed`, `paused`, `resumed`,
@@ -329,8 +343,8 @@ so it does not depend on the data folder's filesystem. Object Storage upload is 
 - `zeroshot_hub_pool_queued_jobs{pool,source,profile}` counts queued jobs by machine choice.
 - `zeroshot_hub_pool_events_total{event}` counts pool pass outcomes by event: `started`,
   `teardown`, `archived`, `deleted`, `reconciled`, `reaped`, `shortage`, `blocked`, `wait_timeout`,
-  or `error`. `reconciled` counts leases recorded as deleted because their server was gone and
-  their pool removed.
+  or `error`. `reconciled` counts leases recorded as deleted because their server was gone or a
+  bounded wait expired, whether or not their pool still exists.
 
 ## Cost
 

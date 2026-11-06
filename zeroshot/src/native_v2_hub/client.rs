@@ -813,6 +813,7 @@ pub(crate) fn add_pool(request: HubPoolAdd) -> Result<AddPool, HubError> {
             .as_deref()
             .map(parse_duration_ms)
             .transpose()?,
+        stale_lease_ms: super::pool::default_stale_lease_ms(),
         image: request.image,
         target_image: request.target_image,
         max: request.max,

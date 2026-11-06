@@ -215,6 +215,12 @@ impl PoolReport {
     }
 }
 
+/// A lease being given up and the operator-facing reason recorded for it.
+struct Retirement {
+    lease: Lease,
+    reason: String,
+}
+
 /// Outcome of one lease step.
 enum Step {
     /// Replace the lease with this record.
@@ -289,12 +295,13 @@ impl HubService {
                         finished.server_id = lease_server_id;
                     }
                     self.mutate(|state| {
+                        let reason = finished.retirement_reason.take();
                         pool::record_lease_phase(
                             state,
                             &mut finished,
                             pool::PoolPhaseChange {
                                 phase: PoolPhase::Deleted,
-                                reason: None,
+                                reason,
                                 at: now_ms(),
                             },
                         );
@@ -745,16 +752,17 @@ impl HubService {
         }
     }
 
-    /// Give up leases whose server the provider no longer has and whose pool was removed: with
-    /// no pool there is no drain, tunnel or archive left to wait for, and with no server there is
-    /// nothing to delete, so the ordinary `deleted` phase is recorded instead. Recording it also
-    /// lets the removed pool complete.
+    /// Give up leases the hub can no longer act on: a removed pool whose server is gone, or a
+    /// lease whose pool still exists but whose phase has made no progress for the pool's
+    /// `staleLeaseMs` while the provider no longer lists its server. A lease stuck past its
+    /// pool's `waitMaxMs` in `connecting`/`preparing`, or past the drain deadline in `draining`,
+    /// is retired even when the server still exists; that path deletes the server instead of
+    /// forgetting it.
     ///
-    /// A lease is left alone while its pool still exists (that pool may still run or drain it),
-    /// while the provider still lists its server (nothing outside an authored drain deletes a
-    /// live server), and while the provider cannot confirm the loss: an inconclusive answer is
-    /// never read as a deleted server, so it changes nothing. A run still placing on such a lease
-    /// is failed first, with the provider's answer as its recorded classification.
+    /// A lease is left alone while the provider still lists its server and no bounded wait has
+    /// expired, and while the provider cannot confirm the loss: an inconclusive answer is never
+    /// read as a deleted server, so it changes nothing. A run still placing on such a lease is
+    /// failed first, with the provider's answer as its recorded classification.
     async fn reconcile(
         &self,
         runtime: &PoolRuntime,
@@ -764,21 +772,24 @@ impl HubService {
         let Some(hub_id) = state.hub_id.clone() else {
             return Ok(());
         };
+        let now = now_ms();
         for lease in state.leases.clone() {
-            // A deleting lease confirms its own deletion, an active pool owns its leases, and a
-            // lease that has not been given a server yet has lost nothing to reconcile.
-            if lease.phase == LeasePhase::Deleting
-                || lease.server_id.is_none()
-                || state.pools.iter().any(|pool| pool.name == lease.pool)
-            {
+            // A deleting lease confirms its own deletion, a lease that has not been given a
+            // server yet has lost nothing to reconcile, and a lease backing off after a failed
+            // delete must not spend another provider request before its retry is due.
+            if lease.phase == LeasePhase::Deleting || lease.server_id.is_none() || !lease.due(now) {
                 continue;
             }
-            let reason = match runtime.server_exists(&hub_id, &lease).await {
-                Ok(true) => continue,
-                Ok(false) => format!(
-                    "pool {} was removed and the provider no longer lists its server",
-                    lease.pool
-                ),
+            let pool = state.pools.iter().find(|pool| pool.name == lease.pool);
+            let bounded = pool.and_then(|pool| bounded_wait_reason(pool, &lease, now));
+            let stale = pool.is_some_and(|pool| lease.stale_for_ms(now) >= pool.stale_lease_ms);
+            // A removed pool is always checked; a live pool only once a lease has stopped
+            // making progress or a bounded wait has expired.
+            if pool.is_some() && bounded.is_none() && !stale {
+                continue;
+            }
+            let exists = match runtime.server_exists(&hub_id, &lease).await {
+                Ok(exists) => exists,
                 Err(error) => {
                     report.errors.push(format!(
                         "{}: reconcile: the provider could not confirm its server: {error}",
@@ -787,39 +798,207 @@ impl HubService {
                     continue;
                 }
             };
-            let name = lease.name.clone();
-            let mut finished = lease;
-            self.mutate(|state| {
-                pool::record_lease_phase(
-                    state,
-                    &mut finished,
-                    pool::PoolPhaseChange {
-                        phase: PoolPhase::Deleted,
-                        reason: Some(reason.clone()),
-                        at: now_ms(),
-                    },
-                );
-                schedule::settle_orphaned_lease(&mut state.jobs, now_ms(), &name, &reason);
-                state.members.retain(|member| member.name != name);
-                state.leases.retain(|slot| slot.name != name);
-                for job in state.jobs.iter_mut() {
-                    if job.target.as_deref() == Some(name.as_str())
-                        && job.run_id.is_some()
-                        && job.archive.is_none()
-                        && job.archive_skipped.is_none()
-                    {
-                        job.archive_skipped = Some(reason.clone());
-                    }
-                }
-                Ok(())
-            })
-            .await?;
-            runtime.tunnels.close(&name);
-            runtime.tailcat.close(&name);
-            if let Err(error) = self.registry().remove(&name) {
-                report.errors.push(format!("{name}: reconcile: {error}"));
+            if !exists {
+                let reason = if pool.is_some() {
+                    format!(
+                        "pool {} still exists but its {} lease made no progress for {}s and the provider no longer lists its server",
+                        lease.pool,
+                        phase_label(&lease),
+                        lease.stale_for_ms(now) / 1000
+                    )
+                } else {
+                    format!(
+                        "pool {} was removed and the provider no longer lists its server",
+                        lease.pool
+                    )
+                };
+                self.settle_reconciled(runtime, Retirement { lease, reason }, report)
+                    .await?;
+                continue;
             }
-            report.reconciled.push((name, reason));
+            // A live server is only retired when a bounded wait, not age alone, requires it.
+            if pool.is_none() {
+                continue;
+            }
+            if let Some(reason) = bounded {
+                self.retire_live(runtime, Retirement { lease, reason }, report)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a lease as `deleted` after its server was confirmed gone, settle every run that
+    /// can no longer be observed, and drop the member, tunnel and target registration.
+    async fn settle_reconciled(
+        &self,
+        runtime: &PoolRuntime,
+        retirement: Retirement,
+        report: &mut PoolReport,
+    ) -> Result<(), HubError> {
+        let Retirement { lease, reason } = retirement;
+        let name = lease.name.clone();
+        let mut finished = lease;
+        self.mutate(|state| {
+            pool::record_lease_phase(
+                state,
+                &mut finished,
+                pool::PoolPhaseChange {
+                    phase: PoolPhase::Deleted,
+                    reason: Some(reason.clone()),
+                    at: now_ms(),
+                },
+            );
+            schedule::settle_orphaned_lease(&mut state.jobs, now_ms(), &name, &reason);
+            state.members.retain(|member| member.name != name);
+            state.leases.retain(|slot| slot.name != name);
+            for job in state.jobs.iter_mut() {
+                if job.target.as_deref() == Some(name.as_str())
+                    && job.run_id.is_some()
+                    && job.archive.is_none()
+                    && job.archive_skipped.is_none()
+                {
+                    job.archive_skipped = Some(reason.clone());
+                }
+            }
+            Ok(())
+        })
+        .await?;
+        runtime.tunnels.close(&name);
+        runtime.tailcat.close(&name);
+        if let Err(error) = self.registry().remove(&name) {
+            report.errors.push(format!("{name}: reconcile: {error}"));
+        }
+        report.reconciled.push((name, reason));
+        Ok(())
+    }
+
+    /// Retire a lease whose bounded wait expired while the provider still lists its server.
+    /// The intent is recorded as `draining` before the delete call, so an interrupted pass
+    /// leaves a visible reason instead of a lease that looks healthy. A confirmed delete
+    /// transitions to `deleting` and the ordinary delete step awaits the provider action and
+    /// removes the firewall. A failed delete keeps the lease in `draining` with the provider's
+    /// error, so the next pass retries rather than leaking a running server.
+    async fn retire_live(
+        &self,
+        runtime: &PoolRuntime,
+        retirement: Retirement,
+        report: &mut PoolReport,
+    ) -> Result<(), HubError> {
+        let Retirement { lease, reason } = retirement;
+        let name = lease.name.clone();
+        let now = now_ms();
+        let mut intent = lease.clone();
+        intent.drain_started_ms.get_or_insert(now);
+        intent.advance(LeasePhase::Draining);
+        intent.event_phase = Some(PoolPhase::Draining);
+        intent.progress_at_ms = now;
+        intent.error = Some(reason.clone());
+        intent.retirement_reason = Some(reason.clone());
+        // Record the transition from the phase the lease actually had; `intent` already holds
+        // the resulting draining phase so the later `deleted` event chains from it.
+        let mut stored = intent.clone();
+        stored.event_phase = lease.event_phase;
+        stored.progress_at_ms = lease.progress_at_ms;
+        let event_reason = reason.clone();
+        let target_name = name.clone();
+        self.mutate(move |state| {
+            pool::record_lease_phase(
+                state,
+                &mut stored,
+                pool::PoolPhaseChange {
+                    phase: PoolPhase::Draining,
+                    reason: Some(event_reason),
+                    at: now,
+                },
+            );
+            if let Some(member) = state
+                .members
+                .iter_mut()
+                .find(|member| member.name == target_name)
+            {
+                member.state = MemberState::Drain;
+            }
+            if let Some(slot) = state
+                .leases
+                .iter_mut()
+                .find(|slot| slot.name == target_name)
+            {
+                *slot = stored.clone();
+            }
+            Ok(())
+        })
+        .await?;
+        let Some(server_id) = lease.server_id else {
+            return Ok(());
+        };
+        let resource = resource(ResourceKind::Server, server_id, &lease);
+        match runtime.provisioner.destroy(&resource).await {
+            Ok(action_id) => {
+                let mut finished = intent;
+                finished.action_id = action_id;
+                if action_id.is_none() {
+                    finished.server_id = None;
+                }
+                finished.advance(LeasePhase::Deleting);
+                let target_name = name.clone();
+                let settle_reason = reason.clone();
+                self.mutate(move |state| {
+                    schedule::settle_retired_lease(
+                        &mut state.jobs,
+                        now_ms(),
+                        schedule::LeaseRetirement {
+                            member: &target_name,
+                            reason: &settle_reason,
+                            classification: schedule::CLASSIFIED_LEASE_RETIRED,
+                        },
+                    );
+                    state.members.retain(|member| member.name != target_name);
+                    for job in state.jobs.iter_mut() {
+                        if job.target.as_deref() == Some(target_name.as_str())
+                            && job.run_id.is_some()
+                            && job.archive.is_none()
+                            && job.archive_skipped.is_none()
+                        {
+                            job.archive_skipped = Some(settle_reason.clone());
+                        }
+                    }
+                    if let Some(slot) = state
+                        .leases
+                        .iter_mut()
+                        .find(|slot| slot.name == target_name)
+                    {
+                        *slot = finished;
+                    }
+                    Ok(())
+                })
+                .await?;
+                runtime.tunnels.close(&name);
+                runtime.tailcat.close(&name);
+                if let Err(error) = self.registry().remove(&name) {
+                    report.errors.push(format!("{name}: reconcile: {error}"));
+                }
+                report.reconciled.push((name, reason));
+            }
+            Err(error) => {
+                let mut failed = intent;
+                failed.retry(now, Some(format!("retiring: {error}")));
+                let target_name = name.clone();
+                self.mutate(move |state| {
+                    if let Some(slot) = state
+                        .leases
+                        .iter_mut()
+                        .find(|slot| slot.name == target_name)
+                    {
+                        *slot = failed;
+                    }
+                    Ok(())
+                })
+                .await?;
+                report.errors.push(format!(
+                    "{name}: reconcile: the server could not be deleted: {error}"
+                ));
+            }
         }
         Ok(())
     }
@@ -1422,6 +1601,65 @@ fn target_registry(error: impl std::fmt::Display) -> HubError {
     HubError::storage("target registry", error)
 }
 
+/// The phase an operator sees for a lease: its recorded event phase when it has one, otherwise
+/// the setup phase the lease is currently in.
+fn phase_label(lease: &Lease) -> &'static str {
+    match lease.event_phase {
+        Some(PoolPhase::Requested) => "requested",
+        Some(PoolPhase::Creating) => "creating",
+        Some(PoolPhase::Booting) => "booting",
+        Some(PoolPhase::Preparing) => "preparing",
+        Some(PoolPhase::Ready) => "ready",
+        Some(PoolPhase::InUse) => "in_use",
+        Some(PoolPhase::Idle) => "idle",
+        Some(PoolPhase::Draining) => "draining",
+        Some(PoolPhase::Deleted) => "deleted",
+        Some(PoolPhase::Failed) => "failed",
+        _ => match lease.phase {
+            LeasePhase::Creating => "creating",
+            LeasePhase::Booting => "booting",
+            LeasePhase::Connecting => "connecting",
+            LeasePhase::Active => "active",
+            LeasePhase::Draining => "draining",
+            LeasePhase::Deleting => "deleting",
+        },
+    }
+}
+
+/// Why a lease must be retired even though its server still exists: it stayed in
+/// `connecting`/`preparing` past its pool's `waitMaxMs`, or in `draining` past the drain
+/// deadline. Age alone never deletes a live server.
+fn bounded_wait_reason(pool: &Pool, lease: &Lease, now: u64) -> Option<String> {
+    match lease.phase {
+        LeasePhase::Connecting => {
+            let wait = pool.wait_max_ms?;
+            let waited = now.saturating_sub(lease.created_at_ms);
+            (waited >= wait).then(|| {
+                format!(
+                    "pool {} retired its {} lease after {}s without reaching the target (wait-max {}s)",
+                    pool.name,
+                    phase_label(lease),
+                    waited / 1000,
+                    wait / 1000
+                )
+            })
+        }
+        LeasePhase::Draining => {
+            let since = lease.drain_started_ms.unwrap_or(lease.created_at_ms);
+            let draining = now.saturating_sub(since);
+            (draining >= DRAIN_TIMEOUT_MS).then(|| {
+                format!(
+                    "pool {} retired its draining lease after {}s past the {}s drain deadline",
+                    pool.name,
+                    draining / 1000,
+                    DRAIN_TIMEOUT_MS / 1000
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
 impl HubService {
     /// Add a pool after checking its server types and locations against the provider's
     /// catalog, which needs the provider token.
@@ -1440,6 +1678,7 @@ impl HubService {
             locations,
             multi_arch: request.multi_arch,
             wait_max_ms: request.wait_max_ms,
+            stale_lease_ms: request.stale_lease_ms,
             image: request.image,
             target_image: request.target_image,
             max: request.max,

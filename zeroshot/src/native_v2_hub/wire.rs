@@ -33,6 +33,10 @@ pub(crate) struct AddPool {
     pub multi_arch: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_max_ms: Option<u64>,
+    /// Grace period before a lease with no provider server is retired while its pool still
+    /// exists.
+    #[serde(default = "super::pool::default_stale_lease_ms")]
+    pub stale_lease_ms: u64,
     pub image: String,
     pub target_image: String,
     pub max: u32,

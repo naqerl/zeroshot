@@ -266,6 +266,8 @@ pub(crate) struct LostTarget {
 pub(crate) const CLASSIFIED_MEMBER_ABSENT: &str = "member_absent";
 pub(crate) const CLASSIFIED_PROVIDER_ABSENT: &str = "provider_confirmed_absent";
 pub(crate) const CLASSIFIED_ENDPOINT_REFUSED: &str = "endpoint_refused";
+/// A bounded wait retired a lease whose provider server still existed.
+pub(crate) const CLASSIFIED_LEASE_RETIRED: &str = "lease_retired";
 pub(crate) const CLASSIFIED_STALLED: &str = "stalled";
 
 /// A lost-target candidate the reaper kept running, with the reason it withheld action.
@@ -350,27 +352,53 @@ pub(crate) fn settle_lost_targets(
     failed
 }
 
-/// Fail the runs still placing on a lease that the hub gave up: its pool was removed and the
-/// provider confirmed its server is gone, so nothing can observe, stop or archive them any more.
+/// A lease the hub is giving up and the observation that authorizes failing its runs.
+pub(crate) struct LeaseRetirement<'a> {
+    pub member: &'a str,
+    pub reason: &'a str,
+    pub classification: &'static str,
+}
+
+/// Fail the runs still placing on a lease that the hub gave up. The classification names the
+/// actual observation: a provider-confirmed absent server for an orphaned lease, or a bounded
+/// wait that retired a live server.
+pub(crate) fn settle_retired_lease(
+    jobs: &mut [Job],
+    now_ms: u64,
+    retirement: LeaseRetirement<'_>,
+) -> Vec<Value> {
+    let mut failed = Vec::new();
+    for job in jobs.iter_mut() {
+        if job.state != JobState::Running || job.target.as_deref() != Some(retirement.member) {
+            continue;
+        }
+        failed.push(fail_job(
+            job,
+            now_ms,
+            retirement.classification,
+            format!("{}; {} is retired", retirement.reason, retirement.member),
+        ));
+    }
+    failed
+}
+
+/// Fail the runs still placing on a lease whose pool was removed and whose provider server is
+/// confirmed gone.
 pub(crate) fn settle_orphaned_lease(
     jobs: &mut [Job],
     now_ms: u64,
     member: &str,
     evidence: &str,
 ) -> Vec<Value> {
-    let mut failed = Vec::new();
-    for job in jobs.iter_mut() {
-        if job.state != JobState::Running || job.target.as_deref() != Some(member) {
-            continue;
-        }
-        failed.push(fail_job(
-            job,
-            now_ms,
-            CLASSIFIED_PROVIDER_ABSENT,
-            format!("{evidence}; {member} is retired"),
-        ));
-    }
-    failed
+    settle_retired_lease(
+        jobs,
+        now_ms,
+        LeaseRetirement {
+            member,
+            reason: evidence,
+            classification: CLASSIFIED_PROVIDER_ABSENT,
+        },
+    )
 }
 
 /// Record one target-lost failure, naming the observation that decided it. `detail` explains

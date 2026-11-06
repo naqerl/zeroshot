@@ -932,8 +932,12 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   `resumed`, `blocked`, `shortage`; `removed` waits for every lease of the pool to be deleted.
   Each pass reconciles a lease whose pool was removed and whose server the provider no longer lists
   into `deleted` with its reason, failing any run still placing there with
-  `failureClassification: provider_confirmed_absent`; a live server, a lease in an existing pool, and
-  an inconclusive provider answer all leave the lease alone.
+  `failureClassification: provider_confirmed_absent`. A lease in an existing pool is retired the
+  same way after its pool's `staleLeaseMs` passes without progress and the provider no longer lists
+  its server, and a bounded `waitMaxMs`/drain deadline retires it even while the server exists by
+  recording the draining intent and deleting that server; a failed delete keeps it draining with
+  the provider error and backoff, and its runs are classified `lease_retired`. An inconclusive
+  provider answer always leaves the lease alone.
   MCP publishes them as `hub.pool` events from `hub pool list`, so no caller polls for readiness. The
   API token comes from `--hetzner-token-file` or `HCLOUD_TOKEN` and is never stored. Labels carry
   IDs, server type and location only. The hub registers the pool's public key with the provider,

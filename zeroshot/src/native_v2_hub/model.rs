@@ -452,8 +452,9 @@ pub(crate) struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
     /// Which decisive observation failed this job, when the hub's own reaper did: `member_absent`,
-    /// `provider_confirmed_absent`, `endpoint_refused`, or `probe_unreachable`. Kept apart from
-    /// the run's `failure_reason` so a lost target is never mistaken for a run failure.
+    /// `provider_confirmed_absent`, `lease_retired`, `endpoint_refused`, or `probe_unreachable`.
+    /// Kept apart from the run's `failure_reason` so a lost target is never mistaken for a run
+    /// failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_classification: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

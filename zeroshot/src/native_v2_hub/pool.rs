@@ -28,6 +28,13 @@ pub(crate) const LABEL_SERVER_TYPE: &str = "zeroshot/server-type";
 pub(crate) const LABEL_LOCATION: &str = "zeroshot/location";
 /// How long a new server may take to boot and answer target discovery.
 pub(crate) const BOOT_DEADLINE_MS: u64 = 15 * 60_000;
+/// Default grace period before a lease with no provider server is retired even though its pool
+/// still exists. A slow boot or a short provider visibility gap is not retired.
+pub(crate) const DEFAULT_STALE_LEASE_MS: u64 = 30 * 60_000;
+
+pub(crate) const fn default_stale_lease_ms() -> u64 {
+    DEFAULT_STALE_LEASE_MS
+}
 /// Longest wait between two provider polls of one lease.
 const MAX_BACKOFF_MS: u64 = 60_000;
 /// Pool lifecycle records kept for the `events/list` stream and `hub pool list`.
@@ -157,6 +164,11 @@ pub(crate) struct Pool {
     /// A queued job this pool serves expires after waiting this long for a server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_max_ms: Option<u64>,
+    /// A lease this old, or one that has made no progress for this long, is retired when the
+    /// provider no longer lists its server, even while its pool still exists. Defaults to
+    /// thirty minutes.
+    #[serde(default = "default_stale_lease_ms")]
+    pub stale_lease_ms: u64,
     /// Provider image: a snapshot ID or an image name such as `docker-ce`.
     pub image: String,
     /// Pinned `zeroshot-target` image reference the server runs.
@@ -284,6 +296,7 @@ impl Pool {
             "locations": self.locations,
             "multiArch": self.multi_arch,
             "waitMaxMs": self.wait_max_ms,
+            "staleLeaseMs": self.stale_lease_ms,
             "image": self.image,
             "targetImage": self.target_image,
             "max": self.max,
@@ -365,6 +378,10 @@ pub(crate) struct Lease {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub transport_logged: bool,
     pub created_at_ms: u64,
+    /// When the lease last recorded a phase change. State written before this field existed
+    /// falls back to `created_at_ms`.
+    #[serde(default)]
+    pub progress_at_ms: u64,
     /// When the lease entered draining, so archive retries are bounded even when a target
     /// never answers again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -387,6 +404,10 @@ pub(crate) struct Lease {
     pub next_attempt_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Why a bounded-wait reconciliation is retiring this lease; carried onto the final
+    /// `deleted` event so the operator sees the same reason through the whole deletion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirement_reason: Option<String>,
     /// The machine the job that started this lease needs, and why.
     #[serde(default)]
     pub spec: Spec,
@@ -502,6 +523,7 @@ pub(crate) fn record_lease_phase(
         prior = Some(step);
     }
     lease.event_phase = Some(change.phase);
+    lease.progress_at_ms = change.at;
     true
 }
 
@@ -566,6 +588,7 @@ impl Lease {
             transport: pool.transport,
             transport_logged: false,
             created_at_ms: now,
+            progress_at_ms: now,
             drain_started_ms: None,
             server_id: None,
             firewall_id: None,
@@ -575,6 +598,7 @@ impl Lease {
             attempts: 0,
             next_attempt_ms: None,
             error: None,
+            retirement_reason: None,
             spec: Spec::default(),
             machine: None,
             event_phase: None,
@@ -591,6 +615,17 @@ impl Lease {
 
     pub(crate) fn due(&self, now: u64) -> bool {
         self.next_attempt_ms.is_none_or(|at| at <= now)
+    }
+
+    /// How long the lease has gone without making progress. A state written before progress was
+    /// tracked falls back to its creation time, and a lease that changed phase inside the grace
+    /// window is never made eligible by an older creation time.
+    pub(crate) fn stale_for_ms(&self, now: u64) -> u64 {
+        if self.progress_at_ms == 0 {
+            now.saturating_sub(self.created_at_ms)
+        } else {
+            now.saturating_sub(self.progress_at_ms)
+        }
     }
 
     /// Record a step that must be retried later, with exponential backoff.
