@@ -146,10 +146,11 @@ The delivery verifier cannot have authored `instructions`, must use `attempts: 1
 the output, signals, and diagnostic of its worker's fixed contract. `zeroshot template show
 software-change --pr` prints a delivery node with the current contract.
 
-A graph can contain at most one delivery node, and no other executable node may run in parallel with
-it, either as a `par` sibling or inside a `map` that can have more than one item. A hosting service
-may require exactly one delivery node; Zeroshot Cloud quick runs require one. See
-[concurrent workspace changes](../concepts/execution.md#concurrent-workspace-changes).
+A graph permits at most one delivery node per execution path. Mutually exclusive `choice` branches
+may each carry one, but no other executable node may run in parallel with a delivery node, either as
+a `par` sibling or inside a `map` that can have more than one item. A hosting service may require at
+least one delivery node; Zeroshot Cloud quick runs require one, and merge profiles require exactly
+one. See [concurrent workspace changes](../concepts/execution.md#concurrent-workspace-changes).
 
 `ignore` skips pull-request discussion. CI, conflict, freshness, and merge-policy checks still apply.
 

@@ -15,9 +15,14 @@ use super::{WorkspaceError as ApiError, BuiltinGraphTemplate, TemplateDelivery};
 pub(super) fn templates() -> Result<Vec<Value>, ApiError> {
     let mut result = Vec::new();
     for template in BuiltinGraphTemplate::all() {
+        if *template == BuiltinGraphTemplate::SoftwareChangeFast {
+            // The editor has no review-policy/cap controls yet; exposing the default-always
+            // variants would only duplicate software-change.
+            continue;
+        }
         let deliveries = match template {
             BuiltinGraphTemplate::SingleWorker => &[TemplateDelivery::None][..],
-            BuiltinGraphTemplate::SoftwareChange => &[
+            BuiltinGraphTemplate::SoftwareChange | BuiltinGraphTemplate::SoftwareChangeFast => &[
                 TemplateDelivery::PullRequest,
                 TemplateDelivery::None,
                 TemplateDelivery::Push,
@@ -64,8 +69,12 @@ fn template_bindings(
         }
         pending.extend(graph_node_children(node));
     }
-    if let Some((name, binding)) = template
-        .delivery_runtime_binding(delivery)
+    for (name, binding) in template
+        .delivery_runtime_bindings_with_feedback(
+            delivery,
+            crate::native_v2_contract::PullRequestFeedback::Consider,
+            Default::default(),
+        )
         .map_err(internal)?
     {
         bindings.insert(
@@ -160,6 +169,7 @@ fn template_label(template: BuiltinGraphTemplate, delivery: TemplateDelivery) ->
     match template {
         BuiltinGraphTemplate::SingleWorker => "Single worker",
         BuiltinGraphTemplate::SoftwareChange => software_change_label(delivery),
+        BuiltinGraphTemplate::SoftwareChangeFast => software_change_fast_label(delivery),
         BuiltinGraphTemplate::AutoResearch => {
             if delivery == TemplateDelivery::Push {
                 "Auto research · push"
@@ -189,6 +199,15 @@ fn software_change_label(delivery: TemplateDelivery) -> &'static str {
         TemplateDelivery::PullRequest => "Software change · pull request",
         TemplateDelivery::Merge => "Software change · merge",
         _ => "Software change",
+    }
+}
+
+fn software_change_fast_label(delivery: TemplateDelivery) -> &'static str {
+    match delivery {
+        TemplateDelivery::Push => "Software change fast · push",
+        TemplateDelivery::PullRequest => "Software change fast · pull request",
+        TemplateDelivery::Merge => "Software change fast · merge",
+        _ => "Software change fast",
     }
 }
 

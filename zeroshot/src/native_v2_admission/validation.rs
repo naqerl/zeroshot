@@ -32,6 +32,7 @@ pub(super) fn validate_executable_bindings(
     declarations: &[ExecutableDeclaration],
     runtime: &RuntimePlan,
     delivery_policy: DeliveryPolicy,
+    root: &openengine_cluster_protocol::GraphNode,
 ) -> Result<(), NativeV2AdmissionError> {
     runtime
         .active_memory()
@@ -51,7 +52,7 @@ pub(super) fn validate_executable_bindings(
     validate_attempts(declarations)?;
     validate_binding_coverage(declarations, bindings)?;
     validate_binding_kinds(declarations, bindings)?;
-    validate_delivery_policy(delivery_policy, declarations)?;
+    validate_delivery_policy(delivery_policy, declarations, root)?;
     validate_declared_environment(runtime, None)
 }
 
@@ -267,14 +268,16 @@ fn validate_instructions(
 fn validate_delivery_policy(
     policy: DeliveryPolicy,
     declarations: &[ExecutableDeclaration],
+    root: &openengine_cluster_protocol::GraphNode,
 ) -> Result<(), NativeV2AdmissionError> {
     let found = declarations
         .iter()
         .filter(|declaration| is_trusted_delivery_worker(&declaration.worker))
         .count();
+    let exclusive = super::concurrency::max_delivery_nodes_per_path(root)? <= 1;
     let accepted = match policy {
-        DeliveryPolicy::Optional => found <= 1,
-        DeliveryPolicy::Required => found == 1,
+        DeliveryPolicy::Optional => found <= 1 || exclusive,
+        DeliveryPolicy::Required => found >= 1 && exclusive,
     };
     if !accepted {
         return Err(NativeV2AdmissionError::DeliveryNodeCount { policy, found });
@@ -298,14 +301,13 @@ fn is_git_delivery_worker(worker: &WorkerRef) -> bool {
     )
 }
 
-pub(crate) fn sole_delivery_node(admitted: &AdmittedRun) -> Option<(NodeName, DeliveryMode)> {
-    let mut deliveries = executable_declarations(&admitted.graph.root)
+pub(crate) fn delivery_nodes(admitted: &AdmittedRun) -> Vec<(NodeName, DeliveryMode)> {
+    executable_declarations(&admitted.graph.root)
         .into_iter()
         .filter_map(|declaration| {
             DeliveryMode::from_worker(&declaration.worker).map(|mode| (declaration.name, mode))
-        });
-    let selected = deliveries.next()?;
-    deliveries.next().is_none().then_some(selected)
+        })
+        .collect()
 }
 
 pub(crate) fn writer_nodes(admitted: &AdmittedRun) -> BTreeSet<NodeName> {

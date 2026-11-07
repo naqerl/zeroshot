@@ -1,5 +1,12 @@
 use super::*;
 
+fn selected_state<'a>(value: &DataSelector, context: &'a Context) -> Option<&'a Value> {
+    match value {
+        DataSelector::State { path } => select(&context.state, path).ok(),
+        DataSelector::Item { .. } => None,
+    }
+}
+
 impl Engine<'_> {
     pub(super) fn guard(
         &self,
@@ -48,6 +55,32 @@ impl Engine<'_> {
                 })
                 .count() as u64
                 >= count.get()),
+            Guard::Compare {
+                value,
+                at_least,
+                at_most,
+            } => {
+                let Some(selected) = selected_state(value, context) else {
+                    return Ok(false);
+                };
+                Ok(selected
+                    .as_i64()
+                    .is_some_and(|value| value >= *at_least && value <= *at_most))
+            }
+            Guard::StateIn { value, labels } => {
+                let Some(selected) = selected_state(value, context) else {
+                    return Ok(false);
+                };
+                let matched = if let Some(value) = selected.as_str() {
+                    labels.values().iter().any(|label| label.as_str() == value)
+                } else if let Some(value) = selected.as_bool() {
+                    let value = if value { "true" } else { "false" };
+                    labels.values().iter().any(|label| label.as_str() == value)
+                } else {
+                    false
+                };
+                Ok(matched)
+            }
         }
     }
 
@@ -192,5 +225,20 @@ impl Engine<'_> {
                 self.push_void_decision(execution, reason);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_state_selector_is_not_selected() {
+        let context = Context::new(serde_json::json!({}));
+        let path = FieldPath::new(vec![
+            openengine_cluster_protocol::FieldName::new("missing").expect("field"),
+        ])
+        .expect("path");
+        assert!(selected_state(&DataSelector::State { path }, &context).is_none());
     }
 }

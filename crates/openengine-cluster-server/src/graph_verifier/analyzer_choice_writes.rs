@@ -243,6 +243,7 @@ pub(super) fn guarded_selector_uses(
         match guard {
             Guard::In { value, .. } => uses.push((value, false, condition)),
             Guard::KOfMap { value, .. } => uses.push((value, true, condition)),
+            Guard::Compare { .. } | Guard::StateIn { .. } => {}
             Guard::KOfN { values, .. } => uses.extend(
                 values
                     .as_slice()

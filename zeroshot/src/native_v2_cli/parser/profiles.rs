@@ -75,5 +75,7 @@ pub(super) struct ProfileSetArgs {
     #[command(flatten)]
     pub(super) delivery: DeliveryArgs,
     #[command(flatten)]
+    pub(super) fast: super::FastTemplateArgs,
+    #[command(flatten)]
     pub(super) route: ProfileRouteArgs,
 }

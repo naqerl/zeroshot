@@ -510,8 +510,13 @@ fn materialize_graph(selection: &RunGraph) -> Result<GraphSpec, NativeV2CliError
     match selection {
         RunGraph::File(path) => read_json("graph", path),
         RunGraph::Template {
-            template, delivery, ..
-        } => template.materialize(*delivery).map_err(template_error),
+            template,
+            delivery,
+            parameters,
+            ..
+        } => template
+            .materialize_with_parameters(*delivery, *parameters)
+            .map_err(template_error),
     }
 }
 
@@ -555,17 +560,17 @@ fn apply_template_runtime(
         template,
         delivery,
         ignore_pr_feedback,
+        parameters,
     } = selection
     else {
         return Ok(runtime);
     };
-    let Some((name, binding)) = template
-        .delivery_runtime_binding_with_feedback(*delivery, feedback)
+    for (name, binding) in template
+        .delivery_runtime_bindings_with_feedback(*delivery, feedback, *parameters)
         .map_err(template_error)?
-    else {
-        return Ok(runtime);
-    };
-    insert_template_binding(&mut runtime, name, binding, *ignore_pr_feedback)?;
+    {
+        insert_template_binding(&mut runtime, name, binding, *ignore_pr_feedback)?;
+    }
     Ok(runtime)
 }
 

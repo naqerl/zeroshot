@@ -72,13 +72,19 @@ read and stop commands.
 
 ## Built-in templates are ordinary graphs
 
-The executable contains `single-worker`, `software-change`, and `auto-research`. Each produces the
-public `GraphSpec` that custom submissions use:
+The executable contains `single-worker`, `software-change`, `software-change-fast`,
+`auto-research`, `issue-review`, and `pr-review`. Each produces the public `GraphSpec` that custom
+submissions use:
 
 ```console
 zeroshot template list
 zeroshot template show software-change
 ```
+
+`software-change-fast` keeps the same review loop by default (`--review-policy always`).
+`--review-policy by_radius` uses a read-only blast-radius judge and sends only a small,
+high-confidence, checked change within `--max-files`/`--max-lines` (defaults 3/80) straight to
+delivery. Its category denylist is prompt-level; the graph enforces the numeric caps.
 
 `software-change` has four delivery choices. The default keeps the accepted change local. `--push`
 publishes the managed run branch without opening a pull request. `--pr` opens or updates a pull

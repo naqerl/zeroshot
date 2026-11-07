@@ -59,6 +59,15 @@ pub(super) fn runtime_for(
     delivery: TemplateDelivery,
     leaves: &[&GraphNode],
 ) -> RuntimePlan {
+    runtime_for_parameters(template, delivery, leaves, Default::default())
+}
+
+pub(super) fn runtime_for_parameters(
+    template: BuiltinGraphTemplate,
+    delivery: TemplateDelivery,
+    leaves: &[&GraphNode],
+    parameters: SoftwareChangeFastParameters,
+) -> RuntimePlan {
     let mut nodes = leaves
         .iter()
         .filter(|node| match node {
@@ -67,7 +76,14 @@ pub(super) fn runtime_for(
         })
         .map(|node| (node.name().clone(), agent_binding()))
         .collect::<BTreeMap<_, _>>();
-    if let Some((name, binding)) = template.delivery_runtime_binding(delivery).assert_value() {
+    for (name, binding) in template
+        .delivery_runtime_bindings_with_feedback(
+            delivery,
+            crate::native_v2_contract::PullRequestFeedback::Consider,
+            parameters,
+        )
+        .assert_value()
+    {
         nodes.insert(name, binding);
     }
     RuntimePlan::Codex {
@@ -170,6 +186,36 @@ pub(super) fn settled_agent(spec: SettledExecutionSpec<'_>) -> DurableExecution 
         spec,
         WorkerOutcome::Verified {
             output: serde_json::Value::Null,
+            artifacts: Vec::new(),
+        },
+    )
+}
+
+pub(super) fn settled_agent_with_output(
+    spec: SettledExecutionSpec<'_>,
+    output: serde_json::Value,
+) -> DurableExecution {
+    settled_execution(
+        spec,
+        WorkerOutcome::Verified {
+            output,
+            artifacts: Vec::new(),
+        },
+    )
+}
+
+pub(super) fn settled_verifier(
+    spec: SettledExecutionSpec<'_>,
+    output: serde_json::Value,
+    signals: BTreeMap<FieldName, EnumLabel>,
+    diagnostic: serde_json::Value,
+) -> DurableExecution {
+    settled_execution(
+        spec,
+        WorkerOutcome::Verifier {
+            output,
+            signals,
+            diagnostic,
             artifacts: Vec::new(),
         },
     )

@@ -26,7 +26,7 @@ use crate::full_v1_reducer::{
     Decision, DurableExecution, DurableExecutionState, ExecutionId, ExecutionVoidReason,
     FullV1Reducer, HistoryPosition, ReducerError, ReductionInput,
 };
-use crate::native_v2_admission::{DeliveryPolicy, sole_delivery_node, writer_nodes};
+use crate::native_v2_admission::{delivery_nodes, DeliveryPolicy, writer_nodes};
 use crate::native_v2_contract::{AdmittedRun, ExecutionRef, NodeCompletion, NodeInvocation};
 use crate::native_v2_delivery::is_matching_success_receipt;
 use crate::native_v2_runner::{
@@ -519,7 +519,7 @@ fn enforce_delivery_terminal(
     terminal: TerminalResult,
 ) -> Result<TerminalResult, NativeV2SupervisorError> {
     let requires_delivery_receipt = policy == DeliveryPolicy::Required
-        || sole_delivery_node(admitted).is_some()
+        || !delivery_nodes(admitted).is_empty()
         || crate::native_v2_admission::comment_node(&admitted.graph.root).is_some();
     let accepted = match &terminal {
         TerminalResult::Succeeded { output } if requires_delivery_receipt => {
@@ -542,15 +542,12 @@ fn has_required_delivery_receipt(
     snapshot: &RunSnapshot,
     terminal_output: &Value,
 ) -> bool {
-    let node = sole_delivery_node(admitted)
-        .map(|(node, _)| node)
-        .or_else(|| {
-            crate::native_v2_admission::comment_node(&admitted.graph.root)
-                .map(|node| node.name.clone())
-        });
-    let Some(node) = node else {
+    let deliveries = delivery_nodes(admitted);
+    let comment = crate::native_v2_admission::comment_node(&admitted.graph.root)
+        .map(|node| node.name.clone());
+    if deliveries.is_empty() && comment.is_none() {
         return false;
-    };
+    }
     let writers = writer_nodes(admitted);
     let Ok(history) = durable_history(snapshot) else {
         return false;
@@ -567,7 +564,11 @@ fn has_required_delivery_receipt(
     else {
         return false;
     };
-    if last_writer.occurrence.node != node {
+    let delivery_mode = deliveries
+        .iter()
+        .find(|(node, _)| node == &last_writer.occurrence.node)
+        .map(|(_, mode)| *mode);
+    if delivery_mode.is_none() && comment.as_ref() != Some(&last_writer.occurrence.node) {
         return false;
     }
     let DurableExecutionState::Settled {
@@ -594,12 +595,16 @@ fn has_required_delivery_receipt(
         }
     });
     writers_settled
-        && receipt_matches_admission(admitted, output)
+        && receipt_matches_admission(admitted, output, delivery_mode)
         && contains_exact_value(terminal_output, output)
 }
 
-fn receipt_matches_admission(admitted: &AdmittedRun, output: &Value) -> bool {
-    if let Some((_, mode)) = sole_delivery_node(admitted) {
+fn receipt_matches_admission(
+    admitted: &AdmittedRun,
+    output: &Value,
+    delivery_mode: Option<crate::native_v2_delivery::DeliveryMode>,
+) -> bool {
+    if let Some(mode) = delivery_mode {
         return admitted
             .source
             .as_ref()

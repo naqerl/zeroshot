@@ -28,6 +28,7 @@ fn catalog_and_template_inputs_are_closed() {
         &[
             BuiltinGraphTemplate::SingleWorker,
             BuiltinGraphTemplate::SoftwareChange,
+            BuiltinGraphTemplate::SoftwareChangeFast,
             BuiltinGraphTemplate::AutoResearch,
             BuiltinGraphTemplate::IssueReview,
             BuiltinGraphTemplate::PrReview,
@@ -36,6 +37,10 @@ fn catalog_and_template_inputs_are_closed() {
     assert_eq!(
         BuiltinGraphTemplate::parse("software-change"),
         Some(BuiltinGraphTemplate::SoftwareChange)
+    );
+    assert_eq!(
+        BuiltinGraphTemplate::parse("software-change-fast"),
+        Some(BuiltinGraphTemplate::SoftwareChangeFast)
     );
     assert_eq!(
         BuiltinGraphTemplate::parse("auto-research"),
@@ -204,6 +209,443 @@ fn software_change_has_one_global_ten_cycle_budget() {
         assert_eq!(change_loop.max_iterations.get(), 10);
         assert!(change_loop.until.is_none());
     }
+}
+
+fn fast_parameters() -> SoftwareChangeFastParameters {
+    SoftwareChangeFastParameters {
+        review_policy: ReviewPolicy::ByRadius,
+        max_files: 3,
+        max_lines: 80,
+    }
+}
+
+fn fast_graph(delivery: TemplateDelivery) -> openengine_cluster_protocol::GraphSpec {
+    BuiltinGraphTemplate::SoftwareChangeFast
+        .materialize_with_parameters(delivery, fast_parameters())
+        .assert_value()
+}
+
+fn named_node<'a>(root: &'a GraphNode, name: &str) -> &'a GraphNode {
+    all_nodes(root)
+        .into_iter()
+        .find(|node| node.name().as_str() == name)
+        .assert_value_with(name)
+}
+
+fn contains_node(root: &GraphNode, name: &str) -> bool {
+    all_nodes(root)
+        .into_iter()
+        .any(|node| node.name().as_str() == name)
+}
+
+#[test]
+fn native_v2_templates_gate_is_discoverable() {
+    let baseline = BuiltinGraphTemplate::SoftwareChange
+        .materialize(TemplateDelivery::None)
+        .assert_value();
+    let fast = BuiltinGraphTemplate::SoftwareChangeFast
+        .materialize_with_parameters(TemplateDelivery::None, fast_parameters())
+        .assert_value();
+    assert_ne!(
+        serde_json::to_value(&baseline).assert_value(),
+        serde_json::to_value(&fast).assert_value(),
+        "by_radius must produce the fast graph, not the baseline"
+    );
+}
+
+#[test]
+fn software_change_fast_always_is_the_software_change_baseline() {
+    for delivery in [
+        TemplateDelivery::None,
+        TemplateDelivery::Push,
+        TemplateDelivery::PullRequest,
+        TemplateDelivery::Merge,
+    ] {
+        let baseline = BuiltinGraphTemplate::SoftwareChange
+            .materialize(delivery)
+            .assert_value();
+        let fast = BuiltinGraphTemplate::SoftwareChangeFast
+            .materialize_with_parameters(
+                delivery,
+                SoftwareChangeFastParameters {
+                    review_policy: ReviewPolicy::Always,
+                    ..fast_parameters()
+                },
+            )
+            .assert_value();
+        assert_eq!(
+            serde_json::to_value(&baseline).assert_value(),
+            serde_json::to_value(&fast).assert_value(),
+            "software-change-fast with review_policy=always must serialize exactly like software-change"
+        );
+    }
+}
+
+#[test]
+fn software_change_fast_by_radius_keeps_reviews_behind_the_large_branch() {
+    for delivery in [
+        TemplateDelivery::None,
+        TemplateDelivery::Push,
+        TemplateDelivery::PullRequest,
+        TemplateDelivery::Merge,
+    ] {
+        let graph = fast_graph(delivery);
+        let GraphNode::Choice(worker_result) = named_node(&graph.root, "worker_result") else {
+            panic!("worker_result must be a choice");
+        };
+        let GraphNode::Seq(blast) = worker_result.otherwise.as_ref().assert_value().as_ref() else {
+            panic!("worker_result otherwise must be the blast sequence");
+        };
+        assert_eq!(blast.name.as_str(), "blast");
+        assert_eq!(
+            blast
+                .children
+                .as_slice()
+                .iter()
+                .map(|node| node.name().as_str())
+                .collect::<Vec<_>>(),
+            ["jev", "blast_route"]
+        );
+
+        let GraphNode::Choice(blast_route) = named_node(&graph.root, "blast_route") else {
+            panic!("blast_route must be a choice");
+        };
+        assert_eq!(blast_route.branches.as_slice().len(), 1);
+        let small = &blast_route.branches.as_slice()[0];
+        assert!(!contains_node(&small.node, "parallel_reviews"));
+        assert!(contains_node(
+            blast_route.otherwise.as_ref().assert_value(),
+            "parallel_reviews"
+        ));
+        let small_accepts_delivery = if delivery == TemplateDelivery::None {
+            contains_node(&small.node, "small_done")
+        } else {
+            contains_node(&small.node, "small_deliver")
+        };
+        assert!(small_accepts_delivery);
+    }
+}
+
+#[test]
+fn jev_output_schema_and_write_bindings_are_closed() {
+    let graph = fast_graph(TemplateDelivery::None);
+    let GraphNode::Step(jev) = named_node(&graph.root, "jev") else {
+        panic!("jev must be a step");
+    };
+    assert_eq!(jev.worker.as_str(), "builtin.agent.jev@1");
+    let PayloadType::Record { fields } = &jev.output else {
+        panic!("jev output must be a record");
+    };
+    assert_eq!(
+        fields
+            .keys()
+            .map(|name| name.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "radius",
+            "confidence",
+            "touches",
+            "files",
+            "lines",
+            "checksReported",
+            "reasons",
+        ])
+    );
+    let written = jev
+        .write_bindings
+        .iter()
+        .filter_map(|binding| binding.target.segments().last())
+        .map(|name| name.as_str())
+        .collect::<BTreeSet<_>>();
+    for field in ["radius", "confidence", "files", "lines", "checksReported"] {
+        assert!(written.contains(field), "missing write binding for {field}");
+    }
+}
+
+async fn verified_fast_template(
+    delivery: TemplateDelivery,
+    parameters: SoftwareChangeFastParameters,
+) -> (
+    openengine_cluster_server::admission::VerifiedGraph,
+    serde_json::Value,
+) {
+    let template = BuiltinGraphTemplate::SoftwareChangeFast;
+    let graph = template
+        .materialize_with_parameters(delivery, parameters)
+        .assert_value();
+    let runtime = runtime_for_parameters(
+        template,
+        delivery,
+        &executable_leaves(&graph.root),
+        parameters,
+    );
+    let initial_input = if delivery == TemplateDelivery::None {
+        json!({"task":"repair checkout"})
+    } else {
+        json!({"task":"repair checkout","issueNumber":"208"})
+    };
+    let admitted = NativeV2Admission
+        .admit(RunSubmission {
+            environment: None,
+            title: RunTitle::new("Fast template behavior").assert_value(),
+            graph,
+            initial_input: initial_input.clone(),
+            runtime,
+            source: Some(resolved_source()),
+            submission_key: IdempotencyKey::new(format!(
+                "fast-template-behavior-{}",
+                delivery.name()
+            ))
+            .assert_value(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("fast template was not admissible: {error:?}"));
+    (
+        openengine_cluster_server::admission::VerifiedGraph {
+            compiled_ir: admitted.graph,
+            diagnostics: Vec::new(),
+        },
+        initial_input,
+    )
+}
+
+fn fast_worker_output(delivery: TemplateDelivery) -> serde_json::Value {
+    if delivery == TemplateDelivery::None {
+        json!({
+            "checksReported": true,
+            "acceptanceItems": [null, null],
+            "codeItems": [null, null],
+        })
+    } else {
+        json!({
+            "checksReported": true,
+            "acceptanceItems": [null, null],
+            "codeItems": [null, null],
+            "title": CHANGE_TITLE,
+            "description": CHANGE_DESCRIPTION,
+        })
+    }
+}
+
+fn settled_fast_worker(delivery: TemplateDelivery) -> DurableExecution {
+    settled_agent_with_output(
+        SettledExecutionSpec {
+            execution: 1,
+            node_instance: 1,
+            node: "worker",
+            settled_at: 1,
+            input: json!({
+                "task":"repair checkout", "phase":{},
+                "acceptanceFeedback":"", "codeFeedback":"", "deliveryFeedback":""
+            }),
+        },
+        fast_worker_output(delivery),
+    )
+}
+
+fn jev_output(
+    radius: &str,
+    confidence: &str,
+    files: i64,
+    lines: i64,
+    checks: bool,
+) -> serde_json::Value {
+    json!({
+        "radius": radius,
+        "confidence": confidence,
+        "touches": ["src/lib.rs"],
+        "files": files,
+        "lines": lines,
+        "checksReported": checks,
+        "reasons": "focused change",
+    })
+}
+
+fn settled_fast_review(
+    execution: u64,
+    node: &str,
+    verdict: &str,
+    diagnostic: &str,
+) -> DurableExecution {
+    let marker = if verdict == ACCEPTED_LABEL {
+        vec![serde_json::Value::Null, serde_json::Value::Null]
+    } else {
+        vec![serde_json::Value::Null]
+    };
+    let output = if node == "acceptance" {
+        json!({ "acceptanceItems": marker })
+    } else {
+        json!({ "codeItems": marker })
+    };
+    settled_verifier(
+        SettledExecutionSpec {
+            execution,
+            node_instance: execution,
+            node,
+            settled_at: execution,
+            input: json!({"task":"repair checkout","deliveryFeedback":""}),
+        },
+        output,
+        BTreeMap::from([(
+            field_name(VERDICT_FIELD).assert_value(),
+            enum_label(verdict).assert_value(),
+        )]),
+        json!({DIAGNOSTIC_MESSAGE_FIELD: diagnostic}),
+    )
+}
+
+fn settled_jev(output: serde_json::Value) -> DurableExecution {
+    settled_agent_with_output(
+        SettledExecutionSpec {
+            execution: 2,
+            node_instance: 2,
+            node: "jev",
+            settled_at: 2,
+            input: json!({"task":"repair checkout", "phase":{}, "checksReported": true}),
+        },
+        output,
+    )
+}
+
+#[tokio::test]
+async fn blast_route_sends_only_a_small_high_confidence_checked_change_to_delivery() {
+    let (verified, initial_input) =
+        verified_fast_template(TemplateDelivery::None, fast_parameters()).await;
+    let history = [
+        settled_fast_worker(TemplateDelivery::None),
+        settled_jev(jev_output("small", "high", 1, 10, true)),
+    ];
+    let reduction = reduce(&verified, &initial_input, &history);
+    assert_eq!(
+        reduction.terminal,
+        Some(TerminalProjection::Succeeded {
+            output: serde_json::Value::Null,
+        })
+    );
+    assert!(reduction.decisions.iter().all(|decision| !matches!(
+        decision,
+        Decision::Dispatch { occurrence, .. }
+            if matches!(occurrence.node.as_str(), "acceptance" | "code")
+    )));
+}
+
+#[tokio::test]
+async fn blast_route_small_change_dispatches_delivery_with_worker_metadata() {
+    let (verified, initial_input) =
+        verified_fast_template(TemplateDelivery::PullRequest, fast_parameters()).await;
+    let history = [
+        settled_fast_worker(TemplateDelivery::PullRequest),
+        settled_jev(jev_output("small", "high", 1, 10, true)),
+    ];
+    let reduction = reduce(&verified, &initial_input, &history);
+    assert_dispatch(&reduction, SMALL_DELIVERY_NODE, &delivery_input());
+}
+
+#[tokio::test]
+async fn blast_route_falls_back_to_reviews_for_each_failed_condition() {
+    let (verified, initial_input) =
+        verified_fast_template(TemplateDelivery::None, fast_parameters()).await;
+    let cases = [
+        ("large radius", jev_output("large", "high", 1, 10, true)),
+        ("low confidence", jev_output("small", "low", 1, 10, true)),
+        (
+            "checks not reported",
+            jev_output("small", "high", 1, 10, false),
+        ),
+        ("files over cap", jev_output("small", "high", 4, 10, true)),
+        ("lines over cap", jev_output("small", "high", 1, 81, true)),
+        ("negative files", jev_output("small", "high", -1, 10, true)),
+        ("negative lines", jev_output("small", "high", 1, -1, true)),
+    ];
+    for (reason, output) in cases {
+        let history = [
+            settled_fast_worker(TemplateDelivery::None),
+            settled_jev(output),
+        ];
+        let reduction = reduce(&verified, &initial_input, &history);
+        assert!(
+            reduction.terminal.is_none(),
+            "{reason} must not complete without review"
+        );
+        assert_dispatched_together(&reduction, &["acceptance", "code"]);
+    }
+}
+
+#[tokio::test]
+async fn fast_template_admits_every_delivery() {
+    for delivery in [
+        TemplateDelivery::None,
+        TemplateDelivery::Push,
+        TemplateDelivery::PullRequest,
+        TemplateDelivery::Merge,
+    ] {
+        let _ = verified_fast_template(delivery, fast_parameters()).await;
+    }
+}
+
+#[tokio::test]
+async fn accepted_large_reviews_reach_delivery_through_both_markers() {
+    let (verified, initial_input) =
+        verified_fast_template(TemplateDelivery::None, fast_parameters()).await;
+    let history = [
+        settled_fast_worker(TemplateDelivery::None),
+        settled_jev(jev_output("large", "high", 4, 120, true)),
+        settled_fast_review(3, "acceptance", ACCEPTED_LABEL, "requirements met"),
+        settled_fast_review(4, "code", ACCEPTED_LABEL, "implementation sound"),
+    ];
+    let reduction = reduce(&verified, &initial_input, &history);
+    assert_eq!(
+        reduction.terminal,
+        Some(TerminalProjection::Succeeded {
+            output: serde_json::Value::Null,
+        })
+    );
+    assert!(reduction.decisions.iter().all(|decision| !matches!(
+        decision,
+        Decision::Dispatch { occurrence, .. } if occurrence.node.as_str() == "worker"
+    )));
+}
+
+#[tokio::test]
+async fn rejected_reviews_clear_the_delivery_marker_and_dispatch_repair() {
+    let (verified, initial_input) =
+        verified_fast_template(TemplateDelivery::None, fast_parameters()).await;
+    let history = [
+        settled_fast_worker(TemplateDelivery::None),
+        settled_jev(jev_output("large", "high", 4, 120, true)),
+        settled_fast_review(
+            3,
+            "acceptance",
+            REJECTED_LABEL,
+            "missing requested behavior",
+        ),
+        settled_fast_review(4, "code", REJECTED_LABEL, "unsafe error handling"),
+    ];
+    let reduction = reduce(&verified, &initial_input, &history);
+    assert!(
+        reduction.terminal.is_none(),
+        "terminal: {:?}; decisions: {:?}",
+        reduction.terminal,
+        reduction.decisions
+    );
+    assert!(
+        reduction.decisions.iter().all(|decision| !matches!(
+            decision,
+            Decision::Dispatch { occurrence, .. } if occurrence.node.as_str() == DELIVERY_NODE
+        )),
+        "a rejected review must never reach delivery"
+    );
+    assert_dispatch(
+        &reduction,
+        "worker",
+        &json!({
+            "task":"repair checkout",
+            "phase":{"after":"rejected"},
+            "acceptanceFeedback":"missing requested behavior",
+            "codeFeedback":"unsafe error handling",
+            "deliveryFeedback":""
+        }),
+    );
 }
 
 #[tokio::test]

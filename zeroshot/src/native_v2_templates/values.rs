@@ -15,7 +15,8 @@ use super::{
     delivery_mode, enum_label, field_name, field_path, node_name, non_empty, static_value,
     BuiltinTemplateError, TemplateDelivery, ACCEPTANCE_FEEDBACK_FIELD, CODE_FEEDBACK_FIELD,
     DELIVERY_FEEDBACK_FIELD, DESCRIPTION_FIELD, DIAGNOSTIC_MESSAGE_FIELD, ISSUE_NUMBER_FIELD,
-    TASK_FIELD, TITLE_FIELD, PHASE_FIELD, CONTINUE_ITEMS_FIELD, verdict_labels,
+    TASK_FIELD, TITLE_FIELD, PHASE_FIELD, CONTINUE_ITEMS_FIELD, CHECKS_REPORTED_FIELD,
+    verdict_labels,
 };
 
 pub(super) fn graph(
@@ -127,7 +128,7 @@ pub(super) fn review_input_type() -> Result<PayloadType, BuiltinTemplateError> {
     ])
 }
 
-fn phase_type(delivery: TemplateDelivery) -> Result<PayloadType, BuiltinTemplateError> {
+pub(super) fn phase_type(delivery: TemplateDelivery) -> Result<PayloadType, BuiltinTemplateError> {
     let mut labels = verdict_labels()?.values().to_vec();
     if let Some(mode) = delivery_mode(delivery) {
         labels.extend(
@@ -145,6 +146,27 @@ fn phase_type(delivery: TemplateDelivery) -> Result<PayloadType, BuiltinTemplate
         },
         false,
     )])
+}
+
+pub(super) fn jev_input_type(
+    delivery: TemplateDelivery,
+) -> Result<PayloadType, BuiltinTemplateError> {
+    record_type(vec![
+        (TASK_FIELD, PayloadType::String, true),
+        (PHASE_FIELD, phase_type(delivery)?, true),
+        (CHECKS_REPORTED_FIELD, PayloadType::Boolean, false),
+    ])
+}
+
+pub(super) fn software_fast_worker_output_type(
+    delivery: TemplateDelivery,
+) -> Result<PayloadType, BuiltinTemplateError> {
+    let mut fields = vec![(CHECKS_REPORTED_FIELD, PayloadType::Boolean, true)];
+    if delivery_mode(delivery).is_some() {
+        fields.push((TITLE_FIELD, PayloadType::String, true));
+        fields.push((DESCRIPTION_FIELD, PayloadType::String, true));
+    }
+    record_type(fields)
 }
 
 pub(super) fn software_state(

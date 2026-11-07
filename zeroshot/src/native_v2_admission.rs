@@ -36,7 +36,8 @@ pub enum DeliveryPolicy {
     /// Local execution may leave changes in the run workspace.
     #[default]
     Optional,
-    /// Hosted execution requires exactly one graph-visible delivery node.
+    /// Hosted execution requires at least one graph-visible delivery node and at most one per
+    /// execution path; mutually exclusive Choice branches may each carry one.
     Required,
 }
 
@@ -108,6 +109,8 @@ pub enum NativeV2AdmissionError {
     },
     #[error("map {map} may execute Git delivery node {delivery} concurrently across items")]
     ConcurrentMapDelivery { map: NodeName, delivery: NodeName },
+    #[error("a single execution path may contain only one graph-visible delivery node")]
+    MultipleDeliveriesOnPath,
     #[error("graph-local worker descriptor could not be constructed: {0}")]
     WorkerDescriptor(String),
     #[error(transparent)]
@@ -130,7 +133,7 @@ impl NativeV2Admission {
             return Err(NativeV2AdmissionError::UnsupportedGraphProfile);
         }
         let declarations = executable_declarations(&graph.root);
-        validate_executable_bindings(&declarations, runtime, delivery_policy)?;
+        validate_executable_bindings(&declarations, runtime, delivery_policy, &graph.root)?;
         validate_delivery_concurrency(&graph.root)?;
         comment::validate_comment_profile(graph)?;
         let registry = GraphBoundWorkerRegistry::from_declarations(graph, &declarations, runtime)?;
@@ -149,6 +152,18 @@ impl NativeV2Admission {
     ) -> Result<(), NativeV2AdmissionError> {
         self.validate_profile(graph, runtime, DeliveryPolicy::Required)
             .await?;
+        let deliveries = executable_declarations(&graph.root)
+            .iter()
+            .filter(|declaration| {
+                crate::native_v2_delivery::DeliveryMode::from_worker(&declaration.worker).is_some()
+            })
+            .count();
+        if deliveries != 1 {
+            return Err(NativeV2AdmissionError::DeliveryNodeCount {
+                policy: DeliveryPolicy::Required,
+                found: deliveries,
+            });
+        }
         let has_merge = executable_declarations(&graph.root)
             .iter()
             .any(|declaration| {
@@ -339,7 +354,7 @@ fn prepare_submission(
     validate_graph_input(&graph, &initial_input)?;
     loop_limits::bind_input_limits(&mut graph.root, &initial_input)?;
     let declarations = executable_declarations(&graph.root);
-    validate_executable_bindings(&declarations, &runtime, delivery_policy)?;
+    validate_executable_bindings(&declarations, &runtime, delivery_policy, &graph.root)?;
     validate_delivery_concurrency(&graph.root)?;
     comment::validate_comment_profile(&graph)?;
     comment::resolve_comment_input(&graph.root, &initial_input)?;
@@ -387,7 +402,7 @@ mod concurrency;
 mod loop_limits;
 mod validation;
 use concurrency::validate_delivery_concurrency;
-pub(crate) use validation::{sole_delivery_node, writer_nodes};
+pub(crate) use validation::{delivery_nodes, writer_nodes};
 use validation::{
     ExecutableDeclaration, executable_declarations, validate_executable_bindings,
     validate_graph_input,

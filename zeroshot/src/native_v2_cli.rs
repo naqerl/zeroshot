@@ -34,7 +34,9 @@ use crate::native_v2_supervisor::RunEnvironmentError;
 
 #[path = "native_v2_templates.rs"]
 mod templates;
-pub use templates::{BuiltinGraphTemplate, TemplateDelivery};
+pub use templates::{
+    BuiltinGraphTemplate, ReviewPolicy, SoftwareChangeFastParameters, TemplateDelivery,
+};
 
 #[path = "native_v2_cli/oecp.rs"]
 pub mod oecp;
@@ -281,6 +283,7 @@ pub enum RunGraph {
         template: BuiltinGraphTemplate,
         delivery: TemplateDelivery,
         ignore_pr_feedback: bool,
+        parameters: SoftwareChangeFastParameters,
     },
 }
 

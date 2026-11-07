@@ -21,7 +21,43 @@ impl<'a> PossibleWriters<'a> {
 pub(super) fn validate_delivery_concurrency(
     node: &GraphNode,
 ) -> Result<(), NativeV2AdmissionError> {
+    if max_delivery_nodes_per_path(node)? > 1 {
+        return Err(NativeV2AdmissionError::MultipleDeliveriesOnPath);
+    }
     possible_writers(node).map(|_| ())
+}
+
+pub(super) fn max_delivery_nodes_per_path(node: &GraphNode) -> Result<u64, NativeV2AdmissionError> {
+    match node {
+        GraphNode::Step(_) | GraphNode::Succeed(_) | GraphNode::Fail(_) => Ok(0),
+        GraphNode::Verifier(verifier) => Ok(u64::from(
+            DeliveryMode::from_worker(&verifier.worker).is_some()
+                || verifier.worker.as_str()
+                    == crate::native_v2_comment_delivery::COMMENT_DELIVERY_WORKER_REF,
+        )),
+        GraphNode::Seq(group) => group
+            .children
+            .as_slice()
+            .iter()
+            .try_fold(0, |total, child| {
+                Ok(total + max_delivery_nodes_per_path(child)?)
+            }),
+        GraphNode::Choice(group) => group
+            .branches
+            .as_slice()
+            .iter()
+            .map(|branch| max_delivery_nodes_per_path(&branch.node))
+            .chain(group.otherwise.as_deref().map(max_delivery_nodes_per_path))
+            .try_fold(0, |maximum, count| Ok(maximum.max(count?))),
+        GraphNode::Par(group) => group
+            .branches
+            .as_slice()
+            .iter()
+            .map(max_delivery_nodes_per_path)
+            .try_fold(0, |maximum, count| Ok(maximum.max(count?))),
+        GraphNode::Loop(group) => max_delivery_nodes_per_path(&group.body),
+        GraphNode::Map(group) => max_delivery_nodes_per_path(&group.body),
+    }
 }
 
 fn possible_writers(node: &GraphNode) -> Result<PossibleWriters<'_>, NativeV2AdmissionError> {

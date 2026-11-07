@@ -539,6 +539,7 @@ fn collect_guard_names(guard: &Guard, names: &mut BTreeSet<NodeName>) {
         Guard::KOfN { values, .. } => {
             names.extend(values.as_slice().iter().map(|value| value.name.clone()))
         }
+        Guard::Compare { .. } | Guard::StateIn { .. } => {}
     }
 }
 
@@ -613,6 +614,7 @@ fn guard_references(guard: &Guard, target: &NodeName) -> bool {
             .any(|guard| guard_references(guard, target)),
         Guard::Not { guard } => guard_references(guard, target),
         Guard::KOfN { values, .. } => values.as_slice().iter().any(|value| &value.name == target),
+        Guard::Compare { .. } | Guard::StateIn { .. } => false,
     }
 }
 

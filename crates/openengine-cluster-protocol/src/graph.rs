@@ -253,6 +253,19 @@ pub enum Guard {
         value: ControlSelector,
         labels: NonEmptyEnumSet,
     },
+    /// Compare a state integer against a constant. Used where a bounded numeric guard must not
+    /// enumerate every accepted count as a control label.
+    Compare {
+        value: DataSelector,
+        at_least: i64,
+        at_most: i64,
+    },
+    /// Match a state string against a closed label set. Used to gate on reviewer verdicts that
+    /// were written into state without treating them as control selectors.
+    StateIn {
+        value: DataSelector,
+        labels: NonEmptyEnumSet,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

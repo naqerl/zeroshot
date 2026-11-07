@@ -181,6 +181,7 @@ fn wave6_cli_contract_uniform_runtime_and_template_bindings_preserve_authority()
         template: BuiltinGraphTemplate::SoftwareChange,
         delivery: TemplateDelivery::None,
         ignore_pr_feedback: false,
+        parameters: Default::default(),
     };
     assert_eq!(
         apply_template_runtime(&no_delivery, runtime.clone(), PullRequestFeedback::Consider)
@@ -423,6 +424,7 @@ async fn wave8_cli_contract_validate_only_preflight_materializes_without_backend
                 template: BuiltinGraphTemplate::SingleWorker,
                 delivery: TemplateDelivery::None,
                 ignore_pr_feedback: false,
+                parameters: Default::default(),
             },
             runtime: RunRuntime::Exact(runtime),
         },

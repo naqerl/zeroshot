@@ -27,7 +27,12 @@ fn set_command(args: ProfileSetArgs) -> Result<NativeV2CliCommand, NativeV2CliEr
     Ok(NativeV2CliCommand::ProfileSet(ProfileSetCommand {
         route: profile_route(args.route.target, args.route.scope)?,
         name: profile_name(args.name)?,
-        graph: super::run_graph(args.graph, args.template, args.delivery.selection())?,
+        graph: super::run_graph(
+            args.graph,
+            args.template,
+            args.delivery.selection(),
+            args.fast,
+        )?,
         runtime: super::run_runtime(args.runtime_config, args.uniform_runtime_config)?,
         set_default: args.default,
     }))

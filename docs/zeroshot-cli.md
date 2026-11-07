@@ -680,11 +680,12 @@ Options:
 
       --template <TEMPLATE>
           Possible values:
-          - single-worker:   A single general-purpose worker
-          - software-change: A review, validation, and optional delivery workflow for code changes
-          - auto-research:   Research with ten iterations by default and independent evidence gates
-          - issue-review:    Inspect an issue proposal and post a review report
-          - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
+          - single-worker:        A single general-purpose worker
+          - software-change:      A review, validation, and optional delivery workflow for code changes
+          - software-change-fast: Software-change with a blast-radius judge that can skip review for a small change. The path denylist is prompt-level; the graph enforces the numeric file/line caps
+          - auto-research:        Research with ten iterations by default and independent evidence gates
+          - issue-review:         Inspect an issue proposal and post a review report
+          - pr-review:            Review a PR diff, conditionally reproduce behavior, and post a concise report
 
       --runtime-config <FILE>
 
@@ -709,6 +710,19 @@ Options:
 
       --no-pr-feedback
           Do not route visible pull-request feedback through the autonomous repair loop
+
+      --review-policy <POLICY>
+          Review policy for --template software-change-fast
+
+          Possible values:
+          - always:    Always run both reviewers; this is the software-change baseline
+          - by-radius: Let the blast-radius judge skip both reviewers for a small change
+
+      --max-files <COUNT>
+          Maximum changed files for a small change with software-change-fast. Defaults to 3
+
+      --max-lines <COUNT>
+          Maximum changed lines for a small change with software-change-fast. Defaults to 80
 
       --target <NAME>
           Use this named hosted target. If omitted, use local profiles
@@ -851,11 +865,12 @@ Arguments:
           Built-in graph template to render
 
           Possible values:
-          - single-worker:   A single general-purpose worker
-          - software-change: A review, validation, and optional delivery workflow for code changes
-          - auto-research:   Research with ten iterations by default and independent evidence gates
-          - issue-review:    Inspect an issue proposal and post a review report
-          - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
+          - single-worker:        A single general-purpose worker
+          - software-change:      A review, validation, and optional delivery workflow for code changes
+          - software-change-fast: Software-change with a blast-radius judge that can skip review for a small change. The path denylist is prompt-level; the graph enforces the numeric file/line caps
+          - auto-research:        Research with ten iterations by default and independent evidence gates
+          - issue-review:         Inspect an issue proposal and post a review report
+          - pr-review:            Review a PR diff, conditionally reproduce behavior, and post a concise report
 
 Options:
       --delivery <MODE>
@@ -1298,11 +1313,12 @@ Options:
           Materialize and run this built-in graph template
 
           Possible values:
-          - single-worker:   A single general-purpose worker
-          - software-change: A review, validation, and optional delivery workflow for code changes
-          - auto-research:   Research with ten iterations by default and independent evidence gates
-          - issue-review:    Inspect an issue proposal and post a review report
-          - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
+          - single-worker:        A single general-purpose worker
+          - software-change:      A review, validation, and optional delivery workflow for code changes
+          - software-change-fast: Software-change with a blast-radius judge that can skip review for a small change. The path denylist is prompt-level; the graph enforces the numeric file/line caps
+          - auto-research:        Research with ten iterations by default and independent evidence gates
+          - issue-review:         Inspect an issue proposal and post a review report
+          - pr-review:            Review a PR diff, conditionally reproduce behavior, and post a concise report
 
       --input <FILE>
           Load the graph's initial input from this JSON file
@@ -1370,6 +1386,19 @@ Options:
 
       --no-pr-feedback
           Do not route visible pull-request feedback through the autonomous repair loop
+
+      --review-policy <POLICY>
+          Review policy for --template software-change-fast
+
+          Possible values:
+          - always:    Always run both reviewers; this is the software-change baseline
+          - by-radius: Let the blast-radius judge skip both reviewers for a small change
+
+      --max-files <COUNT>
+          Maximum changed files for a small change with software-change-fast. Defaults to 3
+
+      --max-lines <COUNT>
+          Maximum changed lines for a small change with software-change-fast. Defaults to 80
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1522,11 +1551,12 @@ Options:
           Materialize and run this built-in graph template
 
           Possible values:
-          - single-worker:   A single general-purpose worker
-          - software-change: A review, validation, and optional delivery workflow for code changes
-          - auto-research:   Research with ten iterations by default and independent evidence gates
-          - issue-review:    Inspect an issue proposal and post a review report
-          - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
+          - single-worker:        A single general-purpose worker
+          - software-change:      A review, validation, and optional delivery workflow for code changes
+          - software-change-fast: Software-change with a blast-radius judge that can skip review for a small change. The path denylist is prompt-level; the graph enforces the numeric file/line caps
+          - auto-research:        Research with ten iterations by default and independent evidence gates
+          - issue-review:         Inspect an issue proposal and post a review report
+          - pr-review:            Review a PR diff, conditionally reproduce behavior, and post a concise report
 
       --input <FILE>
           Load the graph's initial input from this JSON file
@@ -1591,6 +1621,19 @@ Options:
 
       --no-pr-feedback
           Do not route visible pull-request feedback through the autonomous repair loop
+
+      --review-policy <POLICY>
+          Review policy for --template software-change-fast
+
+          Possible values:
+          - always:    Always run both reviewers; this is the software-change baseline
+          - by-radius: Let the blast-radius judge skip both reviewers for a small change
+
+      --max-files <COUNT>
+          Maximum changed files for a small change with software-change-fast. Defaults to 3
+
+      --max-lines <COUNT>
+          Maximum changed lines for a small change with software-change-fast. Defaults to 80
 
   -h, --help
           Print help (see a summary with '-h')
@@ -2436,11 +2479,12 @@ Options:
           Materialize and run this built-in graph template
 
           Possible values:
-          - single-worker:   A single general-purpose worker
-          - software-change: A review, validation, and optional delivery workflow for code changes
-          - auto-research:   Research with ten iterations by default and independent evidence gates
-          - issue-review:    Inspect an issue proposal and post a review report
-          - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
+          - single-worker:        A single general-purpose worker
+          - software-change:      A review, validation, and optional delivery workflow for code changes
+          - software-change-fast: Software-change with a blast-radius judge that can skip review for a small change. The path denylist is prompt-level; the graph enforces the numeric file/line caps
+          - auto-research:        Research with ten iterations by default and independent evidence gates
+          - issue-review:         Inspect an issue proposal and post a review report
+          - pr-review:            Review a PR diff, conditionally reproduce behavior, and post a concise report
 
       --input <FILE>
           Load the graph's initial input from this JSON file
@@ -2505,6 +2549,19 @@ Options:
 
       --no-pr-feedback
           Do not route visible pull-request feedback through the autonomous repair loop
+
+      --review-policy <POLICY>
+          Review policy for --template software-change-fast
+
+          Possible values:
+          - always:    Always run both reviewers; this is the software-change baseline
+          - by-radius: Let the blast-radius judge skip both reviewers for a small change
+
+      --max-files <COUNT>
+          Maximum changed files for a small change with software-change-fast. Defaults to 3
+
+      --max-lines <COUNT>
+          Maximum changed lines for a small change with software-change-fast. Defaults to 80
 
       --from-job <JOB_ID>
           Hub job whose run request, files, source pin, placement, and labels become the case
@@ -3201,11 +3258,12 @@ Options:
           Materialize and run this built-in graph template
 
           Possible values:
-          - single-worker:   A single general-purpose worker
-          - software-change: A review, validation, and optional delivery workflow for code changes
-          - auto-research:   Research with ten iterations by default and independent evidence gates
-          - issue-review:    Inspect an issue proposal and post a review report
-          - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
+          - single-worker:        A single general-purpose worker
+          - software-change:      A review, validation, and optional delivery workflow for code changes
+          - software-change-fast: Software-change with a blast-radius judge that can skip review for a small change. The path denylist is prompt-level; the graph enforces the numeric file/line caps
+          - auto-research:        Research with ten iterations by default and independent evidence gates
+          - issue-review:         Inspect an issue proposal and post a review report
+          - pr-review:            Review a PR diff, conditionally reproduce behavior, and post a concise report
 
       --input <FILE>
           Load the graph's initial input from this JSON file
@@ -3278,6 +3336,19 @@ Options:
 
       --no-pr-feedback
           Do not route visible pull-request feedback through the autonomous repair loop
+
+      --review-policy <POLICY>
+          Review policy for --template software-change-fast
+
+          Possible values:
+          - always:    Always run both reviewers; this is the software-change baseline
+          - by-radius: Let the blast-radius judge skip both reviewers for a small change
+
+      --max-files <COUNT>
+          Maximum changed files for a small change with software-change-fast. Defaults to 3
+
+      --max-lines <COUNT>
+          Maximum changed lines for a small change with software-change-fast. Defaults to 80
 
   -h, --help
           Print help (see a summary with '-h')

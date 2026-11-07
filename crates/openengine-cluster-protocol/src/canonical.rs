@@ -246,7 +246,8 @@ where
 
 fn normalize_guard(guard: &mut Guard) -> Result<(), CanonicalError> {
     match guard {
-        Guard::In { .. } | Guard::KOfMap { .. } => {}
+        Guard::In { .. } | Guard::KOfMap { .. } | Guard::Compare { .. } | Guard::StateIn { .. } => {
+        }
         Guard::KOfN { values, .. } => normalize_selectors(values)?,
         Guard::Not { guard } => normalize_guard(guard)?,
         Guard::All { guards } => normalize_commutative_guards(guards, GuardOperation::All)?,

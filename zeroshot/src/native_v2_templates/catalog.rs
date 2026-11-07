@@ -10,8 +10,9 @@ use crate::native_v2_contract::{
 use crate::native_v2_delivery::GITHUB_TOKEN_ENV;
 
 use super::{
-    auto_research_graph, node_name, single_worker_graph, software_change_graph, static_value,
-    DELIVERY_NODE,
+    auto_research_graph, node_name, single_worker_graph, software_change_fast_graph,
+    software_change_graph, static_value, ReviewPolicy, SoftwareChangeFastParameters, DELIVERY_NODE,
+    SMALL_DELIVERY_NODE,
 };
 
 /// The deliberately small set of built-in graph templates.
@@ -19,15 +20,17 @@ use super::{
 pub enum BuiltinGraphTemplate {
     SingleWorker,
     SoftwareChange,
+    SoftwareChangeFast,
     AutoResearch,
     IssueReview,
     PrReview,
 }
 
 impl BuiltinGraphTemplate {
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::SingleWorker,
         Self::SoftwareChange,
+        Self::SoftwareChangeFast,
         Self::AutoResearch,
         Self::IssueReview,
         Self::PrReview,
@@ -43,6 +46,7 @@ impl BuiltinGraphTemplate {
         match self {
             Self::SingleWorker => "single-worker",
             Self::SoftwareChange => "software-change",
+            Self::SoftwareChangeFast => "software-change-fast",
             Self::AutoResearch => "auto-research",
             Self::IssueReview => "issue-review",
             Self::PrReview => "pr-review",
@@ -54,6 +58,7 @@ impl BuiltinGraphTemplate {
         match value {
             "single-worker" => Some(Self::SingleWorker),
             "software-change" => Some(Self::SoftwareChange),
+            "software-change-fast" => Some(Self::SoftwareChangeFast),
             "auto-research" => Some(Self::AutoResearch),
             "issue-review" => Some(Self::IssueReview),
             "pr-review" => Some(Self::PrReview),
@@ -63,7 +68,7 @@ impl BuiltinGraphTemplate {
 
     pub(crate) const fn default_delivery(self) -> TemplateDelivery {
         match self {
-            Self::SoftwareChange => TemplateDelivery::PullRequest,
+            Self::SoftwareChange | Self::SoftwareChangeFast => TemplateDelivery::PullRequest,
             Self::IssueReview | Self::PrReview => TemplateDelivery::Comment,
             _ => TemplateDelivery::None,
         }
@@ -71,7 +76,7 @@ impl BuiltinGraphTemplate {
 
     pub(crate) fn default_session_scope(self, node: &str) -> SessionScope {
         match (self, node) {
-            (Self::SoftwareChange, "worker")
+            (Self::SoftwareChange | Self::SoftwareChangeFast, "worker")
             | (Self::AutoResearch, "explorer" | "synthesizer" | "challenger" | "researcher") => {
                 SessionScope::NodeInstance
             }
@@ -83,10 +88,19 @@ impl BuiltinGraphTemplate {
         self,
         delivery: TemplateDelivery,
     ) -> Result<GraphSpec, BuiltinTemplateError> {
+        self.materialize_with_parameters(delivery, SoftwareChangeFastParameters::default())
+    }
+
+    pub(crate) fn materialize_with_parameters(
+        self,
+        delivery: TemplateDelivery,
+        parameters: SoftwareChangeFastParameters,
+    ) -> Result<GraphSpec, BuiltinTemplateError> {
         self.validate_delivery(delivery)?;
         match self {
             Self::SingleWorker => single_worker_graph(),
             Self::SoftwareChange => software_change_graph(delivery),
+            Self::SoftwareChangeFast => software_change_fast_graph(delivery, parameters),
             Self::AutoResearch => auto_research_graph(delivery),
             Self::IssueReview => super::review::issue_review_graph(delivery),
             Self::PrReview => super::pr_review::pr_review_graph(delivery),
@@ -104,39 +118,64 @@ impl BuiltinGraphTemplate {
         )
     }
 
+    #[cfg(any(test, feature = "workspace"))]
     pub(crate) fn delivery_runtime_binding_with_feedback(
         self,
         delivery: TemplateDelivery,
         pull_request_feedback: crate::native_v2_contract::PullRequestFeedback,
     ) -> Result<Option<(NodeName, NodeRuntimeBinding)>, BuiltinTemplateError> {
+        Ok(self
+            .delivery_runtime_bindings_with_feedback(
+                delivery,
+                pull_request_feedback,
+                SoftwareChangeFastParameters::default(),
+            )?
+            .into_iter()
+            .next())
+    }
+
+    pub(crate) fn delivery_runtime_bindings_with_feedback(
+        self,
+        delivery: TemplateDelivery,
+        pull_request_feedback: crate::native_v2_contract::PullRequestFeedback,
+        parameters: SoftwareChangeFastParameters,
+    ) -> Result<Vec<(NodeName, NodeRuntimeBinding)>, BuiltinTemplateError> {
         self.validate_delivery(delivery)?;
         if delivery == TemplateDelivery::None {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let connections = delivery_connections(delivery)?;
-        let name = match self {
-            Self::AutoResearch => "checkpoint_delivery",
-            Self::SingleWorker | Self::SoftwareChange | Self::IssueReview | Self::PrReview => {
-                DELIVERY_NODE
+        let binding = if delivery == TemplateDelivery::Comment {
+            NodeRuntimeBinding::CommentDelivery { connections }
+        } else {
+            NodeRuntimeBinding::GitDelivery {
+                connections,
+                pull_request_feedback,
             }
         };
-        Ok(Some((
-            node_name(name)?,
-            if delivery == TemplateDelivery::Comment {
-                NodeRuntimeBinding::CommentDelivery { connections }
-            } else {
-                NodeRuntimeBinding::GitDelivery {
-                    connections,
-                    pull_request_feedback,
-                }
-            },
-        )))
+        let names = match self {
+            Self::AutoResearch => vec!["checkpoint_delivery"],
+            Self::SoftwareChangeFast if parameters.review_policy == ReviewPolicy::ByRadius => {
+                vec![DELIVERY_NODE, SMALL_DELIVERY_NODE]
+            }
+            Self::SingleWorker
+            | Self::SoftwareChange
+            | Self::SoftwareChangeFast
+            | Self::IssueReview
+            | Self::PrReview => vec![DELIVERY_NODE],
+        };
+        names
+            .into_iter()
+            .map(|name| Ok((node_name(name)?, binding.clone())))
+            .collect()
     }
 
     fn validate_delivery(self, delivery: TemplateDelivery) -> Result<(), BuiltinTemplateError> {
         let supported = match self {
             Self::SingleWorker => delivery == TemplateDelivery::None,
-            Self::SoftwareChange => delivery != TemplateDelivery::Comment,
+            Self::SoftwareChange | Self::SoftwareChangeFast => {
+                delivery != TemplateDelivery::Comment
+            }
             Self::AutoResearch => {
                 matches!(delivery, TemplateDelivery::None | TemplateDelivery::Push)
             }

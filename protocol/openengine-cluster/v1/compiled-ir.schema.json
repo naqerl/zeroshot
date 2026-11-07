@@ -771,6 +771,65 @@
             "labels"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Compare a state integer against a constant. Used where a bounded numeric guard must not\nenumerate every accepted count as a control label.",
+          "properties": {
+            "at_least": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "at_most": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "kind": {
+              "const": "compare",
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/$defs/DataSelector"
+            }
+          },
+          "required": [
+            "kind",
+            "value",
+            "at_least",
+            "at_most"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Match a state string against a closed label set. Used to gate on reviewer verdicts that\nwere written into state without treating them as control selectors.",
+          "properties": {
+            "kind": {
+              "const": "state_in",
+              "type": "string"
+            },
+            "labels": {
+              "items": {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$",
+                "type": "string"
+              },
+              "maxItems": 4096,
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "value": {
+              "$ref": "#/$defs/DataSelector"
+            }
+          },
+          "required": [
+            "kind",
+            "value",
+            "labels"
+          ],
+          "type": "object"
         }
       ]
     },

@@ -6,7 +6,11 @@ pub(super) fn guard_node_count(guard: &Guard) -> u64 {
             guards.as_slice().iter().map(guard_node_count).sum()
         }
         Guard::Not { guard } => guard_node_count(guard),
-        Guard::In { .. } | Guard::KOfN { .. } | Guard::KOfMap { .. } => 0,
+        Guard::In { .. }
+        | Guard::KOfN { .. }
+        | Guard::KOfMap { .. }
+        | Guard::Compare { .. }
+        | Guard::StateIn { .. } => 0,
     }
 }
 
@@ -30,6 +34,7 @@ pub(super) fn collect_guard_selector_uses<'a>(
     match guard {
         Guard::In { value, .. } => selectors.push((value, map_aggregate)),
         Guard::KOfMap { value, .. } => selectors.push((value, true)),
+        Guard::Compare { .. } | Guard::StateIn { .. } => {}
         Guard::All { guards } | Guard::Any { guards } => {
             for guard in guards.as_slice() {
                 collect_guard_selector_uses(guard, map_aggregate, selectors);
@@ -55,6 +60,7 @@ pub(super) fn collect_guard_selectors<'a>(
         }
         Guard::Not { guard } => collect_guard_selectors(guard, selectors),
         Guard::KOfN { values, .. } => selectors.extend(values.as_slice()),
+        Guard::Compare { .. } | Guard::StateIn { .. } => {}
     }
 }
 

@@ -606,6 +606,7 @@ fn parser_exposes_the_builtin_templates_and_closed_delivery_choice() {
                 template: BuiltinGraphTemplate::SoftwareChange,
                 delivery: TemplateDelivery::PullRequest,
                 ignore_pr_feedback: false,
+                parameters: Default::default(),
             },
             runtime: RunRuntime::Exact(PathBuf::from("runtime.json")),
         }

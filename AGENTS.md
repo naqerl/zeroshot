@@ -124,6 +124,9 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 
 - Protocol Rust types are the source of truth. Generated files under
   `protocol/openengine-cluster/v1/` must be regenerated through the Rust testkit, not hand-edited.
+- Full-v1 guards may also compare a state integer against a constant (`compare`) or match a state
+  string against a closed label set (`state_in`). These stateful guards are evaluated by the reducer
+  and are opaque to control-assignment exhaustiveness, so they do not add control labels.
 - Initial input remains caller-owned and is validated unchanged. A root group may add required
   state fields only when their payload types have deterministic implicit empty values; verification
   proves this and reduction materializes missing null, string, array, and recursively empty record values.
@@ -654,6 +657,14 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   as `review_output_invalid` and a reviewer refusal as `review_refused`, keeping both distinct from a
   crash and from a genuine rejection. The final rejected round fails without starting an
   unreviewable extra repair, and the failed run retains its workspace for recovery.
+- The built-in `software-change-fast` graph adds a read-only `jev` Step between the worker and a
+  `blast_route` choice. Its template parameters are `review_policy` (`always` or `by_radius`, default
+  `always`), `maxFiles` (default 3), and `maxLines` (default 80). `by_radius` routes straight to
+  delivery only when state shows radius=small, confidence=high, checksReported=true, and both counts
+  are within the caps; every other verdict runs the same parallel reviewers and review loop.
+  `always` materializes the byte-identical `software-change` graph. The category denylist is
+  prompt-level. Admission permits at most one delivery node per execution path, so mutually exclusive
+  Choice branches may each carry one while merge profiles still require exactly one.
 - Delivery-enabled software-change templates make the acceptance verifier the sole author of the
   current change title and description after every review pass. Reviewer output stays small: the
   title is structural output and the prospective description plus actionable findings travel through

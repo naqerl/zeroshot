@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
+use super::{BuiltinGraphTemplate, ReviewPolicy, SoftwareChangeFastParameters};
+
 #[path = "parser/delegations.rs"]
 mod delegations;
 use delegations::DelegationCliCommand;
@@ -419,6 +421,10 @@ enum TemplateName {
     /// A review, validation, and optional delivery workflow for code changes.
     SoftwareChange,
 
+    /// Software-change with a blast-radius judge that can skip review for a small change.
+    /// The path denylist is prompt-level; the graph enforces the numeric file/line caps.
+    SoftwareChangeFast,
+
     /// Research with ten iterations by default and independent evidence gates.
     AutoResearch,
 
@@ -427,6 +433,58 @@ enum TemplateName {
 
     /// Review a PR diff, conditionally reproduce behavior, and post a concise report.
     PrReview,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum ReviewPolicyArg {
+    /// Always run both reviewers; this is the software-change baseline.
+    #[default]
+    Always,
+    /// Let the blast-radius judge skip both reviewers for a small change.
+    ByRadius,
+}
+
+#[derive(Debug, Args)]
+struct FastTemplateArgs {
+    /// Review policy for --template software-change-fast.
+    #[arg(long, value_enum, value_name = "POLICY")]
+    review_policy: Option<ReviewPolicyArg>,
+
+    /// Maximum changed files for a small change with software-change-fast. Defaults to 3.
+    #[arg(long, value_name = "COUNT")]
+    max_files: Option<u64>,
+
+    /// Maximum changed lines for a small change with software-change-fast. Defaults to 80.
+    #[arg(long, value_name = "COUNT")]
+    max_lines: Option<u64>,
+}
+
+impl FastTemplateArgs {
+    fn parameters(
+        self,
+        template: BuiltinGraphTemplate,
+    ) -> Result<SoftwareChangeFastParameters, super::NativeV2CliError> {
+        let defaults = SoftwareChangeFastParameters::default();
+        if template != BuiltinGraphTemplate::SoftwareChangeFast
+            && (self.review_policy.is_some()
+                || self.max_files.is_some()
+                || self.max_lines.is_some())
+        {
+            return Err(super::NativeV2CliError::Usage(
+                "--review-policy, --max-files, and --max-lines require --template software-change-fast"
+                    .to_owned(),
+            ));
+        }
+        Ok(SoftwareChangeFastParameters {
+            review_policy: match self.review_policy {
+                Some(ReviewPolicyArg::Always) => ReviewPolicy::Always,
+                Some(ReviewPolicyArg::ByRadius) => ReviewPolicy::ByRadius,
+                None => defaults.review_policy,
+            },
+            max_files: self.max_files.unwrap_or(defaults.max_files),
+            max_lines: self.max_lines.unwrap_or(defaults.max_lines),
+        })
+    }
 }
 
 #[derive(Debug, Args)]
@@ -657,6 +715,9 @@ struct RunArgs {
 
     #[command(flatten)]
     delivery: DeliveryArgs,
+
+    #[command(flatten)]
+    fast: FastTemplateArgs,
 }
 
 #[derive(Debug, Args)]

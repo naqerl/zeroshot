@@ -335,6 +335,7 @@ impl TemplateName {
         let name = match self {
             Self::SingleWorker => "single-worker",
             Self::SoftwareChange => "software-change",
+            Self::SoftwareChangeFast => "software-change-fast",
             Self::AutoResearch => "auto-research",
             Self::IssueReview => "issue-review",
             Self::PrReview => "pr-review",
@@ -355,6 +356,7 @@ impl RunArgs {
             exact: self.runtime_config,
             uniform: self.uniform_runtime_config,
             delivery: self.delivery.selection(),
+            fast: self.fast,
         })?;
         Ok(NativeV2CliCommand::Run(Box::new(RunCommand {
             target: route.target,
@@ -415,6 +417,7 @@ struct RunSelectionArgs<'a> {
     exact: Option<PathBuf>,
     uniform: Option<PathBuf>,
     delivery: (Option<&'a str>, bool, bool, bool, bool),
+    fast: super::FastTemplateArgs,
 }
 
 fn run_selection(args: RunSelectionArgs<'_>) -> Result<RunSelection, NativeV2CliError> {
@@ -452,7 +455,7 @@ fn inline_or_default_selection(
         ));
     }
     Ok(RunSelection::Inline {
-        graph: run_graph(args.graph, args.template, args.delivery)?,
+        graph: run_graph(args.graph, args.template, args.delivery, args.fast)?,
         runtime: run_runtime(args.exact, args.uniform)?,
     })
 }
@@ -465,7 +468,10 @@ fn selection_shape(args: &RunSelectionArgs<'_>) -> (bool, bool, bool) {
             | args.delivery.1
             | args.delivery.2
             | args.delivery.3
-            | args.delivery.4,
+            | args.delivery.4
+            | args.fast.review_policy.is_some()
+            | args.fast.max_files.is_some()
+            | args.fast.max_lines.is_some(),
     )
 }
 
@@ -552,24 +558,30 @@ fn run_graph(
     graph: Option<PathBuf>,
     template: Option<TemplateName>,
     delivery: (Option<&str>, bool, bool, bool, bool),
+    fast: super::FastTemplateArgs,
 ) -> Result<RunGraph, NativeV2CliError> {
     let (delivery, push, pr, ship, no_pr_feedback) = delivery;
+    let fast_default =
+        fast.review_policy.is_none() && fast.max_files.is_none() && fast.max_lines.is_none();
     match (graph, template) {
         (Some(path), None)
-            if delivery_options_empty((delivery, push, pr, ship, no_pr_feedback)) =>
+            if delivery_options_empty((delivery, push, pr, ship, no_pr_feedback))
+                && fast_default =>
         {
             Ok(RunGraph::File(path))
         }
         (Some(_), None) => Err(usage(
-            "delivery flags require --template; author delivery in custom graphs",
+            "delivery flags require --template; fast-template flags also require it; author them in custom graphs",
         )),
         (None, Some(template)) => {
             let template = template.into_template()?;
             let delivery = template_delivery(template, (delivery, push, pr, ship, no_pr_feedback))?;
+            let parameters = fast.parameters(template)?;
             Ok(RunGraph::Template {
                 template,
                 delivery,
                 ignore_pr_feedback: no_pr_feedback,
+                parameters,
             })
         }
         _ => Err(usage("exactly one of --graph or --template is required")),
@@ -680,7 +692,9 @@ fn validate_template_delivery(
     }
     let supported = match template {
         BuiltinGraphTemplate::SingleWorker => delivery == TemplateDelivery::None,
-        BuiltinGraphTemplate::SoftwareChange => delivery != TemplateDelivery::Comment,
+        BuiltinGraphTemplate::SoftwareChange | BuiltinGraphTemplate::SoftwareChangeFast => {
+            delivery != TemplateDelivery::Comment
+        }
         BuiltinGraphTemplate::AutoResearch => {
             matches!(delivery, TemplateDelivery::None | TemplateDelivery::Push)
         }

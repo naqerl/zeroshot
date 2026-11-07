@@ -313,6 +313,18 @@ pub(in crate::graph_verifier) fn evaluate_guard(guard: &Guard, assignment: &Assi
             value,
             labels,
         } => selector_occurrences(value, labels.values(), assignment) >= count.get(),
+        Guard::Compare { .. } | Guard::StateIn { .. } => false,
+    }
+}
+
+pub(in crate::graph_verifier) fn guard_is_stateful(guard: &Guard) -> bool {
+    match guard {
+        Guard::Compare { .. } | Guard::StateIn { .. } => true,
+        Guard::All { guards } | Guard::Any { guards } => {
+            guards.as_slice().iter().any(guard_is_stateful)
+        }
+        Guard::Not { guard } => guard_is_stateful(guard),
+        Guard::In { .. } | Guard::KOfN { .. } | Guard::KOfMap { .. } => false,
     }
 }
 

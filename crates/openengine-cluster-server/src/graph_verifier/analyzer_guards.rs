@@ -106,6 +106,11 @@ impl<'a> Analyzer<'a> {
         let mut outcomes = Vec::with_capacity(choice.branches.as_slice().len());
         let mut reachable = Vec::with_capacity(choice.branches.as_slice().len());
         for (index, branch) in choice.branches.as_slice().iter().enumerate() {
+            if guard_is_stateful(&branch.when) {
+                reachable.push(true);
+                outcomes.push(OutcomeRefinement::default());
+                continue;
+            }
             let mut residual = Vec::new();
             for (assignment, matched_prior) in assignments.iter().zip(&mut prior) {
                 let matches = evaluate_guard(&branch.when, assignment);
@@ -250,6 +255,23 @@ impl<'a> Analyzer<'a> {
                 labels: labels.values(),
                 guard: context,
             }),
+            Guard::Compare {
+                at_least, at_most, ..
+            } => {
+                if at_least > at_most {
+                    emit_diagnostic!(
+                        self,
+                        GraphDiagnosticCode::SchemaSafety,
+                        "compare guard has inverted bounds",
+                        context.path.to_vec(),
+                        Vec::new(),
+                    );
+                    false
+                } else {
+                    true
+                }
+            }
+            Guard::StateIn { .. } => true,
         }
     }
 
