@@ -188,6 +188,13 @@ const TOOLS: &[Tool] = &[
         argv: hub_dequeue_argv,
     },
     Tool {
+        name: "hub_stop",
+        cli: &["hub", "stop"],
+        allowed: &["job", "hub"],
+        schema: hub_stop_schema,
+        argv: hub_stop_argv,
+    },
+    Tool {
         name: "hub_add",
         cli: &["hub", "add"],
         allowed: &["name", "tag", "slots", "priority", "hub"],
@@ -464,6 +471,9 @@ fn tool_matches(name: &str, command: &NativeV2CliCommand) -> bool {
         }
         ("hub_dequeue", NativeV2CliCommand::Hub(request)) => {
             matches!(request.command, HubCommand::Dequeue { .. })
+        }
+        ("hub_stop", NativeV2CliCommand::Hub(request)) => {
+            matches!(request.command, HubCommand::Stop { .. })
         }
         ("hub_add", NativeV2CliCommand::Hub(request)) => {
             matches!(request.command, HubCommand::Add(_))
@@ -879,6 +889,14 @@ fn hub_dequeue_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFailure>
     Ok(argv)
 }
 
+fn hub_stop_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFailure> {
+    let mut argv = hub_prefix(map, &["stop"])?;
+    if let Some(job) = optional_string(map, "job")? {
+        argv.push(job);
+    }
+    Ok(argv)
+}
+
 fn hub_add_argv(map: &Map<String, Value>) -> Result<Vec<String>, McpFailure> {
     let mut argv = hub_prefix(map, &["add"])?;
     if let Some(name) = optional_string(map, "name")? {
@@ -1188,7 +1206,7 @@ fn hub_jobs_schema() -> Value {
                 "state",
                 string_prop(
                     "Job state filter: active, queued, scheduled, running, succeeded, failed, \
-                     dequeued, or all. Defaults to all.",
+                     dequeued, stopped, or all. Defaults to all.",
                 ),
             ),
             (
@@ -1312,6 +1330,10 @@ fn hub_daemon_status_schema() -> Value {
 }
 
 fn hub_dequeue_schema() -> Value {
+    object_schema(&["job"], hub_job_properties(Vec::new()))
+}
+
+fn hub_stop_schema() -> Value {
     object_schema(&["job"], hub_job_properties(Vec::new()))
 }
 

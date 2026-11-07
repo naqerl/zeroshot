@@ -377,6 +377,11 @@ pub(crate) struct Lease {
     /// Whether the chosen transport was logged, so an operator sees it once per lease.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub transport_logged: bool,
+    /// Kept after its last job was stopped deliberately with `hub stop`, so the operator's
+    /// machine survives until they release it or a new job uses it. The idle rule never tears
+    /// a held lease down; the stall path and every other teardown reason still apply.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold: bool,
     pub created_at_ms: u64,
     /// When the lease last recorded a phase change. State written before this field existed
     /// falls back to `created_at_ms`.
@@ -587,6 +592,7 @@ impl Lease {
             local_port,
             transport: pool.transport,
             transport_logged: false,
+            hold: false,
             created_at_ms: now,
             progress_at_ms: now,
             drain_started_ms: None,
@@ -657,6 +663,7 @@ impl Lease {
             "serverId": self.server_id,
             "localPort": self.local_port,
             "transport": self.transport,
+            "hold": self.hold,
             "createdAt": rfc3339(self.created_at_ms),
             "reason": self.reason,
             "attempts": self.attempts,
@@ -791,6 +798,13 @@ pub(crate) fn update_idle(state: &mut HubState, now: u64) {
     }
 }
 
+/// Hold or release the lease of `member`: a held lease survives the idle rule.
+pub(crate) fn set_hold(state: &mut HubState, member: &str, hold: bool) {
+    if let Some(lease) = state.leases.iter_mut().find(|lease| lease.name == member) {
+        lease.hold = hold;
+    }
+}
+
 /// Leases that must start their teardown now, with the reason.
 pub(crate) fn teardown_due(state: &HubState, now: u64) -> Vec<(String, TeardownReason)> {
     let mut due = Vec::new();
@@ -806,12 +820,18 @@ pub(crate) fn teardown_due(state: &HubState, now: u64) -> Vec<(String, TeardownR
                 })
             }
             LeasePhase::Active => {
-                let idle_ms = pool.map_or(0, |pool| pool.idle_ms);
-                state
-                    .member(&lease.name)
-                    .and_then(|member| member.idle_since_ms)
-                    .filter(|since| now >= since.saturating_add(idle_ms))
-                    .map(|_| TeardownReason::Idle)
+                if lease.hold {
+                    // A deliberate `hub stop` keeps the machine: the operator paid for it and
+                    // will reuse it. `hub pool release` or a new job clears the hold.
+                    None
+                } else {
+                    let idle_ms = pool.map_or(0, |pool| pool.idle_ms);
+                    state
+                        .member(&lease.name)
+                        .and_then(|member| member.idle_since_ms)
+                        .filter(|since| now >= since.saturating_add(idle_ms))
+                        .map(|_| TeardownReason::Idle)
+                }
             }
         };
         if let Some(reason) = reason {

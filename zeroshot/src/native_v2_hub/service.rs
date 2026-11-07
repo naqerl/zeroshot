@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 
 use super::clock::{self, now_ms};
 use super::cron;
-use super::driver::{HubDriver, force_stop_arguments, route};
+use super::driver::{HubDriver, force_stop_arguments, route, unanswered_when_uncertain};
 use super::error::HubError;
 use super::metrics::Metrics;
 use super::model::{
@@ -539,6 +539,7 @@ impl HubService {
         };
         let at = now_ms();
         self.mutate(|state| {
+            pool::set_hold(state, &member, false);
             pool::record_member_phase(state, &member, pool::PoolPhase::InUse, at);
             Ok(())
         })
@@ -852,6 +853,155 @@ impl HubService {
             job.state = JobState::Dequeued;
             job.finished_at_ms = Some(now);
             Ok(job_document(job, now, max_stall_ms))
+        })
+        .await
+    }
+
+    /// Stop a job deliberately without deleting its pool machine. A queued job never starts;
+    /// a running job's run is stopped through the same target call as `hub force-stop` and the
+    /// lease that ran it is held for reuse. A failed stop leaves the job running.
+    ///
+    /// Placement is serialized for the whole stop: a dispatcher pass cannot poll the run to a
+    /// terminal state between reading the job and recording the stop, and cannot choose and
+    /// dispatch a job that was read as queued. A concurrent status read still may settle the
+    /// run while the target stop is in flight, so [`Self::settle_stop`] accepts the exact run
+    /// in a terminal state and records the deliberate stop over it.
+    pub(crate) async fn stop(&self, job_id: &str) -> Result<Value, HubError> {
+        let _placing = self.placement.lock().await;
+        let job = self.job(job_id).await?;
+        match job.state {
+            JobState::Queued => self.settle_stop(job_id, None, None).await,
+            JobState::Running => {
+                let (Some(target), Some(run_id)) = (&job.target, &job.run_id) else {
+                    return Err(HubError::InvalidState(format!(
+                        "hub job {job_id} is placing on {} and has no run to stop; use \
+                         `zeroshot hub dequeue` to cancel it",
+                        job.target.as_deref().unwrap_or("its member")
+                    )));
+                };
+                if let Err(error) = self.driver().stop(target, run_id).await {
+                    let error = unanswered_when_uncertain(error);
+                    return Err(match error {
+                        HubError::Unanswered(message) => HubError::Unanswered(format!(
+                            "hub job {job_id}: could not stop run {run_id} on {target}: {message}"
+                        )),
+                        HubError::Target {
+                            message,
+                            diagnostic,
+                        } => HubError::Target {
+                            message: format!(
+                                "hub job {job_id}: could not stop run {run_id} on {target}: {message}"
+                            ),
+                            diagnostic,
+                        },
+                        other => other,
+                    });
+                }
+                self.settle_stop(job_id, Some(target.as_str()), Some(run_id.as_str()))
+                    .await
+            }
+            _ => Err(HubError::InvalidState(format!(
+                "hub job {job_id} is {}; only queued or running jobs can be stopped",
+                job.display_state(now_ms())
+            ))),
+        }
+    }
+
+    /// Record a deliberate stop and hold the lease that ran the job, if it was a pool member.
+    ///
+    /// `run_id` names the exact run being stopped. A concurrent status read may have settled
+    /// that run as succeeded or failed while the target stop was in flight; that already-known
+    /// outcome is kept (so stats do not lose it) and the lease is still held.
+    async fn settle_stop(
+        &self,
+        job_id: &str,
+        member: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Result<Value, HubError> {
+        let max_stall_ms = self.max_stall_ms;
+        let member = member.map(str::to_owned);
+        self.mutate(|state| {
+            let now = now_ms();
+            let position = state
+                .jobs
+                .iter()
+                .position(|job| job.job_id == job_id)
+                .ok_or_else(|| HubError::JobNotFound(job_id.to_owned()))?;
+            {
+                let job = &mut state.jobs[position];
+                match run_id {
+                    Some(run_id) if job.run_id.as_deref() == Some(run_id) => match job.state {
+                        // A status read settled this exact run while the target stop was in
+                        // flight. Keep that real outcome; only the hold is new.
+                        JobState::Succeeded | JobState::Failed => {}
+                        JobState::Running => {
+                            job.state = JobState::Stopped;
+                            job.finished_at_ms = Some(now);
+                            // A deliberate stop is not a failure: clear any earlier hub error
+                            // (for example a stalled stop that has not settled yet) so no
+                            // surface reports it as one.
+                            job.error = None;
+                            job.failure_reason = None;
+                            job.failure_classification = None;
+                        }
+                        _ => {
+                            return Err(HubError::InvalidState(format!(
+                                "hub job {job_id} is {}; only queued or running jobs can be \
+                                 stopped",
+                                job.display_state(now)
+                            )));
+                        }
+                    },
+                    Some(_) => {
+                        return Err(HubError::InvalidState(format!(
+                            "hub job {job_id} changed runs while it was being stopped"
+                        )));
+                    }
+                    None if job.state == JobState::Queued => {
+                        job.state = JobState::Stopped;
+                        job.finished_at_ms = Some(now);
+                    }
+                    None => {
+                        return Err(HubError::InvalidState(format!(
+                            "hub job {job_id} is {}; only queued or running jobs can be stopped",
+                            job.display_state(now)
+                        )));
+                    }
+                }
+            }
+            if let Some(member) = member {
+                pool::set_hold(state, &member, true);
+            }
+            Ok(job_document(&state.jobs[position], now, max_stall_ms))
+        })
+        .await
+    }
+
+    /// Give a held lease back to its pool, so the ordinary idle rule deletes the machine.
+    pub(crate) async fn release_lease(&self, name: &str) -> Result<Value, HubError> {
+        self.mutate(|state| {
+            let now = now_ms();
+            let position = state
+                .leases
+                .iter()
+                .position(|lease| lease.name == name)
+                .ok_or_else(|| HubError::InvalidState(format!("hub lease {name} was not found")))?;
+            state.leases[position].hold = false;
+            // A member still running a job must not be marked idle: its in-use lease would
+            // enter the teardown path prematurely. The hold is cleared regardless, so the
+            // ordinary idle rule takes over once the job settles.
+            let idle = pool::drained(&state.jobs, name);
+            if let Some(member) = state.members.iter_mut().find(|member| member.name == name)
+                && idle
+                && member.idle_since_ms.is_none()
+            {
+                member.idle_since_ms = Some(now);
+            }
+            Ok(json!({
+                "schema": "zeroshot.hub.lease/v1",
+                "released": true,
+                "lease": state.leases[position].view(),
+            }))
         })
         .await
     }
@@ -1318,7 +1468,7 @@ fn dequeue_placing(job: &mut Job, now: u64, hub_max_stall_ms: Option<u64>) -> Va
 }
 
 /// The state filters `hub ps` and `hub jobs` accept.
-const JOB_STATES: [&str; 9] = [
+const JOB_STATES: [&str; 10] = [
     "active",
     "all",
     "recurring",
@@ -1328,6 +1478,7 @@ const JOB_STATES: [&str; 9] = [
     "succeeded",
     "failed",
     "dequeued",
+    "stopped",
 ];
 
 /// Jobs one history page returns when the caller sets no `--limit`.

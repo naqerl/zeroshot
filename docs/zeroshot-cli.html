@@ -81,6 +81,7 @@ section { margin-block: 2.5rem; }
 <li><a href="#zeroshot-hub-logs"><code>zeroshot hub logs</code></a></li>
 <li><a href="#zeroshot-hub-attach"><code>zeroshot hub attach</code></a></li>
 <li><a href="#zeroshot-hub-force-stop"><code>zeroshot hub force-stop</code></a></li>
+<li><a href="#zeroshot-hub-stop"><code>zeroshot hub stop</code></a></li>
 <li><a href="#zeroshot-hub-dequeue"><code>zeroshot hub dequeue</code></a></li>
 <li><a href="#zeroshot-hub-dispatch"><code>zeroshot hub dispatch</code></a></li>
 <li><a href="#zeroshot-hub-stats"><code>zeroshot hub stats</code></a></li>
@@ -117,6 +118,7 @@ section { margin-block: 2.5rem; }
 <li><a href="#zeroshot-hub-pool-remove"><code>zeroshot hub pool remove</code></a></li>
 <li><a href="#zeroshot-hub-pool-types"><code>zeroshot hub pool types</code></a></li>
 <li><a href="#zeroshot-hub-pool-resume"><code>zeroshot hub pool resume</code></a></li>
+<li><a href="#zeroshot-hub-pool-release"><code>zeroshot hub pool release</code></a></li>
 <li><a href="#zeroshot-hub-pool-tag"><code>zeroshot hub pool tag</code></a></li>
 <li><a href="#zeroshot-hub-pool-tag-set"><code>zeroshot hub pool tag set</code></a></li>
 <li><a href="#zeroshot-hub-pool-tag-list"><code>zeroshot hub pool tag list</code></a></li>
@@ -1025,6 +1027,7 @@ Commands:
   logs        Follow a placed job&#39;s run logs as NDJSON
   attach      Attach to an execution of a placed job as NDJSON
   force-stop  Force a placed job&#39;s run to stop
+  stop        Stop a job deliberately without deleting the machine that ran it
   dequeue     Remove a queued or scheduled job before it is placed, a placing job its target has not confirmed, or a recurring schedule (`hs_…`)
   dispatch    Ask the hub daemon to run one dispatcher pass now and print its summary
   stats       Aggregate job outcomes and provider-reported tokens as JSON
@@ -1619,7 +1622,7 @@ Options:
           Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
 
       --state &lt;STATE&gt;
-          Job state filter: active (queued, scheduled, running), queued, scheduled, running, succeeded, failed, dequeued, recurring (schedules only), or all. Active schedules are listed with active and recurring; all schedules with all
+          Job state filter: active (queued, scheduled, running), queued, scheduled, running, succeeded, failed, dequeued, stopped, recurring (schedules only), or all. Active schedules are listed with active and recurring; all schedules with all
 
           [default: active]
 
@@ -1646,7 +1649,7 @@ Options:
           Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
 
       --state &lt;STATE&gt;
-          Job state filter: active (queued, scheduled, running), queued, scheduled, running, succeeded, failed, dequeued, or all
+          Job state filter: active (queued, scheduled, running), queued, scheduled, running, succeeded, failed, dequeued, stopped, or all
 
           [default: all]
 
@@ -1782,6 +1785,23 @@ Options:
 
   -h, --help
           Print help</code></pre></section>
+<section id="zeroshot-hub-stop"><h4><code>zeroshot hub stop</code></h4>
+<pre><code>Stop a job deliberately without deleting the machine that ran it.
+
+A queued job never starts. A running job&#39;s run is stopped through the same target call as `hub force-stop`, the job becomes `stopped` rather than failed, and its pool machine is held for reuse until `hub pool release` or a new job uses it.
+
+Usage: zeroshot hub stop [OPTIONS] &lt;JOB_ID&gt;
+
+Arguments:
+  &lt;JOB_ID&gt;
+          Hub job ID
+
+Options:
+      --hub &lt;CONTEXT&gt;
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help (see a summary with &#39;-h&#39;)</code></pre></section>
 <section id="zeroshot-hub-dequeue"><h4><code>zeroshot hub dequeue</code></h4>
 <pre><code>Remove a queued or scheduled job before it is placed, a placing job its target has not confirmed, or a recurring schedule (`hs_…`).
 
@@ -2624,13 +2644,14 @@ A pool with no live server still counts as eligible, so a matching job queues an
 Usage: zeroshot hub pool [OPTIONS] &lt;COMMAND&gt;
 
 Commands:
-  add     Add a pool. The daemon needs a provider token (--hetzner-token-file or HCLOUD_TOKEN)
-  list    List pools and their servers as JSON [alias: ls]
-  remove  Remove a pool that has no servers left [alias: rm]
-  types   List the provider&#39;s current server types as JSON: vCPUs, memory, disk, architecture, gross price per hour by location, and the locations that can create each one now
-  resume  Let a pool start servers again after it stopped on an account limit or a rejected request, and retry a capacity shortage or a failed-boot pause now
-  tag     Prefer machines per job tag: set, list or remove a pool&#39;s tag profiles
-  help    Print this message or the help of the given subcommand(s)
+  add      Add a pool. The daemon needs a provider token (--hetzner-token-file or HCLOUD_TOKEN)
+  list     List pools and their servers as JSON [alias: ls]
+  remove   Remove a pool that has no servers left [alias: rm]
+  types    List the provider&#39;s current server types as JSON: vCPUs, memory, disk, architecture, gross price per hour by location, and the locations that can create each one now
+  resume   Let a pool start servers again after it stopped on an account limit or a rejected request, and retry a capacity shortage or a failed-boot pause now
+  release  Give a lease held by `hub stop` back to its pool
+  tag      Prefer machines per job tag: set, list or remove a pool&#39;s tag profiles
+  help     Print this message or the help of the given subcommand(s)
 
 Options:
       --hub &lt;CONTEXT&gt;
@@ -2759,6 +2780,23 @@ Options:
 
   -h, --help
           Print help</code></pre></section>
+<section id="zeroshot-hub-pool-release"><h5><code>zeroshot hub pool release</code></h5>
+<pre><code>Give a lease held by `hub stop` back to its pool.
+
+The machine then follows the pool&#39;s ordinary --idle rule and is deleted once it has been idle that long. A lease still running a job keeps running; its hold is cleared so the machine becomes eligible again when the job settles.
+
+Usage: zeroshot hub pool release [OPTIONS] &lt;LEASE&gt;
+
+Arguments:
+  &lt;LEASE&gt;
+          Held lease name, as shown by `hub pool list`
+
+Options:
+      --hub &lt;CONTEXT&gt;
+          Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
+
+  -h, --help
+          Print help (see a summary with &#39;-h&#39;)</code></pre></section>
 <section id="zeroshot-hub-pool-tag"><h5><code>zeroshot hub pool tag</code></h5>
 <pre><code>Prefer machines per job tag: set, list or remove a pool&#39;s tag profiles.
 
@@ -2865,13 +2903,14 @@ Commands:
 Usage: zeroshot hub pool help [COMMAND]
 
 Commands:
-  add     Add a pool. The daemon needs a provider token (--hetzner-token-file or HCLOUD_TOKEN)
-  list    List pools and their servers as JSON
-  remove  Remove a pool that has no servers left
-  types   List the provider&#39;s current server types as JSON: vCPUs, memory, disk, architecture, gross price per hour by location, and the locations that can create each one now
-  resume  Let a pool start servers again after it stopped on an account limit or a rejected request, and retry a capacity shortage or a failed-boot pause now
-  tag     Prefer machines per job tag: set, list or remove a pool&#39;s tag profiles
-  help    Print this message or the help of the given subcommand(s)</code></pre></section>
+  add      Add a pool. The daemon needs a provider token (--hetzner-token-file or HCLOUD_TOKEN)
+  list     List pools and their servers as JSON
+  remove   Remove a pool that has no servers left
+  types    List the provider&#39;s current server types as JSON: vCPUs, memory, disk, architecture, gross price per hour by location, and the locations that can create each one now
+  resume   Let a pool start servers again after it stopped on an account limit or a rejected request, and retry a capacity shortage or a failed-boot pause now
+  release  Give a lease held by `hub stop` back to its pool
+  tag      Prefer machines per job tag: set, list or remove a pool&#39;s tag profiles
+  help     Print this message or the help of the given subcommand(s)</code></pre></section>
 <section id="zeroshot-hub-help"><h4><code>zeroshot hub help</code></h4>
 <pre><code>Print this message or the help of the given subcommand(s)
 
@@ -2892,6 +2931,7 @@ Commands:
   logs        Follow a placed job&#39;s run logs as NDJSON
   attach      Attach to an execution of a placed job as NDJSON
   force-stop  Force a placed job&#39;s run to stop
+  stop        Stop a job deliberately without deleting the machine that ran it
   dequeue     Remove a queued or scheduled job before it is placed, a placing job its target has not confirmed, or a recurring schedule (`hs_…`)
   dispatch    Ask the hub daemon to run one dispatcher pass now and print its summary
   stats       Aggregate job outcomes and provider-reported tokens as JSON

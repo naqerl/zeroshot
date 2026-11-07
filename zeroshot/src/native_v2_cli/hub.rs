@@ -62,6 +62,14 @@ pub enum HubCommand {
     ForceStop {
         job: String,
     },
+    /// Stop a job deliberately without deleting the machine that ran it.
+    ///
+    /// A queued job never starts. A running job's run is stopped through the same target call
+    /// as `hub force-stop`, the job becomes `stopped` rather than failed, and its pool machine
+    /// is held until `hub pool release` or a new job uses it.
+    Stop {
+        job: String,
+    },
     /// Remove a queued job (`hj_…`) or a recurring schedule (`hs_…`).
     Dequeue {
         job: String,
@@ -97,6 +105,10 @@ pub enum HubPoolCommand {
     /// Clear a blocked, capacity-waiting or boot-paused pool so it starts servers again.
     Resume {
         name: String,
+    },
+    /// Give a lease held by `hub stop` back to its pool, so the idle rule deletes the machine.
+    Release {
+        lease: String,
     },
     /// Set the machines a pool creates for jobs with a tag.
     TagSet(Box<HubPoolTag>),

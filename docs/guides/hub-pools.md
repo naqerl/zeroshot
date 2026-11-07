@@ -35,7 +35,8 @@ The type names above are only an example. There is no default type.
   than `latest`.
 - `--max` caps live servers. `--slots` (default 1) is concurrent runs per server.
 - `--idle` (default 10m) is the only automatic teardown trigger: a server with no hub jobs for
-  this long drains and is deleted. A busy server is never torn down by a clock.
+  this long drains and is deleted, unless a deliberate `hub stop` holds the lease (see
+  [Deliberate stops](#deliberate-stops-and-release)). A busy server is never torn down by a clock.
 - `--ssh-key` is a private key on the hub host. Only its `.pub` sibling goes to the server.
 - `--ssh-from` is the hub's public address. The server firewall allows SSH from it and nothing
   else.
@@ -156,6 +157,11 @@ skipped without a create call. What happens next depends on how the provider ans
 - **Account limit or rejected request** (quota, invalid type or image). The pool is blocked
   with the provider's error, and jobs show `blocked: …`. Fix the cause, then run
   `zeroshot hub pool resume burst`. `resume` also clears capacity waits and the boot pause.
+- **Held machine.** `zeroshot hub stop <JOB>` deliberately stops a job and holds its lease, so
+  the idle rule does not delete the server. Give it back with
+  `zeroshot hub pool release <LEASE>` (the lease name is in `hub pool list`); the server then
+  follows the ordinary `--idle` rule. A held lease still counts against `--max` until it is
+  released, because the server is still billed.
 - **Rate limit, timeout or server error.** The hub retries the lease with its own backoff.
 
 A refused create can leave a half-made resource behind. The hub deletes everything under the
@@ -183,7 +189,8 @@ job waits until its own expiry.
    Then it reads target discovery through the tunnel,
    registers the target, and adds it as a member with the pool's and its profiles' tags. A dropped tunnel is
    reopened. Host keys are trusted on first use into the pool's own `known_hosts`.
-5. **Teardown.** When a server has been idle for `--idle`, the hub drains it. It
+5. **Teardown.** When a server has been idle for `--idle` and its lease is not held by a
+   deliberate `hub stop`, the hub drains it. It
    waits until each run is terminal and its postmortem has finished, then archives the run. Next it
    removes the member and the target, closes the tunnel, deletes the server, waits for the delete
    action, and finally deletes the firewall.
@@ -200,6 +207,19 @@ job. When no free member can take it but a pool can serve its placement, submit 
 queued and returns it without an error, because that pool starts a server for it; exit 3 with
 `hub.no_capacity` remains for a placement that neither a free member nor a pool can serve now.
 Use `zeroshot hub enqueue` when no free member can take the job now and no pool serves it.
+
+## Deliberate stops and release
+
+`zeroshot hub stop <JOB>` stops a job deliberately and marks it `stopped` rather than failed.
+The lease that ran it is held (`hold: true` in `GET /v1/hub/pools`), so the idle rule does not
+delete the machine while the operator still wants it. A new job placed on that member clears the
+hold automatically. To give the machine back, run `zeroshot hub pool release <LEASE>`; the server
+then follows the ordinary `--idle` rule and is drained and deleted. A held lease still counts
+against the pool's `--max` because it is still billed.
+
+This is separate from `hub force-stop`, which stops a run but leaves the idle rule in charge, and
+from the daemon's `--max-stall` enforcement: a stalled job still fails with `stalled` and its
+server is still deleted.
 
 ## Watching a machine come up
 
@@ -218,7 +238,7 @@ transitions in the order the hub made them.
 | `preparing` | Opened the tunnel and is checking the data folder, image, and target startup.     | no         |
 | `ready`     | The target answered discovery and the server joined the hub as a member.          | yes        |
 | `in_use`    | The hub placed a job on this member.                                              | yes        |
-| `idle`      | The job finished; the idle timer is running.                                      | yes        |
+| `idle`      | The job finished or was deliberately stopped; the idle timer runs unless held.    | yes        |
 | `draining`  | Teardown started: archive the runs, remove the member, close the tunnel.          | yes        |
 | `deleted`   | The provider confirmed deletion; billing stopped.                                 | yes        |
 | `failed`    | The lease stopped early; `reason` names `creating`, `booting`, or `preparing`.     | no         |

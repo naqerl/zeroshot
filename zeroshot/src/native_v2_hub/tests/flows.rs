@@ -8,15 +8,14 @@ use serde_json::{Value, json};
 use zeroshot_engine::native_v2_cli::hub::HubLogs;
 use zeroshot_engine::native_v2_cli::hub::{
     HubApiOptions, HubCommand, HubContextCommand, HubDaemonRun, HubEnqueue, HubInstall,
-    HubJobHistory, HubJobSpec, HubManager, HubMemberAdd, HubMemberState, HubMemberUpdate, HubPs,
-    HubStats, HubStrategy, HubSubmit, HubUninstall,
+    HubJobHistory, HubJobSpec, HubManager, HubMemberAdd, HubMemberState, HubMemberUpdate,
+    HubPoolCommand, HubPs, HubStats, HubStrategy, HubSubmit, HubUninstall,
 };
 
 use super::super::api::{ApiState, metrics_router, router};
 use super::super::client::{HubClient, execute, job_files, schedule};
 use super::super::context::{Resolved, TokenRef};
 use super::super::error::HubError;
-#[cfg(unix)]
 use super::super::model::JobState;
 use super::super::service::HubService;
 use super::super::store::HubStore;
@@ -1049,4 +1048,210 @@ async fn placing_jobs_can_be_dequeued_through_the_api_and_are_never_adopted() {
         Value::Null,
         "the run is not adopted"
     );
+}
+
+#[tokio::test]
+async fn a_queued_job_stopped_before_placement_never_runs() {
+    let hub = hub_with(FakeDriver::default(), None).await;
+    run(&hub.client, add("local", 1)).await.expect("add");
+    let queued = run(
+        &hub.client,
+        HubCommand::Enqueue(Box::new(HubEnqueue {
+            job: spec(hub.directory.path(), "stopped-early", None),
+            at: None,
+            cron: None,
+            cron_timezone: None,
+            priority: 0,
+        })),
+    )
+    .await
+    .expect("enqueue");
+    let job = queued["job"]["jobId"].as_str().expect("job").to_owned();
+    let stopped = run(&hub.client, HubCommand::Stop { job: job.clone() })
+        .await
+        .expect("stop");
+    assert_eq!(stopped["job"]["state"], json!("stopped"));
+    assert_eq!(stopped["job"]["failureReason"], Value::Null);
+    assert!(stopped["job"]["finishedAt"].is_string());
+
+    run(&hub.client, HubCommand::Dispatch)
+        .await
+        .expect("dispatch");
+    let state = hub.service.snapshot().await;
+    let record = state
+        .jobs
+        .iter()
+        .find(|slot| slot.job_id == job)
+        .expect("job");
+    assert_eq!(record.state, JobState::Stopped);
+    assert!(record.target.is_none(), "it was never placed");
+    assert!(record.run_id.is_none(), "it never started");
+    assert!(
+        hub.driver.submissions.lock().expect("fake lock").is_empty(),
+        "a stopped queued job is never submitted"
+    );
+}
+
+#[tokio::test]
+async fn a_running_job_is_stopped_without_failing() {
+    let hub = hub_with(FakeDriver::default(), None).await;
+    run(&hub.client, add("local", 1)).await.expect("add");
+    let placed = run(
+        &hub.client,
+        submit(spec(hub.directory.path(), "stopped-now", None)),
+    )
+    .await
+    .expect("submit");
+    let job = placed["job"]["jobId"].as_str().expect("job").to_owned();
+    let run_id = placed["job"]["runId"].as_str().expect("run id").to_owned();
+    let stopped = run(&hub.client, HubCommand::Stop { job: job.clone() })
+        .await
+        .expect("stop");
+    assert_eq!(stopped["job"]["state"], json!("stopped"));
+    assert_eq!(stopped["job"]["failureReason"], Value::Null);
+    assert_eq!(stopped["job"]["error"], Value::Null);
+    assert_eq!(
+        hub.driver.stops.lock().expect("fake lock").as_slice(),
+        [("local".to_owned(), run_id)]
+    );
+
+    run(&hub.client, HubCommand::Dispatch)
+        .await
+        .expect("dispatch");
+    let state = hub.service.snapshot().await;
+    let record = state
+        .jobs
+        .iter()
+        .find(|slot| slot.job_id == job)
+        .expect("job");
+    assert_eq!(
+        record.state,
+        JobState::Stopped,
+        "a later pass keeps it stopped"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_stop_leaves_the_job_running_and_names_the_target() {
+    let hub = hub_with(FakeDriver::default(), None).await;
+    run(&hub.client, add("local", 1)).await.expect("add");
+    let placed = run(
+        &hub.client,
+        submit(spec(hub.directory.path(), "stop-refused", None)),
+    )
+    .await
+    .expect("submit");
+    let job = placed["job"]["jobId"].as_str().expect("job").to_owned();
+    hub.driver
+        .fail_stops
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let error = run(&hub.client, HubCommand::Stop { job: job.clone() })
+        .await
+        .expect_err("stop refused");
+    assert!(error.to_string().contains("local"), "{error}");
+    let state = hub.service.snapshot().await;
+    let record = state
+        .jobs
+        .iter()
+        .find(|slot| slot.job_id == job)
+        .expect("job");
+    assert_eq!(
+        record.state,
+        JobState::Running,
+        "a failed stop changes nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_held_lease_is_released_through_the_pool_route() {
+    let hub = hub_with(FakeDriver::default(), None).await;
+    let lease = serde_json::from_value::<super::super::pool::Lease>(json!({
+        "id": "one",
+        "name": "zs-one",
+        "pool": "burst",
+        "phase": "active",
+        "localPort": 1000,
+        "createdAtMs": 1,
+        "hold": true,
+    }))
+    .expect("lease");
+    hub.service
+        .mutate(|state| {
+            state.members.push(super::member("zs-one", &[], 1, 0));
+            state.leases.push(lease);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+
+    let released = run(
+        &hub.client,
+        HubCommand::Pool(HubPoolCommand::Release {
+            lease: "zs-one".to_owned(),
+        }),
+    )
+    .await
+    .expect("release");
+    assert_eq!(released["released"], json!(true));
+    assert_eq!(released["lease"]["hold"], json!(false));
+    let state = hub.service.snapshot().await;
+    assert!(!state.leases[0].hold);
+    assert!(
+        state
+            .member("zs-one")
+            .expect("member")
+            .idle_since_ms
+            .is_some(),
+        "a drained member becomes eligible for the idle rule"
+    );
+}
+
+#[tokio::test]
+async fn a_stop_keeps_the_outcome_of_a_run_a_status_read_already_settled() {
+    let hub = hub_with(
+        FakeDriver {
+            stop_delay: Some(std::time::Duration::from_millis(200)),
+            ..FakeDriver::default()
+        },
+        None,
+    )
+    .await;
+    run(&hub.client, add("local", 1)).await.expect("add");
+    let placed = run(
+        &hub.client,
+        submit(spec(hub.directory.path(), "stop-race", None)),
+    )
+    .await
+    .expect("submit");
+    let job = placed["job"]["jobId"].as_str().expect("job").to_owned();
+    let run_id = placed["job"]["runId"].as_str().expect("run id").to_owned();
+    // The run is terminal when the status read below observes it, while the slow stop is
+    // still in flight. That real outcome is kept rather than relabelled `stopped`.
+    hub.driver.finish_all();
+
+    let service = hub.service.clone();
+    let stopping = tokio::spawn({
+        let service = service.clone();
+        let job = job.clone();
+        async move { service.stop(&job).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let status = service.status(&job).await.expect("status");
+    assert_eq!(status["job"]["state"], json!("succeeded"));
+    let stopped = stopping.await.expect("join").expect("stop");
+    assert_eq!(stopped["job"]["state"], json!("succeeded"));
+    assert_eq!(stopped["job"]["failureReason"], Value::Null);
+    assert_eq!(stopped["job"]["error"], Value::Null);
+    assert_eq!(
+        hub.driver.stops.lock().expect("fake lock").as_slice(),
+        [("local".to_owned(), run_id)],
+        "the target stop still ran"
+    );
+    let state = hub.service.snapshot().await;
+    let record = state
+        .jobs
+        .iter()
+        .find(|slot| slot.job_id == job)
+        .expect("job");
+    assert_eq!(record.state, JobState::Succeeded);
 }

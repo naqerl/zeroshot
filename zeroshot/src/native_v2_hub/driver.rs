@@ -285,7 +285,7 @@ fn last_json(stdout: &str) -> Option<Value> {
 /// (`target.unavailable`) or its answer was unreadable (a `protocol` diagnostic). Refusals the
 /// target or the CLI reported (invalid requests, submission conflicts, backend errors) stay
 /// rejections.
-fn unanswered_when_uncertain(error: HubError) -> HubError {
+pub(crate) fn unanswered_when_uncertain(error: HubError) -> HubError {
     let uncertain = matches!(
         &error,
         HubError::Target { diagnostic: Some(diagnostic), .. }

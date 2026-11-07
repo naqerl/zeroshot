@@ -80,7 +80,9 @@ pub(crate) fn router_with_mcp(state: Arc<ApiState>, mcp: Option<Router>) -> Rout
         .route("/v1/hub/jobs/query", post(ps))
         .route("/v1/hub/jobs/history", post(history))
         .route("/v1/hub/jobs/{id}", get(status).delete(dequeue))
+        .route("/v1/hub/jobs/{id}/stop", post(stop_job))
         .route("/v1/hub/jobs/{id}/stream", post(stream))
+        .route("/v1/hub/leases/{name}/release", post(release_lease))
         .route("/v1/hub/queue", post(enqueue))
         .route("/v1/hub/schedules", post(create_schedule))
         .route("/v1/hub/dispatch", post(dispatch))
@@ -363,6 +365,14 @@ async fn status(State(state): State<Arc<ApiState>>, Path(id): Path<String>) -> R
 
 async fn dequeue(State(state): State<Arc<ApiState>>, Path(id): Path<String>) -> Response {
     reply(state.service.dequeue(&id).await)
+}
+
+async fn stop_job(State(state): State<Arc<ApiState>>, Path(id): Path<String>) -> Response {
+    reply(state.service.stop(&id).await)
+}
+
+async fn release_lease(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Response {
+    reply(state.service.release_lease(&name).await)
 }
 
 async fn dispatch(State(state): State<Arc<ApiState>>) -> Response {

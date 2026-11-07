@@ -15,7 +15,9 @@ use super::super::capacity;
 use super::super::clock::now_ms;
 use super::super::error::{EXIT_NO_CAPACITY, EXIT_NO_ELIGIBLE_TARGET, HubError};
 use super::super::lease::{PoolRuntime, REAP_INTERVAL_MS, production_runtime};
-use super::super::model::{HubState, Job, JobState, MemberState, STATE_VERSION, Strategy};
+use super::super::model::{
+    HubState, Job, JobError, JobErrorKind, JobState, MemberState, STATE_VERSION, Strategy,
+};
 use super::super::pool::{
     self, BOOT_DEADLINE_MS, FIRST_PAUSE_MS, LABEL_HUB, LABEL_LEASE, LABEL_LOCATION,
     LABEL_SERVER_TYPE, Lease, LeasePhase, MAX_PAUSE_MS, Pool, PoolEventKind, PoolPhase, Provider,
@@ -2701,4 +2703,185 @@ async fn a_provider_404_for_the_delete_action_completes_the_lease() {
     assert!(state.leases.is_empty(), "{:?}", state.leases);
     assert_eq!(rig.cloud.servers(), 0);
     assert_eq!(rig.cloud.with(|cloud| cloud.destroyed.len()), 3);
+}
+
+#[tokio::test]
+async fn a_stopped_job_keeps_its_server_until_the_lease_is_released() {
+    let rig = rig();
+    let lease = rig.running_job_on_server().await;
+    let run_id = job_named(&rig.state().await, "hj_one")
+        .run_id
+        .clone()
+        .expect("run");
+    let stopped = rig.service.stop("hj_one").await.expect("stop");
+    assert_eq!(stopped["job"]["state"], json!("stopped"));
+    assert_eq!(stopped["job"]["failureReason"], serde_json::Value::Null);
+    assert!(stopped["job"]["finishedAt"].is_string());
+    assert_eq!(
+        rig.driver.stops.lock().expect("fake lock").as_slice(),
+        [(lease.name.clone(), run_id)]
+    );
+
+    // The idle mark a finished run leaves behind must not tear a held lease down, however far
+    // the clock advances.
+    rig.set(|state| {
+        state
+            .members
+            .iter_mut()
+            .find(|member| member.name == lease.name)
+            .expect("member")
+            .idle_since_ms = Some(1);
+    })
+    .await;
+    let state = rig.state().await;
+    assert!(state.leases[0].hold);
+    assert_eq!(job_named(&state, "hj_one").state, JobState::Stopped);
+    let far_future = now_ms().saturating_add(365 * 24 * 60 * 60 * 1000);
+    assert!(
+        pool::teardown_due(&state, far_future).is_empty(),
+        "a deliberate stop keeps the machine"
+    );
+
+    let released = rig
+        .service
+        .release_lease(&lease.name)
+        .await
+        .expect("release");
+    assert_eq!(released["released"], json!(true));
+    assert_eq!(released["lease"]["hold"], json!(false));
+    let state = rig.state().await;
+    assert!(!state.leases[0].hold);
+    assert_eq!(
+        pool::teardown_due(&state, far_future),
+        [(lease.name.clone(), TeardownReason::Idle)],
+        "a released lease follows the ordinary idle rule again"
+    );
+}
+
+#[tokio::test]
+async fn a_new_job_on_a_held_lease_clears_the_hold() {
+    let rig = rig();
+    let lease = rig.running_job_on_server().await;
+    rig.service.stop("hj_one").await.expect("stop");
+    assert!(rig.state().await.leases[0].hold);
+    rig.driver.finish_all();
+
+    rig.enqueue("hj_two").await;
+    for _ in 0..4 {
+        rig.pass().await;
+    }
+    let state = rig.state().await;
+    assert_eq!(
+        job_named(&state, "hj_two").target.as_deref(),
+        Some(lease.name.as_str())
+    );
+    assert!(!state.leases[0].hold, "placing a job releases the hold");
+}
+
+#[tokio::test]
+async fn the_stall_path_still_fails_and_tears_the_server_down() {
+    let rig = rig();
+    let lease = rig.running_job_on_server().await;
+    rig.set(|state| {
+        let job = state
+            .jobs
+            .iter_mut()
+            .find(|job| job.job_id == "hj_one")
+            .expect("job");
+        job.max_stall_ms = Some(1);
+        job.last_cursor = Some("stuck".to_owned());
+        job.last_cursor_at_ms = Some(1);
+    })
+    .await;
+
+    let view = rig.pass().await;
+    assert_eq!(view["stalled"][0]["jobId"], json!("hj_one"));
+    let state = rig.state().await;
+    let stalled = job_named(&state, "hj_one");
+    assert_eq!(stalled.state, JobState::Failed);
+    assert_eq!(stalled.failure_reason.as_deref(), Some("stalled"));
+    assert_eq!(
+        stalled.error.as_ref().map(|error| error.kind),
+        Some(JobErrorKind::Stalled)
+    );
+    assert!(
+        !state.leases[0].hold,
+        "only a deliberate stop holds the machine"
+    );
+
+    rig.set(|state| {
+        state
+            .members
+            .iter_mut()
+            .find(|member| member.name == lease.name)
+            .expect("member")
+            .idle_since_ms = Some(1);
+    })
+    .await;
+    let state = rig.state().await;
+    let far_future = now_ms().saturating_add(365 * 24 * 60 * 60 * 1000);
+    assert_eq!(
+        pool::teardown_due(&state, far_future),
+        [(lease.name.clone(), TeardownReason::Idle)],
+        "the stall path still tears the machine down"
+    );
+}
+
+#[tokio::test]
+async fn a_deliberate_stop_clears_an_earlier_hub_error() {
+    let rig = rig();
+    rig.running_job_on_server().await;
+    rig.set(|state| {
+        let job = state
+            .jobs
+            .iter_mut()
+            .find(|job| job.job_id == "hj_one")
+            .expect("job");
+        job.error = Some(JobError::new(
+            JobErrorKind::Stalled,
+            "stalled: no cursor movement",
+        ));
+        job.failure_reason = Some("stalled".to_owned());
+        job.failure_classification = Some(super::super::schedule::CLASSIFIED_STALLED.to_owned());
+    })
+    .await;
+
+    let stopped = rig.service.stop("hj_one").await.expect("stop");
+    assert_eq!(stopped["job"]["state"], json!("stopped"));
+    assert_eq!(stopped["job"]["error"], serde_json::Value::Null);
+    assert_eq!(stopped["job"]["errorKind"], serde_json::Value::Null);
+    assert_eq!(stopped["job"]["failureReason"], serde_json::Value::Null);
+    assert_eq!(
+        stopped["job"]["failureClassification"],
+        serde_json::Value::Null
+    );
+}
+
+#[tokio::test]
+async fn releasing_a_lease_while_its_job_runs_does_not_mark_the_member_idle() {
+    let rig = rig();
+    let lease = rig.running_job_on_server().await;
+    rig.set(|state| {
+        state.leases[0].hold = true;
+        state
+            .members
+            .iter_mut()
+            .find(|member| member.name == lease.name)
+            .expect("member")
+            .idle_since_ms = None;
+    })
+    .await;
+
+    let released = rig
+        .service
+        .release_lease(&lease.name)
+        .await
+        .expect("release");
+    assert_eq!(released["lease"]["hold"], json!(false));
+    let state = rig.state().await;
+    assert_eq!(
+        state.member(&lease.name).expect("member").idle_since_ms,
+        None,
+        "an in-use lease is not marked idle before its job settles"
+    );
 }

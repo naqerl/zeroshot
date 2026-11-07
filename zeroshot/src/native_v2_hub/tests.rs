@@ -1184,6 +1184,8 @@ pub(super) struct FakeDriver {
     pub cursors: Mutex<BTreeMap<String, String>>,
     /// `force-stop` calls as (member, run ID).
     pub stops: Mutex<Vec<(String, String)>>,
+    /// Makes `force-stop` slow, so a test can overlap a status read with a stop.
+    pub stop_delay: Option<std::time::Duration>,
     /// Makes every `force-stop` fail.
     pub fail_stops: std::sync::atomic::AtomicBool,
 }
@@ -1305,6 +1307,9 @@ impl HubDriver for FakeDriver {
     }
 
     async fn stop(&self, member: &str, run_id: &str) -> Result<(), HubError> {
+        if let Some(delay) = self.stop_delay {
+            tokio::time::sleep(delay).await;
+        }
         self.stops
             .lock()
             .expect("fake lock")

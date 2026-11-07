@@ -81,6 +81,7 @@ pub(crate) const JOB_STATES: &[&str] = &[
     "succeeded",
     "failed",
     "dequeued",
+    "stopped",
     "cancelled",
 ];
 /// The hub's built-in local member is the default local backend, not a named target.
@@ -1712,7 +1713,7 @@ fn job_state_rank(state: &str) -> u8 {
         "queued" | "scheduled" => 1,
         "placing" => 2,
         "running" => 3,
-        "succeeded" | "failed" | "dequeued" | "cancelled" => 4,
+        "succeeded" | "failed" | "dequeued" | "stopped" | "cancelled" => 4,
         _ => 3,
     }
 }
@@ -1763,7 +1764,7 @@ where
         let state = hub_job_state(&view);
         let terminal = matches!(
             state.as_str(),
-            "succeeded" | "failed" | "dequeued" | "cancelled"
+            "succeeded" | "failed" | "dequeued" | "stopped" | "cancelled"
         );
         let mut run = feed.run_facts.borrow().get(&job_id).cloned();
         let needs_facts = terminal
@@ -1940,7 +1941,7 @@ async fn poll_jobs<H>(
         live_jobs.insert(job_id.clone());
         if !matches!(
             hub_job_state(&view).as_str(),
-            "succeeded" | "failed" | "dequeued" | "cancelled"
+            "succeeded" | "failed" | "dequeued" | "stopped" | "cancelled"
         ) {
             running_jobs.insert(job_id.clone());
         }
@@ -2086,7 +2087,10 @@ where
     if feed.terminal_jobs.borrow().contains(job_id) {
         return;
     }
-    let terminal = matches!(state, "succeeded" | "failed" | "dequeued" | "cancelled");
+    let terminal = matches!(
+        state,
+        "succeeded" | "failed" | "dequeued" | "stopped" | "cancelled"
+    );
     if terminal {
         if !matches!(delivery_facts(feed, job_id, view), Some((Some(_), Some(_))))
             && view.get("runId").and_then(Value::as_str).is_some()
@@ -3016,7 +3020,7 @@ fn payload_schema(name: &str) -> Value {
             "status": {"type": ["object", "null"]},
             "state": {
                 "type": "string",
-                "enum": ["submitted", "queued", "scheduled", "placing", "running", "succeeded", "failed", "dequeued", "cancelled"]
+                "enum": ["submitted", "queued", "scheduled", "placing", "running", "succeeded", "failed", "dequeued", "stopped", "cancelled"]
             },
             "target": {"type": ["string", "null"]},
             "project": {"type": ["string", "object", "null"]},

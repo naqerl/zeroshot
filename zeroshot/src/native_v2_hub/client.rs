@@ -335,6 +335,11 @@ async fn request_document(client: &HubClient, command: HubCommand) -> Result<Val
             client.post(&["v1", "hub", "jobs", "history"], &query).await
         }
         HubCommand::Status { job } => client.get(&["v1", "hub", "jobs", &job]).await,
+        HubCommand::Stop { job } => {
+            client
+                .post(&["v1", "hub", "jobs", &job, "stop"], &json!({}))
+                .await
+        }
         HubCommand::Dequeue { job } => {
             client
                 .call(Method::DELETE, &["v1", "hub", "jobs", &job], None::<&Value>)
@@ -747,6 +752,11 @@ async fn pool_document(client: &HubClient, command: HubPoolCommand) -> Result<Va
         HubPoolCommand::Resume { name } => {
             client
                 .post(&["v1", "hub", "pools", &name, "resume"], &json!({}))
+                .await
+        }
+        HubPoolCommand::Release { lease } => {
+            client
+                .post(&["v1", "hub", "leases", &lease, "release"], &json!({}))
                 .await
         }
         HubPoolCommand::TagSet(request) => {

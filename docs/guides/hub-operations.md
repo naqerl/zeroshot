@@ -50,12 +50,12 @@ restarts. Pass, placement, and API series are counted since the daemon started.
 
 | Metric | Type | Labels |
 |---|---|---|
-| `zeroshot_hub_jobs` | gauge | `state` (queued, scheduled, running, succeeded, failed, dequeued) |
+| `zeroshot_hub_jobs` | gauge | `state` (queued, scheduled, running, succeeded, failed, dequeued, stopped) |
 | `zeroshot_hub_queue_depth` | gauge | `kind` (due, scheduled) |
 | `zeroshot_hub_schedules` | gauge | active recurring schedules |
 | `zeroshot_hub_cron_fires_total`, `zeroshot_hub_cron_skips_total` | counter | none |
 | `zeroshot_hub_job_queue_wait_seconds` | histogram | `target` |
-| `zeroshot_hub_job_run_duration_seconds` | histogram | `target`, `outcome` |
+| `zeroshot_hub_job_run_duration_seconds` | histogram | `target`, `outcome` (succeeded, failed, stopped) |
 | `zeroshot_hub_member_slots`, `_slots_used`, `_slots_free` | gauge | `member` |
 | `zeroshot_hub_member_up` | gauge | `member` (last load probe; absent until probed) |
 | `zeroshot_hub_member_state` | gauge | `member`, `state` |

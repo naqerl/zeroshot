@@ -892,7 +892,11 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   with `--max-stall-ms` on `hub submit`/`hub enqueue`; the job value wins over the hub's
   `--max-stall`, and the diagnostic and `hub status` name the effective limit and its source.
   `hub dequeue` also removes placing jobs
-  (`dequeued_while_placing`); a run the target accepts under their key is noted, never adopted. Jobs placing when a daemon stops stay on their member as unconfirmed. Hub-side job problems
+  (`dequeued_while_placing`); a run the target accepts under their key is noted, never adopted.
+  `hub stop` deliberately stops a queued or running job as the terminal non-failing `stopped`
+  state and holds its pool lease (`Lease.hold`), which suppresses only the idle teardown until a
+  new placement or `hub pool release` clears it; `--max-stall` still fails a stalled job and tears
+  its lease down. Jobs placing when a daemon stops stay on their member as unconfirmed. Hub-side job problems
   are a typed `JobError` (plain strings from older state load as `unclassified`). API errors carry the
   `zeroshot.error/v1` diagnostic plus `x-zeroshot-exit-code`; logs, watch, attach, and force-stop
   stream NDJSON frames from a `zeroshot` child on the hub host. Every other hub command is a client

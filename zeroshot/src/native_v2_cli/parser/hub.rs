@@ -130,6 +130,13 @@ pub(super) enum HubCliCommand {
     /// Force a placed job's run to stop.
     ForceStop(HubJobArgs),
 
+    /// Stop a job deliberately without deleting the machine that ran it.
+    ///
+    /// A queued job never starts. A running job's run is stopped through the same target call
+    /// as `hub force-stop`, the job becomes `stopped` rather than failed, and its pool machine
+    /// is held for reuse until `hub pool release` or a new job uses it.
+    Stop(HubJobArgs),
+
     /// Remove a queued or scheduled job before it is placed, a placing job its target has not
     /// confirmed, or a recurring schedule (`hs_…`).
     ///
@@ -204,6 +211,13 @@ pub(super) enum HubPoolCliCommand {
     /// Let a pool start servers again after it stopped on an account limit or a rejected
     /// request, and retry a capacity shortage or a failed-boot pause now.
     Resume(HubPoolNameArgs),
+
+    /// Give a lease held by `hub stop` back to its pool.
+    ///
+    /// The machine then follows the pool's ordinary --idle rule and is deleted once it has
+    /// been idle that long. A lease still running a job keeps running; its hold is cleared so
+    /// the machine becomes eligible again when the job settles.
+    Release(HubPoolReleaseArgs),
 
     /// Prefer machines per job tag: set, list or remove a pool's tag profiles.
     ///
@@ -294,6 +308,13 @@ fn memory_gb(value: &str) -> Result<u32, String> {
             "{value:?} is not a memory size in GB, such as 16 or 16G"
         )),
     }
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HubPoolReleaseArgs {
+    /// Held lease name, as shown by `hub pool list`.
+    #[arg(value_name = "LEASE")]
+    lease: String,
 }
 
 #[derive(Debug, Args)]
@@ -409,6 +430,9 @@ impl HubPoolCliCommand {
             Self::Types => HubPoolCommand::Types,
             Self::Resume(args) => HubPoolCommand::Resume {
                 name: member_name(args.name)?,
+            },
+            Self::Release(args) => HubPoolCommand::Release {
+                lease: member_name(args.lease)?,
             },
             Self::Tag(HubPoolTagCliCommand::Set(args)) => {
                 let args = *args;
@@ -792,7 +816,7 @@ pub(super) struct HubEnqueueArgs {
 #[derive(Debug, Args)]
 pub(super) struct HubPsArgs {
     /// Job state filter: active (queued, scheduled, running), queued, scheduled, running,
-    /// succeeded, failed, dequeued, recurring (schedules only), or all. Active schedules are
+    /// succeeded, failed, dequeued, stopped, recurring (schedules only), or all. Active schedules are
     /// listed with active and recurring; all schedules with all.
     #[arg(long, value_name = "STATE", default_value = "active")]
     state: String,
@@ -813,7 +837,7 @@ pub(super) struct HubPsArgs {
 #[derive(Debug, Args)]
 pub(super) struct HubJobsArgs {
     /// Job state filter: active (queued, scheduled, running), queued, scheduled, running,
-    /// succeeded, failed, dequeued, or all.
+    /// succeeded, failed, dequeued, stopped, or all.
     #[arg(long, value_name = "STATE", default_value = "all")]
     state: String,
 
@@ -962,6 +986,7 @@ impl HubCliCommand {
                 execution: args.execution,
             }),
             Self::ForceStop(args) => Ok(HubCommand::ForceStop { job: args.job }),
+            Self::Stop(args) => Ok(HubCommand::Stop { job: args.job }),
             Self::Dequeue(args) => Ok(HubCommand::Dequeue { job: args.job }),
             Self::Dispatch => Ok(HubCommand::Dispatch),
             Self::Stats(args) => Ok(stats_command(args)),

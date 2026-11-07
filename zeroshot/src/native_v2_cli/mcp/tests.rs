@@ -823,6 +823,7 @@ async fn handshake_lists_cli_tools() {
             "hub_logs",
             "hub_daemon_status",
             "hub_dequeue",
+            "hub_stop",
             "hub_add",
             "hub_update",
             "hub_remove",
@@ -857,6 +858,7 @@ fn hub_tools_are_listed_and_map_arguments() {
         .collect::<Vec<_>>();
     for name in [
         "hub_dequeue",
+        "hub_stop",
         "hub_add",
         "hub_update",
         "hub_remove",

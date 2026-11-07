@@ -303,6 +303,9 @@ pub(crate) enum JobState {
     Succeeded,
     Failed,
     Dequeued,
+    /// Deliberately stopped by an operator through `hub stop`. Terminal, but not a failure:
+    /// the job keeps no failure reason and its pool machine is held for reuse.
+    Stopped,
 }
 
 impl JobState {
@@ -500,6 +503,7 @@ impl Job {
             JobState::Succeeded => "succeeded",
             JobState::Failed => "failed",
             JobState::Dequeued => "dequeued",
+            JobState::Stopped => "stopped",
         }
     }
 

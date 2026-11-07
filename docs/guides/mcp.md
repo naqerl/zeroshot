@@ -114,6 +114,7 @@ pull-request URL into the run input. It conflicts with `input`, `repository`, an
 | `hub_enqueue`       | `zeroshot hub enqueue`       | Queue a run for later placement.                    |
 | `hub_watch`         | `zeroshot hub watch`         | Follow a placed job's events until the stream ends. |
 | `hub_dequeue`       | `zeroshot hub dequeue`       | Cancel a queued job or a recurring schedule.        |
+| `hub_stop`          | `zeroshot hub stop`          | Stop a job deliberately and keep its machine.       |
 | `hub_dispatch`      | `zeroshot hub dispatch`      | Run one dispatcher pass now and print its summary.  |
 | `hub_force_stop`    | `zeroshot hub force-stop`    | Force a placed job's run to stop.                   |
 | `hub_stats`         | `zeroshot hub stats`         | Aggregate job outcomes and token usage.             |
@@ -130,8 +131,9 @@ will start a server for it, and fails when nothing can take it. Use `hub_enqueue
 Read-only tools are `status`, `logs`, `watch`, `list`, `report`, `hub_list`, `hub_ps`,
 `hub_jobs`, `hub_status`, `hub_watch`, `hub_stats`, `hub_logs`, and `hub_daemon_status`. `run`,
 `resume`, `hub_submit`, and `hub_enqueue` submit work. `hub_add`, `hub_update`, and `hub_remove`
-manage members; `hub_dequeue` cancels queued jobs or schedules; `hub_dispatch` requests a
-dispatcher pass; `force-stop` and `hub_force_stop` stop runs.
+manage members; `hub_dequeue` cancels queued jobs or schedules; `hub_stop` stops a job deliberately
+and keeps its pool machine; `hub_dispatch` requests a dispatcher pass; `force-stop` and
+`hub_force_stop` stop runs.
 
 `hub_jobs` lists job history instead of live load: `state` (`all` by default), `label` (one or
 more `key=value` pairs), `since` (`10m`, `2h`, `3d`), and `limit`. It returns at most a page of
@@ -254,8 +256,8 @@ lost events sends another `notifications/events/active` with the `{from,to}` ran
 continuing.
 
 A terminal run or job is an ordinary event. Every job produces exactly one terminal `hub.job`
-occurrence, including `succeeded`, `failed`, `force_stopped`, `dequeued`, `target_lost`, and jobs
-found terminal after a daemon restart. It carries `data.terminal: true`, `finishedAt`,
+occurrence, including `succeeded`, `failed`, `stopped`, `force_stopped`, `dequeued`,
+`target_lost`, and jobs found terminal after a daemon restart. It carries `data.terminal: true`, `finishedAt`,
 `failureReason`, `errorKind`, and `headBranch`/`headRevision` when Git delivery landed. A snapshot
 for a job that was already terminal is that terminal occurrence. The stream never completes on a
 terminal event: it stays open for later jobs, later runs, pool changes, warnings, and idle
@@ -268,7 +270,7 @@ it subscribes to the whole hub and is the ordinary way to watch jobs, runs, pool
 warnings on one stream.
 
 `hub.job` follows the same hub record as `hub_status`, including `submitted`, `queued`,
-`scheduled`, `placing`, `running`, `succeeded`, `failed`, `dequeued`, and `cancelled`. A job that
+`scheduled`, `placing`, `running`, `succeeded`, `failed`, `dequeued`, `stopped`, and `cancelled`. A job that
 fails or is cancelled before it runs still produces its one terminal `hub.job` event. Run events
 are collapsed: `hub.run` fires only when the active node changes (including a shrinking parallel
 set) or the phase leaves `running`, and cursor advances inside one node publish nothing to default

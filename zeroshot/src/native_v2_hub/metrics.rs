@@ -568,13 +568,14 @@ fn spec_labels(spec: Option<&Spec>) -> (&'static str, String) {
     (source, spec.tag.clone().unwrap_or_default())
 }
 
-const JOB_STATES: [&str; 6] = [
+const JOB_STATES: [&str; 7] = [
     "queued",
     "scheduled",
     "running",
     "succeeded",
     "failed",
     "dequeued",
+    "stopped",
 ];
 
 #[allow(clippy::cast_precision_loss)]
@@ -800,10 +801,10 @@ fn render_job_histograms(out: &mut Exposition, state: &HubState) {
             .or_insert_with(|| Histogram::new(&JOB_BUCKETS))
             .observe(dispatched.saturating_sub(ready) as f64 / 1000.0);
         if let Some(finished) = job.finished_at_ms.filter(|_| job.state.is_terminal()) {
-            let outcome = if job.state == JobState::Succeeded {
-                "succeeded"
-            } else {
-                "failed"
+            let outcome = match job.state {
+                JobState::Succeeded => "succeeded",
+                JobState::Stopped => "stopped",
+                _ => "failed",
             };
             durations
                 .entry((target, outcome))
