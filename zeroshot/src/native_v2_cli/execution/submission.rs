@@ -20,7 +20,7 @@ use serde::{Deserialize, Deserializer};
 use super::super::{
     BuiltinGraphTemplate, CliOutcome, NativeV2CliBackend, NativeV2CliCommand, NativeV2CliError,
     PreparedRunRequest, RunCommand, RunGraph, RunRuntime, RunSelection, TargetRunIntent,
-    TemplateDelivery,
+    SoftwareChangeFastOptions, TemplateDelivery,
 };
 use super::{CliExecutionContext, write_json};
 use crate::native_v2_admission::{DeliveryPolicy, NativeV2Admission, executable_runtime_roles};
@@ -129,9 +129,11 @@ pub fn try_execute_native_v2_static(
             return super::merge_plans::validate_file(file, output).map(Some);
         }
         NativeV2CliCommand::TemplateList => execute_template_list(output)?,
-        NativeV2CliCommand::TemplateShow { template, delivery } => {
-            execute_template_show(*template, *delivery, output)?
-        }
+        NativeV2CliCommand::TemplateShow {
+            template,
+            delivery,
+            options,
+        } => execute_template_show(*template, *delivery, *options, output)?,
         _ => return Ok(None),
     };
     Ok(Some(outcome))
@@ -149,10 +151,11 @@ fn execute_template_list(output: &mut impl Write) -> Result<CliOutcome, NativeV2
 fn execute_template_show(
     template: BuiltinGraphTemplate,
     delivery: TemplateDelivery,
+    options: SoftwareChangeFastOptions,
     output: &mut impl Write,
 ) -> Result<CliOutcome, NativeV2CliError> {
     let graph = template
-        .materialize(delivery)
+        .materialize_with_options(delivery, options)
         .map_err(|error| NativeV2CliError::Usage(error.to_string()))?;
     write_json(output, &graph)?;
     Ok(CliOutcome::Completed)
@@ -510,8 +513,13 @@ fn materialize_graph(selection: &RunGraph) -> Result<GraphSpec, NativeV2CliError
     match selection {
         RunGraph::File(path) => read_json("graph", path),
         RunGraph::Template {
-            template, delivery, ..
-        } => template.materialize(*delivery).map_err(template_error),
+            template,
+            delivery,
+            options,
+            ..
+        } => template
+            .materialize_with_options(*delivery, *options)
+            .map_err(template_error),
     }
 }
 
@@ -555,6 +563,7 @@ fn apply_template_runtime(
         template,
         delivery,
         ignore_pr_feedback,
+        ..
     } = selection
     else {
         return Ok(runtime);

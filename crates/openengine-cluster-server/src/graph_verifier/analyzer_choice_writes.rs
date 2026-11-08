@@ -242,6 +242,7 @@ pub(super) fn guarded_selector_uses(
     ) {
         match guard {
             Guard::In { value, .. } => uses.push((value, false, condition)),
+            Guard::StateIn { .. } | Guard::StateAtMost { .. } => {}
             Guard::KOfMap { value, .. } => uses.push((value, true, condition)),
             Guard::KOfN { values, .. } => uses.extend(
                 values

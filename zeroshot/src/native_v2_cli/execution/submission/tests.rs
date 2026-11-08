@@ -8,6 +8,33 @@ use openengine_cluster_testkit::assertions::{AssertError, AssertValue};
 use super::*;
 
 #[test]
+fn template_options_reach_public_graph_materialization() {
+    let fast = RunGraph::Template {
+        template: BuiltinGraphTemplate::SoftwareChangeFast,
+        delivery: TemplateDelivery::None,
+        options: crate::native_v2_cli::SoftwareChangeFastOptions::by_radius(),
+        ignore_pr_feedback: false,
+    };
+    let graph = materialize_graph(&fast).assert_value();
+    let text = serde_json::to_string(&graph).assert_value();
+    assert!(text.contains("\"jev\""));
+    assert!(text.contains("\"blast_route\""));
+
+    let always = RunGraph::Template {
+        template: BuiltinGraphTemplate::SoftwareChangeFast,
+        delivery: TemplateDelivery::None,
+        options: crate::native_v2_cli::SoftwareChangeFastOptions::default(),
+        ignore_pr_feedback: false,
+    };
+    assert_eq!(
+        materialize_graph(&always).assert_value(),
+        BuiltinGraphTemplate::SoftwareChange
+            .materialize(TemplateDelivery::None)
+            .assert_value()
+    );
+}
+
+#[test]
 fn target_api_keys_cannot_be_collected_by_a_runtime_connection_requirement() {
     let fields = ["ZEROSHOT_API_KEY", "zeroshot_api_key", "OPENAI_API_KEY"]
         .into_iter()
@@ -180,6 +207,7 @@ fn wave6_cli_contract_uniform_runtime_and_template_bindings_preserve_authority()
     let no_delivery = RunGraph::Template {
         template: BuiltinGraphTemplate::SoftwareChange,
         delivery: TemplateDelivery::None,
+        options: crate::native_v2_cli::SoftwareChangeFastOptions::default(),
         ignore_pr_feedback: false,
     };
     assert_eq!(
@@ -422,6 +450,7 @@ async fn wave8_cli_contract_validate_only_preflight_materializes_without_backend
             graph: RunGraph::Template {
                 template: BuiltinGraphTemplate::SingleWorker,
                 delivery: TemplateDelivery::None,
+                options: crate::native_v2_cli::SoftwareChangeFastOptions::default(),
                 ignore_pr_feedback: false,
             },
             runtime: RunRuntime::Exact(runtime),

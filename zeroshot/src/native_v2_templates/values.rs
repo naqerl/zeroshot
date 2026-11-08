@@ -12,10 +12,13 @@ use crate::native_v2_delivery::contract::{delivery_result_schema, delivery_signa
 use crate::native_v2_delivery::DeliveryMode;
 
 use super::{
-    delivery_mode, enum_label, field_name, field_path, node_name, non_empty, static_value,
-    BuiltinTemplateError, TemplateDelivery, ACCEPTANCE_FEEDBACK_FIELD, CODE_FEEDBACK_FIELD,
-    DELIVERY_FEEDBACK_FIELD, DESCRIPTION_FIELD, DIAGNOSTIC_MESSAGE_FIELD, ISSUE_NUMBER_FIELD,
-    TASK_FIELD, TITLE_FIELD, PHASE_FIELD, CONTINUE_ITEMS_FIELD, verdict_labels,
+    delivery_mode, enum_label, enum_labels, field_name, field_path, node_name, non_empty,
+    static_value, BuiltinTemplateError, TemplateDelivery, ACCEPTANCE_FEEDBACK_FIELD,
+    CHECKS_REPORTED_FIELD, CODE_FEEDBACK_FIELD, CONFIDENCE_FIELD, CONTINUE_ITEMS_FIELD,
+    DELIVERY_FEEDBACK_FIELD, DESCRIPTION_FIELD, DIAGNOSTIC_MESSAGE_FIELD, FILES_FIELD,
+    HIGH_CONFIDENCE_LABEL, ISSUE_NUMBER_FIELD, LARGE_RADIUS_LABEL, LINES_FIELD,
+    LOW_CONFIDENCE_LABEL, PHASE_FIELD, RADIUS_FIELD, REASONS_FIELD, SMALL_RADIUS_LABEL, TASK_FIELD,
+    TITLE_FIELD, TOUCHES_FIELD, verdict_labels,
 };
 
 pub(super) fn graph(
@@ -98,6 +101,33 @@ pub(super) fn software_worker_input_type(
     ])
 }
 
+pub(super) fn fast_phase_type(
+    delivery: TemplateDelivery,
+) -> Result<PayloadType, BuiltinTemplateError> {
+    let PayloadType::Record { mut fields } = phase_type(delivery)? else {
+        return Err(BuiltinTemplateError::InvalidStaticContract);
+    };
+    fields.insert(
+        field_name("code")?,
+        optional(PayloadType::Enum {
+            values: verdict_labels()?,
+        }),
+    );
+    Ok(PayloadType::Record { fields })
+}
+
+pub(super) fn fast_software_worker_input_type(
+    delivery: TemplateDelivery,
+) -> Result<PayloadType, BuiltinTemplateError> {
+    record_type(vec![
+        (PHASE_FIELD, fast_phase_type(delivery)?, true),
+        (TASK_FIELD, PayloadType::String, true),
+        (ACCEPTANCE_FEEDBACK_FIELD, PayloadType::String, true),
+        (CODE_FEEDBACK_FIELD, PayloadType::String, true),
+        (DELIVERY_FEEDBACK_FIELD, PayloadType::String, true),
+    ])
+}
+
 pub(super) fn software_input_type(
     delivery: TemplateDelivery,
 ) -> Result<PayloadType, BuiltinTemplateError> {
@@ -106,6 +136,45 @@ pub(super) fn software_input_type(
         fields.push((ISSUE_NUMBER_FIELD, PayloadType::String, false));
     }
     record_type(fields)
+}
+
+pub(super) fn jev_input_type(
+    delivery: TemplateDelivery,
+) -> Result<PayloadType, BuiltinTemplateError> {
+    record_type(vec![
+        (PHASE_FIELD, phase_type(delivery)?, true),
+        (TASK_FIELD, PayloadType::String, true),
+    ])
+}
+
+pub(super) fn jev_output_type() -> Result<PayloadType, BuiltinTemplateError> {
+    record_type(vec![
+        (
+            RADIUS_FIELD,
+            PayloadType::Enum {
+                values: enum_labels(&[SMALL_RADIUS_LABEL, LARGE_RADIUS_LABEL])?,
+            },
+            true,
+        ),
+        (
+            CONFIDENCE_FIELD,
+            PayloadType::Enum {
+                values: enum_labels(&[HIGH_CONFIDENCE_LABEL, LOW_CONFIDENCE_LABEL])?,
+            },
+            true,
+        ),
+        (
+            TOUCHES_FIELD,
+            PayloadType::Array {
+                items: Box::new(PayloadType::String),
+            },
+            true,
+        ),
+        (FILES_FIELD, PayloadType::Integer, true),
+        (LINES_FIELD, PayloadType::Integer, true),
+        (CHECKS_REPORTED_FIELD, PayloadType::Boolean, true),
+        (REASONS_FIELD, PayloadType::String, true),
+    ])
 }
 
 pub(super) fn change_title_type() -> Result<PayloadType, BuiltinTemplateError> {
@@ -175,6 +244,34 @@ pub(super) fn software_state(
     if let Some(mode) = delivery_mode(delivery) {
         add_delivery_state_fields(&mut fields, mode)?;
     }
+    Ok(PayloadType::Record { fields })
+}
+
+pub(super) fn fast_state(delivery: TemplateDelivery) -> Result<PayloadType, BuiltinTemplateError> {
+    let PayloadType::Record { mut fields } = software_state(delivery)? else {
+        return Err(BuiltinTemplateError::InvalidStaticContract);
+    };
+    if let Some(phase) = fields.get_mut(&field_name(PHASE_FIELD)?) {
+        phase.value_type = fast_phase_type(delivery)?;
+    }
+    fields.insert(
+        field_name(RADIUS_FIELD)?,
+        optional(PayloadType::Enum {
+            values: enum_labels(&[SMALL_RADIUS_LABEL, LARGE_RADIUS_LABEL])?,
+        }),
+    );
+    fields.insert(
+        field_name(CONFIDENCE_FIELD)?,
+        optional(PayloadType::Enum {
+            values: enum_labels(&[HIGH_CONFIDENCE_LABEL, LOW_CONFIDENCE_LABEL])?,
+        }),
+    );
+    fields.insert(field_name(FILES_FIELD)?, optional(PayloadType::Integer));
+    fields.insert(field_name(LINES_FIELD)?, optional(PayloadType::Integer));
+    fields.insert(
+        field_name(CHECKS_REPORTED_FIELD)?,
+        optional(PayloadType::Boolean),
+    );
     Ok(PayloadType::Record { fields })
 }
 

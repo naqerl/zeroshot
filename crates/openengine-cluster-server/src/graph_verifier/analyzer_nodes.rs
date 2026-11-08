@@ -329,6 +329,7 @@ impl<'a> Analyzer<'a> {
             GuardValidationContext {
                 path: &until_path,
                 code: GraphDiagnosticCode::LoopExitSatisfiability,
+                state: None,
             },
         );
         for selector in guard_selectors(until) {

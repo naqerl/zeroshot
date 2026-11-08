@@ -419,6 +419,9 @@ enum TemplateName {
     /// A review, validation, and optional delivery workflow for code changes.
     SoftwareChange,
 
+    /// Software changes with a blast-radius judge that may skip review for small changes.
+    SoftwareChangeFast,
+
     /// Research with ten iterations by default and independent evidence gates.
     AutoResearch,
 
@@ -465,6 +468,21 @@ impl DeliveryArgs {
 }
 
 #[derive(Debug, Args)]
+struct TemplateOptionsArgs {
+    /// Review policy for software-change-fast: always or by_radius.
+    #[arg(long, value_name = "POLICY")]
+    review_policy: Option<String>,
+
+    /// Maximum changed files for the software-change-fast small-change shortcut.
+    #[arg(long, value_name = "COUNT")]
+    max_files: Option<u64>,
+
+    /// Maximum changed lines for the software-change-fast small-change shortcut.
+    #[arg(long, value_name = "COUNT")]
+    max_lines: Option<u64>,
+}
+
+#[derive(Debug, Args)]
 struct TemplateShowArgs {
     /// Built-in graph template to render.
     #[arg(value_enum, value_name = "TEMPLATE")]
@@ -472,6 +490,9 @@ struct TemplateShowArgs {
 
     #[command(flatten)]
     delivery: DeliveryArgs,
+
+    #[command(flatten)]
+    options: TemplateOptionsArgs,
 }
 
 #[derive(Debug, Args)]
@@ -657,6 +678,9 @@ struct RunArgs {
 
     #[command(flatten)]
     delivery: DeliveryArgs,
+
+    #[command(flatten)]
+    options: TemplateOptionsArgs,
 }
 
 #[derive(Debug, Args)]

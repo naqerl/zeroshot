@@ -84,6 +84,7 @@ impl<'a> Analyzer<'a> {
                 GuardValidationContext {
                     path: &guard_path,
                     code: GraphDiagnosticCode::ChoiceExhaustiveness,
+                    state: Some(&choice.state),
                 },
             );
             for selector in guard_selectors(&branch.when) {
@@ -106,6 +107,14 @@ impl<'a> Analyzer<'a> {
         let mut outcomes = Vec::with_capacity(choice.branches.as_slice().len());
         let mut reachable = Vec::with_capacity(choice.branches.as_slice().len());
         for (index, branch) in choice.branches.as_slice().iter().enumerate() {
+            // State predicates are opaque to the control assignment space: they can be true or
+            // false independently of any emitted signal, so they neither consume assignments nor
+            // make the remaining otherwise branch unreachable.
+            if guard_has_state_predicate(&branch.when) {
+                reachable.push(!assignments.is_empty());
+                outcomes.push(outcome_refinement(&[]));
+                continue;
+            }
             let mut residual = Vec::new();
             for (assignment, matched_prior) in assignments.iter().zip(&mut prior) {
                 let matches = evaluate_guard(&branch.when, assignment);
@@ -203,6 +212,70 @@ impl<'a> Analyzer<'a> {
             }
         }
         valid &= self.validate_guard_labels(guard, context);
+        valid &= self.validate_state_guards(guard, context);
+        valid
+    }
+
+    fn validate_state_guards(
+        &mut self,
+        guard: &Guard,
+        context: GuardValidationContext<'_>,
+    ) -> bool {
+        match guard {
+            Guard::StateIn { path, .. } => self.validate_state_guard_path(path, context, false),
+            Guard::StateAtMost { path, .. } => self.validate_state_guard_path(path, context, true),
+            Guard::All { guards } | Guard::Any { guards } => {
+                let mut valid = true;
+                for guard in guards.as_slice() {
+                    valid &= self.validate_state_guards(guard, context);
+                }
+                valid
+            }
+            Guard::Not { guard } => self.validate_state_guards(guard, context),
+            Guard::In { .. } | Guard::KOfN { .. } | Guard::KOfMap { .. } => true,
+        }
+    }
+
+    fn validate_state_guard_path(
+        &mut self,
+        path: &FieldPath,
+        context: GuardValidationContext<'_>,
+        numeric: bool,
+    ) -> bool {
+        let Some(state) = context.state else {
+            return true;
+        };
+        let Some(value_type) = path_type(state, path) else {
+            emit_diagnostic!(
+                self,
+                GraphDiagnosticCode::SchemaSafety,
+                "state guard path does not exist in the current state",
+                context.path.to_vec(),
+                Vec::new(),
+            );
+            return false;
+        };
+        let valid = if numeric {
+            matches!(value_type, PayloadType::Integer | PayloadType::Number)
+        } else {
+            matches!(
+                value_type,
+                PayloadType::Boolean | PayloadType::String | PayloadType::Enum { .. }
+            )
+        };
+        if !valid {
+            emit_diagnostic!(
+                self,
+                GraphDiagnosticCode::SchemaSafety,
+                if numeric {
+                    "state-at-most guard path must select a numeric value"
+                } else {
+                    "state-in guard path must select an enum, boolean, or string value"
+                },
+                context.path.to_vec(),
+                Vec::new(),
+            );
+        }
         valid
     }
 
@@ -220,6 +293,7 @@ impl<'a> Analyzer<'a> {
                     message: "guard labels exceed the selector's closed domain",
                 },
             ),
+            Guard::StateIn { .. } | Guard::StateAtMost { .. } => true,
             Guard::All { guards } | Guard::Any { guards } => {
                 self.validate_nested_guard_labels(guards.as_slice(), context)
             }
@@ -436,5 +510,16 @@ impl<'a> Analyzer<'a> {
 
     pub(super) fn map_owner(&self, target: &NodeName) -> Option<&NodeName> {
         find_map_owner(&self.graph.root, target, None)
+    }
+}
+
+fn guard_has_state_predicate(guard: &Guard) -> bool {
+    match guard {
+        Guard::StateIn { .. } | Guard::StateAtMost { .. } => true,
+        Guard::All { guards } | Guard::Any { guards } => {
+            guards.as_slice().iter().any(guard_has_state_predicate)
+        }
+        Guard::Not { guard } => guard_has_state_predicate(guard),
+        Guard::In { .. } | Guard::KOfN { .. } | Guard::KOfMap { .. } => false,
     }
 }

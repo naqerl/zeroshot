@@ -178,3 +178,56 @@ async fn all_any_quorum_and_first_use_exact_authored_join_rules() {
 }
 
 use openengine_cluster_testkit::assertions::{AssertValue};
+
+#[tokio::test]
+async fn state_guards_route_on_a_step_written_field() {
+    let state = json!({
+        "kind":"record",
+        "fields":{"value":{"type":{"kind":"integer"},"required":false}}
+    });
+    let choice = json!({
+        "kind":"choice","name":"route","state":state,
+        "branches":[{
+            "when":{"kind":"state_at_most","path":["value"],"maximum":1},
+            "node":succeed("accepted")
+        }],
+        "otherwise":{"kind":"fail","name":"rejected","reason":"verification_rejected"},
+        "promotedStatePaths":[]
+    });
+    let graph = verified(
+        json!({
+            "kind":"seq","name":"root","state":state,
+            "children":[promoted_integer_step("work", "value"), choice],
+            "promotedStatePaths":[]
+        }),
+        json!({}),
+    )
+    .await;
+
+    let accepted = [settled(
+        SettledSpec::new(1, 1, "work").position(10),
+        WorkerOutcome::Verified {
+            output: json!({"value":1}),
+            artifacts: Vec::new(),
+        },
+    )];
+    assert!(matches!(
+        reduce(&graph, &json!({}), &accepted).terminal,
+        Some(TerminalProjection::Succeeded { .. })
+    ));
+
+    let rejected = [settled(
+        SettledSpec::new(1, 1, "work").position(10),
+        WorkerOutcome::Verified {
+            output: json!({"value":2}),
+            artifacts: Vec::new(),
+        },
+    )];
+    assert_eq!(
+        reduce(&graph, &json!({}), &rejected).terminal,
+        Some(TerminalProjection::Failed {
+            context: None,
+            reason: "verification_rejected".parse().assert_value()
+        })
+    );
+}

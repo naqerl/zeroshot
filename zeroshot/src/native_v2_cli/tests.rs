@@ -572,6 +572,7 @@ fn template_list_and_show_are_static_and_emit_ordinary_json() {
         json!([
             "single-worker",
             "software-change",
+            "software-change-fast",
             "auto-research",
             "issue-review",
             "pr-review"

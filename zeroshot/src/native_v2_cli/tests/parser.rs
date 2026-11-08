@@ -563,6 +563,110 @@ fn parser_is_the_agreed_lean_hosted_surface() {
 }
 
 #[test]
+fn software_change_fast_parameters_are_selectable_through_the_public_parser() {
+    let shown = parse_native_v2_args(args(&[
+        "template",
+        "show",
+        "software-change-fast",
+        "--review-policy",
+        "by_radius",
+        "--max-files",
+        "1",
+        "--max-lines",
+        "10",
+    ]))
+    .assert_value();
+    assert!(matches!(
+        shown,
+        NativeV2CliCommand::TemplateShow {
+            options: crate::native_v2_cli::SoftwareChangeFastOptions {
+                review_policy: crate::native_v2_cli::ReviewPolicy::ByRadius,
+                max_files: 1,
+                max_lines: 10,
+            },
+            ..
+        }
+    ));
+
+    let run = parse_native_v2_args(args(&[
+        "run",
+        "--title",
+        "Fast",
+        "--template",
+        "software-change-fast",
+        "--review-policy",
+        "by_radius",
+        "--max-files",
+        "2",
+        "--max-lines",
+        "20",
+        "--input",
+        "input.json",
+        "--runtime-config",
+        "runtime.json",
+    ]))
+    .assert_value();
+    let run = run_command(run);
+    assert!(matches!(
+        run.selection,
+        crate::native_v2_cli::RunSelection::Inline {
+            graph: RunGraph::Template {
+                options: crate::native_v2_cli::SoftwareChangeFastOptions {
+                    review_policy: crate::native_v2_cli::ReviewPolicy::ByRadius,
+                    max_files: 2,
+                    max_lines: 20,
+                },
+                ..
+            },
+            ..
+        }
+    ));
+
+    assert!(
+        parse_native_v2_args(args(&[
+            "template",
+            "show",
+            "software-change",
+            "--review-policy",
+            "by_radius",
+        ]))
+        .is_err()
+    );
+    assert!(
+        parse_native_v2_args(args(&[
+            "template",
+            "show",
+            "software-change-fast",
+            "--review-policy",
+            "sometimes",
+        ]))
+        .is_err()
+    );
+    for flag in ["--max-files", "--max-lines"] {
+        assert!(
+            parse_native_v2_args(args(&[
+                "template",
+                "show",
+                "software-change-fast",
+                flag,
+                "0",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_native_v2_args(args(&[
+                "template",
+                "show",
+                "software-change-fast",
+                flag,
+                "10001",
+            ]))
+            .is_err()
+        );
+    }
+}
+
+#[test]
 fn parser_exposes_the_builtin_templates_and_closed_delivery_choice() {
     assert_eq!(
         parse_native_v2_args(args(&["template", "list"])).assert_value(),
@@ -574,6 +678,7 @@ fn parser_exposes_the_builtin_templates_and_closed_delivery_choice() {
         NativeV2CliCommand::TemplateShow {
             template: BuiltinGraphTemplate::SoftwareChange,
             delivery: TemplateDelivery::Merge,
+            options: crate::native_v2_cli::SoftwareChangeFastOptions::default(),
         }
     );
     assert_eq!(
@@ -581,6 +686,7 @@ fn parser_exposes_the_builtin_templates_and_closed_delivery_choice() {
         NativeV2CliCommand::TemplateShow {
             template: BuiltinGraphTemplate::AutoResearch,
             delivery: TemplateDelivery::Push,
+            options: crate::native_v2_cli::SoftwareChangeFastOptions::default(),
         }
     );
     assert!(parse_native_v2_args(args(&["template", "show", "auto-research", "--pr"])).is_err());
@@ -605,6 +711,7 @@ fn parser_exposes_the_builtin_templates_and_closed_delivery_choice() {
             graph: RunGraph::Template {
                 template: BuiltinGraphTemplate::SoftwareChange,
                 delivery: TemplateDelivery::PullRequest,
+                options: crate::native_v2_cli::SoftwareChangeFastOptions::default(),
                 ignore_pr_feedback: false,
             },
             runtime: RunRuntime::Exact(PathBuf::from("runtime.json")),

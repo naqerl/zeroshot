@@ -234,6 +234,14 @@ pub enum Guard {
         value: ControlSelector,
         labels: NonEmptyEnumSet,
     },
+    StateIn {
+        path: FieldPath,
+        labels: NonEmptyEnumSet,
+    },
+    StateAtMost {
+        path: FieldPath,
+        maximum: PositiveInteger,
+    },
     All {
         guards: NonEmptyVec<Guard>,
     },

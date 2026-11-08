@@ -680,11 +680,12 @@ Options:
 
       --template <TEMPLATE>
           Possible values:
-          - single-worker:   A single general-purpose worker
-          - software-change: A review, validation, and optional delivery workflow for code changes
-          - auto-research:   Research with ten iterations by default and independent evidence gates
-          - issue-review:    Inspect an issue proposal and post a review report
-          - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
+          - single-worker:        A single general-purpose worker
+          - software-change:      A review, validation, and optional delivery workflow for code changes
+          - software-change-fast: Software changes with a blast-radius judge that may skip review for small changes
+          - auto-research:        Research with ten iterations by default and independent evidence gates
+          - issue-review:         Inspect an issue proposal and post a review report
+          - pr-review:            Review a PR diff, conditionally reproduce behavior, and post a concise report
 
       --runtime-config <FILE>
 
@@ -709,6 +710,15 @@ Options:
 
       --no-pr-feedback
           Do not route visible pull-request feedback through the autonomous repair loop
+
+      --review-policy <POLICY>
+          Review policy for software-change-fast: always or by_radius
+
+      --max-files <COUNT>
+          Maximum changed files for the software-change-fast small-change shortcut
+
+      --max-lines <COUNT>
+          Maximum changed lines for the software-change-fast small-change shortcut
 
       --target <NAME>
           Use this named hosted target. If omitted, use local profiles
@@ -851,11 +861,12 @@ Arguments:
           Built-in graph template to render
 
           Possible values:
-          - single-worker:   A single general-purpose worker
-          - software-change: A review, validation, and optional delivery workflow for code changes
-          - auto-research:   Research with ten iterations by default and independent evidence gates
-          - issue-review:    Inspect an issue proposal and post a review report
-          - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
+          - single-worker:        A single general-purpose worker
+          - software-change:      A review, validation, and optional delivery workflow for code changes
+          - software-change-fast: Software changes with a blast-radius judge that may skip review for small changes
+          - auto-research:        Research with ten iterations by default and independent evidence gates
+          - issue-review:         Inspect an issue proposal and post a review report
+          - pr-review:            Review a PR diff, conditionally reproduce behavior, and post a concise report
 
 Options:
       --delivery <MODE>
@@ -872,6 +883,15 @@ Options:
 
       --no-pr-feedback
           Do not route visible pull-request feedback through the autonomous repair loop
+
+      --review-policy <POLICY>
+          Review policy for software-change-fast: always or by_radius
+
+      --max-files <COUNT>
+          Maximum changed files for the software-change-fast small-change shortcut
+
+      --max-lines <COUNT>
+          Maximum changed lines for the software-change-fast small-change shortcut
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1299,11 +1319,12 @@ Options:
           Materialize and run this built-in graph template
 
           Possible values:
-          - single-worker:   A single general-purpose worker
-          - software-change: A review, validation, and optional delivery workflow for code changes
-          - auto-research:   Research with ten iterations by default and independent evidence gates
-          - issue-review:    Inspect an issue proposal and post a review report
-          - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
+          - single-worker:        A single general-purpose worker
+          - software-change:      A review, validation, and optional delivery workflow for code changes
+          - software-change-fast: Software changes with a blast-radius judge that may skip review for small changes
+          - auto-research:        Research with ten iterations by default and independent evidence gates
+          - issue-review:         Inspect an issue proposal and post a review report
+          - pr-review:            Review a PR diff, conditionally reproduce behavior, and post a concise report
 
       --input <FILE>
           Load the graph's initial input from this JSON file
@@ -1371,6 +1392,15 @@ Options:
 
       --no-pr-feedback
           Do not route visible pull-request feedback through the autonomous repair loop
+
+      --review-policy <POLICY>
+          Review policy for software-change-fast: always or by_radius
+
+      --max-files <COUNT>
+          Maximum changed files for the software-change-fast small-change shortcut
+
+      --max-lines <COUNT>
+          Maximum changed lines for the software-change-fast small-change shortcut
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1523,11 +1553,12 @@ Options:
           Materialize and run this built-in graph template
 
           Possible values:
-          - single-worker:   A single general-purpose worker
-          - software-change: A review, validation, and optional delivery workflow for code changes
-          - auto-research:   Research with ten iterations by default and independent evidence gates
-          - issue-review:    Inspect an issue proposal and post a review report
-          - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
+          - single-worker:        A single general-purpose worker
+          - software-change:      A review, validation, and optional delivery workflow for code changes
+          - software-change-fast: Software changes with a blast-radius judge that may skip review for small changes
+          - auto-research:        Research with ten iterations by default and independent evidence gates
+          - issue-review:         Inspect an issue proposal and post a review report
+          - pr-review:            Review a PR diff, conditionally reproduce behavior, and post a concise report
 
       --input <FILE>
           Load the graph's initial input from this JSON file
@@ -1592,6 +1623,15 @@ Options:
 
       --no-pr-feedback
           Do not route visible pull-request feedback through the autonomous repair loop
+
+      --review-policy <POLICY>
+          Review policy for software-change-fast: always or by_radius
+
+      --max-files <COUNT>
+          Maximum changed files for the software-change-fast small-change shortcut
+
+      --max-lines <COUNT>
+          Maximum changed lines for the software-change-fast small-change shortcut
 
   -h, --help
           Print help (see a summary with '-h')
@@ -2458,11 +2498,12 @@ Options:
           Materialize and run this built-in graph template
 
           Possible values:
-          - single-worker:   A single general-purpose worker
-          - software-change: A review, validation, and optional delivery workflow for code changes
-          - auto-research:   Research with ten iterations by default and independent evidence gates
-          - issue-review:    Inspect an issue proposal and post a review report
-          - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
+          - single-worker:        A single general-purpose worker
+          - software-change:      A review, validation, and optional delivery workflow for code changes
+          - software-change-fast: Software changes with a blast-radius judge that may skip review for small changes
+          - auto-research:        Research with ten iterations by default and independent evidence gates
+          - issue-review:         Inspect an issue proposal and post a review report
+          - pr-review:            Review a PR diff, conditionally reproduce behavior, and post a concise report
 
       --input <FILE>
           Load the graph's initial input from this JSON file
@@ -2527,6 +2568,15 @@ Options:
 
       --no-pr-feedback
           Do not route visible pull-request feedback through the autonomous repair loop
+
+      --review-policy <POLICY>
+          Review policy for software-change-fast: always or by_radius
+
+      --max-files <COUNT>
+          Maximum changed files for the software-change-fast small-change shortcut
+
+      --max-lines <COUNT>
+          Maximum changed lines for the software-change-fast small-change shortcut
 
       --from-job <JOB_ID>
           Hub job whose run request, files, source pin, placement, and labels become the case
@@ -3247,11 +3297,12 @@ Options:
           Materialize and run this built-in graph template
 
           Possible values:
-          - single-worker:   A single general-purpose worker
-          - software-change: A review, validation, and optional delivery workflow for code changes
-          - auto-research:   Research with ten iterations by default and independent evidence gates
-          - issue-review:    Inspect an issue proposal and post a review report
-          - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
+          - single-worker:        A single general-purpose worker
+          - software-change:      A review, validation, and optional delivery workflow for code changes
+          - software-change-fast: Software changes with a blast-radius judge that may skip review for small changes
+          - auto-research:        Research with ten iterations by default and independent evidence gates
+          - issue-review:         Inspect an issue proposal and post a review report
+          - pr-review:            Review a PR diff, conditionally reproduce behavior, and post a concise report
 
       --input <FILE>
           Load the graph's initial input from this JSON file
@@ -3324,6 +3375,15 @@ Options:
 
       --no-pr-feedback
           Do not route visible pull-request feedback through the autonomous repair loop
+
+      --review-policy <POLICY>
+          Review policy for software-change-fast: always or by_radius
+
+      --max-files <COUNT>
+          Maximum changed files for the software-change-fast small-change shortcut
+
+      --max-lines <COUNT>
+          Maximum changed lines for the software-change-fast small-change shortcut
 
   -h, --help
           Print help (see a summary with '-h')

@@ -10,8 +10,8 @@ use crate::native_v2_contract::{
 use crate::native_v2_delivery::GITHUB_TOKEN_ENV;
 
 use super::{
-    auto_research_graph, node_name, single_worker_graph, software_change_graph, static_value,
-    DELIVERY_NODE,
+    auto_research_graph, node_name, single_worker_graph, software_change_fast_graph,
+    software_change_graph, static_value, SoftwareChangeFastOptions, DELIVERY_NODE,
 };
 
 /// The deliberately small set of built-in graph templates.
@@ -19,15 +19,17 @@ use super::{
 pub enum BuiltinGraphTemplate {
     SingleWorker,
     SoftwareChange,
+    SoftwareChangeFast,
     AutoResearch,
     IssueReview,
     PrReview,
 }
 
 impl BuiltinGraphTemplate {
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::SingleWorker,
         Self::SoftwareChange,
+        Self::SoftwareChangeFast,
         Self::AutoResearch,
         Self::IssueReview,
         Self::PrReview,
@@ -43,6 +45,7 @@ impl BuiltinGraphTemplate {
         match self {
             Self::SingleWorker => "single-worker",
             Self::SoftwareChange => "software-change",
+            Self::SoftwareChangeFast => "software-change-fast",
             Self::AutoResearch => "auto-research",
             Self::IssueReview => "issue-review",
             Self::PrReview => "pr-review",
@@ -54,6 +57,7 @@ impl BuiltinGraphTemplate {
         match value {
             "single-worker" => Some(Self::SingleWorker),
             "software-change" => Some(Self::SoftwareChange),
+            "software-change-fast" => Some(Self::SoftwareChangeFast),
             "auto-research" => Some(Self::AutoResearch),
             "issue-review" => Some(Self::IssueReview),
             "pr-review" => Some(Self::PrReview),
@@ -63,7 +67,7 @@ impl BuiltinGraphTemplate {
 
     pub(crate) const fn default_delivery(self) -> TemplateDelivery {
         match self {
-            Self::SoftwareChange => TemplateDelivery::PullRequest,
+            Self::SoftwareChange | Self::SoftwareChangeFast => TemplateDelivery::PullRequest,
             Self::IssueReview | Self::PrReview => TemplateDelivery::Comment,
             _ => TemplateDelivery::None,
         }
@@ -71,7 +75,7 @@ impl BuiltinGraphTemplate {
 
     pub(crate) fn default_session_scope(self, node: &str) -> SessionScope {
         match (self, node) {
-            (Self::SoftwareChange, "worker")
+            (Self::SoftwareChange | Self::SoftwareChangeFast, "worker")
             | (Self::AutoResearch, "explorer" | "synthesizer" | "challenger" | "researcher") => {
                 SessionScope::NodeInstance
             }
@@ -79,17 +83,51 @@ impl BuiltinGraphTemplate {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn materialize(
         self,
         delivery: TemplateDelivery,
+    ) -> Result<GraphSpec, BuiltinTemplateError> {
+        self.materialize_with_options(delivery, SoftwareChangeFastOptions::default())
+    }
+
+    pub(crate) fn materialize_with_options(
+        self,
+        delivery: TemplateDelivery,
+        options: SoftwareChangeFastOptions,
     ) -> Result<GraphSpec, BuiltinTemplateError> {
         self.validate_delivery(delivery)?;
         match self {
             Self::SingleWorker => single_worker_graph(),
             Self::SoftwareChange => software_change_graph(delivery),
+            Self::SoftwareChangeFast => software_change_fast_graph(delivery, options),
             Self::AutoResearch => auto_research_graph(delivery),
             Self::IssueReview => super::review::issue_review_graph(delivery),
             Self::PrReview => super::pr_review::pr_review_graph(delivery),
+        }
+    }
+
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) const fn description(self) -> &'static str {
+        match self {
+            Self::SingleWorker => "A single general-purpose worker.",
+            Self::SoftwareChange => {
+                "A review, validation, and optional delivery workflow for code changes."
+            }
+            Self::SoftwareChangeFast => {
+                "Like software-change, but a blast-radius judge may skip both reviewers for a \
+                 small, high-confidence change. The radius denylist is prompt-level; only the \
+                 numeric file and line caps are enforced by the graph. Graphs using the state \
+                 guards require a target built with state-guard support."
+            }
+            Self::AutoResearch => {
+                "Research with ten iterations by default and independent evidence gates."
+            }
+            Self::IssueReview => "Inspect an issue proposal and post a review report.",
+            Self::PrReview => {
+                "Review a PR diff, conditionally reproduce behavior, and post a concise report."
+            }
         }
     }
 
@@ -116,9 +154,11 @@ impl BuiltinGraphTemplate {
         let connections = delivery_connections(delivery)?;
         let name = match self {
             Self::AutoResearch => "checkpoint_delivery",
-            Self::SingleWorker | Self::SoftwareChange | Self::IssueReview | Self::PrReview => {
-                DELIVERY_NODE
-            }
+            Self::SingleWorker
+            | Self::SoftwareChange
+            | Self::SoftwareChangeFast
+            | Self::IssueReview
+            | Self::PrReview => DELIVERY_NODE,
         };
         Ok(Some((
             node_name(name)?,
@@ -136,7 +176,9 @@ impl BuiltinGraphTemplate {
     fn validate_delivery(self, delivery: TemplateDelivery) -> Result<(), BuiltinTemplateError> {
         let supported = match self {
             Self::SingleWorker => delivery == TemplateDelivery::None,
-            Self::SoftwareChange => delivery != TemplateDelivery::Comment,
+            Self::SoftwareChange | Self::SoftwareChangeFast => {
+                delivery != TemplateDelivery::Comment
+            }
             Self::AutoResearch => {
                 matches!(delivery, TemplateDelivery::None | TemplateDelivery::Push)
             }

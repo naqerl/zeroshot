@@ -69,6 +69,7 @@ pub(super) struct ExecutableIndexContext<'a> {
 pub(super) struct GuardValidationContext<'a> {
     pub(super) path: &'a [DiagnosticPathSegment],
     pub(super) code: GraphDiagnosticCode,
+    pub(super) state: Option<&'a PayloadType>,
 }
 
 pub(super) struct SelectorLabelsValidationContext<'a> {

@@ -284,6 +284,9 @@ pub(in crate::graph_verifier) fn combine_outcome_occurrences(
 pub(in crate::graph_verifier) fn evaluate_guard(guard: &Guard, assignment: &Assignment) -> bool {
     match guard {
         Guard::In { value, labels } => selector_matches(value, labels.values(), assignment),
+        // A state predicate is not part of the emitted-control assignment and never covers an
+        // assignment; choice reachability treats it as independently satisfiable separately.
+        Guard::StateIn { .. } | Guard::StateAtMost { .. } => false,
         Guard::All { guards } => guards
             .as_slice()
             .iter()

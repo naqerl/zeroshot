@@ -119,6 +119,7 @@ impl<'a> Analyzer<'a> {
                 GuardValidationContext {
                     path: &field_path(path, &["join", "when"]),
                     code: GraphDiagnosticCode::InvalidGraphShape,
+                    state: None,
                 },
             );
         }

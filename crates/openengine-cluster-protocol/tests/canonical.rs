@@ -76,6 +76,24 @@ fn ir(par_order: &[&str], seq_order: &[&str]) -> CompiledGraphIr {
 }
 
 #[test]
+fn canonical_ir_roundtrips_state_guards() {
+    let mut value = serde_json::to_value(ir(&["a"], &["one"])).assert_value();
+    *json_mut::json_at_mut(&mut value, "/root/children/0/join/when") = json!({
+        "kind":"all",
+        "guards":[
+            {"kind":"state_in","path":["verdict"],"labels":["accepted"]},
+            {"kind":"state_at_most","path":["lines"],"maximum":80}
+        ]
+    });
+    let graph: CompiledGraphIr = serde_json::from_value(value).assert_value();
+    let text = String::from_utf8(graph.canonical_bytes().assert_value()).assert_value();
+    assert!(text.contains("\"kind\":\"state_in\""));
+    assert!(text.contains("\"kind\":\"state_at_most\""));
+    assert!(text.contains("\"path\":[\"verdict\"]"));
+    assert!(text.contains("\"maximum\":80"));
+}
+
+#[test]
 fn canonical_ir_ignores_set_parallel_and_commutative_guard_order() {
     let left = ir(&["b", "a"], &["one", "two"]);
     let right = ir(&["a", "b"], &["one", "two"]);

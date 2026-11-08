@@ -12,6 +12,16 @@ impl Engine<'_> {
                 .control_values(value, context, map_indices)
                 .iter()
                 .any(|actual| labels.values().iter().any(|label| label.as_str() == actual))),
+            Guard::StateIn { path, labels } => Ok(select(&context.state, path)
+                .ok()
+                .and_then(state_control_label)
+                .is_some_and(|actual| {
+                    labels.values().iter().any(|label| label.as_str() == actual)
+                })),
+            Guard::StateAtMost { path, maximum } => Ok(select(&context.state, path)
+                .ok()
+                .and_then(Value::as_u64)
+                .is_some_and(|actual| actual <= maximum.get())),
             Guard::All { guards } => guards.as_slice().iter().try_fold(true, |matches, guard| {
                 Ok(matches && self.guard(guard, context, map_indices)?)
             }),
@@ -192,5 +202,13 @@ impl Engine<'_> {
                 self.push_void_decision(execution, reason);
             }
         }
+    }
+}
+
+fn state_control_label(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
     }
 }

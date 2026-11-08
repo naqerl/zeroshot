@@ -124,6 +124,12 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 
 - Protocol Rust types are the source of truth. Generated files under
   `protocol/openengine-cluster/v1/` must be regenerated through the Rust testkit, not hand-edited.
+- `Guard::StateIn` compares a state path against enum, boolean, or string labels.
+  `Guard::StateAtMost` compares a nonnegative numeric state path against a positive maximum. State
+  guards are additive graph-v1 syntax: an older verifier rejects unknown guard variants, so a graph
+  using them requires a target built with the same state-guard support. Admission validates that each
+  path exists in the current state and selects the required scalar kind; numeric comparisons use
+  `StateAtMost` rather than enumerated labels.
 - Initial input remains caller-owned and is validated unchanged. A root group may add required
   state fields only when their payload types have deterministic implicit empty values; verification
   proves this and reduction materializes missing null, string, array, and recursively empty record values.

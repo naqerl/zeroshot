@@ -11,14 +11,14 @@ use super::{
     AcpArgs, AttachArgs, Cli, CliCommand, ConnectionCommand, ConnectionScopeArg, PlanCommand,
     PlanSelectorArgs, PlanSubmitArgs, RunArgs, RunCheckpointsArgs, RunResumeArgs, RunLogsArgs,
     RunReportArgs, RunSelectorArgs, RunWatchArgs, TargetCommand, TemplateCommand, TemplateName,
-    UtilityCommand,
+    TemplateOptionsArgs, UtilityCommand,
 };
 use crate::native_v2_cli::{
     BuiltinGraphTemplate, ConnectionInput, ConnectionRoute, ConnectionSetCommand,
     MergePlanSelector, MergePlanSubmitCommand, NativeV2CliCommand, NativeV2CliError,
-    ProfileQualifier, ProfileReference, RunCommand, RunGraph, RunLogsCommand, RunRepository,
-    RunRuntime, RunSelection, RunSelector, RunResumeCommand, RunCheckpointsCommand,
-    RunWatchCommand, TargetAdd, TargetServe, TemplateDelivery,
+    ProfileQualifier, ProfileReference, ReviewPolicy, RunCommand, RunGraph, RunLogsCommand,
+    RunRepository, RunRuntime, RunSelection, RunSelector, RunResumeCommand, RunCheckpointsCommand,
+    RunWatchCommand, SoftwareChangeFastOptions, TargetAdd, TargetServe, TemplateDelivery,
 };
 
 #[path = "convert/profile_commands.rs"]
@@ -290,6 +290,7 @@ impl TemplateCommand {
                 Ok(NativeV2CliCommand::TemplateShow {
                     template,
                     delivery: template_delivery(template, args.delivery.selection())?,
+                    options: args.options.into_options(template)?,
                 })
             }
         }
@@ -335,6 +336,7 @@ impl TemplateName {
         let name = match self {
             Self::SingleWorker => "single-worker",
             Self::SoftwareChange => "software-change",
+            Self::SoftwareChangeFast => "software-change-fast",
             Self::AutoResearch => "auto-research",
             Self::IssueReview => "issue-review",
             Self::PrReview => "pr-review",
@@ -355,6 +357,7 @@ impl RunArgs {
             exact: self.runtime_config,
             uniform: self.uniform_runtime_config,
             delivery: self.delivery.selection(),
+            options: self.options,
         })?;
         Ok(NativeV2CliCommand::Run(Box::new(RunCommand {
             target: route.target,
@@ -415,6 +418,7 @@ struct RunSelectionArgs<'a> {
     exact: Option<PathBuf>,
     uniform: Option<PathBuf>,
     delivery: (Option<&'a str>, bool, bool, bool, bool),
+    options: TemplateOptionsArgs,
 }
 
 fn run_selection(args: RunSelectionArgs<'_>) -> Result<RunSelection, NativeV2CliError> {
@@ -452,7 +456,7 @@ fn inline_or_default_selection(
         ));
     }
     Ok(RunSelection::Inline {
-        graph: run_graph(args.graph, args.template, args.delivery)?,
+        graph: run_graph(args.graph, args.template, args.delivery, args.options)?,
         runtime: run_runtime(args.exact, args.uniform)?,
     })
 }
@@ -465,7 +469,8 @@ fn selection_shape(args: &RunSelectionArgs<'_>) -> (bool, bool, bool) {
             | args.delivery.1
             | args.delivery.2
             | args.delivery.3
-            | args.delivery.4,
+            | args.delivery.4
+            | args.options.is_set(),
     )
 }
 
@@ -548,20 +553,64 @@ fn parse_repository(value: String) -> Result<RunRepository, NativeV2CliError> {
         .map_err(|error| usage(format!("invalid --repository: {error}")))
 }
 
+const MAX_TEMPLATE_CAP: u64 = 10_000;
+
+impl TemplateOptionsArgs {
+    fn is_set(&self) -> bool {
+        self.review_policy.is_some() || self.max_files.is_some() || self.max_lines.is_some()
+    }
+
+    fn into_options(
+        self,
+        template: BuiltinGraphTemplate,
+    ) -> Result<SoftwareChangeFastOptions, NativeV2CliError> {
+        if template != BuiltinGraphTemplate::SoftwareChangeFast && self.is_set() {
+            return Err(usage(
+                "template parameters are only supported by --template software-change-fast",
+            ));
+        }
+        let defaults = SoftwareChangeFastOptions::default();
+        let review_policy = match self.review_policy.as_deref() {
+            Some(value) => ReviewPolicy::parse(value)
+                .ok_or_else(|| usage("--review-policy must be always or by_radius"))?,
+            None => defaults.review_policy,
+        };
+        let max_files = self.max_files.unwrap_or(defaults.max_files);
+        let max_lines = self.max_lines.unwrap_or(defaults.max_lines);
+        for (flag, value) in [("--max-files", max_files), ("--max-lines", max_lines)] {
+            if !(1..=MAX_TEMPLATE_CAP).contains(&value) {
+                return Err(usage(format!(
+                    "{flag} must be between 1 and {MAX_TEMPLATE_CAP}"
+                )));
+            }
+        }
+        Ok(SoftwareChangeFastOptions::new(
+            review_policy,
+            max_files,
+            max_lines,
+        ))
+    }
+}
+
 fn run_graph(
     graph: Option<PathBuf>,
     template: Option<TemplateName>,
     delivery: (Option<&str>, bool, bool, bool, bool),
+    options: TemplateOptionsArgs,
 ) -> Result<RunGraph, NativeV2CliError> {
     let (delivery, push, pr, ship, no_pr_feedback) = delivery;
     match (graph, template) {
         (Some(path), None)
-            if delivery_options_empty((delivery, push, pr, ship, no_pr_feedback)) =>
+            if delivery_options_empty((delivery, push, pr, ship, no_pr_feedback))
+                && !options.is_set() =>
         {
             Ok(RunGraph::File(path))
         }
-        (Some(_), None) => Err(usage(
+        (Some(_), None) if !options.is_set() => Err(usage(
             "delivery flags require --template; author delivery in custom graphs",
+        )),
+        (Some(_), None) => Err(usage(
+            "template parameters require --template software-change-fast",
         )),
         (None, Some(template)) => {
             let template = template.into_template()?;
@@ -569,6 +618,7 @@ fn run_graph(
             Ok(RunGraph::Template {
                 template,
                 delivery,
+                options: options.into_options(template)?,
                 ignore_pr_feedback: no_pr_feedback,
             })
         }
@@ -680,7 +730,9 @@ fn validate_template_delivery(
     }
     let supported = match template {
         BuiltinGraphTemplate::SingleWorker => delivery == TemplateDelivery::None,
-        BuiltinGraphTemplate::SoftwareChange => delivery != TemplateDelivery::Comment,
+        BuiltinGraphTemplate::SoftwareChange | BuiltinGraphTemplate::SoftwareChangeFast => {
+            delivery != TemplateDelivery::Comment
+        }
         BuiltinGraphTemplate::AutoResearch => {
             matches!(delivery, TemplateDelivery::None | TemplateDelivery::Push)
         }

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{ArgGroup, Args, ValueEnum};
 
-use super::{DeliveryArgs, TemplateName};
+use super::{DeliveryArgs, TemplateName, TemplateOptionsArgs};
 
 #[derive(Debug, clap::Subcommand)]
 pub(super) enum ProfileCommand {
@@ -74,6 +74,8 @@ pub(super) struct ProfileSetArgs {
     pub(super) default: bool,
     #[command(flatten)]
     pub(super) delivery: DeliveryArgs,
+    #[command(flatten)]
+    pub(super) options: TemplateOptionsArgs,
     #[command(flatten)]
     pub(super) route: ProfileRouteArgs,
 }

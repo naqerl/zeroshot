@@ -175,6 +175,19 @@ pub(super) fn settled_agent(spec: SettledExecutionSpec<'_>) -> DurableExecution 
     )
 }
 
+pub(super) fn settled_step(
+    spec: SettledExecutionSpec<'_>,
+    output: serde_json::Value,
+) -> DurableExecution {
+    settled_execution(
+        spec,
+        WorkerOutcome::Verified {
+            output,
+            artifacts: Vec::new(),
+        },
+    )
+}
+
 pub(super) fn settled_failure(
     spec: SettledExecutionSpec<'_>,
     code: WorkerErrorCode,

@@ -28,6 +28,7 @@ fn catalog_and_template_inputs_are_closed() {
         &[
             BuiltinGraphTemplate::SingleWorker,
             BuiltinGraphTemplate::SoftwareChange,
+            BuiltinGraphTemplate::SoftwareChangeFast,
             BuiltinGraphTemplate::AutoResearch,
             BuiltinGraphTemplate::IssueReview,
             BuiltinGraphTemplate::PrReview,
@@ -204,6 +205,399 @@ fn software_change_has_one_global_ten_cycle_budget() {
         assert_eq!(change_loop.max_iterations.get(), 10);
         assert!(change_loop.until.is_none());
     }
+}
+
+#[test]
+fn software_change_fast_always_is_byte_identical_to_software_change() {
+    for delivery in [
+        TemplateDelivery::None,
+        TemplateDelivery::Push,
+        TemplateDelivery::PullRequest,
+        TemplateDelivery::Merge,
+    ] {
+        let baseline = BuiltinGraphTemplate::SoftwareChange
+            .materialize(delivery)
+            .assert_value();
+        let fast = BuiltinGraphTemplate::SoftwareChangeFast
+            .materialize_with_options(delivery, SoftwareChangeFastOptions::default())
+            .assert_value();
+        assert_eq!(
+            serde_json::to_value(fast).assert_value(),
+            serde_json::to_value(baseline).assert_value(),
+            "review_policy=always must keep the software-change graph byte-identical"
+        );
+    }
+}
+
+#[test]
+fn software_change_fast_by_radius_routes_jev_then_blast_route() {
+    let graph = BuiltinGraphTemplate::SoftwareChangeFast
+        .materialize_with_options(
+            TemplateDelivery::PullRequest,
+            SoftwareChangeFastOptions::by_radius(),
+        )
+        .assert_value();
+    let worker_result = node_named(&graph.root, "worker_result");
+    let GraphNode::Choice(worker_result) = worker_result else {
+        panic!("worker_result must be a choice");
+    };
+    let otherwise = worker_result
+        .otherwise
+        .as_deref()
+        .assert_value_with("otherwise");
+    let GraphNode::Seq(blast) = otherwise else {
+        panic!("worker_result otherwise must be the blast sequence");
+    };
+    assert_eq!(
+        blast
+            .children
+            .as_slice()
+            .iter()
+            .take(2)
+            .map(GraphNode::name)
+            .map(openengine_cluster_protocol::NodeName::as_str)
+            .collect::<Vec<_>>(),
+        vec!["jev", "blast_route"]
+    );
+    let jev = node_named(&graph.root, "jev");
+    assert!(matches!(jev, GraphNode::Step(_)));
+    let blast_route = node_named(&graph.root, "blast_route");
+    let GraphNode::Choice(blast_route) = blast_route else {
+        panic!("blast_route must be a choice");
+    };
+    assert_eq!(blast_route.branches.as_slice().len(), 1);
+    assert!(!node_names_in(&blast_route.branches.as_slice()[0].node).contains("parallel_reviews"));
+    let delivery_route = node_named(&graph.root, "delivery_route");
+    assert!(node_names_in(delivery_route).contains("deliver"));
+    let reviews = blast_route
+        .otherwise
+        .as_deref()
+        .assert_value_with("otherwise");
+    let reviews = node_names_in(reviews);
+    assert!(reviews.contains("parallel_reviews"));
+    assert!(reviews.contains("review_result"));
+}
+
+#[test]
+fn jev_declares_the_seven_blast_radius_fields_and_writes_the_five_routing_fields() {
+    let graph = BuiltinGraphTemplate::SoftwareChangeFast
+        .materialize_with_options(
+            TemplateDelivery::None,
+            SoftwareChangeFastOptions::by_radius(),
+        )
+        .assert_value();
+    let GraphNode::Step(jev) = node_named(&graph.root, "jev") else {
+        panic!("jev must be a step");
+    };
+    let PayloadType::Record { fields } = &jev.output else {
+        panic!("jev output must be a record");
+    };
+    assert_eq!(
+        fields.keys().map(|name| name.as_str()).collect::<Vec<_>>(),
+        vec![
+            "checksReported",
+            "confidence",
+            "files",
+            "lines",
+            "radius",
+            "reasons",
+            "touches"
+        ]
+    );
+    assert_eq!(
+        field_type(fields, "radius"),
+        PayloadType::Enum {
+            values: enum_labels(&["small", "large"]).assert_value()
+        }
+    );
+    assert_eq!(
+        field_type(fields, "confidence"),
+        PayloadType::Enum {
+            values: enum_labels(&["high", "low"]).assert_value()
+        }
+    );
+    assert_eq!(
+        field_type(fields, "touches"),
+        PayloadType::Array {
+            items: Box::new(PayloadType::String)
+        }
+    );
+    assert_eq!(field_type(fields, "files"), PayloadType::Integer);
+    assert_eq!(field_type(fields, "lines"), PayloadType::Integer);
+    assert_eq!(field_type(fields, "checksReported"), PayloadType::Boolean);
+    assert_eq!(field_type(fields, "reasons"), PayloadType::String);
+    assert_eq!(
+        jev.write_bindings
+            .iter()
+            .map(|binding| binding.target.segments()[0].as_str())
+            .collect::<BTreeSet<_>>(),
+        ["radius", "confidence", "files", "lines", "checksReported"]
+            .into_iter()
+            .collect()
+    );
+}
+
+#[tokio::test]
+async fn software_change_fast_by_radius_is_admissible_without_delivery() {
+    let _ = verified_fast_template(
+        TemplateDelivery::None,
+        SoftwareChangeFastOptions::by_radius(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn blast_route_skips_review_only_when_every_condition_holds() {
+    let (verified, initial_input) = verified_fast_template(
+        TemplateDelivery::PullRequest,
+        SoftwareChangeFastOptions::by_radius(),
+    )
+    .await;
+    let cases = [
+        (
+            json!({"radius":"small","confidence":"high","touches":["a.rs"],"files":3,"lines":80,"checksReported":true,"reasons":"focused"}),
+            true,
+        ),
+        (
+            json!({"radius":"large","confidence":"high","touches":["a.rs"],"files":3,"lines":80,"checksReported":true,"reasons":"schema"}),
+            false,
+        ),
+        (
+            json!({"radius":"small","confidence":"low","touches":["a.rs"],"files":3,"lines":80,"checksReported":true,"reasons":"unclear"}),
+            false,
+        ),
+        (
+            json!({"radius":"small","confidence":"high","touches":["a.rs"],"files":3,"lines":80,"checksReported":false,"reasons":"no checks"}),
+            false,
+        ),
+        (
+            json!({"radius":"small","confidence":"high","touches":["a.rs"],"files":4,"lines":80,"checksReported":true,"reasons":"too many files"}),
+            false,
+        ),
+        (
+            json!({"radius":"small","confidence":"high","touches":["a.rs"],"files":3,"lines":81,"checksReported":true,"reasons":"too many lines"}),
+            false,
+        ),
+    ];
+    for (output, delivers) in cases {
+        let history = vec![
+            settled_worker(),
+            settled_step(
+                SettledExecutionSpec {
+                    execution: 2,
+                    node_instance: 2,
+                    node: "jev",
+                    settled_at: 2,
+                    input: json!({"task":"repair checkout","phase":{}}),
+                },
+                output.clone(),
+            ),
+        ];
+        let reduction = reduce(&verified, &initial_input, &history);
+        if delivers {
+            assert_dispatch_node(&reduction, "deliver");
+            let deliver_input = dispatch_input(&reduction, "deliver");
+            assert_eq!(deliver_input["title"], "focused");
+            assert_eq!(deliver_input["description"], "focused");
+            assert!(!reduction.decisions.iter().any(|decision| matches!(
+                decision,
+                Decision::Dispatch { occurrence, .. }
+                    if matches!(occurrence.node.as_str(), "acceptance" | "code")
+            )));
+        } else {
+            assert_dispatched_together(&reduction, &["acceptance", "code"]);
+            assert_no_dispatch_node(&reduction, "deliver");
+        }
+        assert!(output["radius"].is_string());
+    }
+}
+
+fn field_type(
+    fields: &std::collections::BTreeMap<
+        openengine_cluster_protocol::FieldName,
+        openengine_cluster_protocol::RecordField,
+    >,
+    name: &str,
+) -> PayloadType {
+    fields
+        .iter()
+        .find(|(field, _)| field.as_str() == name)
+        .map(|(_, field)| field.value_type.clone())
+        .unwrap_or_else(|| panic!("missing field {name}"))
+}
+
+#[tokio::test]
+async fn fast_template_honors_non_default_file_and_line_caps() {
+    let options =
+        SoftwareChangeFastOptions::new(crate::native_v2_cli::ReviewPolicy::ByRadius, 1, 10);
+    let (verified, initial_input) =
+        verified_fast_template(TemplateDelivery::PullRequest, options).await;
+    for (files, lines, delivers) in [(1, 10, true), (2, 10, false), (1, 11, false)] {
+        let output = json!({
+            "radius":"small","confidence":"high","touches":["a.rs"],
+            "files":files,"lines":lines,"checksReported":true,"reasons":"focused"
+        });
+        let history = vec![
+            settled_worker(),
+            settled_step(
+                SettledExecutionSpec {
+                    execution: 2,
+                    node_instance: 2,
+                    node: "jev",
+                    settled_at: 2,
+                    input: json!({"task":"repair checkout","phase":{}}),
+                },
+                output,
+            ),
+        ];
+        let reduction = reduce(&verified, &initial_input, &history);
+        if delivers {
+            assert_dispatch_node(&reduction, "deliver");
+        } else {
+            assert_dispatched_together(&reduction, &["acceptance", "code"]);
+            assert_no_dispatch_node(&reduction, "deliver");
+        }
+    }
+}
+
+#[tokio::test]
+async fn fast_reviews_deliver_only_when_both_verdicts_accept() {
+    let (verified, initial_input) = verified_fast_template(
+        TemplateDelivery::PullRequest,
+        SoftwareChangeFastOptions::by_radius(),
+    )
+    .await;
+    let large = json!({"radius":"large","confidence":"high","touches":["a.rs"],"files":3,"lines":80,"checksReported":true,"reasons":"schema"});
+    let base = vec![
+        settled_worker(),
+        settled_step(
+            SettledExecutionSpec {
+                execution: 2,
+                node_instance: 2,
+                node: "jev",
+                settled_at: 2,
+                input: json!({"task":"repair checkout","phase":{}}),
+            },
+            large,
+        ),
+    ];
+    let acceptance = || {
+        settled_review_execution_with_output(
+            SettledExecutionSpec {
+                execution: 3,
+                node_instance: 3,
+                node: "acceptance",
+                settled_at: 3,
+                input: json!({"task":"repair checkout","deliveryFeedback":""}),
+            },
+            ACCEPTED_LABEL,
+            CHANGE_DESCRIPTION,
+            change_manifest(),
+        )
+    };
+    let mut accepted = base.clone();
+    accepted.push(acceptance());
+    accepted.push(settled_review(4, "code", ACCEPTED_LABEL, "ok"));
+    let accepted = reduce(&verified, &initial_input, &accepted);
+    assert_dispatch_node(&accepted, "deliver");
+
+    let mut rejected = base;
+    rejected.push(acceptance());
+    rejected.push(settled_review(4, "code", REJECTED_LABEL, "unsafe"));
+    let rejected = reduce(&verified, &initial_input, &rejected);
+    assert_dispatch_node(&rejected, "worker");
+    assert!(!rejected.decisions.iter().any(|decision| matches!(
+        decision,
+        Decision::Dispatch { occurrence, .. } if occurrence.node.as_str() == "deliver"
+    )));
+}
+
+fn dispatch_input<'a>(reduction: &'a Reduction, node: &str) -> &'a serde_json::Value {
+    reduction
+        .decisions
+        .iter()
+        .find_map(|decision| match decision {
+            Decision::Dispatch {
+                occurrence, input, ..
+            } if occurrence.node.as_str() == node => Some(input),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("missing dispatch of {node}"))
+}
+
+fn assert_no_dispatch_node(reduction: &Reduction, node: &str) {
+    assert!(
+        !reduction.decisions.iter().any(|decision| matches!(
+            decision,
+            Decision::Dispatch { occurrence, .. } if occurrence.node.as_str() == node
+        )),
+        "unexpected dispatch of {node}; decisions: {:?}",
+        reduction.decisions
+    );
+}
+
+fn assert_dispatch_node(reduction: &Reduction, node: &str) {
+    assert!(
+        reduction.decisions.iter().any(|decision| matches!(
+            decision,
+            Decision::Dispatch { occurrence, .. } if occurrence.node.as_str() == node
+        )),
+        "expected dispatch of {node}; decisions: {:?}",
+        reduction.decisions
+    );
+}
+
+fn node_names_in(root: &GraphNode) -> BTreeSet<&str> {
+    all_nodes(root)
+        .into_iter()
+        .map(|node| node.name().as_str())
+        .collect()
+}
+
+fn node_named<'a>(root: &'a GraphNode, name: &str) -> &'a GraphNode {
+    all_nodes(root)
+        .into_iter()
+        .find(|node| node.name().as_str() == name)
+        .unwrap_or_else(|| panic!("missing node {name}"))
+}
+
+async fn verified_fast_template(
+    delivery: TemplateDelivery,
+    options: SoftwareChangeFastOptions,
+) -> (
+    openengine_cluster_server::admission::VerifiedGraph,
+    serde_json::Value,
+) {
+    let template = BuiltinGraphTemplate::SoftwareChangeFast;
+    let graph = template
+        .materialize_with_options(delivery, options)
+        .assert_value();
+    let runtime = runtime_for(template, delivery, &executable_leaves(&graph.root));
+    let initial_input = if delivery == TemplateDelivery::None {
+        json!({"task":"repair checkout"})
+    } else {
+        json!({"task":"repair checkout","issueNumber":"208"})
+    };
+    let admitted = NativeV2Admission
+        .admit(RunSubmission {
+            environment: None,
+            title: RunTitle::new("Fast template behavior").assert_value(),
+            graph,
+            initial_input: initial_input.clone(),
+            runtime,
+            source: Some(resolved_source()),
+            submission_key: IdempotencyKey::new(format!("fast-template-{}", delivery.name()))
+                .assert_value(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("fast template admission failed: {error:?}"));
+    (
+        openengine_cluster_server::admission::VerifiedGraph {
+            compiled_ir: admitted.graph,
+            diagnostics: Vec::new(),
+        },
+        initial_input,
+    )
 }
 
 #[tokio::test]

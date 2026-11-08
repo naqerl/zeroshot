@@ -122,11 +122,12 @@ fn first_template_choices_use_their_default_delivery_bindings() {
 
 #[test]
 fn software_templates_keep_one_worker_session_and_fresh_reviewers() {
-    for template in templates()
-        .assert_value()
-        .iter()
-        .filter(|value| value["name"] == "software-change")
-    {
+    for template in templates().assert_value().iter().filter(|value| {
+        matches!(
+            value["name"].as_str(),
+            Some("software-change" | "software-change-fast")
+        )
+    }) {
         let bindings = &template["runtimeBindings"];
         assert_eq!(bindings["worker"]["sessionScope"], "node_instance");
         assert!(bindings["acceptance"].is_null());

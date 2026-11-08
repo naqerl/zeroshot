@@ -57,6 +57,92 @@ const REJECTED_LABEL: &str = "rejected";
 const DELIVERY_NODE: &str = "deliver";
 const REVIEW_OUTPUT_INVALID_REASON: &str = "review_output_invalid";
 const REVIEW_REFUSED_REASON: &str = "review_refused";
+const RADIUS_FIELD: &str = "radius";
+const CONFIDENCE_FIELD: &str = "confidence";
+const TOUCHES_FIELD: &str = "touches";
+const FILES_FIELD: &str = "files";
+const LINES_FIELD: &str = "lines";
+const CHECKS_REPORTED_FIELD: &str = "checksReported";
+const REASONS_FIELD: &str = "reasons";
+const SMALL_RADIUS_LABEL: &str = "small";
+const LARGE_RADIUS_LABEL: &str = "large";
+const HIGH_CONFIDENCE_LABEL: &str = "high";
+const LOW_CONFIDENCE_LABEL: &str = "low";
+const DEFAULT_MAX_FILES: u64 = 3;
+const DEFAULT_MAX_LINES: u64 = 80;
+const SOFTWARE_WORKER_INSTRUCTIONS: &str = "Implement the requested software change fully in the shared workspace. Follow the repository's guidance, keep the change focused, and run relevant checks. Delivery runs `git add --all`; do not leave unrelated unignored files in the repository checkout. Use current input on every visit. An empty phase means implementation; phase.after accepted or rejected means repair the latest acceptanceFeedback and codeFeedback; ci_failed, conflict, or repair_required means repair deliveryFeedback. Other feedback is historical. Resolve Git/CI issues without weakening the task; preserve integrated upstream changes. sourceRevision is original provenance, reviewBaseRevision the captured target. Do not restore files merely to match sourceRevision. Run relevant checks after repairs.";
+
+/// Whether `software-change-fast` runs the ordinary reviewers or lets a small blast radius skip
+/// them.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReviewPolicy {
+    /// Always run the acceptance and code reviewers, exactly like `software-change`.
+    #[default]
+    Always,
+    /// Skip both reviewers only when `jev` proves a small, high-confidence change.
+    ByRadius,
+}
+
+#[allow(dead_code)]
+impl ReviewPolicy {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::ByRadius => "by_radius",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "always" => Some(Self::Always),
+            "by_radius" => Some(Self::ByRadius),
+            _ => None,
+        }
+    }
+}
+
+/// Build-time parameters for `software-change-fast`.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SoftwareChangeFastOptions {
+    pub review_policy: ReviewPolicy,
+    pub max_files: u64,
+    pub max_lines: u64,
+}
+
+impl Default for SoftwareChangeFastOptions {
+    fn default() -> Self {
+        Self {
+            review_policy: ReviewPolicy::Always,
+            max_files: DEFAULT_MAX_FILES,
+            max_lines: DEFAULT_MAX_LINES,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl SoftwareChangeFastOptions {
+    #[must_use]
+    pub const fn new(review_policy: ReviewPolicy, max_files: u64, max_lines: u64) -> Self {
+        Self {
+            review_policy,
+            max_files,
+            max_lines,
+        }
+    }
+
+    #[must_use]
+    pub const fn by_radius() -> Self {
+        Self {
+            review_policy: ReviewPolicy::ByRadius,
+            max_files: DEFAULT_MAX_FILES,
+            max_lines: DEFAULT_MAX_LINES,
+        }
+    }
+}
 
 fn single_worker_graph() -> Result<GraphSpec, BuiltinTemplateError> {
     let state = task_type()?;
@@ -87,23 +173,332 @@ fn software_change_graph(delivery: TemplateDelivery) -> Result<GraphSpec, Builti
     )
 }
 
+fn software_change_fast_graph(
+    delivery: TemplateDelivery,
+    options: SoftwareChangeFastOptions,
+) -> Result<GraphSpec, BuiltinTemplateError> {
+    if options.review_policy == ReviewPolicy::Always {
+        // The A/B switch must be exact: `always` is byte-for-byte `software-change`.
+        return software_change_graph(delivery);
+    }
+    graph(
+        software_input_type(delivery)?,
+        fast_change_loop(fast_state(delivery)?, delivery, options)?,
+    )
+}
+
+fn fast_change_loop(
+    state: PayloadType,
+    delivery: TemplateDelivery,
+    options: SoftwareChangeFastOptions,
+) -> Result<GraphNode, BuiltinTemplateError> {
+    let worker = software_worker_with_input(fast_software_worker_input_type(delivery)?)?;
+    let route = fast_worker_route(state.clone(), delivery, options)?;
+    let paths = fast_feedback_paths()?;
+    let body = sequence(
+        "change_iteration",
+        state.clone(),
+        vec![worker, route],
+        paths.clone(),
+    )?;
+    let loop_node = GraphNode::Loop(LoopNode {
+        name: node_name("change_loop")?,
+        state: state.clone(),
+        body: Box::new(body),
+        until: None,
+        max_iterations: positive(CHANGE_ITERATIONS)?,
+        max_iterations_input: None,
+        promoted_state_paths: paths,
+    });
+    sequence(
+        "run",
+        state,
+        vec![
+            loop_node,
+            fail("change_attempts_exhausted", "change_attempts_exhausted")?,
+        ],
+        Vec::new(),
+    )
+}
+
+fn fast_worker_route(
+    state: PayloadType,
+    delivery: TemplateDelivery,
+    options: SoftwareChangeFastOptions,
+) -> Result<GraphNode, BuiltinTemplateError> {
+    Ok(GraphNode::Choice(ChoiceNode {
+        name: node_name("worker_result")?,
+        state: state.clone(),
+        branches: non_empty(vec![ChoiceBranch {
+            when: executable_error_guard("worker")?,
+            node: fail("worker_failed", "worker_failed")?,
+        }])?,
+        otherwise: Some(Box::new(sequence(
+            "blast",
+            state.clone(),
+            if delivery == TemplateDelivery::None {
+                vec![
+                    jev_node(delivery)?,
+                    blast_route_without_delivery(state, delivery, options)?,
+                ]
+            } else {
+                vec![
+                    jev_node(delivery)?,
+                    blast_route(state.clone(), delivery, options)?,
+                    delivery_route(state, delivery, options)?,
+                ]
+            },
+            fast_feedback_paths()?,
+        )?)),
+        promoted_state_paths: fast_feedback_paths()?,
+    }))
+}
+
+fn jev_node(delivery: TemplateDelivery) -> Result<GraphNode, BuiltinTemplateError> {
+    Ok(GraphNode::Step(StepNode {
+        name: node_name("jev")?,
+        worker: worker_ref("builtin.agent.jev@1")?,
+        instructions: Some(jev_instructions(delivery)?),
+        input: jev_input_type(delivery)?,
+        output: jev_output_type()?,
+        input_bindings: vec![
+            state_input(TASK_FIELD, TASK_FIELD)?,
+            state_input(PHASE_FIELD, PHASE_FIELD)?,
+        ],
+        write_bindings: jev_write_bindings(delivery)?,
+        timeout_ms: None,
+        attempts: positive(1)?,
+    }))
+}
+
+fn jev_instructions(delivery: TemplateDelivery) -> Result<NodeInstructions, BuiltinTemplateError> {
+    let phase = if delivery_mode(delivery).is_some() {
+        "phase.after names the latest reviewer or delivery outcome; use it as context, not as a \
+         substitute for inspecting the change."
+    } else {
+        "phase.after names the latest reviewer outcome; use it as context, not as a substitute \
+         for inspecting the change."
+    };
+    instructions(&format!(
+        "Judge the blast radius of the change in the shared workspace. You are read-only: inspect \
+         the repository and do not modify files. Read the repository's AGENTS.md first. Run \
+         `git diff --stat` and `git diff` yourself; do not trust a summary from the worker. {phase} \
+         Run the repository's relevant checks yourself in addition to inspecting the diff, and set \
+         checksReported true only when you actually ran them; do not invent it. Report exactly the \
+         output fields: radius (small or large), \
+         confidence (high or low), touches (the changed paths), files (the number of changed \
+         files), lines (the number of changed lines), checksReported (true only when you actually \
+         ran the checks), and reasons (a concise explanation that can serve as provisional \
+         delivery metadata). \
+         Force radius=large when the change includes any of: database migrations; public API or \
+         schema changes; authentication; payments; configuration or infrastructure; dependency \
+         manifests. This denylist is a prompt-level rule, not a runtime enforcement: the only \
+         hard backstop is the graph's numeric file and line caps. When evidence is incomplete or \
+         ambiguous, choose large and low confidence."
+    ))
+}
+
+fn blast_small_guard(options: SoftwareChangeFastOptions) -> Result<Guard, BuiltinTemplateError> {
+    Ok(Guard::All {
+        guards: non_empty(vec![
+            state_guard(RADIUS_FIELD, &[SMALL_RADIUS_LABEL])?,
+            state_guard(CONFIDENCE_FIELD, &[HIGH_CONFIDENCE_LABEL])?,
+            state_guard(CHECKS_REPORTED_FIELD, &["true"])?,
+            Guard::StateAtMost {
+                path: field_path(FILES_FIELD)?,
+                maximum: positive(options.max_files)?,
+            },
+            Guard::StateAtMost {
+                path: field_path(LINES_FIELD)?,
+                maximum: positive(options.max_lines)?,
+            },
+        ])?,
+    })
+}
+
+fn state_guard(field: &str, labels: &[&str]) -> Result<Guard, BuiltinTemplateError> {
+    Ok(Guard::StateIn {
+        path: field_path(field)?,
+        labels: enum_labels(labels)?,
+    })
+}
+
+fn blast_route_without_delivery(
+    state: PayloadType,
+    delivery: TemplateDelivery,
+    options: SoftwareChangeFastOptions,
+) -> Result<GraphNode, BuiltinTemplateError> {
+    Ok(GraphNode::Choice(ChoiceNode {
+        name: node_name("blast_route")?,
+        state: state.clone(),
+        branches: non_empty(vec![ChoiceBranch {
+            when: blast_small_guard(options)?,
+            node: succeed_null("small_done")?,
+        }])?,
+        otherwise: Some(Box::new(sequence(
+            "reviews",
+            state.clone(),
+            vec![
+                parallel_reviewers(state.clone(), delivery)?,
+                review_route(state, delivery)?,
+            ],
+            feedback_paths()?,
+        )?)),
+        promoted_state_paths: Vec::new(),
+    }))
+}
+
+fn blast_route(
+    state: PayloadType,
+    delivery: TemplateDelivery,
+    options: SoftwareChangeFastOptions,
+) -> Result<GraphNode, BuiltinTemplateError> {
+    Ok(GraphNode::Choice(ChoiceNode {
+        name: node_name("blast_route")?,
+        state: state.clone(),
+        branches: non_empty(vec![ChoiceBranch {
+            when: blast_small_guard(options)?,
+            // The shared delivery_route below remains the only delivery node in the graph.
+            node: next_iteration("small_accepted", state.clone())?,
+        }])?,
+        otherwise: Some(Box::new(sequence(
+            "reviews",
+            state.clone(),
+            vec![
+                fast_parallel_reviewers(state.clone(), delivery)?,
+                fast_review_route(state)?,
+            ],
+            review_promoted_paths(delivery)?,
+        )?)),
+        promoted_state_paths: review_promoted_paths(delivery)?,
+    }))
+}
+
+fn fast_review_route(state: PayloadType) -> Result<GraphNode, BuiltinTemplateError> {
+    Ok(GraphNode::Choice(ChoiceNode {
+        name: node_name("review_result")?,
+        state: state.clone(),
+        branches: non_empty({
+            let mut branches = review_failure_branches(&["acceptance", "code"])?;
+            branches.push(ChoiceBranch {
+                when: accepted_reviews_guard()?,
+                node: next_iteration("reviews_accepted", state.clone())?,
+            });
+            branches
+        })?,
+        otherwise: Some(Box::new(next_iteration("review_retry", state)?)),
+        promoted_state_paths: vec![
+            field_path(DELIVERY_FEEDBACK_FIELD)?,
+            field_path(PHASE_FIELD)?,
+        ],
+    }))
+}
+
+fn fast_parallel_reviewers(
+    state: PayloadType,
+    delivery: TemplateDelivery,
+) -> Result<GraphNode, BuiltinTemplateError> {
+    let mut node = parallel_reviewers(state, delivery)?;
+    let GraphNode::Par(parallel) = &mut node else {
+        return Ok(node);
+    };
+    for branch in parallel.branches.as_mut_slice() {
+        let GraphNode::Verifier(verifier) = branch else {
+            continue;
+        };
+        if verifier.name.as_str() == "code" {
+            verifier
+                .write_bindings
+                .push(phase_code_write("code", VERDICT_FIELD)?);
+        }
+    }
+    Ok(node)
+}
+
+fn phase_code_write(node: &str, signal: &str) -> Result<WriteBinding, BuiltinTemplateError> {
+    let mut binding = signal_write(node, signal, PHASE_FIELD)?;
+    binding.target = static_value(FieldPath::new(vec![
+        field_name(PHASE_FIELD)?,
+        field_name("code")?,
+    ]))?;
+    Ok(binding)
+}
+
+fn delivery_route(
+    state: PayloadType,
+    delivery: TemplateDelivery,
+    options: SoftwareChangeFastOptions,
+) -> Result<GraphNode, BuiltinTemplateError> {
+    Ok(GraphNode::Choice(ChoiceNode {
+        name: node_name("delivery_route")?,
+        state: state.clone(),
+        branches: non_empty(vec![ChoiceBranch {
+            when: Guard::Any {
+                guards: non_empty(vec![
+                    blast_small_guard(options)?,
+                    Guard::All {
+                        guards: non_empty(vec![
+                            Guard::StateIn {
+                                path: static_value(FieldPath::new(vec![
+                                    field_name(PHASE_FIELD)?,
+                                    field_name("after")?,
+                                ]))?,
+                                labels: enum_labels(&[ACCEPTED_LABEL])?,
+                            },
+                            Guard::StateIn {
+                                path: static_value(FieldPath::new(vec![
+                                    field_name(PHASE_FIELD)?,
+                                    field_name("code")?,
+                                ]))?,
+                                labels: enum_labels(&[ACCEPTED_LABEL])?,
+                            },
+                        ])?,
+                    },
+                ])?,
+            },
+            node: accepted_change(state.clone(), delivery)?,
+        }])?,
+        otherwise: Some(Box::new(next_iteration("delivery_skip", state)?)),
+        promoted_state_paths: Vec::new(),
+    }))
+}
+
+fn jev_write_bindings(
+    delivery: TemplateDelivery,
+) -> Result<Vec<WriteBinding>, BuiltinTemplateError> {
+    let mut bindings = [
+        RADIUS_FIELD,
+        CONFIDENCE_FIELD,
+        FILES_FIELD,
+        LINES_FIELD,
+        CHECKS_REPORTED_FIELD,
+    ]
+    .into_iter()
+    .map(|field| output_write("jev", field, field))
+    .collect::<Result<Vec<_>, _>>()?;
+    if delivery_mode(delivery).is_some() {
+        // The small shortcut skips the acceptance verifier, so the judge supplies provisional
+        // delivery metadata; an accepted review overwrites it before delivery.
+        bindings.push(output_write("jev", REASONS_FIELD, TITLE_FIELD)?);
+        bindings.push(output_write("jev", REASONS_FIELD, DESCRIPTION_FIELD)?);
+    }
+    Ok(bindings)
+}
+
+fn fast_feedback_paths() -> Result<Vec<FieldPath>, BuiltinTemplateError> {
+    feedback_paths()
+}
+
 fn software_worker(delivery: TemplateDelivery) -> Result<GraphNode, BuiltinTemplateError> {
+    software_worker_with_input(software_worker_input_type(delivery)?)
+}
+
+fn software_worker_with_input(input: PayloadType) -> Result<GraphNode, BuiltinTemplateError> {
     Ok(GraphNode::Step(StepNode {
         name: node_name("worker")?,
         worker: worker_ref("builtin.agent.software-worker@1")?,
-        instructions: Some(instructions(
-            "Implement the requested software change fully in the shared workspace. Follow the \
-             repository's guidance, keep the change focused, and run relevant checks. Delivery runs \
-             `git add --all`; do not leave unrelated unignored files in the repository checkout. \
-             Use current input on every visit. An empty phase means implementation; phase.after \
-             accepted or rejected means repair the latest acceptanceFeedback and codeFeedback; \
-             ci_failed, conflict, or repair_required means repair deliveryFeedback. Other feedback \
-             is historical. Resolve Git/CI issues without weakening the task; preserve integrated \
-             upstream changes. sourceRevision is original provenance, reviewBaseRevision the \
-             captured target. Do not restore files merely to match sourceRevision. Run relevant \
-             checks after repairs.",
-        )?),
-        input: software_worker_input_type(delivery)?,
+        instructions: Some(instructions(SOFTWARE_WORKER_INSTRUCTIONS)?),
+        input,
         output: PayloadType::Null,
         input_bindings: [
             TASK_FIELD,
