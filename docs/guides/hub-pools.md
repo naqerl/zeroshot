@@ -283,8 +283,7 @@ An example notification for a lease that just became ready:
     "reason": null,
     "at": "2026-02-11T09:41:12.481Z",
     "cursor": "hub:57",
-    "summary": {"phase": "ready", "node": null, "terminal": false, "reason": null},
-    "replayed": false
+    "summary": {"phase": "ready", "node": null, "terminal": false, "reason": null}
   },
   "_meta": {}
 }

@@ -414,12 +414,16 @@ async fn events_command(
     }
     // `cursor` is a subscription parameter, not one of the worker-binding arguments. Putting
     // it under `arguments` makes the subscription reject it as unknown and drops the resume.
+    // A null MCP cursor means "from now", so the operator CLI asks for the bootstrap state
+    // explicitly when no `--after` was given.
+    let bootstrap = events.after.is_none();
     let stream = json!({
         "jsonrpc": "2.0",
         "id": 2,
         "method": "events/stream",
         "params": {
             "cursor": events.after,
+            "snapshot": bootstrap,
             "arguments": Value::Object(arguments)
         }
     });

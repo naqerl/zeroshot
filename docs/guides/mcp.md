@@ -149,11 +149,11 @@ carry in `data.kind`:
 
 | Kind             | Data                                                                                             |
 | ---------------- | ------------------------------------------------------------------------------------------------ |
-| `hub.job`        | `kind`, `jobId`, `title`, `state`, `target`, `project`, `runId`, `attempts`, `pinnedRevision`, `labels`, `submittedAt`, `finishedAt`, `failureReason`, `failureClassification`, `errorKind`, `headBranch`, `headRevision`, `status`, `terminal`, `snapshot`, `reason`, `at`, `cursor`, `summary`, `replayed`, `sequence` |
-| `hub.run`        | `kind`, `runId`, `cursor`, `runCursor`, `node`, `previousNode`, `phase`, `lastCursorAt`, `cursorsSinceLastEvent`, `elapsedMsInNode`, `nodeChangedAt`, `terminal`, `reason`, `status`, `summary`, `replayed` |
-| `hub.run.detail` | `kind` and one raw per-cursor run watch record: `runId`, `cursor`, `runCursor`, `status`, `summary`, `replayed` |
-| `hub.pool`       | `kind`, `scope`, `pool`, `leaseId`, `serverId`, `memberId`, `machine`, `phase`, `previousPhase`, `reason`, `at`, `cursor`, `summary`, `replayed` |
-| `hub.warning`    | `kind`, `jobId`, `runId`, `message`, `at`, `cursor`, `summary`, `replayed`                              |
+| `hub.job`        | `kind`, `jobId`, `title`, `state`, `target`, `project`, `runId`, `attempts`, `pinnedRevision`, `labels`, `submittedAt`, `finishedAt`, `failureReason`, `failureClassification`, `errorKind`, `headBranch`, `headRevision`, `status`, `terminal`, `snapshot`, `reason`, `at`, `cursor`, `summary`, `sequence` |
+| `hub.run`        | `kind`, `runId`, `cursor`, `runCursor`, `node`, `previousNode`, `phase`, `lastCursorAt`, `cursorsSinceLastEvent`, `elapsedMsInNode`, `nodeChangedAt`, `terminal`, `reason`, `status`, `summary` |
+| `hub.run.detail` | `kind` and one raw per-cursor run watch record: `runId`, `cursor`, `runCursor`, `status`, `summary` |
+| `hub.pool`       | `kind`, `scope`, `pool`, `leaseId`, `serverId`, `memberId`, `machine`, `phase`, `previousPhase`, `reason`, `at`, `cursor`, `summary` |
+| `hub.warning`    | `kind`, `jobId`, `runId`, `message`, `at`, `cursor`, `summary`                                       |
 
 Every occurrence's envelope `name` is the name the client subscribed with: `hub` for a
 subscription without a `name`, otherwise the requested name (`hub.job`, `hub.event`, …). MCP events
@@ -169,7 +169,10 @@ events/subscribe {}
 {"eventId": "hub:42", "name": "hub", "timestamp": "RFC3339", "data": {"kind": "hub.run"}, "_meta": {}}
 ```
 
-`summary`, `replayed`, the carried kind in `data.kind`, and the hub cursor live inside `data`.
+`summary`, the carried kind in `data.kind`, and the hub cursor live inside `data`. Occurrences
+carry only the SEP-3415 envelope (`eventId`, `name`, `timestamp`, `data`, `_meta`); provenance is
+not a field, because a client that supplied a cursor already knows it is being served from one, and
+what is new to it is decided by `eventId`.
 `data.cursor` is the same `hub:<sequence>` value as `eventId`. The sequence is monotonic across
 jobs, runs, pools, and warnings, so a client can keep one cursor and resume the whole feed. A
 `hub.run` or `hub.run.detail` record keeps its original durable `v2:<sequence>` watch cursor as
@@ -218,20 +221,26 @@ Subscription arguments are all optional filters:
 }
 ```
 
-- `cursor: null` starts with a bootstrap snapshot and then the live feed. For every recent known
-  job (queued, placing, running, or already attempted, bounded to the newest 512 job views) the
-  first batch contains one synthesized `hub.job` in `submittedAt` order with `data.snapshot: true`
+- `cursor: null` (or absent) means "from now": the response carries `events: []` and a fresh,
+  plain durable `hub:<sequence>` cursor at the current feed head, so the next call continues with
+  events produced after this request. It never synthesizes state and never returns a
+  `hub:snapshot:` cursor. Deduplicate by `eventId` and resume from the returned cursor.
+- `snapshot: true` opts into the bootstrap state. Only then does a null cursor return the
+  synthesized `hub.job` records for every recent known job (queued, placing, running, or already
+  attempted, bounded to the newest 512 job views) in `submittedAt` order with `data.snapshot: true`
   and the current state. Each record has a distinct `eventId`/`data.cursor` of
   `hub:snapshot:<delivered>:<start>`, where `<delivered>` counts the synthesized records already
-  sent and `<start>` is the durable boundary the batch began from. It is never replayed, and is
-  never reported by a later poll. After that, the feed carries each genuine occurrence once;
-  bootstrap records replace remembered job replay so stale job state cannot be repeated. A
-  bootstrap for an already-terminal job is that job's one durable terminal occurrence, so its
-  publication moves the response cursor past itself and a resume cannot replay it. Run and pool
-  replay still follows the retained window. There is no backfill of run history. If `maxEvents`
-  clips the bootstrap, the returned cursor resumes after exactly the delivered snapshots with
-  `hasMore: true`; it never drops the rest.
+  sent and `<start>` is the durable boundary the batch began from. It is never reported by a later
+  poll. After that, the feed carries each genuine occurrence once; bootstrap records replace
+  remembered job replay so stale job state cannot be repeated. A bootstrap for an already-terminal
+  job is that job's one durable terminal occurrence, so its publication moves the response cursor
+  past itself and a resume cannot replay it. The batch also replays the remembered latest state of
+  every known run and pool lease, so a bootstrap covers current state, not only jobs. There is no
+  backfill of run history. If `maxEvents` clips the bootstrap, the returned cursor
+  resumes after exactly the delivered snapshots with `hasMore: true`; it never drops the rest.
 - A subscription opened with a cursor does not bootstrap; it resumes strictly after that cursor.
+  A subscription opened without one (and without `snapshot: true`) starts at the feed head and
+  delivers only events produced after it.
 - A cursor is exclusive. The response cursor advances to the last delivered event and never moves
   backwards.
 - `truncated` is `false` when nothing was lost. It is `{ "from": "hub:N", "to": "hub:M" }` only
@@ -247,11 +256,11 @@ Subscription arguments are all optional filters:
 `notifications/events/active`, replays the available window, then sends one
 `notifications/events/event` per occurrence and `notifications/events/heartbeat` about every five
 seconds while idle. Every notification carries
-`_meta["io.modelcontextprotocol/subscriptionId"]` set to the request id. `replayed` is `true`
-only for records drained from the replay buffer at subscribe time; events delivered after a lag
-or from the live broadcast are `false`. A real replay or backpressure shortfall that permanently
-lost events sends another `notifications/events/active` with the `{from,to}` range before
-continuing.
+`_meta["io.modelcontextprotocol/subscriptionId"]` set to the request id. A stream opened with
+`cursor: null` sends no bootstrap state: it starts at the feed head and delivers only events
+produced after the subscribe. Pass `snapshot: true` to opt into the bootstrap state, or a cursor
+to resume. A real replay or backpressure shortfall that permanently lost events sends another
+`notifications/events/active` with the `{from,to}` range before continuing.
 
 A terminal run or job is an ordinary event. Every job produces exactly one terminal `hub.job`
 occurrence, including `succeeded`, `failed`, `force_stopped`, `dequeued`, `target_lost`, and jobs
@@ -290,10 +299,11 @@ zeroshot hub events --json --after hub:42 --states running,failed --phases runni
 ```
 
 `zeroshot hub events` prints one NDJSON occurrence per line with the same five names, fields,
-bootstrap snapshots, sequence counter, cursor semantics, and `--job`/`--target`/`--label` filters.
-`--json` is accepted for symmetry with other hub commands; NDJSON is the only format. A request
-without `--after` prints the bootstrap snapshot and then follows live occurrences; a request with
-`--after` resumes instead of bootstrapping.
+sequence counter, cursor semantics, and `--job`/`--target`/`--label` filters. `--json` is accepted
+for symmetry with other hub commands; NDJSON is the only format. A request without `--after`
+prints the bootstrap snapshot and then follows live occurrences; a request with `--after` resumes
+instead of bootstrapping. That CLI bootstrap is the operator-facing equivalent of the MCP
+`snapshot: true` opt-in; MCP itself starts from now unless asked.
 
 ## Resume and stop
 
