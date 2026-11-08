@@ -1,7 +1,8 @@
 //! A hosted capsule builds one harness configuration per distinct effective lane.
 use std::collections::BTreeMap;
+use std::path::Path;
 
-use crate::execution::process::HostedProcessPool;
+use crate::execution::process::{HostedProcessIdentity, HostedProcessPool, HostedProcessScope};
 use crate::native_v2_candidate::NativeV2HarnessConfig;
 use crate::native_v2_capsule::{CapsuleFilesystem, HarnessProcessEnvironment};
 use crate::native_v2_claude::ClaudeAdapterConfig;
@@ -49,7 +50,32 @@ impl ProductionCapsuleAllocator {
         let tools_directory = environment::tools_directory(run_root)
             .to_string_lossy()
             .into_owned();
-        let base_environment = BTreeMap::from([("ZEROSHOT_TOOLS".to_owned(), tools_directory)]);
+        // Keep every hosted build's caches and fallback temp files on the capsule storage
+        // root, not the target's root disk. The writer's private home already exists for the
+        // provider session; Cargo creates its own cache and target subdirectories under it.
+        let writer = process_pool
+            .identity(HostedProcessScope::Writer)
+            .map_err(|_| CapsuleAllocationUnavailable::Runtime)?;
+        let build_home = HostedProcessScope::Writer.private_home(&filesystem.runtime_home);
+        prepare_build_home(&build_home, writer)?;
+        let base_environment = BTreeMap::from([
+            ("ZEROSHOT_TOOLS".to_owned(), tools_directory),
+            (
+                "CARGO_HOME".to_owned(),
+                build_home.join(".cargo").to_string_lossy().into_owned(),
+            ),
+            (
+                "CARGO_TARGET_DIR".to_owned(),
+                build_home
+                    .join(".cargo-target")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                "TMPDIR".to_owned(),
+                build_home.to_string_lossy().into_owned(),
+            ),
+        ]);
         let inputs = HostedLaneInputs {
             filesystem,
             search_path: &search_path,
@@ -133,4 +159,23 @@ impl ProductionCapsuleAllocator {
             }
         }
     }
+}
+
+/// Create the writer-owned build home under the capsule runtime root. Ownership is best effort
+/// so an unprivileged test composition can still inspect the lane; production runs as root.
+fn prepare_build_home(
+    path: &Path,
+    identity: HostedProcessIdentity,
+) -> Result<(), CapsuleAllocationUnavailable> {
+    std::fs::create_dir_all(path).map_err(|_| CapsuleAllocationUnavailable::Runtime)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| CapsuleAllocationUnavailable::Runtime)?;
+        let _ = std::os::unix::fs::chown(path, Some(identity.uid()), Some(identity.gid()));
+    }
+    #[cfg(not(unix))]
+    let _ = identity;
+    Ok(())
 }

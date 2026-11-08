@@ -7,6 +7,9 @@ use crate::native_v2_runner::{NodeRunnerError, ResolvedEnvironment};
 use std::fmt;
 
 pub(crate) const CODEX_LOCAL_ENVIRONMENT: &[&str] = &[
+    "CARGO_HOME",
+    "CARGO_TARGET_DIR",
+    "TMPDIR",
     "CODEX_API_KEY",
     "OPENAI_API_KEY",
     "CODEX_BASE_URL",
@@ -64,6 +67,8 @@ pub(crate) const PI_LOCAL_ENVIRONMENT: &[&str] = &[
 ];
 
 pub(crate) const COPILOT_LOCAL_ENVIRONMENT: &[&str] = &[
+    "CARGO_HOME",
+    "CARGO_TARGET_DIR",
     "COPILOT_GITHUB_TOKEN",
     "GH_TOKEN",
     "GITHUB_TOKEN",

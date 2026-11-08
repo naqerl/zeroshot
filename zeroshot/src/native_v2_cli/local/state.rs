@@ -70,6 +70,8 @@ fn copy_minimal_environment(
         "TERM",
         "TMPDIR",
         "HOME",
+        "CARGO_HOME",
+        "CARGO_TARGET_DIR",
         "USERPROFILE",
         "APPDATA",
         "LOCALAPPDATA",

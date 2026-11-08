@@ -2,13 +2,15 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-pub(crate) const MINIMAL_ENVIRONMENT_NAMES: [&str; 7] = [
+pub(crate) const MINIMAL_ENVIRONMENT_NAMES: [&str; 9] = [
     "HOME",
     "LANG",
     "LC_ALL",
     "PATH",
     "TERM",
     "TMPDIR",
+    "CARGO_HOME",
+    "CARGO_TARGET_DIR",
     "ZEROSHOT_TOOLS",
 ];
 

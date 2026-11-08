@@ -49,7 +49,7 @@ fn user_data_installs_a_strict_idempotent_btrfs_boot_script() {
     assert!(!script.contains("DATA_MODE"));
     assert!(!script.contains("DATA_SIZE_GB"));
     assert!(!script.contains("/dev/disk/by-id/scsi-0HC_Volume_"));
-    assert!(script.contains("OPTIONS='noatime,compress=zstd:1'"));
+    assert!(script.contains("OPTIONS='noatime,compress=zstd:1,discard'"));
     assert!(!script.contains("tailcat"));
     assert!(script.contains("--network host"));
     assert!(script.contains("--listen \"127.0.0.1:8080\""));
@@ -65,12 +65,16 @@ fn user_data_installs_a_strict_idempotent_btrfs_boot_script() {
         "mkfs.btrfs -q -L zeroshot-data \"$DATA_FILE.part\"",
         ">>/etc/fstab",
         "mount \"$DATA\"",
+        "fstrim -av",
+        "df -B1 --output=avail /",
+        "disk_full",
         "stat -f -c %T \"$DATA\"",
         "[ \"$fs\" = btrfs ] || fail \"$DATA is $fs, not btrfs; the target is not started on it\"",
         "btrfs subvolume create \"$probe\"",
         "btrfs subvolume snapshot -r",
         "cp --reflink=always",
         "btrfs subvolume delete \"$probe\"",
+        "mkdir -p \"$DATA/.cargo\" \"$DATA/.cargo-target\" \"$DATA/tmp\"",
         "docker run --detach",
         "touch \"$STATUS/ok\"",
     ];
@@ -106,6 +110,60 @@ fn user_data_installs_a_strict_idempotent_btrfs_boot_script() {
     }
     assert!(!script.contains("mkfs.btrfs -f"));
     assert!(!script.contains("--force"));
+}
+
+#[test]
+fn the_boot_script_bounds_the_data_file_and_fails_below_the_floor() {
+    let pool = pool_fixture();
+    let lease = Lease::new(&pool, "hj_one", 40123, 0);
+    let document = provision::user_data(&pool, &lease, "ssh-ed25519 AAAA hub").expect("user data");
+    let script = embedded_script(&document);
+    // The template owns the bounds; the shell never sizes the file from the whole free disk.
+    for needle in [
+        format!("HEADROOM_GB={}", data::HEADROOM_GB),
+        format!("MIN_DATA_GB={}", data::MIN_DATA_GB),
+        format!(
+            "MIN_DATA_BYTES={}",
+            u64::from(data::MIN_DATA_GB) * (1 << 30)
+        ),
+        format!(
+            "MAX_DATA_BYTES={}",
+            u64::from(data::DATA_MAX_GB) * (1 << 30)
+        ),
+        format!("DISK_FLOOR_GB={}", data::DISK_FLOOR_GB),
+        format!("DATA_FLOOR_GB={}", data::DATA_FLOOR_GB),
+        "[ \"$size\" -le \"$MAX_DATA_BYTES\" ] || size=$MAX_DATA_BYTES".to_owned(),
+        // The floor check on the root disk and on the data filesystem, with its reason.
+        "root_avail=$(df -B1 --output=avail / | tail -n 1 | tr -d ' ')".to_owned(),
+        "data_avail=$(df -B1 --output=avail \"$DATA\" | tail -n 1 | tr -d ' ')".to_owned(),
+        "fail \"disk_full: the root disk has".to_owned(),
+        "fail \"disk_full: the data folder has".to_owned(),
+        "below the $DATA_FLOOR_GB GiB floor".to_owned(),
+        // Freed blocks go back to ext4 on boot and on teardown.
+        "fstrim -av".to_owned(),
+    ] {
+        assert!(
+            script.contains(&needle),
+            "{needle:?} missing from\n{script}"
+        );
+    }
+    // A fresh minimum data file reports slightly under 5 GiB, so its floor is lower.
+    const { assert!(data::DATA_FLOOR_GB < data::MIN_DATA_GB) };
+    // The build cache and fallback temp folder live on btrfs, and the target's local runs
+    // forward the two CARGO_* values to harness children.
+    for bind in [
+        "--env CARGO_HOME=/var/lib/zeroshot/.cargo",
+        "--env CARGO_TARGET_DIR=/var/lib/zeroshot/.cargo-target",
+        "--env TMPDIR=/var/lib/zeroshot/tmp",
+    ] {
+        assert!(script.contains(bind), "{bind:?} missing from\n{script}");
+        let mkdir = "mkdir -p \"$DATA/.cargo\" \"$DATA/.cargo-target\" \"$DATA/tmp\"";
+        assert!(position(&script, mkdir) < position(&script, bind), "{bind}");
+    }
+    let teardown = data::teardown_script();
+    assert!(teardown.contains("docker rm -f zeroshot-target"));
+    assert!(teardown.contains("docker system prune -af --volumes"));
+    assert!(teardown.find("docker system prune -af --volumes") < teardown.find("fstrim -av"));
 }
 
 #[test]

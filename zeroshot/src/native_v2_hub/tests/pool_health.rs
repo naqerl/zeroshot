@@ -3,7 +3,7 @@
 
 use super::super::health::{self, Health};
 use super::super::model::MemberState;
-use super::super::pool::{LeasePhase, ResourceKind, TeardownReason};
+use super::super::pool::{LeasePhase, PoolEventKind, PoolPhase, ResourceKind, TeardownReason};
 use super::super::provision::DATA_FOLDER;
 use super::pool::{first_error, rig};
 use crate::native_v2_target::TargetRegistry;
@@ -201,6 +201,59 @@ async fn a_failed_data_check_fails_the_boot_and_deletes_the_server() {
         rig.cloud
             .with(|cloud| cloud.destroyed.contains(&(ResourceKind::Server, server)))
     );
+}
+
+#[tokio::test]
+async fn a_disk_full_data_check_reports_disk_full_and_pauses_the_pool() {
+    let rig = rig();
+    rig.add_pool(1).await;
+    *rig.tunnels.health.lock().expect("lock") = Some(Ok(
+        "failed boot: disk_full: the root disk has 2 GiB free, below the 5 GiB floor\n".to_owned(),
+    ));
+    rig.enqueue("hj_one").await;
+    for _ in 0..3 {
+        rig.pass().await;
+    }
+    let lease = rig.lease().await;
+    assert_eq!(lease.reason, Some(TeardownReason::DiskFull), "{lease:?}");
+    assert!(
+        lease
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("disk_full")),
+        "{lease:?}"
+    );
+    let failed: Vec<_> = rig
+        .state()
+        .await
+        .pool_events
+        .iter()
+        .filter(|event| event.kind == PoolEventKind::Lease && event.phase == PoolPhase::Failed)
+        .cloned()
+        .collect();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(
+        failed[0].previous_phase,
+        Some(PoolPhase::Preparing),
+        "{failed:?}"
+    );
+    assert!(
+        failed[0]
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("disk_full")),
+        "{failed:?}"
+    );
+    for _ in 0..4 {
+        rig.pass().await;
+        if rig.state().await.leases.is_empty() {
+            break;
+        }
+    }
+    let state = rig.state().await;
+    assert!(state.leases.is_empty(), "{:?}", state.leases);
+    assert_eq!(state.pools[0].boot_failures, 1);
+    assert!(state.pools[0].paused_until_ms.is_some());
 }
 
 #[cfg(unix)]

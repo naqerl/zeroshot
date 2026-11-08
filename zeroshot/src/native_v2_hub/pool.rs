@@ -355,6 +355,8 @@ pub(crate) enum TeardownReason {
     WaitExpired,
     /// The provider reported the server failed or gone while it booted.
     BootFailed,
+    /// The boot script found the root disk or the data folder below its free-space floor.
+    DiskFull,
     PoolRemoved,
 }
 

@@ -13,6 +13,7 @@ use time::format_description::well_known::Rfc3339;
 use super::super::archive::{self, FILES};
 use super::super::capacity;
 use super::super::clock::now_ms;
+use super::super::data;
 use super::super::error::{EXIT_NO_CAPACITY, EXIT_NO_ELIGIBLE_TARGET, HubError};
 use super::super::lease::{PoolRuntime, REAP_INTERVAL_MS, production_runtime};
 use super::super::model::{
@@ -2855,6 +2856,39 @@ async fn a_deliberate_stop_clears_an_earlier_hub_error() {
         stopped["job"]["failureClassification"],
         serde_json::Value::Null
     );
+}
+
+#[test]
+fn data_size_bytes_bounds_the_btrfs_file_to_the_root_disk() {
+    const GIB: u64 = 1 << 30;
+    // A 75 GiB root disk reserves the cap, not the 67 GiB left after the headroom.
+    assert_eq!(
+        data::data_size_bytes(75 * GIB, 8, 5, data::DATA_MAX_GB),
+        Some(24 * GIB)
+    );
+    // A 40 GiB disk leaves 32 GiB beside the headroom; a 32 GiB cap keeps all of it.
+    assert_eq!(data::data_size_bytes(40 * GIB, 8, 5, 32), Some(32 * GIB));
+    // The shipped cap bounds the same disk to 24 GiB.
+    assert_eq!(
+        data::data_size_bytes(
+            40 * GIB,
+            data::HEADROOM_GB,
+            data::MIN_DATA_GB,
+            data::DATA_MAX_GB
+        ),
+        Some(24 * GIB)
+    );
+    // A 10 GiB disk cannot hold the 8 GiB headroom and the 5 GiB minimum.
+    assert_eq!(data::data_size_bytes(10 * GIB, 8, 5, 24), None);
+    // Exactly the minimum is allowed, and never more than `free - headroom`.
+    assert_eq!(data::data_size_bytes(13 * GIB, 8, 5, 24), Some(5 * GIB));
+    for free in [0, 1, 5 * GIB, 13 * GIB, 20 * GIB + 123, 40 * GIB, 75 * GIB] {
+        if let Some(size) = data::data_size_bytes(free, 8, 5, data::DATA_MAX_GB) {
+            assert!(size <= free - 8 * GIB, "{free} reserved {size}");
+            assert_eq!(size % GIB, 0, "{free} reserved {size}");
+            assert!(size >= 5 * GIB);
+        }
+    }
 }
 
 #[tokio::test]

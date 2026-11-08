@@ -993,5 +993,61 @@ fn local_git_metadata_rejects_invalid_records_and_bounds_untrusted_output() {
     );
 }
 
+#[test]
+fn local_process_environment_forwards_build_cache_paths_and_tmpdir() {
+    let environment = LocalHarnessEnvironment::new(BTreeMap::from([
+        ("PATH".to_owned(), "/bin".to_owned()),
+        ("TMPDIR".to_owned(), "/var/lib/zeroshot/tmp".to_owned()),
+        (
+            "CARGO_HOME".to_owned(),
+            "/var/lib/zeroshot/.cargo".to_owned(),
+        ),
+        (
+            "CARGO_TARGET_DIR".to_owned(),
+            "/var/lib/zeroshot/.cargo-target".to_owned(),
+        ),
+        ("SECRET".to_owned(), "not-forwarded".to_owned()),
+    ]));
+    let values = local_process_environment("/bin", &environment)
+        .assert_value()
+        .clone_values();
+    assert_eq!(values["TMPDIR"], "/var/lib/zeroshot/tmp");
+    assert_eq!(values["CARGO_HOME"], "/var/lib/zeroshot/.cargo");
+    assert_eq!(
+        values["CARGO_TARGET_DIR"],
+        "/var/lib/zeroshot/.cargo-target"
+    );
+    assert!(!values.contains_key("SECRET"));
+}
+
+#[test]
+fn local_lane_environment_selections_keep_build_cache_paths() {
+    let environment = LocalHarnessEnvironment::new(BTreeMap::from([
+        (
+            "CARGO_HOME".to_owned(),
+            "/var/lib/zeroshot/.cargo".to_owned(),
+        ),
+        (
+            "CARGO_TARGET_DIR".to_owned(),
+            "/var/lib/zeroshot/.cargo-target".to_owned(),
+        ),
+        ("TMPDIR".to_owned(), "/var/lib/zeroshot/tmp".to_owned()),
+        ("UNRELATED".to_owned(), "not-forwarded".to_owned()),
+    ]));
+    let codex =
+        environment.selected(crate::native_v2_capsule::provider_process::CODEX_LOCAL_ENVIRONMENT);
+    assert_eq!(codex["CARGO_HOME"], "/var/lib/zeroshot/.cargo");
+    assert_eq!(codex["CARGO_TARGET_DIR"], "/var/lib/zeroshot/.cargo-target");
+    assert_eq!(codex["TMPDIR"], "/var/lib/zeroshot/tmp");
+    let copilot =
+        environment.selected(crate::native_v2_capsule::provider_process::COPILOT_LOCAL_ENVIRONMENT);
+    assert_eq!(copilot["CARGO_HOME"], "/var/lib/zeroshot/.cargo");
+    assert_eq!(
+        copilot["CARGO_TARGET_DIR"],
+        "/var/lib/zeroshot/.cargo-target"
+    );
+    assert!(!copilot.contains_key("UNRELATED"));
+}
+
 #[path = "tests/comments.rs"]
 mod comments;

@@ -570,6 +570,17 @@ fn hosted_lanes_build_one_configuration_per_effective_lane_from_shared_capsule_i
     );
     assert_eq!(codex.search_path, copilot.search_path);
     assert_eq!(claude_environment.get("PATH"), Some(&copilot.search_path));
+    let build = filesystem.runtime_home.join("writer");
+    for (name, path) in [
+        ("CARGO_HOME", build.join(".cargo")),
+        ("CARGO_TARGET_DIR", build.join(".cargo-target")),
+        ("TMPDIR", build.clone()),
+    ] {
+        let expected = path.to_string_lossy().into_owned();
+        assert_eq!(copilot.base_environment.get(name), Some(&expected));
+        assert_eq!(codex.base_environment.get(name), Some(&expected));
+        assert_eq!(claude_environment.get(name), Some(&expected));
+    }
 }
 
 #[test]
@@ -619,4 +630,12 @@ fn hosted_pi_harness_builds_the_contained_lane_from_the_capsule() {
             |path| path.starts_with(&format!("{}:", root.child("tools/bin").display()))
         )
     );
+    let build = filesystem.runtime_home.join("writer");
+    for (name, path) in [
+        ("CARGO_HOME", build.join(".cargo")),
+        ("CARGO_TARGET_DIR", build.join(".cargo-target")),
+        ("TMPDIR", build.clone()),
+    ] {
+        assert_eq!(values.get(name).map(String::as_str), path.to_str());
+    }
 }

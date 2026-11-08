@@ -950,8 +950,12 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   reuses an existing key by public key or MD5 fingerprint, attaches it to the server by key ID,
   and also writes it plus a non-expiring login in user data; key-registration failures remain
   distinct from server create/delete errors. No secret enters either. `data.rs` owns the btrfs
-  data folder: an automatically sized file on the server's local disk and the idempotent, strict
-  boot script (mkfs.btrfs, fstab, snapshot and reflink probe, then the target). The target shares
+  data folder: a data file bounded to clamp(free - 8 GiB headroom, 5 GiB, 24 GiB) and mounted
+  with `discard`, the boot script that fails as `disk_full` below a 5 GiB root or 3 GiB data
+  floor, and the ordinary-teardown prune before deletion. Hosted lanes pin `CARGO_HOME`,
+  `CARGO_TARGET_DIR` and `TMPDIR` under the capsule runtime home so a job's build stays off the
+  target's root disk. The idempotent, strict boot script (mkfs.btrfs, fstab, snapshot and
+  reflink probe, then the target) follows. The target shares
   the server's network namespace bound to `127.0.0.1`, so the hub's SSH tunnel reaches it directly
   without Docker's published-port proxy; a job whose `--wait-max` expires while its lease is still
   starting tears that lease down with reason `wait_expired` instead of leaving it silently

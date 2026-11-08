@@ -16,11 +16,12 @@ use serde_json::{Value, json};
 
 use super::archive;
 use super::capacity::{self, Machine, PoolType};
-use super::profile::{self, Spec};
 use super::clock::now_ms;
+use super::data;
 use super::error::HubError;
 use super::health::{self, DataHealth, FILE_MODE, Health};
 use super::model::{HubState, Member, MemberState};
+use super::profile::{self, Spec};
 use super::pool::{
     self, LABEL_HUB, LABEL_LEASE, LABEL_LOCATION, LABEL_SERVER_TYPE, Lease, LeasePhase, Pool,
     PoolPhase, Resource, ResourceKind, TeardownReason, Transport,
@@ -283,7 +284,11 @@ impl HubService {
             let lease_server_id = lease.server_id;
             let failed_boot = matches!(
                 lease.reason,
-                Some(TeardownReason::BootFailed | TeardownReason::BootTimeout)
+                Some(
+                    TeardownReason::BootFailed
+                        | TeardownReason::BootTimeout
+                        | TeardownReason::DiskFull
+                )
             );
             let pool_name = lease.pool.clone();
             match self.step(runtime, lease, &mut report).await {
@@ -548,6 +553,19 @@ impl HubService {
                     Drain::Pending => return Ok(Step::Update(Box::new(lease))),
                     Drain::Done(skipped) => skipped,
                 };
+                if let Some(pool) = pool
+                    && lease.server_id.is_some()
+                    && lease.ipv4.is_some()
+                {
+                    match self.tunnel_spec(pool, &lease) {
+                        Ok(spec) => {
+                            prune_before_delete(runtime, spec, &lease.name, report).await;
+                        }
+                        Err(error) => report
+                            .errors
+                            .push(format!("{}: prune: {error}", lease.name)),
+                    }
+                }
                 // A boot that failed or timed out may still hold its creation action; only a
                 // deletion action may confirm the server gone.
                 lease.action_id = None;
@@ -1372,7 +1390,27 @@ fn open_selected(
     }
 }
 
-/// Run the data health check on the lease's server. `None` while its boot script runs, or once
+/// Run the remote cleanup before a lease's server is deleted. Best effort: a failed prune is
+/// reported and the server is deleted anyway, because a stuck box must not keep billing.
+async fn prune_before_delete(
+    runtime: &PoolRuntime,
+    spec: TunnelSpec,
+    name: &str,
+    report: &mut PoolReport,
+) {
+    let script = data::teardown_script();
+    let tunnels = Arc::clone(&runtime.tunnels);
+    let output = tokio::task::spawn_blocking(move || tunnels.run(&spec, &script)).await;
+    match output {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => report.errors.push(format!("{name}: prune: {error}")),
+        Err(error) => report
+            .errors
+            .push(format!("{name}: prune stopped: {error}")),
+    }
+}
+
+/// The data health check on the lease's server. `None` while its boot script runs, or once
 /// the check failed, which fails the boot: the lease drains and its server is deleted.
 async fn check_data(
     tunnels: Arc<dyn Tunnels>,
@@ -1394,7 +1432,14 @@ async fn check_data(
             Ok(None)
         }
         Health::Failed(reason) => {
-            lease.reason = Some(TeardownReason::BootFailed);
+            let failure = reason.strip_prefix("boot: ").unwrap_or(&reason);
+            lease.reason = Some(if failure.starts_with("disk_full") {
+                TeardownReason::DiskFull
+            } else {
+                TeardownReason::BootFailed
+            });
+            // `store_lease` turns this into the single `failed` event, so the reason still
+            // carries the `preparing:` step that the health check failed in.
             lease.event_phase = Some(PoolPhase::Failed);
             lease.drain_started_ms = Some(now_ms());
             lease.advance(LeasePhase::Draining);

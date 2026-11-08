@@ -319,16 +319,50 @@ subvolumes, no `btrfs` command, and no extra container privileges.
 The boot script is written by the hub into cloud-init user data, so any server image with
 Docker or apt/dnf works. No custom image is needed. The script runs with `set -eu`:
 
-- It allocates `/var/lib/zeroshot-data.btrfs` (mode 0600) with `fallocate`. It formats the file
-  with `mkfs.btrfs` and loop-mounts it at `/mnt/zs`.
-- It mounts with `noatime,compress=zstd:1` and adds a `nofail` line to `/etc/fstab`, so a reboot
-  remounts the folder. `/mnt/zs` is made immutable before the mount, so nothing can write to the
-  ext4 underneath.
+- It allocates `/var/lib/zeroshot-data.btrfs` (mode 0600) with `fallocate`. The size is the free
+  root disk minus an 8 GiB headroom, clamped to 5 GiB at the low end and 24 GiB at the high end,
+  rounded down to whole GiB. It formats the file with `mkfs.btrfs` and loop-mounts it at
+  `/mnt/zs`.
+- The file is bounded because the root disk is ext4 and shared with Docker: the image, the
+  container's writable layer, logs and any build the job runs outside `/var/lib/zeroshot` all
+  live there. Sizing the file from the whole free disk (54 GiB on a 75 GB `ccx23`) left the
+  build a few GiB, so the layer filled the disk and the run ledger failed with `database is
+  full`. A bigger server type buys more root disk for that layer and more headroom, not a bigger
+  data file: the 24 GiB cap stays.
+- It mounts with `noatime,compress=zstd:1,discard` and adds a `nofail` line to `/etc/fstab`, so a
+  reboot remounts the folder. `/mnt/zs` is made immutable before the mount, so nothing can write
+  to the ext4 underneath. `discard` returns deleted extents to the loop file, and therefore to
+  ext4, instead of letting the file grow until the disk is full.
+- It runs `fstrim -av` once after the mount. On an ordinary drained teardown it removes the target
+  container so its writable layer can be reclaimed, prunes unused images and volumes with `docker
+  system prune -af --volumes`, trims the data folder, and only then deletes the server. A lease
+  whose pool was already removed is deleted without this remote cleanup because the pool's SSH key
+  is gone with the pool.
+- After the mount it fails the boot with `disk_full` when `/` has less than 5 GiB free or the
+  data folder has less than 3 GiB. The data floor is lower because a freshly formatted 5 GiB
+  btrfs reports slightly under 5 GiB available. The hub reports `reason: "disk_full"` on the lease
+  and counts it as a failed boot, so the pool pauses instead of silently recycling the box. The
+  floor check is boot-only: a later fill of the 24 GiB data file, such as the run ledger or
+  checkpoints, still surfaces as the opaque SQLite database-is-full error.
+- The target starts with `CARGO_HOME=/var/lib/zeroshot/.cargo`,
+  `CARGO_TARGET_DIR=/var/lib/zeroshot/.cargo-target` and `TMPDIR=/var/lib/zeroshot/tmp`, all
+  created on the btrfs data folder first. A pool member executes submitted runs through the hosted
+  capsule allocator, which pins those same three values under the capsule runtime home on btrfs
+  and puts them in every lane's base environment. Codex keeps that `TMPDIR`; Claude, Pi and
+  Copilot replace it with their own session scratch, which is also under the capsule storage root.
+  Local CLI runs forward the container values through the local controller as well. `HOME` stays
+  the container user's home, so a build that writes `$HOME/.rustup` remains in the container layer
+  on ext4; the 8 GiB headroom covers that residual.
 - The script then checks that `/mnt/zs` is btrfs. It creates a subvolume, takes a read-only
   snapshot and makes a reflink copy, then starts the target. If any step fails, the target is not
   started.
 - Rerunning the script never reformats: a mounted or formatted folder is reused. Its log and an
   `ok` or `failed` marker are kept in `/var/lib/zeroshot-boot/`.
+
+Provisioning a **btrfs root image** (`pool.image`) would remove the loop file entirely: the root
+filesystem would already support reflinks, so there would be no ext4/Docker layer to protect and
+no size arithmetic to get wrong. That is out of scope here; the bounded loop file is the fix for
+current ext4 images.
 
 Before the hub registers a server, it runs a health check as root over SSH:
 

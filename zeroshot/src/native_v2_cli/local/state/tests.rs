@@ -44,6 +44,38 @@ fn local_controller_receives_only_minimal_non_harness_environment() {
 }
 
 #[test]
+fn local_controller_receives_build_cache_paths() {
+    let values = |cargo_home: Option<&str>, target: Option<&str>| {
+        let mut command = Command::new("true");
+        command.env_clear();
+        copy_minimal_environment(&mut command, |name| match name {
+            "CARGO_HOME" => cargo_home.map(std::ffi::OsString::from),
+            "CARGO_TARGET_DIR" => target.map(std::ffi::OsString::from),
+            _ => None,
+        })
+        .expect("copy local environment");
+        command
+            .as_std()
+            .get_envs()
+            .filter_map(|(name, value)| value.map(|value| (name.to_owned(), value.to_owned())))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let forwarded = values(
+        Some("/var/lib/zeroshot/.cargo"),
+        Some("/var/lib/zeroshot/.cargo-target"),
+    );
+    assert_eq!(
+        forwarded.get(std::ffi::OsStr::new("CARGO_HOME")),
+        Some(&std::ffi::OsString::from("/var/lib/zeroshot/.cargo"))
+    );
+    assert_eq!(
+        forwarded.get(std::ffi::OsStr::new("CARGO_TARGET_DIR")),
+        Some(&std::ffi::OsString::from("/var/lib/zeroshot/.cargo-target"))
+    );
+    assert!(values(None, None).is_empty());
+}
+
+#[test]
 fn local_controller_receives_an_absolute_restic_selector() {
     let environment = |restic: OsString| {
         let mut command = Command::new("true");

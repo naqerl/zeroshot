@@ -713,7 +713,14 @@ fn local_process_environment(
     native_environment: &LocalHarnessEnvironment,
 ) -> Result<HarnessProcessEnvironment, crate::native_v2_capsule::ProcessEnvironmentError> {
     let mut base_environment = BTreeMap::from([("PATH".to_owned(), search_path.to_owned())]);
-    for name in ["LANG", "LC_ALL", "TERM", "TMPDIR"] {
+    for name in [
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "TMPDIR",
+        "CARGO_HOME",
+        "CARGO_TARGET_DIR",
+    ] {
         if let Some(value) = native_environment.get(name) {
             base_environment.insert(name.to_owned(), value.clone());
         }
