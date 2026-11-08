@@ -1110,6 +1110,22 @@ async fn events_list_describes_one_hub_type_and_poll_and_push() {
             .unwrap_or_default()
             .contains("maxAgeMs")
     );
+    assert!(
+        event["inputSchema"]["properties"].get("snapshot").is_some(),
+        "the snapshot opt-in is documented"
+    );
+    let advertised = serde_json::to_string(&listed).expect("events/list serialises");
+    assert!(
+        !advertised.contains("replayed"),
+        "the advertised schema never mentions a non-standard replayed field: {advertised}"
+    );
+    assert!(
+        event["inputSchema"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("from now"),
+        "the schema documents that a null cursor starts from now"
+    );
     let next = session
         .request(3, "events/list", json!({"cursor": "1"}))
         .await;
@@ -1207,7 +1223,6 @@ async fn hub_events_multiplex_a_whole_hub_on_one_cursor() {
     assert_eq!(run["data"]["runId"], json!("run-public"));
     assert_eq!(run["data"]["runCursor"], json!("v2:1"));
     assert_eq!(run["data"]["summary"]["phase"], json!("running"));
-    assert_eq!(run["data"]["replayed"], json!(true));
 
     let after = session
         .request(
@@ -1336,7 +1351,6 @@ async fn events_stream_pushes_a_hub_run_notification() {
         "a subscription by kind carries the name it subscribed with"
     );
     assert_eq!(event["params"]["data"]["runId"], json!("run-public"));
-    assert_eq!(event["params"]["data"]["replayed"], json!(false));
     assert_eq!(
         event["params"]["data"]["summary"]["phase"],
         json!("running")
@@ -1412,69 +1426,261 @@ async fn job_id_selector_still_chooses_one_job_and_is_not_a_filter() {
     assert!(!has_complete_frame(&frames));
 }
 
+/// SEP-3415's occurrence object is `{eventId, name, timestamp, data, cursor}`: provenance is
+/// not part of it, and a client decides what is new by `eventId`. No response may carry an
+/// invented `replayed` field at any depth.
+fn assert_no_replayed(value: &Value) {
+    match value {
+        Value::Object(map) => {
+            assert!(
+                !map.contains_key("replayed"),
+                "replayed must not cross the wire: {value}"
+            );
+            for value in map.values() {
+                assert_no_replayed(value);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                assert_no_replayed(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[tokio::test]
-async fn events_poll_marks_replayed_and_live_hub_events() {
+async fn events_poll_with_a_null_cursor_starts_from_now() {
     let host = HubLifecycleHost::new(
         vec![vec![hub_lifecycle_job(
-            "hj_replayed",
+            "hj_now",
             "running",
-            Some("run-replayed"),
+            Some("run-now"),
         )]],
         vec![hub_member("builder")],
         HashMap::new(),
     );
     let mut session = Session::spawn(host);
     initialize(&mut session).await;
-    let mut replayed = Value::Null;
-    for _ in 0..40 {
-        replayed = session
+    let first = session
+        .request(
+            2,
+            "events/poll",
+            json!({"arguments": {}, "cursor": Value::Null}),
+        )
+        .await;
+    assert_eq!(first["result"]["events"], json!([]), "{first}");
+    let cursor = first["result"]["cursor"]
+        .as_str()
+        .expect("a null cursor returns the feed head")
+        .to_owned();
+    assert!(cursor.starts_with("hub:"), "{first}");
+    assert!(
+        !cursor.starts_with("hub:snapshot:"),
+        "a null cursor returns a durable position, not bootstrap progress: {first}"
+    );
+    assert_no_replayed(&first);
+
+    // The resident poller produces the job's first observation after the request, so the next
+    // call from the returned cursor carries exactly that event.
+    let mut events = Vec::new();
+    for id in 3..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let response = session
             .request(
-                2,
+                id,
                 "events/poll",
-                json!({"arguments": {}, "cursor": "hub:0", "maxEvents": 100}),
+                json!({"arguments": {}, "cursor": cursor, "maxEvents": 100}),
             )
             .await;
-        if replayed["result"]["events"]
-            .as_array()
-            .is_some_and(|events| !events.is_empty())
+        assert_no_replayed(&response);
+        if let Some(batch) = response["result"]["events"].as_array() {
+            events.extend(batch.iter().cloned());
+        }
+        if !events.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["data"]["kind"], json!("hub.job"));
+    assert_eq!(events[0]["data"]["jobId"], json!("hj_now"));
+    assert_eq!(events[0]["data"]["state"], json!("running"));
+    assert!(
+        events[0]["eventId"]
+            .as_str()
+            .is_some_and(|event_id| event_id.starts_with("hub:")),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn events_poll_snapshot_opt_in_returns_bootstrap_state() {
+    let host = HubLifecycleHost::new(
+        vec![vec![hub_lifecycle_job("hj_snap", "queued", None)]],
+        vec![hub_member("builder")],
+        HashMap::new(),
+    );
+    let mut session = Session::spawn(host);
+    initialize(&mut session).await;
+    let response = session
+        .request(
+            2,
+            "events/poll",
+            json!({"arguments": {}, "cursor": Value::Null, "snapshot": true}),
+        )
+        .await;
+    let events = response["result"]["events"]
+        .as_array()
+        .expect("bootstrap events");
+    assert_eq!(events.len(), 1, "{response}");
+    assert_eq!(events[0]["data"]["snapshot"], json!(true), "{response}");
+    assert_eq!(events[0]["data"]["jobId"], json!("hj_snap"));
+    assert_eq!(events[0]["data"]["state"], json!("queued"));
+    // The synthesized record carries the resumable bootstrap-progress cursor; the response
+    // cursor stays the durable boundary the batch began from.
+    let record_cursor = events[0]["data"]["cursor"]
+        .as_str()
+        .expect("bootstrap record cursor");
+    assert!(record_cursor.starts_with("hub:snapshot:"), "{response}");
+    assert_eq!(events[0]["eventId"], json!(record_cursor));
+    assert!(
+        response["result"]["cursor"].as_str().is_some_and(|cursor| {
+            cursor.starts_with("hub:") && !cursor.starts_with("hub:snapshot:")
+        }),
+        "the response cursor stays a durable position: {response}"
+    );
+    assert_no_replayed(&response);
+}
+
+#[tokio::test]
+async fn events_poll_snapshot_opt_in_replays_remembered_run_and_pool_state() {
+    let host = hub_feed_host();
+    let mut session = Session::spawn(host);
+    initialize(&mut session).await;
+    // Let the resident poller publish the run transition and the pool lease so the feed
+    // remembers them; a later snapshot opt-in replays that remembered state.
+    let mut cursor = json!("hub:0");
+    let mut kinds = Vec::new();
+    for id in 2..60 {
+        let response = session
+            .request(
+                id,
+                "events/poll",
+                json!({"arguments": {}, "cursor": cursor, "maxEvents": 100}),
+            )
+            .await;
+        cursor = response["result"]["cursor"].clone();
+        if let Some(events) = response["result"]["events"].as_array() {
+            kinds.extend(
+                events
+                    .iter()
+                    .filter_map(|event| event["data"]["kind"].as_str().map(str::to_owned)),
+            );
+        }
+        if kinds.iter().any(|kind| kind == "hub.run") && kinds.iter().any(|kind| kind == "hub.pool")
         {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let events = replayed["result"]["events"]
-        .as_array()
-        .expect("hub poll events");
-    assert!(!events.is_empty());
-    assert!(
-        events
-            .iter()
-            .all(|event| event["data"]["replayed"] == json!(true))
-    );
+    assert!(kinds.iter().any(|kind| kind == "hub.run"), "{kinds:?}");
+    assert!(kinds.iter().any(|kind| kind == "hub.pool"), "{kinds:?}");
 
+    let bootstrap = session
+        .request(
+            60,
+            "events/poll",
+            json!({"arguments": {}, "cursor": Value::Null, "snapshot": true, "maxEvents": 100}),
+        )
+        .await;
+    let events = bootstrap["result"]["events"]
+        .as_array()
+        .expect("bootstrap events");
+    assert!(
+        events.iter().any(|event| {
+            event["data"]["kind"] == json!("hub.run")
+                && event["data"]["runId"] == json!("run-public")
+        }),
+        "remembered run state is replayed: {bootstrap}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["data"]["kind"] == json!("hub.pool")
+                && event["data"]["leaseId"] == json!("zs-feed")
+        }),
+        "remembered pool-lease state is replayed: {bootstrap}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["data"]["kind"] == json!("hub.job") && event["data"]["snapshot"] == json!(true)
+        }),
+        "synthesized job state is still sent: {bootstrap}"
+    );
+    assert_no_replayed(&bootstrap);
+}
+
+#[tokio::test]
+async fn events_stream_with_a_null_cursor_delivers_only_events_produced_after_it() {
+    let host = HubLifecycleHost::new(
+        vec![
+            vec![hub_lifecycle_job("hj_live", "queued", None)],
+            vec![hub_lifecycle_job("hj_live", "queued", None)],
+            vec![hub_lifecycle_job("hj_live", "running", Some("run-live"))],
+            vec![hub_lifecycle_job("hj_live", "running", Some("run-live"))],
+        ],
+        vec![hub_member("builder")],
+        HashMap::new(),
+    );
+    let mut session = Session::spawn(host);
+    initialize(&mut session).await;
     let response = session
         .start_stream(&json!({
             "jsonrpc": "2.0",
-            "id": 3,
+            "id": 13,
             "method": "events/stream",
-            "params": {"arguments": {}}
+            "params": {"arguments": {}, "cursor": null}
         }))
         .await;
-    let frames = collect_stream(response, Duration::from_secs(2), |frames| {
-        stream_notifications(frames)
+    let frames = collect_stream(response, Duration::from_secs(10), |frames| {
+        hub_event_states(frames, "hj_live")
             .iter()
-            .any(|frame| frame["params"]["data"]["replayed"] == json!(true))
+            .any(|state| state == "running")
     })
     .await;
-    let event = stream_notifications(&frames)
-        .into_iter()
-        .find(|frame| frame["params"]["data"]["replayed"] == json!(true))
-        .expect("a replayed hub event");
+    assert_no_replayed(&Value::Array(frames.clone()));
+    let notifications = stream_notifications(&frames);
     assert!(
-        event["params"]["eventId"]
-            .as_str()
-            .is_some_and(|event_id| event_id.starts_with("hub:"))
+        notifications
+            .iter()
+            .all(|frame| frame["params"]["data"]["snapshot"] != json!(true)),
+        "a null cursor never synthesizes bootstrap state: {frames:#?}"
     );
+    assert!(
+        notifications.iter().all(|frame| {
+            !frame["params"]["eventId"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("hub:snapshot:")
+        }),
+        "no bootstrap-progress cursor is delivered: {frames:#?}"
+    );
+    let active = notifications
+        .iter()
+        .find(|frame| frame["method"] == json!("notifications/events/active"))
+        .expect("an active frame");
+    assert!(
+        active["params"]["cursor"].as_str().is_some_and(|cursor| {
+            cursor.starts_with("hub:") && !cursor.starts_with("hub:snapshot:")
+        }),
+        "{frames:#?}"
+    );
+    assert!(
+        hub_event_states(&frames, "hj_live")
+            .iter()
+            .any(|state| state == "running"),
+        "the transition produced while streaming is delivered: {frames:#?}"
+    );
+    assert!(!has_complete_frame(&frames));
 }
 
 #[tokio::test]
@@ -1527,11 +1733,6 @@ async fn hub_subscription_opens_before_any_job_and_follows_its_lifecycle() {
     assert!(
         job_events
             .iter()
-            .all(|frame| frame["params"]["data"]["replayed"] == json!(false))
-    );
-    assert!(
-        job_events
-            .iter()
             .all(|frame| frame["params"]["data"]["at"].is_string())
     );
     let mut sequences = job_events
@@ -1568,7 +1769,7 @@ async fn hub_bootstrap_snapshots_every_known_job_in_submission_order() {
         .request(
             2,
             "events/poll",
-            json!({"name": "hub.job", "arguments": {}}),
+            json!({"name": "hub.job", "arguments": {}, "snapshot": true}),
         )
         .await;
     let snapshots = response["result"]["events"]
@@ -1586,7 +1787,6 @@ async fn hub_bootstrap_snapshots_every_known_job_in_submission_order() {
         let identity = format!("hub:snapshot:{}:0", index + 1);
         assert_eq!(event["eventId"], json!(identity));
         assert_eq!(event["data"]["cursor"], json!(identity));
-        assert_eq!(event["data"]["replayed"], json!(false));
         sequences.push(event["data"]["sequence"].as_u64().expect("sequence"));
         for field in [
             "jobId",
@@ -1623,7 +1823,7 @@ async fn hub_bootstrap_clipping_resumes_after_the_delivered_snapshots() {
         .request(
             2,
             "events/poll",
-            json!({"name": "hub.job", "arguments": {}, "maxEvents": 2}),
+            json!({"name": "hub.job", "arguments": {}, "maxEvents": 2, "snapshot": true}),
         )
         .await;
     assert_eq!(first["result"]["hasMore"], json!(true), "{first}");
@@ -1700,7 +1900,7 @@ async fn hub_poll_sequences_are_monotone_across_calls_and_ignore_filtered_events
         .request(
             3,
             "events/poll",
-            json!({"name": "hub.job", "arguments": {}}),
+            json!({"name": "hub.job", "arguments": {}, "snapshot": true}),
         )
         .await;
     assert_eq!(snapshots(&first), [1], "{first}");
@@ -1708,7 +1908,7 @@ async fn hub_poll_sequences_are_monotone_across_calls_and_ignore_filtered_events
         .request(
             4,
             "events/poll",
-            json!({"name": "hub.job", "arguments": {}}),
+            json!({"name": "hub.job", "arguments": {}, "snapshot": true}),
         )
         .await;
     assert_eq!(snapshots(&second), [2], "{second}");
@@ -1738,7 +1938,7 @@ async fn hub_bootstrap_terminal_advances_the_cursor_and_carries_run_delivery_fac
         .request(
             2,
             "events/poll",
-            json!({"name": "hub.job", "arguments": {}}),
+            json!({"name": "hub.job", "arguments": {}, "snapshot": true}),
         )
         .await;
     let events = response["result"]["events"]
@@ -2613,8 +2813,9 @@ async fn hub_replay_reports_the_exact_evicted_range_and_starts_at_the_front() {
         }))
         .await;
     // The active view now follows the replayed prefix, so a large evicted batch may take a
-    // moment before the completed frame arrives.
-    let frames = collect_stream(response, Duration::from_secs(10), |frames| {
+    // while before the completed frame arrives; the retained log alone can be thousands of
+    // events on a slow debug build.
+    let frames = collect_stream(response, Duration::from_secs(120), |frames| {
         let notifications = stream_notifications(frames);
         notifications
             .iter()

@@ -645,6 +645,21 @@ async fn hub_events_resumes_with_a_top_level_cursor_and_surfaces_refusals() {
         "cursor is a subscription parameter, not a worker argument: {stream}"
     );
 
+    // Without `--after` the operator CLI keeps its bootstrap view, which MCP only sends on an
+    // explicit snapshot opt-in.
+    let _ = execute(&client, events(None), &mut Vec::new())
+        .await
+        .expect("events without a cursor");
+    let bootstrap = requests
+        .lock()
+        .expect("requests")
+        .iter()
+        .rfind(|request| request["method"] == json!("events/stream"))
+        .cloned()
+        .expect("bootstrap stream request");
+    assert_eq!(bootstrap["params"]["cursor"], Value::Null, "{bootstrap}");
+    assert_eq!(bootstrap["params"]["snapshot"], json!(true), "{bootstrap}");
+
     let error = execute(&client, events(Some("hub:error")), &mut Vec::new())
         .await
         .expect_err("a refused subscription is not a clean end of stream");

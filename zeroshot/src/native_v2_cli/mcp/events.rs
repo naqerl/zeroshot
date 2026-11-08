@@ -128,6 +128,9 @@ struct PollRequest {
     target: Option<String>,
     cursor: Option<String>,
     max_events: usize,
+    /// Opt into the synthesized bootstrap state when `cursor` is null. Per SEP-3415 a null
+    /// cursor means "from now", so bootstrap state is only ever sent on explicit request.
+    snapshot: bool,
     /// The kind implied by a kind-named subscription (`hub.job`, ...). A hub subscription by
     /// name or alias carries every kind. This is subscription identity, not a narrowing argument.
     kinds: Option<Vec<String>>,
@@ -213,8 +216,9 @@ pub(super) struct HubEvent {
     target: Option<String>,
     phase: Option<String>,
     terminal: bool,
-    /// A bootstrap state synthesized when a subscription starts without a cursor. It is sent
-    /// before live work but is never appended to the durable log or counted as a new cursor.
+    /// A bootstrap state synthesized only for a subscription that explicitly asks for
+    /// `snapshot: true`. It is sent before live work but is never appended to the durable log or
+    /// counted as a new cursor.
     snapshot: bool,
     /// Distinct resumable identity for a synthesized bootstrap record. Durable occurrences leave
     /// this absent and use their feed sequence.
@@ -763,7 +767,13 @@ where
             HubCursor::Durable(sequence) => (Some(sequence), 0, false),
             HubCursor::Snapshot { delivered, start } => (Some(start), delivered, true),
         },
-        None => (None, 0, true),
+        // The explicit opt-in keeps the bootstrap batch: remembered latest run and pool-lease
+        // state plus one synthesized `hub.job` per known job, with `hub:snapshot:` progress
+        // cursors. `feed.snapshot(None)` is what replays that remembered state.
+        None if request.snapshot => (None, 0, true),
+        // A null cursor otherwise starts from now: no events, a plain durable cursor at the feed
+        // head. The subscriber then sees only what is produced after this subscription.
+        None => (Some(feed.head()), 0, false),
     };
     let (after, stale) = clamp_resume(feed, after);
     let start = after.unwrap_or_else(|| feed.head());
@@ -870,7 +880,6 @@ where
                 &event,
                 &filter,
                 Stamp {
-                    replayed: true,
                     sequence: next,
                     id: Some(&id),
                 },
@@ -932,7 +941,6 @@ where
                                         &event,
                                         &filter,
                                         Stamp {
-                                            replayed: false,
                                             sequence: next,
                                             id: Some(&id),
                                         },
@@ -979,7 +987,6 @@ where
                                         &event,
                                         &filter,
                                         Stamp {
-                                            replayed: false,
                                             sequence: next,
                                             id: Some(&id),
                                         },
@@ -1012,9 +1019,8 @@ struct HubFilter<'a> {
     stream: &'a str,
 }
 
-/// One delivery's position: replay state, monotone sequence, and the enclosing request ID.
+/// One delivery's position: monotone sequence and the enclosing request ID.
 struct Stamp<'a> {
-    replayed: bool,
     sequence: u64,
     id: Option<&'a Value>,
 }
@@ -1088,7 +1094,6 @@ fn hub_event_value(event: &HubEvent, filter: &HubFilter<'_>, stamp: Stamp<'_>) -
         map.insert("kind".to_owned(), json!(name));
         map.insert("cursor".to_owned(), json!(&event_cursor));
         map.insert("summary".to_owned(), summary);
-        map.insert("replayed".to_owned(), json!(stamp.replayed));
         map.insert("sequence".to_owned(), json!(stamp.sequence));
         if event.snapshot {
             map.insert("snapshot".to_owned(), json!(true));
@@ -1168,9 +1173,16 @@ fn parse_subscription(params: &Value, capped: bool) -> Result<PollRequest, Event
         }
     };
     let allowed: &[&str] = if capped {
-        &["name", "arguments", "cursor", "maxAgeMs", "maxEvents"]
+        &[
+            "name",
+            "arguments",
+            "cursor",
+            "maxAgeMs",
+            "maxEvents",
+            "snapshot",
+        ]
     } else {
-        &["name", "arguments", "cursor", "maxAgeMs"]
+        &["name", "arguments", "cursor", "maxAgeMs", "snapshot"]
     };
     reject_unknown(map, allowed).map_err(EventError::Invalid)?;
     let name = optional_string(map, "name").map_err(EventError::Invalid)?;
@@ -1201,6 +1213,7 @@ fn parse_subscription(params: &Value, capped: bool) -> Result<PollRequest, Event
             )));
         }
     };
+    let snapshot = optional_bool(map, "snapshot")?;
     let arguments = match map.get("arguments") {
         None | Some(Value::Null) => json!({}),
         Some(value @ Value::Object(_)) => value.clone(),
@@ -1264,6 +1277,7 @@ fn parse_subscription(params: &Value, capped: bool) -> Result<PollRequest, Event
         target,
         cursor,
         max_events,
+        snapshot,
         kinds,
         detail,
         hub,
@@ -1364,7 +1378,7 @@ async fn collect_after(
             continue;
         }
         cursor = event_cursor;
-        if let Some(occurrence) = occurrence(&event, false).map_err(classify)? {
+        if let Some(occurrence) = occurrence(&event).map_err(classify)? {
             events.push(occurrence);
         }
     }
@@ -1453,7 +1467,13 @@ where
             HubCursor::Durable(sequence) => (Some(sequence), 0, false),
             HubCursor::Snapshot { delivered, start } => (Some(start), delivered, true),
         },
-        None => (None, 0, true),
+        // The explicit opt-in keeps the bootstrap batch: remembered latest run and pool-lease
+        // state plus one synthesized `hub.job` per known job, with `hub:snapshot:` progress
+        // cursors. `feed.snapshot(None)` is what replays that remembered state.
+        None if request.snapshot => (None, 0, true),
+        // A null cursor otherwise means "from now": no events and a plain durable cursor at the
+        // head, so the next call continues from events produced after this request.
+        None => (Some(feed.head()), 0, false),
     };
     let (after, stale) = clamp_resume(feed, after);
     let start = after.unwrap_or_else(|| feed.head());
@@ -1493,7 +1513,6 @@ where
                 event,
                 &filter,
                 Stamp {
-                    replayed: false,
                     sequence: 0,
                     id: None,
                 },
@@ -1511,7 +1530,6 @@ where
             event,
             &filter,
             Stamp {
-                replayed: true,
                 sequence: 0,
                 id: None,
             },
@@ -1809,7 +1827,6 @@ where
             &event,
             &filter,
             Stamp {
-                replayed: false,
                 sequence: 0,
                 id: None,
             },
@@ -2683,7 +2700,6 @@ impl HubFeed {
                     event,
                     &filter,
                     Stamp {
-                        replayed: false,
                         sequence: 0,
                         id: None,
                     },
@@ -2841,14 +2857,13 @@ fn summary(data: &Value) -> Value {
     })
 }
 
-fn occurrence(event: &Value, replayed: bool) -> Result<Option<Value>, McpFailure> {
+fn occurrence(event: &Value) -> Result<Option<Value>, McpFailure> {
     let cursor = watch_cursor(event)?;
     let run_id = event.get("runId").and_then(Value::as_str).unwrap_or("run");
     let mut data = event_data(event, false);
     let summary = summary(&data);
     if let Some(map) = data.as_object_mut() {
         map.insert("summary".to_owned(), summary);
-        map.insert("replayed".to_owned(), json!(replayed));
     }
     Ok(Some(json!({
         "eventId": format!("{run_id}:{cursor}"),
@@ -2884,7 +2899,17 @@ fn input_schema(name: &str) -> Value {
         vec![
             (
                 "cursor",
-                string_prop("Resume from this hub:<sequence> cursor."),
+                string_prop(
+                    "Resume after this hub:<sequence> cursor, deduplicating by eventId. A null or \
+                     absent cursor starts from now: no events and a fresh hub:<sequence> head.",
+                ),
+            ),
+            (
+                "snapshot",
+                bool_prop(
+                    "Opt into the synthesized bootstrap state when cursor is null. Without it a \
+                     null cursor means \"from now\" and returns no events.",
+                ),
             ),
             (
                 "maxAgeMs",
@@ -2922,8 +2947,11 @@ fn input_schema(name: &str) -> Value {
          transitions; pass arguments.detail to receive every raw record as hub.run.detail. \
          Optional runId, jobId, or target selectors choose which subscription this is. The stream \
          stays open after terminal run events and idle periods; stop it with events/unsubscribe, \
-         session end, or cancellation. Resume with the hub:N cursor from notifications/events/active. \
-         maxAgeMs is accepted but not applied because durable watch records carry no occurrence time."
+         session end, or cancellation. Resume with the hub:N cursor from notifications/events/active \
+         and dedupe by eventId. A null cursor starts from now: the poll returns no events and a fresh \
+         hub:<sequence> head, and a stream carries only events produced after the subscribe. Pass \
+         snapshot: true to opt into the synthesized bootstrap state instead. maxAgeMs is accepted \
+         but not applied because durable watch records carry no occurrence time."
     ));
     schema
 }
@@ -2936,7 +2964,7 @@ fn payload_schema(name: &str) -> Value {
         "required": [
             "kind", "runId", "cursor", "runCursor", "node", "previousNode", "phase", "lastCursorAt",
             "cursorsSinceLastEvent", "elapsedMsInNode", "nodeChangedAt", "terminal", "reason",
-            "status", "summary", "replayed"
+            "status", "summary"
         ],
         "properties": {
             "kind": {"const": HUB_RUN},
@@ -2967,7 +2995,6 @@ fn payload_schema(name: &str) -> Value {
                 }
             },
             "summary": {"type": "object"},
-            "replayed": {"type": "boolean"},
             "sequence": {"type": "integer", "minimum": 1}
         }
     });
@@ -2975,7 +3002,7 @@ fn payload_schema(name: &str) -> Value {
         "type": "object",
         "description": "One raw per-cursor run record. data.cursor is the hub cursor; data.runCursor keeps the run's v2: cursor. Transition records also carry the collapsed-event evidence.",
         "additionalProperties": true,
-        "required": ["kind", "runId", "cursor", "runCursor", "status", "summary", "replayed"],
+        "required": ["kind", "runId", "cursor", "runCursor", "status", "summary"],
         "properties": {
             "kind": {"const": HUB_RUN_DETAIL},
             "runId": {"type": "string"},
@@ -2991,20 +3018,19 @@ fn payload_schema(name: &str) -> Value {
             "terminal": {"type": "boolean"},
             "reason": {"type": ["string", "null"]},
             "status": {"type": "object", "additionalProperties": true},
-            "summary": {"type": "object"},
-            "replayed": {"type": "boolean"}
+            "summary": {"type": "object"}
         }
     });
     let job_data = json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["kind", "jobId", "title", "state", "target", "project", "runId", "attempts", "pinnedRevision", "labels", "submittedAt", "finishedAt", "failureReason", "errorKind", "reason", "at", "cursor", "summary", "replayed", "sequence"],
+        "required": ["kind", "jobId", "title", "state", "target", "project", "runId", "attempts", "pinnedRevision", "labels", "submittedAt", "finishedAt", "failureReason", "errorKind", "reason", "at", "cursor", "summary", "sequence"],
         "properties": {
             "kind": {"const": HUB_JOB},
             "jobId": {"type": "string"},
             "cursor": {"type": "string", "pattern": HUB_CURSOR_PATTERN, "description": "Durable hub:<sequence> cursor, or hub:snapshot:<delivered>:<start> for a bootstrap record."},
             "sequence": {"type": "integer", "minimum": 1},
-            "snapshot": {"type": "boolean", "description": "Bootstrap state, not replayed history."},
+            "snapshot": {"type": "boolean", "description": "Bootstrap state synthesized for an explicit snapshot request."},
             "terminal": {"type": "boolean", "description": "The one terminal occurrence for this job."},
             "title": {"type": ["string", "null"]},
             "runId": {"type": ["string", "null"]},
@@ -3026,14 +3052,13 @@ fn payload_schema(name: &str) -> Value {
             "project": {"type": ["string", "object", "null"]},
             "reason": {"type": ["string", "null"]},
             "at": {"type": "string"},
-            "summary": {"type": "object"},
-            "replayed": {"type": "boolean"}
+            "summary": {"type": "object"}
         }
     });
     let pool_data = json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["kind", "scope", "pool", "leaseId", "serverId", "memberId", "machine", "phase", "previousPhase", "at", "reason", "cursor", "summary", "replayed"],
+        "required": ["kind", "scope", "pool", "leaseId", "serverId", "memberId", "machine", "phase", "previousPhase", "at", "reason", "cursor", "summary"],
         "properties": {
             "kind": {"const": HUB_POOL},
             "scope": {"type": "string", "enum": ["lease", "pool"], "description": "Whether the transition is one lease's or the pool's own."},
@@ -3060,14 +3085,13 @@ fn payload_schema(name: &str) -> Value {
             "reason": {"type": ["string", "null"]},
             "at": {"type": "string"},
             "summary": {"type": "object"},
-            "replayed": {"type": "boolean"},
             "sequence": {"type": "integer", "minimum": 1}
         }
     });
     let warning_data = json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["kind", "jobId", "runId", "message", "at", "cursor", "summary", "replayed"],
+        "required": ["kind", "jobId", "runId", "message", "at", "cursor", "summary"],
         "properties": {
             "kind": {"const": HUB_WARNING},
             "jobId": {"type": "string"},
@@ -3076,7 +3100,6 @@ fn payload_schema(name: &str) -> Value {
             "message": {"type": "string"},
             "at": {"type": "string"},
             "summary": {"type": "object"},
-            "replayed": {"type": "boolean"},
             "sequence": {"type": "integer", "minimum": 1}
         }
     });
