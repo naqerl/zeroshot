@@ -904,7 +904,17 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   `hub stop` deliberately stops a queued or running job as the terminal non-failing `stopped`
   state and holds its pool lease (`Lease.hold`), which suppresses only the idle teardown until a
   new placement or `hub pool release` clears it; `--max-stall` still fails a stalled job and tears
-  its lease down. Jobs placing when a daemon stops stay on their member as unconfirmed. Hub-side job problems
+  its lease down. Jobs placing when a daemon stops stay on their member as unconfirmed. A
+  provider quota refusal in a failed run's bounded failure context is classified as
+  `JobErrorKind::ProviderQuota`, naming the exhausted limit and any provider `retryAt`. The job
+  enters nonterminal `waiting_quota`, holds its pool lease through an automatic quota hold that is
+  separate from the operator's `hub stop` hold, and after a bounded exponential
+  backoff (at least one minute, capped at one hour, with jitter) resumes the same run from its
+  latest checkpoint so the executing node is retried rather than restarted; a reviewer refused by
+  the provider is therefore never reported as `review_failed`. `GET /v1/hub/jobs/{id}` exposes
+  `errorKind: provider_quota` and `quota: {limit, retryAt, attempts}`, and `hub.warning` announces
+  entering and leaving the wait. A process-wide exhaustion deadline refuses or parks new
+  placements until `retryAt` and is cleared by a successful provider call. Hub-side job problems
   are a typed `JobError` (plain strings from older state load as `unclassified`). API errors carry the
   `zeroshot.error/v1` diagnostic plus `x-zeroshot-exit-code`; logs, watch, attach, and force-stop
   stream NDJSON frames from a `zeroshot` child on the hub host. Every other hub command is a client

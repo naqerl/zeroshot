@@ -79,6 +79,7 @@ pub(crate) const JOB_STATES: &[&str] = &[
     "scheduled",
     "placing",
     "running",
+    "waiting_quota",
     "succeeded",
     "failed",
     "dequeued",
@@ -1957,19 +1958,35 @@ async fn poll_jobs<H>(
             continue;
         };
         live_jobs.insert(job_id.clone());
-        if !matches!(
-            hub_job_state(&view).as_str(),
-            "succeeded" | "failed" | "dequeued" | "stopped" | "cancelled"
-        ) {
+        let state = hub_job_state(&view);
+        // A quota-paused job is alive but has no live run to watch: its predecessor is
+        // terminal until resume supplies a successor run id. Watching it would replay the
+        // finished run's history every retry interval for the whole wait.
+        if state == "running" {
             running_jobs.insert(job_id.clone());
         }
-        let state = hub_job_state(&view);
         if let Some(labels) = view.get("labels") {
             feed.job_labels
                 .borrow_mut()
                 .insert(job_id.clone(), labels.clone());
         }
         let previous = jobs.get(&job_id).cloned();
+        let run_id = view
+            .get("runId")
+            .and_then(Value::as_str)
+            .filter(|run_id| !run_id.is_empty());
+        // Entering and leaving a provider-quota wait is self-diagnosing, so it is one of the
+        // few places a `hub.warning` is the right event. The transition is published even on
+        // the feed's first observation, because the job is already waiting.
+        if previous.as_deref() != Some(state.as_str())
+            && let Some(run_id) = run_id
+        {
+            if state == "waiting_quota" {
+                feed.publish_warning(&job_id, run_id, quota_warning_data(&view, true, now_ms()));
+            } else if previous.as_deref() == Some("waiting_quota") {
+                feed.publish_warning(&job_id, run_id, quota_warning_data(&view, false, now_ms()));
+            }
+        }
         if previous.is_none() {
             // The first observation is the job's current state, not a synthetic `submitted`
             // that the next record would immediately supersede. A synthetic intermediate is
@@ -2373,6 +2390,51 @@ where
     feed.warnings.borrow_mut().retain_running(&running);
 }
 
+/// Facts for the `hub.warning` emitted when a job enters or leaves a provider-quota wait. The
+/// message is self-diagnosing: it names the exhausted limit and the next attempt.
+fn quota_warning_data(view: &Value, entering: bool, _now: u64) -> Value {
+    let job_id = view
+        .get("jobId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let quota = view.get("quota");
+    let limit = quota
+        .and_then(|quota| quota.get("limit"))
+        .and_then(Value::as_str)
+        .unwrap_or("provider");
+    let retry_at = quota
+        .and_then(|quota| quota.get("retryAt"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let attempts = quota
+        .and_then(|quota| quota.get("attempts"))
+        .cloned()
+        .unwrap_or_else(|| json!(0));
+    let state = view
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let message = if entering {
+        format!(
+            "job {job_id} is waiting_quota: provider quota {limit} is exhausted; next attempt at {}",
+            retry_at.as_str().unwrap_or("an unknown time")
+        )
+    } else if state == "running" {
+        format!("job {job_id} left the provider quota {limit} wait and is resuming")
+    } else {
+        format!("job {job_id} left the provider quota {limit} wait as {state}")
+    };
+    json!({
+        "message": message,
+        "waiting": entering,
+        "state": state,
+        "limit": limit,
+        "retryAt": retry_at,
+        "attempts": attempts,
+        "quota": quota.cloned().unwrap_or(Value::Null),
+    })
+}
+
 struct RunOrigin<'a> {
     run_id: &'a str,
     job_id: &'a str,
@@ -2550,6 +2612,9 @@ impl HubFeed {
     /// Facts the hub already knows about one running job, keeping the payload additive: every
     /// earlier `jobId`/`runId`/`message`/`at` field keeps its meaning.
     fn warning_data(&self, view: &Value, now: u64) -> Value {
+        if view.get("state").and_then(Value::as_str) == Some("waiting_quota") {
+            return quota_warning_data(view, true, now);
+        }
         let job_id = view
             .get("jobId")
             .and_then(Value::as_str)
@@ -3051,7 +3116,7 @@ fn payload_schema(name: &str) -> Value {
             "status": {"type": ["object", "null"]},
             "state": {
                 "type": "string",
-                "enum": ["submitted", "queued", "scheduled", "placing", "running", "succeeded", "failed", "dequeued", "stopped", "cancelled"]
+                "enum": JOB_STATES
             },
             "target": {"type": ["string", "null"]},
             "project": {"type": ["string", "object", "null"]},
@@ -3209,7 +3274,41 @@ where
 
 #[cfg(test)]
 mod warning_tests {
+    use std::sync::Mutex as StdMutex;
+
+    use async_trait::async_trait;
+    use tokio::sync::mpsc;
+
+    use super::super::host::{McpFailure, McpHost, WatchStream};
     use super::*;
+
+    struct QuotaTransitionHost {
+        steps: StdMutex<Vec<Vec<Value>>>,
+        watches: StdMutex<usize>,
+    }
+
+    #[async_trait(?Send)]
+    impl McpHost for QuotaTransitionHost {
+        async fn execute(&self, command: NativeV2CliCommand) -> Result<String, McpFailure> {
+            match command {
+                NativeV2CliCommand::Hub(HubRequest {
+                    command: HubCommand::Ps(_),
+                    ..
+                }) => {
+                    let jobs = self.steps.lock().expect("steps").remove(0);
+                    Ok(json!({"schema": "zeroshot.hub.jobs/v1", "jobs": jobs}).to_string())
+                }
+                _ => Err(McpFailure::invalid("quota host only lists jobs")),
+            }
+        }
+
+        async fn open_watch(&self, _command: &RunWatchCommand) -> Result<WatchStream, McpFailure> {
+            *self.watches.lock().expect("watches") += 1;
+            let (sender, receiver) = mpsc::channel(1);
+            drop(sender);
+            Ok(WatchStream::new(receiver, tokio::spawn(async {})))
+        }
+    }
 
     #[test]
     fn hub_warnings_name_the_execution_and_cursor_delta() {
@@ -3256,6 +3355,217 @@ mod warning_tests {
                 .expect("message")
                 .contains("5 cursor events")
         );
+    }
+
+    #[test]
+    fn quota_warnings_name_the_limit_and_the_retry() {
+        let now = parse_rfc3339_ms("2024-01-01T06:12:00Z").expect("time");
+        let view = json!({
+            "jobId": "hj_quota",
+            "runId": "run-1",
+            "state": "waiting_quota",
+            "quota": {
+                "limit": "weekly",
+                "retryAt": "2024-01-01T08:12:00Z",
+                "attempts": 2,
+            },
+        });
+        let entering = quota_warning_data(&view, true, now);
+        assert_eq!(entering["waiting"], json!(true));
+        assert_eq!(entering["limit"], json!("weekly"));
+        assert_eq!(entering["quota"]["attempts"], json!(2));
+        let message = entering["message"].as_str().expect("message");
+        assert!(message.contains("weekly") && message.contains("waiting_quota"));
+        assert!(message.contains("2024-01-01T08:12:00Z"));
+
+        let mut resumed = view.clone();
+        resumed["state"] = json!("running");
+        let leaving = quota_warning_data(&resumed, false, now);
+        assert_eq!(leaving["waiting"], json!(false));
+        assert!(
+            leaving["message"]
+                .as_str()
+                .expect("message")
+                .contains("resuming")
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_wait_transitions_publish_entering_and_leaving_warnings() {
+        tokio::task::LocalSet::new()
+            .run_until(quota_wait_transitions())
+            .await;
+    }
+
+    async fn quota_wait_transitions() {
+        let feed = Rc::new(HubFeed::new());
+        let running = json!({
+            "jobId": "hj_quota",
+            "runId": "run-quota",
+            "state": "running",
+            "title": "quota wait",
+            "target": "local",
+            "submittedAt": "2026-01-01T00:00:00Z",
+            "dispatchedAt": "2026-01-01T00:00:01Z",
+            "quota": {
+                "limit": "weekly",
+                "retryAt": "2026-01-01T02:00:00Z",
+                "attempts": 1,
+            },
+        });
+        let waiting = json!({
+            "jobId": "hj_quota",
+            "runId": "run-quota",
+            "state": "waiting_quota",
+            "title": "quota wait",
+            "target": "local",
+            "submittedAt": "2026-01-01T00:00:00Z",
+            "dispatchedAt": "2026-01-01T00:00:01Z",
+            "quota": {
+                "limit": "weekly",
+                "retryAt": "2026-01-01T02:00:00Z",
+                "attempts": 1,
+            },
+        });
+        let host = QuotaTransitionHost {
+            steps: StdMutex::new(vec![vec![running.clone()], vec![waiting], vec![running]]),
+            watches: StdMutex::new(0),
+        };
+        let mut jobs = HashMap::new();
+        let watched = Rc::new(RefCell::new(WatchBook::default()));
+        for _ in 0..3 {
+            super::poll_jobs(&host, &feed, &mut jobs, &watched).await;
+        }
+        let warnings = feed
+            .test_deliver(None, json!({}))
+            .into_iter()
+            .filter(|event| event["data"]["kind"] == json!("hub.warning"))
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        let entering = &warnings[0]["data"];
+        assert_eq!(entering["waiting"], json!(true));
+        assert_eq!(entering["limit"], json!("weekly"));
+        assert!(
+            entering["message"]
+                .as_str()
+                .expect("message")
+                .contains("weekly")
+        );
+        let leaving = &warnings[1]["data"];
+        assert_eq!(leaving["waiting"], json!(false));
+        assert!(
+            leaving["message"]
+                .as_str()
+                .expect("message")
+                .contains("resuming")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_quota_wait_is_not_watched_or_rewarned_on_every_poll() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let feed = Rc::new(HubFeed::new());
+                let waiting = json!({
+                    "jobId": "hj_quota",
+                    "runId": "run-quota",
+                    "state": "waiting_quota",
+                    "title": "quota wait",
+                    "target": "local",
+                    "submittedAt": "2026-01-01T00:00:00Z",
+                    "dispatchedAt": "2026-01-01T00:00:01Z",
+                    "quota": {
+                        "limit": "weekly",
+                        "retryAt": "2026-01-08T00:00:00Z",
+                        "attempts": 1,
+                    },
+                });
+                let host = QuotaTransitionHost {
+                    steps: StdMutex::new(vec![
+                        vec![waiting.clone()],
+                        vec![waiting.clone()],
+                        vec![waiting.clone()],
+                        vec![waiting],
+                    ]),
+                    watches: StdMutex::new(0),
+                };
+                let mut jobs = HashMap::new();
+                let watched = Rc::new(RefCell::new(WatchBook::default()));
+                for _ in 0..4 {
+                    super::poll_jobs(&host, &feed, &mut jobs, &watched).await;
+                }
+                assert_eq!(
+                    *host.watches.lock().expect("watches"),
+                    0,
+                    "a waiting job must not reopen a watch for its terminal predecessor"
+                );
+                let events = feed.test_deliver(None, json!({}));
+                let warnings = events
+                    .iter()
+                    .filter(|event| event["data"]["kind"] == json!("hub.warning"))
+                    .count();
+                assert_eq!(warnings, 1, "only the entry transition is announced");
+                let run_events = events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event["data"]["kind"].as_str(),
+                            Some("hub.run" | "hub.run.detail")
+                        )
+                    })
+                    .count();
+                assert_eq!(run_events, 0, "no terminal history is republished");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn quota_leaving_warnings_name_the_actual_new_state() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                for terminal in ["failed", "stopped"] {
+                    let feed = Rc::new(HubFeed::new());
+                    let waiting = json!({
+                        "jobId": "hj_quota",
+                        "runId": "run-quota",
+                        "state": "waiting_quota",
+                        "title": "quota wait",
+                        "target": "local",
+                        "submittedAt": "2026-01-01T00:00:00Z",
+                        "dispatchedAt": "2026-01-01T00:00:01Z",
+                        "quota": {
+                            "limit": "weekly",
+                            "retryAt": "2026-01-01T02:00:00Z",
+                            "attempts": 1,
+                        },
+                    });
+                    let mut ended = waiting.clone();
+                    ended["state"] = json!(terminal);
+                    ended["quota"] = Value::Null;
+                    let host = QuotaTransitionHost {
+                        steps: StdMutex::new(vec![vec![waiting], vec![ended]]),
+                        watches: StdMutex::new(0),
+                    };
+                    let mut jobs = HashMap::new();
+                    let watched = Rc::new(RefCell::new(WatchBook::default()));
+                    for _ in 0..2 {
+                        super::poll_jobs(&host, &feed, &mut jobs, &watched).await;
+                    }
+                    let warnings = feed
+                        .test_deliver(None, json!({}))
+                        .into_iter()
+                        .filter(|event| event["data"]["kind"] == json!("hub.warning"))
+                        .collect::<Vec<_>>();
+                    assert_eq!(warnings.len(), 2, "{warnings:?}");
+                    let leaving = &warnings[1]["data"];
+                    assert_eq!(leaving["waiting"], json!(false));
+                    assert_eq!(leaving["state"], json!(terminal));
+                    let message = leaving["message"].as_str().expect("message");
+                    assert!(message.contains(terminal), "{message}");
+                    assert!(!message.contains("resuming"), "{message}");
+                }
+            })
+            .await;
     }
 
     fn job_event(state: &str, snapshot: bool) -> HubEvent {

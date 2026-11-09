@@ -108,6 +108,37 @@ pub(super) fn job(id: &str, submitted_at_ms: u64) -> Job {
         archive_skipped: None,
         graph_hash: None,
         pool_wait: None,
+        quota: None,
+        quota_attempts: 0,
+    }
+}
+
+fn lease_on(member: &str) -> Lease {
+    Lease {
+        id: format!("lease-{member}"),
+        name: member.to_owned(),
+        pool: "burst".to_owned(),
+        phase: LeasePhase::Active,
+        local_port: 0,
+        transport: super::pool::Transport::Ssh,
+        transport_logged: false,
+        hold: false,
+        quota_hold: false,
+        created_at_ms: 1,
+        progress_at_ms: 1,
+        drain_started_ms: None,
+        server_id: None,
+        firewall_id: None,
+        ipv4: None,
+        action_id: None,
+        reason: None,
+        attempts: 0,
+        next_attempt_ms: None,
+        error: None,
+        retirement_reason: None,
+        spec: Default::default(),
+        machine: None,
+        event_phase: None,
     }
 }
 
@@ -1188,6 +1219,17 @@ pub(super) struct FakeDriver {
     pub stop_delay: Option<std::time::Duration>,
     /// Makes every `force-stop` fail.
     pub fail_stops: std::sync::atomic::AtomicBool,
+    /// Status reads that answer with a provider quota failure before normal status: run ID to the
+    /// number of remaining refusals.
+    pub quota_failures: Mutex<BTreeMap<String, usize>>,
+    /// Provider retry instant included in those quota statuses.
+    pub quota_retry_at: Option<String>,
+    /// Terminal reason of those quota statuses; defaults to `worker_failed`.
+    pub quota_reason: Option<String>,
+    /// `resume` calls as (member, failed run ID).
+    pub resumes: Mutex<Vec<(String, String)>>,
+    /// Makes every `resume` fail.
+    pub fail_resumes: std::sync::atomic::AtomicBool,
 }
 
 impl FakeDriver {
@@ -1277,6 +1319,23 @@ impl HubDriver for FakeDriver {
         if let Some(delay) = self.status_delay {
             tokio::time::sleep(delay).await;
         }
+        let quota_refusal = {
+            let mut failures = self.quota_failures.lock().expect("fake lock");
+            failures.get_mut(run_id).is_some_and(|remaining| {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            })
+        };
+        if quota_refusal {
+            return Ok(quota_status(
+                self.quota_reason.as_deref().unwrap_or("worker_failed"),
+                self.quota_retry_at.as_deref(),
+            ));
+        }
         let cursor = self
             .cursors
             .lock()
@@ -1321,6 +1380,24 @@ impl HubDriver for FakeDriver {
             });
         }
         Ok(())
+    }
+
+    async fn resume(&self, member: &str, run_id: &str) -> Result<String, HubError> {
+        if self.fail_resumes.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(HubError::Target {
+                message: "resume refused".to_owned(),
+                diagnostic: None,
+            });
+        }
+        self.resumes
+            .lock()
+            .expect("fake lock")
+            .push((member.to_owned(), run_id.to_owned()));
+        let mut runs = self.runs.lock().expect("fake lock");
+        let entry = runs.entry(member.to_owned()).or_default();
+        let successor = format!("{run_id}-resumed");
+        entry.push((successor.clone(), "running"));
+        Ok(successor)
     }
 
     async fn capabilities(&self, member: &str) -> Result<Vec<String>, HubError> {
@@ -1780,6 +1857,478 @@ async fn too_many_unconfirmed_submissions_fail_the_job_naming_its_key() {
     fresh.as_object_mut().expect("object").remove("attempts");
     let loaded: Job = serde_json::from_value(fresh).expect("an earlier hub's job loads");
     assert_eq!(loaded.unconfirmed_submissions, 0);
+}
+
+#[test]
+fn the_go_usage_limit_payload_is_recognised_with_its_limit() {
+    let payload = json!({
+        "status": {
+            "phase": "finished",
+            "terminalResult": {
+                "status": "failed",
+                "reason": "worker_failed",
+                "context": {
+                    "primary": {
+                        "message": "provider returned 429 {\"type\":\"GoUsageLimitError\",\"message\":\"Go usage limit exceeded\",\"metadata\":{\"limitName\":\"weekly\"}}"
+                    },
+                    "recorded": []
+                }
+            }
+        }
+    });
+    let now = 1_700_000_000_000;
+    let failure = super::quota::detect(&payload, now).expect("quota");
+    assert_eq!(failure.limit, "weekly");
+    assert_eq!(failure.retry_at_ms, None);
+}
+
+#[test]
+fn a_provider_retry_hint_survives_detection() {
+    let now = 1_700_000_000_000;
+    let at = now + 3 * 3_600_000;
+    let status = json!({
+        "status": {
+            "phase": "finished",
+            "terminalResult": {
+                "status": "failed",
+                "reason": "review_failed",
+                "context": {
+                    "primary": {
+                        "message": format!(
+                            "HTTP 429 Go usage limit exceeded limitName=weekly retryAt={}",
+                            super::clock::rfc3339(at)
+                        )
+                    }
+                }
+            }
+        }
+    });
+    let failure = super::quota::detect(&status, now).expect("quota");
+    assert_eq!(failure.limit, "weekly");
+    assert_eq!(failure.retry_at_ms, Some(at));
+}
+
+#[test]
+fn a_json_provider_retry_hint_is_parsed_from_the_quota_payload() {
+    let now = 1_700_000_000_000;
+    let at = now + 5 * 3_600_000;
+    let retry_at = super::clock::rfc3339(at);
+    let status = json!({
+        "status": {
+            "phase": "finished",
+            "terminalResult": {
+                "status": "failed",
+                "reason": "review_failed",
+                "context": {
+                    "primary": {
+                        "message": format!(
+                            "429 {{\"type\":\"GoUsageLimitError\",\"message\":\"Go usage limit exceeded\",\"metadata\":{{\"limitName\":\"weekly\",\"retryAt\":\"{retry_at}\"}}}}"
+                        )
+                    }
+                }
+            }
+        }
+    });
+    let failure = super::quota::detect(&status, now).expect("quota");
+    assert_eq!(failure.limit, "weekly");
+    assert_eq!(failure.retry_at_ms, Some(at));
+}
+
+#[test]
+fn unrelated_failures_are_not_quota_failures() {
+    let status = json!({
+        "status": {
+            "phase": "finished",
+            "terminalResult": {"status": "failed", "reason": "worker_failed"}
+        }
+    });
+    assert!(super::quota::detect(&status, 1).is_none());
+}
+
+#[test]
+fn quota_backoff_is_at_least_a_minute_and_capped() {
+    let delays = (1..=10)
+        .map(|attempt| super::quota::backoff_ms(attempt, "hj_test"))
+        .collect::<Vec<_>>();
+    assert!(delays.iter().all(|delay| *delay >= 60_000));
+    assert!(delays.iter().all(|delay| *delay <= 3_600_000 + 360_001));
+}
+
+/// A failed run status whose bounded failure context carries the model gateway's quota payload.
+fn quota_status(reason: &str, retry_at: Option<&str>) -> Value {
+    let message = match retry_at {
+        Some(retry_at) => format!(
+            "429 GoUsageLimitError Go usage limit exceeded limitName=weekly retryAt={retry_at}"
+        ),
+        None => "429 {\"type\":\"GoUsageLimitError\",\"message\":\"Go usage limit exceeded\",\"metadata\":{\"limitName\":\"weekly\"}}".to_owned(),
+    };
+    json!({
+        "atCursor": "v2:9",
+        "status": {
+            "phase": "finished",
+            "terminalResult": {
+                "status": "failed",
+                "reason": reason,
+                "context": {
+                    "primary": {"message": message},
+                    "recorded": [],
+                },
+            },
+            "metadata": {
+                "tokenUsage": {"inputTokens": 10, "outputTokens": 2, "complete": true}
+            },
+        },
+    })
+}
+
+#[tokio::test]
+async fn a_provider_quota_failure_pauses_the_node_then_resumes_and_succeeds() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let driver = std::sync::Arc::new(FakeDriver::default());
+    driver
+        .runs
+        .lock()
+        .expect("fake lock")
+        .entry("box".to_owned())
+        .or_default()
+        .push(("run-quota".to_owned(), "running"));
+    driver
+        .quota_failures
+        .lock()
+        .expect("fake lock")
+        .insert("run-quota".to_owned(), 1);
+    let service = super::service::HubService::open(
+        super::store::HubStore::new(directory.path().join("hub")),
+        driver.clone(),
+        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
+    )
+    .expect("service");
+    service
+        .mutate(|state| {
+            state.members.push(member("box", &[], 1, 0));
+            let mut lease = lease_on("box");
+            lease.hold = true;
+            state.leases.push(lease);
+            let mut running = job("hj_quota", 0);
+            running.state = JobState::Running;
+            running.target = Some("box".to_owned());
+            running.run_id = Some("run-quota".to_owned());
+            running.dispatched_at_ms = Some(1);
+            running.last_cursor_at_ms = Some(1);
+            state.jobs.push(running);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+
+    service.pass().await.expect("quota pass");
+    let state = service.snapshot().await;
+    let paused = &state.jobs[0];
+    assert_eq!(paused.state, JobState::WaitingQuota);
+    assert_eq!(paused.failure_reason, None, "a quota wait is not a failure");
+    let error = paused.error.as_ref().expect("quota error");
+    assert_eq!(error.kind, JobErrorKind::ProviderQuota);
+    assert!(error.message.contains("weekly"), "{}", error.message);
+    let quota = paused.quota.as_ref().expect("quota wait");
+    assert_eq!(quota.limit, "weekly");
+    assert_eq!(quota.attempts, 1);
+    assert!(
+        quota.retry_at_ms >= 60_000,
+        "never retry faster than a minute"
+    );
+    assert!(driver.stops.lock().expect("fake lock").is_empty());
+    assert!(
+        state.leases[0].quota_hold,
+        "the quota pause adds an automatic hold so the machine survives"
+    );
+    assert!(
+        state.leases[0].hold,
+        "the quota hold never clears the operator's deliberate hold"
+    );
+    assert_eq!(
+        paused.display_state(super::clock::now_ms()),
+        "waiting_quota"
+    );
+    let view = paused.view(super::clock::now_ms());
+    assert_eq!(view["state"], json!("waiting_quota"));
+    assert_eq!(view["errorKind"], json!("provider_quota"));
+    assert_eq!(view["quota"]["limit"], json!("weekly"));
+
+    // The retry deadline has arrived: resume the same run instead of dispatching a new one.
+    service
+        .mutate(|state| {
+            state.jobs[0].quota.as_mut().expect("quota").retry_at_ms = 0;
+            Ok(())
+        })
+        .await
+        .expect("expire wait");
+    let (report, _) = service.pass().await.expect("resume pass");
+    assert_eq!(report.resumed.len(), 1);
+    let state = service.snapshot().await;
+    let resumed = &state.jobs[0];
+    assert_eq!(resumed.state, JobState::Running);
+    assert_eq!(resumed.run_id.as_deref(), Some("run-quota-resumed"));
+    assert_eq!(resumed.failure_reason, None);
+    assert!(
+        !state.leases[0].quota_hold,
+        "resuming removes only the automatic quota hold"
+    );
+    assert!(
+        state.leases[0].hold,
+        "the operator's hold survives the quota resume"
+    );
+    assert_eq!(
+        driver.resumes.lock().expect("fake lock").as_slice(),
+        &[("box".to_owned(), "run-quota".to_owned())]
+    );
+    assert!(driver.stops.lock().expect("fake lock").is_empty());
+
+    driver.finish_all();
+    service.pass().await.expect("finish pass");
+    let state = service.snapshot().await;
+    assert_eq!(state.jobs[0].state, JobState::Succeeded);
+    assert!(state.jobs[0].quota.is_none());
+}
+
+#[tokio::test]
+async fn a_reviewer_quota_refusal_is_not_reported_as_review_failed() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let driver = std::sync::Arc::new(FakeDriver {
+        quota_reason: Some("review_failed".to_owned()),
+        ..FakeDriver::default()
+    });
+    driver
+        .runs
+        .lock()
+        .expect("fake lock")
+        .entry("box".to_owned())
+        .or_default()
+        .push(("run-review".to_owned(), "running"));
+    driver
+        .quota_failures
+        .lock()
+        .expect("fake lock")
+        .insert("run-review".to_owned(), 1);
+    let service = super::service::HubService::open(
+        super::store::HubStore::new(directory.path().join("hub")),
+        driver.clone(),
+        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
+    )
+    .expect("service");
+    service
+        .mutate(|state| {
+            state.members.push(member("box", &[], 1, 0));
+            let mut running = job("hj_review", 0);
+            running.state = JobState::Running;
+            running.target = Some("box".to_owned());
+            running.run_id = Some("run-review".to_owned());
+            running.dispatched_at_ms = Some(1);
+            running.last_cursor_at_ms = Some(1);
+            state.jobs.push(running);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+    service.pass().await.expect("quota pass");
+    let state = service.snapshot().await;
+    let paused = &state.jobs[0];
+    assert_eq!(paused.state, JobState::WaitingQuota);
+    assert_eq!(
+        paused.failure_reason, None,
+        "the reviewer never produced a verdict, so the run is not review_failed"
+    );
+    assert_eq!(
+        paused.error.as_ref().expect("quota error").kind,
+        JobErrorKind::ProviderQuota
+    );
+    assert!(paused.quota.is_some());
+}
+
+#[tokio::test]
+async fn a_far_future_quota_retry_keeps_the_job_waiting_quota() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let now = super::clock::now_ms();
+    let retry_at = super::clock::rfc3339(now + 2 * 3_600_000);
+    let driver = std::sync::Arc::new(FakeDriver {
+        quota_retry_at: Some(retry_at.clone()),
+        ..FakeDriver::default()
+    });
+    driver
+        .runs
+        .lock()
+        .expect("fake lock")
+        .entry("box".to_owned())
+        .or_default()
+        .push(("run-far".to_owned(), "running"));
+    driver
+        .quota_failures
+        .lock()
+        .expect("fake lock")
+        .insert("run-far".to_owned(), 1);
+    let service = super::service::HubService::open(
+        super::store::HubStore::new(directory.path().join("hub")),
+        driver.clone(),
+        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
+    )
+    .expect("service");
+    service
+        .mutate(|state| {
+            state.members.push(member("box", &[], 1, 0));
+            let mut running = job("hj_far", 0);
+            running.state = JobState::Running;
+            running.target = Some("box".to_owned());
+            running.run_id = Some("run-far".to_owned());
+            running.dispatched_at_ms = Some(1);
+            running.last_cursor_at_ms = Some(1);
+            state.jobs.push(running);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+    service.pass().await.expect("quota pass");
+    let state = service.snapshot().await;
+    let paused = &state.jobs[0];
+    assert_eq!(paused.state, JobState::WaitingQuota);
+    let quota = paused.quota.as_ref().expect("quota wait");
+    assert_eq!(quota.limit, "weekly");
+    assert_eq!(quota.retry_at_ms, now + 2 * 3_600_000);
+    assert!(driver.resumes.lock().expect("fake lock").is_empty());
+
+    let (report, _) = service.pass().await.expect("waiting pass");
+    assert!(report.resumed.is_empty());
+    assert_eq!(
+        service.snapshot().await.jobs[0].state,
+        JobState::WaitingQuota
+    );
+    assert!(driver.resumes.lock().expect("fake lock").is_empty());
+}
+
+#[tokio::test]
+async fn a_quota_paused_job_keeps_its_member_and_settles_when_lost() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let driver = std::sync::Arc::new(FakeDriver::default());
+    let service = super::service::HubService::open(
+        super::store::HubStore::new(directory.path().join("hub")),
+        driver,
+        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
+    )
+    .expect("service");
+    service
+        .mutate(|state| {
+            state.members.push(member("box", &[], 1, 0));
+            state.leases.push(lease_on("box"));
+            let mut paused = job("hj_paused", 0);
+            paused.state = JobState::WaitingQuota;
+            paused.target = Some("box".to_owned());
+            paused.run_id = Some("run-paused".to_owned());
+            paused.quota = Some(super::model::QuotaWait {
+                limit: "weekly".to_owned(),
+                retry_at_ms: super::clock::now_ms() + 3_600_000,
+                attempts: 1,
+            });
+            state.jobs.push(paused);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+    assert!(service.snapshot().await.leases[0].quota_hold);
+
+    let error = service
+        .remove("box")
+        .await
+        .expect_err("a held job blocks removal");
+    let HubError::Conflict(message) = error else {
+        panic!("expected a conflict, got {error:?}");
+    };
+    assert!(message.contains("hj_paused"), "{message}");
+
+    service
+        .mutate(|state| {
+            state.members.clear();
+            Ok(())
+        })
+        .await
+        .expect("member gone");
+    let (report, _) = service.pass().await.expect("lost pass");
+    assert_eq!(report.target_lost.len(), 1);
+    let state = service.snapshot().await;
+    assert_eq!(state.jobs[0].state, JobState::Failed);
+    assert_eq!(state.jobs[0].failure_reason.as_deref(), Some("target_lost"));
+    assert_eq!(
+        state.jobs[0].error.as_ref().expect("error").kind,
+        JobErrorKind::TargetLost
+    );
+    assert!(state.jobs[0].quota.is_none());
+    assert!(
+        !state.leases[0].quota_hold,
+        "settling the lost quota job releases only its automatic hold"
+    );
+}
+
+#[test]
+fn quota_holds_are_derived_without_clearing_operator_holds() {
+    let mut state = HubState {
+        members: vec![member("box", &[], 1, 0)],
+        jobs: vec![job("hj_paused", 0)],
+        leases: vec![lease_on("box")],
+        ..HubState::default()
+    };
+    state.jobs[0].state = JobState::WaitingQuota;
+    state.jobs[0].target = Some("box".to_owned());
+    state.leases[0].hold = true;
+    super::pool::sync_quota_holds(&mut state);
+    assert!(state.leases[0].quota_hold);
+    assert!(
+        state.leases[0].hold,
+        "the automatic hold never clears an operator hold"
+    );
+
+    state.jobs[0].state = JobState::Running;
+    super::pool::sync_quota_holds(&mut state);
+    assert!(!state.leases[0].quota_hold);
+    assert!(
+        state.leases[0].hold,
+        "the operator hold survives the quota wait"
+    );
+}
+
+#[test]
+fn placement_is_refused_while_the_provider_quota_is_exhausted() {
+    let now = 1_000_000;
+    let deadline = super::quota::QuotaDeadline::new();
+    deadline.record(now + 60_000, "weekly");
+    let refusal = deadline.refusal(now).expect("refused while exhausted");
+    assert!(refusal.contains("weekly"), "{refusal}");
+
+    let mut state = HubState {
+        members: vec![member("box", &[], 1, 0)],
+        jobs: vec![job("hj_waiting", 0)],
+        ..HubState::default()
+    };
+    let mut observed = loads(&[("box", true, 0)]);
+    assert!(
+        super::schedule::choose_with_quota(&mut state, now, &mut observed, Some(&refusal))
+            .is_empty(),
+        "no new placement while the gateway is exhausted"
+    );
+    assert!(
+        state.jobs[0]
+            .pool_wait
+            .as_deref()
+            .is_some_and(|waiting| waiting.contains("weekly"))
+    );
+
+    assert!(deadline.refusal(now + 60_001).is_none());
+    let chosen = super::schedule::choose(&mut state, now + 60_001, &mut observed);
+    assert_eq!(chosen, vec![("hj_waiting".to_owned(), "box".to_owned())]);
+
+    let mut waiting_run = job("hj_paused", 0);
+    waiting_run.state = JobState::WaitingQuota;
+    waiting_run.target = Some("box".to_owned());
+    assert!(
+        !super::pool::drained(&[waiting_run], "box"),
+        "a quota-paused run keeps its machine busy"
+    );
 }
 
 #[path = "tests/hetzner.rs"]

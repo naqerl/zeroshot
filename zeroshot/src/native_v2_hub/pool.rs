@@ -544,6 +544,10 @@ pub(crate) struct Lease {
     /// a held lease down; the stall path and every other teardown reason still apply.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hold: bool,
+    /// An automatic hold derived from a job on this member waiting for provider quota. It is
+    /// recomputed from job state, so it never masks or clears the operator's `hold`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quota_hold: bool,
     pub created_at_ms: u64,
     /// When the lease last recorded a phase change. State written before this field existed
     /// falls back to `created_at_ms`.
@@ -889,6 +893,7 @@ impl Lease {
             transport: pool.transport,
             transport_logged: false,
             hold: false,
+            quota_hold: false,
             created_at_ms: now,
             progress_at_ms: now,
             drain_started_ms: None,
@@ -960,6 +965,7 @@ impl Lease {
             "localPort": self.local_port,
             "transport": self.transport,
             "hold": self.hold,
+            "quotaHold": self.quota_hold,
             "createdAt": rfc3339(self.created_at_ms),
             "reason": self.reason,
             "attempts": self.attempts,
@@ -1071,7 +1077,7 @@ pub(crate) fn update_idle(state: &mut HubState, now: u64) {
             .filter(|member| member.pool.is_some())
         {
             let busy = jobs.iter().any(|job| {
-                job.state == JobState::Running
+                matches!(job.state, JobState::Running | JobState::WaitingQuota)
                     && job.target.as_deref() == Some(member.name.as_str())
             });
             if busy {
@@ -1094,10 +1100,25 @@ pub(crate) fn update_idle(state: &mut HubState, now: u64) {
     }
 }
 
-/// Hold or release the lease of `member`: a held lease survives the idle rule.
+/// Hold or release the operator hold of `member`: a held lease survives the idle rule.
 pub(crate) fn set_hold(state: &mut HubState, member: &str, hold: bool) {
     if let Some(lease) = state.leases.iter_mut().find(|lease| lease.name == member) {
         lease.hold = hold;
+    }
+}
+
+/// Recompute automatic quota holds from the jobs on each member. This keeps the operator hold
+/// (`hub stop`) separate: a quota wait adds `quota_hold`, and resuming or settling the job only
+/// removes that automatic hold.
+pub(crate) fn sync_quota_holds(state: &mut HubState) {
+    let waiting = state
+        .jobs
+        .iter()
+        .filter(|job| job.state == JobState::WaitingQuota)
+        .filter_map(|job| job.target.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    for lease in &mut state.leases {
+        lease.quota_hold = waiting.contains(&lease.name);
     }
 }
 
@@ -1116,9 +1137,10 @@ pub(crate) fn teardown_due(state: &HubState, now: u64) -> Vec<(String, TeardownR
                 })
             }
             LeasePhase::Active => {
-                if lease.hold {
-                    // A deliberate `hub stop` keeps the machine: the operator paid for it and
-                    // will reuse it. `hub pool release` or a new job clears the hold.
+                if lease.hold || lease.quota_hold {
+                    // A deliberate `hub stop` keeps the machine for the operator, and a
+                    // provider-quota wait keeps it while the held node is retried. Both holds
+                    // must clear before the idle rule can tear it down.
                     None
                 } else {
                     let idle_ms = pool.map_or(0, |pool| pool.idle_ms);
@@ -1148,11 +1170,13 @@ pub(crate) fn unarchived<'a>(jobs: &'a [Job], member: &str) -> Vec<&'a Job> {
         .collect()
 }
 
-/// Whether every hub job on `member` has finished: nothing running or placing there.
+/// Whether every hub job on `member` has finished: nothing running, waiting on a quota, or
+/// placing there.
 pub(crate) fn drained(jobs: &[Job], member: &str) -> bool {
-    !jobs
-        .iter()
-        .any(|job| job.state == JobState::Running && job.target.as_deref() == Some(member))
+    !jobs.iter().any(|job| {
+        matches!(job.state, JobState::Running | JobState::WaitingQuota)
+            && job.target.as_deref() == Some(member)
+    })
 }
 
 /// A labelled provider resource found by the reaper.

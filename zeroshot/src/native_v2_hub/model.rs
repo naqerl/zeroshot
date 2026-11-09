@@ -300,6 +300,10 @@ pub(crate) struct PlacementSpec {
 pub(crate) enum JobState {
     Queued,
     Running,
+    /// The run's provider refused a model call because its quota is exhausted. The executing
+    /// node is held on its member and the same run is resumed after [`QuotaWait::retry_at_ms`].
+    /// Nonterminal: the job has not failed and keeps its pool machine.
+    WaitingQuota,
     Succeeded,
     Failed,
     Dequeued,
@@ -310,7 +314,27 @@ pub(crate) enum JobState {
 
 impl JobState {
     pub(crate) const fn is_terminal(self) -> bool {
-        !matches!(self, Self::Queued | Self::Running)
+        !matches!(self, Self::Queued | Self::Running | Self::WaitingQuota)
+    }
+}
+
+/// A provider quota pause: the limit that was exhausted, when the hub will retry, and how many
+/// quota pauses this job has accumulated. Exposed as `quota` on the job view.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct QuotaWait {
+    pub limit: String,
+    pub retry_at_ms: u64,
+    pub attempts: u32,
+}
+
+impl QuotaWait {
+    pub(crate) fn view(&self) -> Value {
+        json!({
+            "limit": self.limit,
+            "retryAt": rfc3339(self.retry_at_ms),
+            "attempts": self.attempts,
+        })
     }
 }
 
@@ -343,6 +367,9 @@ pub(crate) enum JobErrorKind {
     /// the hub confirmed the loss with the provider or a direct TCP refusal, so the hub cannot
     /// observe or stop its run.
     TargetLost,
+    /// The model gateway refused a call because its quota is exhausted. This is a wait, not a
+    /// failure: the job holds its machine and resumes the same node after `retryAt`.
+    ProviderQuota,
     /// Recorded as plain text by an earlier hub, or a kind this hub no longer produces.
     Unclassified,
 }
@@ -364,6 +391,7 @@ impl<'de> Deserialize<'de> for JobErrorKind {
             "pool_wait_timeout" => Self::PoolWaitTimeout,
             "stalled" => Self::Stalled,
             "target_lost" => Self::TargetLost,
+            "provider_quota" => Self::ProviderQuota,
             _ => Self::Unclassified,
         })
     }
@@ -492,6 +520,12 @@ pub(crate) struct Job {
     /// Why a queued job its pool serves has no server yet, such as a capacity shortage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_wait: Option<String>,
+    /// The current quota pause, while the job is waiting or resuming from one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<QuotaWait>,
+    /// Quota pauses this job has accumulated, so backoff keeps growing across resumed runs.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub quota_attempts: u32,
 }
 
 impl Job {
@@ -507,6 +541,7 @@ impl Job {
             JobState::Queued if self.not_before_ms.is_some_and(|at| at > now_ms) => "scheduled",
             JobState::Queued => "queued",
             JobState::Running => "running",
+            JobState::WaitingQuota => "waiting_quota",
             JobState::Succeeded => "succeeded",
             JobState::Failed => "failed",
             JobState::Dequeued => "dequeued",
@@ -593,6 +628,7 @@ impl Job {
             "archiveSkipped": self.archive_skipped,
             "graphHash": self.graph_hash,
             "waiting": self.pool_wait,
+            "quota": self.quota.as_ref().map(QuotaWait::view),
             "spec": self.requirements.machine,
         })
     }

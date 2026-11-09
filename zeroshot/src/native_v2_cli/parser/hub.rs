@@ -815,9 +815,9 @@ pub(super) struct HubEnqueueArgs {
 
 #[derive(Debug, Args)]
 pub(super) struct HubPsArgs {
-    /// Job state filter: active (queued, scheduled, running), queued, scheduled, running,
-    /// succeeded, failed, dequeued, stopped, recurring (schedules only), or all. Active schedules are
-    /// listed with active and recurring; all schedules with all.
+    /// Job state filter: active (queued, scheduled, running, waiting_quota), queued, scheduled,
+    /// running, waiting_quota, succeeded, failed, dequeued, stopped, recurring (schedules only), or
+    /// all. Active schedules are listed with active and recurring; all schedules with all.
     #[arg(long, value_name = "STATE", default_value = "active")]
     state: String,
 
@@ -836,8 +836,8 @@ pub(super) struct HubPsArgs {
 
 #[derive(Debug, Args)]
 pub(super) struct HubJobsArgs {
-    /// Job state filter: active (queued, scheduled, running), queued, scheduled, running,
-    /// succeeded, failed, dequeued, stopped, or all.
+    /// Job state filter: active (queued, scheduled, running, waiting_quota), queued, scheduled,
+    /// running, waiting_quota, succeeded, failed, dequeued, stopped, or all.
     #[arg(long, value_name = "STATE", default_value = "all")]
     state: String,
 

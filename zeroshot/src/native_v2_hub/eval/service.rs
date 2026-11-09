@@ -605,6 +605,8 @@ impl HubService {
             archive_skipped: None,
             graph_hash: None,
             pool_wait: None,
+            quota: None,
+            quota_attempts: 0,
         })
     }
 

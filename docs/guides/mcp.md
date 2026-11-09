@@ -135,8 +135,9 @@ manage members; `hub_dequeue` cancels queued jobs or schedules; `hub_stop` stops
 and keeps its pool machine; `hub_dispatch` requests a dispatcher pass; `force-stop` and
 `hub_force_stop` stop runs.
 
-`hub_jobs` lists job history instead of live load: `state` (`all` by default), `label` (one or
-more `key=value` pairs), `since` (`10m`, `2h`, `3d`), and `limit`. It returns at most a page of
+`hub_jobs` lists job history instead of live load: `state` (`all` by default; accepts `active`,
+`queued`, `scheduled`, `running`, `waiting_quota`, `succeeded`, `failed`, `dequeued`, `stopped`,
+or `all`), `label` (one or more `key=value` pairs), `since` (`10m`, `2h`, `3d`), and `limit`. It returns at most a page of
 the newest jobs, with `jobId`, `state`, `labels`, `pinnedRevision`, `attempts`, `lastCursor`,
 `createdAt`, `updatedAt`, and `failureReason` only on a terminal failure. The page is
 `{"schema": "zeroshot.hub.job-history/v1", "filters": …, "limit": …, "returned": …, "jobs": […]}`.

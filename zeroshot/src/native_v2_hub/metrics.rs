@@ -568,10 +568,11 @@ fn spec_labels(spec: Option<&Spec>) -> (&'static str, String) {
     (source, spec.tag.clone().unwrap_or_default())
 }
 
-const JOB_STATES: [&str; 7] = [
+const JOB_STATES: [&str; 8] = [
     "queued",
     "scheduled",
     "running",
+    "waiting_quota",
     "succeeded",
     "failed",
     "dequeued",
@@ -704,7 +705,10 @@ fn render_members(out: &mut Exposition, state: &HubState, metrics: &Metrics) {
         let own = state
             .jobs
             .iter()
-            .filter(|job| job.state == JobState::Running && job.target.as_deref() == Some(name))
+            .filter(|job| {
+                matches!(job.state, JobState::Running | JobState::WaitingQuota)
+                    && job.target.as_deref() == Some(name)
+            })
             .count();
         let probed = metrics.load(name).map_or(0, |load| load.active);
         u32::try_from(own).unwrap_or(u32::MAX).max(probed)

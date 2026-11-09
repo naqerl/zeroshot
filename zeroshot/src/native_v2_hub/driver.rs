@@ -33,6 +33,14 @@ pub(crate) trait HubDriver: Send + Sync {
     async fn stop(&self, _member: &str, _run_id: &str) -> Result<(), HubError> {
         Ok(())
     }
+    /// Resume a failed run from its latest checkpoint and return the successor run ID. The
+    /// successor retries the node that was executing when the provider refused the call.
+    async fn resume(&self, _member: &str, _run_id: &str) -> Result<String, HubError> {
+        Err(HubError::Target {
+            message: "this driver cannot resume a run".to_owned(),
+            diagnostic: None,
+        })
+    }
     /// Capability kinds advertised by a named target's discovery document.
     async fn capabilities(&self, member: &str) -> Result<Vec<String>, HubError>;
     /// Complete standard output of a read-only run command (`report`, `status`, `watch`,
@@ -132,6 +140,51 @@ impl ProcessDriver {
             diagnostic,
         ))
     }
+
+    /// Newest checkpoint of a run, reading every bounded page. `None` means the run has no
+    /// checkpoint, so resuming cannot continue from an exact node boundary.
+    async fn latest_checkpoint(
+        &self,
+        member: &str,
+        run_id: &str,
+    ) -> Result<Option<String>, HubError> {
+        let mut after: Option<String> = None;
+        let mut latest = None;
+        for _ in 0..100 {
+            let mut arguments = vec![
+                "checkpoints".to_owned(),
+                run_id.to_owned(),
+                "--limit".to_owned(),
+                "100".to_owned(),
+            ];
+            if let Some(after) = &after {
+                arguments.extend(["--after".to_owned(), after.clone()]);
+            }
+            arguments.extend(route(member));
+            let stdout = self.call(arguments, None).await?;
+            let document = last_json(&stdout).ok_or_else(|| {
+                target_error("zeroshot checkpoints returned no JSON".to_owned(), None)
+            })?;
+            if let Some(checkpoint) = document
+                .get("checkpoints")
+                .and_then(Value::as_array)
+                .and_then(|checkpoints| checkpoints.last())
+                .and_then(|checkpoint| checkpoint.get("checkpointId"))
+                .and_then(Value::as_str)
+            {
+                latest = Some(checkpoint.to_owned());
+            }
+            let next = document
+                .get("nextAfter")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            match next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        Ok(latest)
+    }
 }
 
 #[async_trait]
@@ -194,6 +247,38 @@ impl HubDriver for ProcessDriver {
         Ok(())
     }
 
+    async fn resume(&self, member: &str, run_id: &str) -> Result<String, HubError> {
+        // Prefer the latest checkpoint: a fresh restart would rerun the whole graph from the
+        // worker instead of retrying the held node. The inventory is paged so a long loop's
+        // newest entry is found rather than only the first page.
+        let checkpoint = match self.latest_checkpoint(member, run_id).await {
+            Ok(checkpoint) => checkpoint,
+            // A target without checkpoint support can still resume its retained workspace; a
+            // transient or malformed answer stays retryable instead of silently restarting.
+            Err(error) if checkpoints_unsupported(&error) => None,
+            Err(error) => return Err(error),
+        };
+        let mut arguments = vec!["resume".to_owned(), run_id.to_owned()];
+        if let Some(checkpoint) = checkpoint {
+            arguments.extend(["--from-checkpoint".to_owned(), checkpoint]);
+        }
+        arguments.extend(route(member));
+        let stdout = self
+            .call(arguments, None)
+            .await
+            .map_err(unanswered_when_uncertain)?;
+        last_json(&stdout)
+            .and_then(|document| {
+                document
+                    .get("runId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .ok_or_else(|| {
+                HubError::Unanswered("zeroshot resume returned no run receipt".to_owned())
+            })
+    }
+
     async fn capabilities(&self, member: &str) -> Result<Vec<String>, HubError> {
         let record = self
             .registry
@@ -230,6 +315,22 @@ impl HubDriver for ProcessDriver {
         self.call_within(arguments, None, self.capture_timeout)
             .await
     }
+}
+
+/// Whether a failed checkpoint listing means the target does not implement the command.
+fn checkpoints_unsupported(error: &HubError) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    [
+        "unknown",
+        "unrecognized",
+        "unsupported",
+        "not supported",
+        "no such",
+        "unexpected argument",
+        "invalid subcommand",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 /// Every advertised `kind`: the document kind and each extension marker's kind.

@@ -99,7 +99,7 @@ impl Row {
         self.jobs += 1;
         match job.state {
             JobState::Queued => self.queued += 1,
-            JobState::Running => self.running += 1,
+            JobState::Running | JobState::WaitingQuota => self.running += 1,
             JobState::Succeeded => self.succeeded += 1,
             JobState::Failed => self.failed += 1,
             JobState::Dequeued => self.dequeued += 1,

@@ -1735,7 +1735,7 @@ Options:
           Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
 
       --state <STATE>
-          Job state filter: active (queued, scheduled, running), queued, scheduled, running, succeeded, failed, dequeued, stopped, recurring (schedules only), or all. Active schedules are listed with active and recurring; all schedules with all
+          Job state filter: active (queued, scheduled, running, waiting_quota), queued, scheduled, running, waiting_quota, succeeded, failed, dequeued, stopped, recurring (schedules only), or all. Active schedules are listed with active and recurring; all schedules with all
 
           [default: active]
 
@@ -1766,7 +1766,7 @@ Options:
           Hub context to address [default: ZEROSHOT_HUB, then `hub context use`, then local]
 
       --state <STATE>
-          Job state filter: active (queued, scheduled, running), queued, scheduled, running, succeeded, failed, dequeued, stopped, or all
+          Job state filter: active (queued, scheduled, running, waiting_quota), queued, scheduled, running, waiting_quota, succeeded, failed, dequeued, stopped, or all
 
           [default: all]
 

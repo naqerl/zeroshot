@@ -1090,6 +1090,16 @@ async fn events_list_describes_one_hub_type_and_poll_and_push() {
             "data.kind names the carried kind"
         );
     }
+    let job_states =
+        event["payloadSchema"]["properties"]["data"]["oneOf"][0]["properties"]["state"]["enum"]
+            .as_array()
+            .expect("hub.job state enum");
+    for state in super::events::JOB_STATES {
+        assert!(
+            job_states.contains(&json!(state)),
+            "the advertised hub.job schema includes {state}"
+        );
+    }
     assert!(
         event["payloadSchema"]["properties"]["data"].is_object(),
         "payload documents data"

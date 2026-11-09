@@ -50,7 +50,7 @@ restarts. Pass, placement, and API series are counted since the daemon started.
 
 | Metric | Type | Labels |
 |---|---|---|
-| `zeroshot_hub_jobs` | gauge | `state` (queued, scheduled, running, succeeded, failed, dequeued, stopped) |
+| `zeroshot_hub_jobs` | gauge | `state` (queued, scheduled, running, waiting_quota, succeeded, failed, dequeued, stopped) |
 | `zeroshot_hub_queue_depth` | gauge | `kind` (due, scheduled) |
 | `zeroshot_hub_schedules` | gauge | active recurring schedules |
 | `zeroshot_hub_cron_fires_total`, `zeroshot_hub_cron_skips_total` | counter | none |
@@ -153,6 +153,22 @@ Both fields are persisted in hub state as `lastCursor` and `lastCursorAt`, so a 
 does not lose the stall clock. The daemon heartbeat (`daemon.json` and the `started` record)
 reports the configured duration in milliseconds as `maxStallMs`; it is `null` when disabled.
 `zeroshot hub install` passes `--max-stall` through to the installed service.
+
+## Provider quota pauses
+
+When a model gateway refuses a call because a provider quota is exhausted, the failed run's
+bounded failure context is classified as `errorKind` `provider_quota`. The job does not fail: it
+enters nonterminal `waiting_quota`, keeps its pool machine held through an automatic quota hold
+separate from an operator `hub stop` hold, and exposes
+`quota: {limit, retryAt, attempts}` on `zeroshot hub status`. The executing node is resumed from
+the failed run's latest checkpoint after a bounded exponential backoff (at least one minute,
+capped at one hour, with jitter), so work does not restart from the beginning. A reviewer that
+never produced a verdict because the provider refused the call is not reported as `review_failed`;
+it judges only after the wait.
+
+While the gateway is known exhausted, new placements are refused or parked until `retryAt`; the
+refusal names the exhausted limit. A `hub.warning` event announces both entering and leaving the
+wait. The exhaustion deadline is process-wide and clears after a successful provider call.
 
 ## Lost members and removing a member
 

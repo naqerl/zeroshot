@@ -1205,8 +1205,8 @@ fn hub_jobs_schema() -> Value {
             (
                 "state",
                 string_prop(
-                    "Job state filter: active, queued, scheduled, running, succeeded, failed, \
-                     dequeued, stopped, or all. Defaults to all.",
+                    "Job state filter: active, queued, scheduled, running, waiting_quota, \
+                     succeeded, failed, dequeued, stopped, or all. Defaults to all.",
                 ),
             ),
             (

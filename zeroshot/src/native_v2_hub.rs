@@ -42,6 +42,7 @@ mod placement;
 mod pool;
 mod profile;
 mod provision;
+mod quota;
 mod schedule;
 mod service;
 mod stats;

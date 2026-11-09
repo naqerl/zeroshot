@@ -28,6 +28,7 @@ use super::placement::{Fit, Placement, Rejection, describe, fit, matching_member
 use super::lease::{PoolReport, PoolRuntime};
 use super::pool;
 use super::profile;
+use super::quota;
 use super::schedule::{self, Dispatched, LostTarget, TickReport, WithheldTarget};
 use super::stats;
 use super::store::HubStore;
@@ -61,6 +62,8 @@ pub(crate) struct HubService {
     eval_claims: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// Provider and tunnel effects of pools; `None` without a provider token.
     pools: Option<PoolRuntime>,
+    /// Process-wide provider exhaustion for this hub's placements, owned by the service.
+    quota: quota::QuotaDeadline,
 }
 
 pub(crate) fn member_document(member: &Member) -> Value {
@@ -104,6 +107,10 @@ impl HubService {
             let lock = store.lock()?;
             store.save(&lock, &state)?;
         }
+        // A daemon restart must not forget a provider exhaustion that quota-paused jobs still
+        // carry, or new placements would start work the gateway refuses.
+        let quota = quota::QuotaDeadline::new();
+        quota.record_jobs(&state.jobs);
         Ok(Self {
             store,
             driver,
@@ -115,6 +122,7 @@ impl HubService {
             max_stall_ms: None,
             eval_claims: std::sync::Mutex::default(),
             pools: None,
+            quota,
         })
     }
 
@@ -189,6 +197,9 @@ impl HubService {
         let mut state = self.state.lock().await;
         let mut next = state.clone();
         let result = change(&mut next)?;
+        // Quota holds are derived from job state, never stored independently, so every
+        // transition (poll, resume, stop, target loss) keeps the lease consistent.
+        pool::sync_quota_holds(&mut next);
         if next != *state {
             let lock = self.store.lock()?;
             self.store.save(&lock, &next)?;
@@ -281,7 +292,10 @@ impl HubService {
             let placed = state
                 .jobs
                 .iter()
-                .filter(|job| job.state == JobState::Running && job.target.as_deref() == Some(name))
+                .filter(|job| {
+                    matches!(job.state, JobState::Running | JobState::WaitingQuota)
+                        && job.target.as_deref() == Some(name)
+                })
                 .map(|job| job.job_id.clone())
                 .collect::<Vec<_>>();
             if !placed.is_empty() {
@@ -349,8 +363,10 @@ impl HubService {
                     state
                         .jobs
                         .iter()
-                        .filter(|job| job.state == JobState::Running
-                            && job.target.as_deref() == Some(member.name.as_str()))
+                        .filter(|job| matches!(
+                            job.state,
+                            JobState::Running | JobState::WaitingQuota
+                        ) && job.target.as_deref() == Some(member.name.as_str()))
                         .count()
                 );
                 let queued = state.jobs.iter().filter(|job| {
@@ -452,6 +468,16 @@ impl HubService {
             .await?;
         job.requirements.machine =
             profile::machine_for(&state.pools, &job.placement, &job.requirements);
+        if let Some(refusal) = self.quota.refusal(now_ms()) {
+            self.metrics.record_rejection(None);
+            return Err(HubError::no_eligible(
+                describe(&job.placement),
+                vec![Rejection {
+                    member: "model-gateway".to_owned(),
+                    reason: refusal,
+                }],
+            ));
+        }
         if let Some(rejected) = unplaceable(&state, &job.placement, &job.requirements) {
             self.metrics.record_rejection(Some(&rejected));
             return Err(HubError::no_eligible(describe(&job.placement), rejected));
@@ -490,6 +516,47 @@ impl HubService {
                 Err(HubError::NoCapacity(describe(&job.placement)))
             }
         }
+    }
+
+    /// Resume every quota-paused job whose retry deadline has arrived. Target calls run outside
+    /// the state lock; each result is merged only into the exact run it was for. A resume that
+    /// cannot be submitted extends the pause instead of failing the job.
+    async fn resume_quota_waits(&self, now: u64) -> Result<Vec<Value>, HubError> {
+        let waits = schedule::due_quota_waits(&self.snapshot().await, now);
+        if waits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let driver = self.driver();
+        let results = join_all(waits.into_iter().map(|wait| async move {
+            let result = driver.resume(&wait.target, &wait.run_id).await;
+            (wait, result)
+        }))
+        .await;
+        self.mutate(|state| {
+            let mut resumed = Vec::new();
+            for (wait, result) in results {
+                match result {
+                    Ok(successor) => {
+                        if let Some(record) =
+                            schedule::settle_quota_resumed(&mut state.jobs, &wait, &successor, now)
+                        {
+                            resumed.push(record);
+                        }
+                    }
+                    Err(error) => {
+                        schedule::reschedule_quota_wait(
+                            &mut state.jobs,
+                            &wait,
+                            &error.to_string(),
+                            now,
+                        );
+                    }
+                }
+            }
+            self.quota.record_jobs(&state.jobs);
+            Ok(resumed)
+        })
+        .await
     }
 
     /// Stop the runs of selected jobs through the same target operation as `hub force-stop`.
@@ -779,16 +846,26 @@ impl HubService {
                             .iter_mut()
                             .find(|job| job.job_id == job_id)
                             .ok_or_else(|| HubError::JobNotFound(job_id.to_owned()))?;
-                        let status = if job.state == JobState::Running
-                            && job.run_id.as_deref() == Some(run_id.as_str())
-                        {
+                        let observing = job.state == JobState::Running
+                            && job.run_id.as_deref() == Some(run_id.as_str());
+                        let status = if observing {
                             schedule::apply_refresh(job, result, now)
                         } else {
                             result.ok()
                         };
-                        Ok((job.clone(), status))
+                        // Only a status read that watched this exact run reach success proves
+                        // provider progress; reading an already-terminal success again does not.
+                        let just_succeeded = observing && job.state == JobState::Succeeded;
+                        let result = (job.clone(), status, just_succeeded);
+                        self.quota.record_jobs(&state.jobs);
+                        Ok(result)
                     })
                     .await?;
+                if job.2 {
+                    self.quota.clear();
+                    let state = self.snapshot().await;
+                    self.quota.record_jobs(&state.jobs);
+                }
                 let mut document = job_document(&job.0, now, self.max_stall_ms);
                 document["run"] = job.1.unwrap_or(Value::Null);
                 return Ok(document);
@@ -843,10 +920,12 @@ impl HubService {
                     "hub job {job_id} is {}; only queued, scheduled, or placing jobs can be \
                      dequeued{}",
                     job.display_state(now),
-                    if job.state == JobState::Running {
-                        "; use `zeroshot hub force-stop` to stop its run"
-                    } else {
-                        ""
+                    match job.state {
+                        JobState::Running => "; use `zeroshot hub force-stop` to stop its run",
+                        JobState::WaitingQuota => {
+                            "; use `zeroshot hub stop` to stop the quota-paused job"
+                        }
+                        _ => "",
                     }
                 )));
             }
@@ -873,6 +952,12 @@ impl HubService {
         let job = self.job(job_id).await?;
         match job.state {
             JobState::Queued => self.settle_stop(job_id, None, None).await,
+            JobState::WaitingQuota => {
+                let target = job.target.clone();
+                let run_id = job.run_id.clone();
+                self.settle_stop(job_id, target.as_deref(), run_id.as_deref())
+                    .await
+            }
             JobState::Running => {
                 let (Some(target), Some(run_id)) = (&job.target, &job.run_id) else {
                     return Err(HubError::InvalidState(format!(
@@ -936,7 +1021,7 @@ impl HubService {
                         // A status read settled this exact run while the target stop was in
                         // flight. Keep that real outcome; only the hold is new.
                         JobState::Succeeded | JobState::Failed => {}
-                        JobState::Running => {
+                        JobState::Running | JobState::WaitingQuota => {
                             job.state = JobState::Stopped;
                             job.finished_at_ms = Some(now);
                             // A deliberate stop is not a failure: clear any earlier hub error
@@ -945,6 +1030,7 @@ impl HubService {
                             job.error = None;
                             job.failure_reason = None;
                             job.failure_classification = None;
+                            job.quota = None;
                         }
                         _ => {
                             return Err(HubError::InvalidState(format!(
@@ -1120,14 +1206,25 @@ impl HubService {
         let (finished, members) = self
             .mutate(|state| {
                 let finished = schedule::apply_polls(state, results, now);
+                self.quota.record_jobs(&state.jobs);
                 Ok((finished, state.members.clone()))
             })
             .await?;
+        if finished
+            .iter()
+            .any(|record| record.get("state").and_then(Value::as_str) == Some("succeeded"))
+        {
+            self.quota.clear();
+            let state = self.snapshot().await;
+            self.quota.record_jobs(&state.jobs);
+        }
         let mut report = TickReport {
             fired,
             finished,
             ..TickReport::default()
         };
+        let now = now_ms();
+        report.resumed = self.resume_quota_waits(now).await?;
         {
             let hub_max_stall_ms = self.max_stall_ms;
             let now = now_ms();
@@ -1204,8 +1301,16 @@ impl HubService {
             })
             .await?;
             let now = now_ms();
+            let quota_refusal = self.quota.refusal(now);
             let chosen = self
-                .mutate(|state| Ok(schedule::choose(state, now, &mut loads)))
+                .mutate(|state| {
+                    Ok(schedule::choose_with_quota(
+                        state,
+                        now,
+                        &mut loads,
+                        quota_refusal.as_deref(),
+                    ))
+                })
                 .await?;
             for (job_id, member) in chosen {
                 let (job, dispatched) = self.dispatch(&job_id, &member, now).await?;
@@ -1472,13 +1577,14 @@ fn dequeue_placing(job: &mut Job, now: u64, hub_max_stall_ms: Option<u64>) -> Va
 }
 
 /// The state filters `hub ps` and `hub jobs` accept.
-const JOB_STATES: [&str; 10] = [
+const JOB_STATES: [&str; 11] = [
     "active",
     "all",
     "recurring",
     "queued",
     "scheduled",
     "running",
+    "waiting_quota",
     "succeeded",
     "failed",
     "dequeued",
@@ -1502,7 +1608,7 @@ fn state_matches(job: &Job, filter: &str, now: u64) -> bool {
     let state = job.display_state(now);
     match filter {
         "all" => true,
-        "active" => matches!(state, "queued" | "scheduled" | "running"),
+        "active" => matches!(state, "queued" | "scheduled" | "running" | "waiting_quota"),
         filter => state == filter,
     }
 }

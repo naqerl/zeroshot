@@ -6,11 +6,15 @@ use serde_json::{Value, json};
 
 use super::driver::{HubDriver, SubmitRequest};
 use super::error::HubError;
-use super::model::{HubState, Job, JobError, JobErrorKind, JobState, LOCAL_MEMBER, Member, MemberState};
+use super::model::{
+    HubState, Job, JobError, JobErrorKind, JobState, LOCAL_MEMBER, Member, MemberState, QuotaWait,
+};
 use super::usage::JobUsage;
 use super::placement::{Load, Placement, Reachability, place};
+use super::pool;
+use super::quota;
 #[cfg(test)]
-use super::pool::{self, PoolPhase};
+use super::pool::PoolPhase;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Consecutive *decisive* unreachable member probes, one per dispatcher interval, after which a
@@ -34,6 +38,7 @@ pub(crate) struct TickReport {
     pub target_lost: Vec<Value>,
     pub failed: Vec<Value>,
     pub unconfirmed: Vec<Value>,
+    pub resumed: Vec<Value>,
     pub loads: Option<BTreeMap<String, Load>>,
 }
 
@@ -65,6 +70,7 @@ impl TickReport {
             "targetLost": self.target_lost,
             "dispatchFailed": self.failed,
             "dispatchUnconfirmed": self.unconfirmed,
+            "resumed": self.resumed,
             "queued": queued,
             "running": running,
         })
@@ -116,11 +122,17 @@ pub(crate) async fn probe(
         .await
         .into_iter()
         .collect::<BTreeMap<_, _>>();
-    for job in jobs.iter().filter(|job| job.state == JobState::Running) {
+    for job in jobs
+        .iter()
+        .filter(|job| matches!(job.state, JobState::Running | JobState::WaitingQuota))
+    {
         if let Some(load) = job.target.as_ref().and_then(|target| loads.get_mut(target)) {
             let own = u32::try_from(
                 jobs.iter()
-                    .filter(|other| other.state == JobState::Running && other.target == job.target)
+                    .filter(|other| {
+                        matches!(other.state, JobState::Running | JobState::WaitingQuota)
+                            && other.target == job.target
+                    })
                     .count(),
             )
             .unwrap_or(u32::MAX);
@@ -199,7 +211,10 @@ pub(crate) fn record_health(
             Reachability::Inconclusive => {}
         }
     }
-    for job in jobs.iter_mut().filter(|job| job.state == JobState::Running) {
+    for job in jobs
+        .iter_mut()
+        .filter(|job| matches!(job.state, JobState::Running | JobState::WaitingQuota))
+    {
         let Some(target) = job.target.as_deref() else {
             continue;
         };
@@ -230,11 +245,10 @@ pub(crate) fn record_target_health(state: &mut HubState, target: &str, now_ms: u
         member.unreachable_probes = 0;
         member.last_probe_ok_at_ms = Some(now_ms);
     }
-    for job in state
-        .jobs
-        .iter_mut()
-        .filter(|job| job.state == JobState::Running && job.target.as_deref() == Some(target))
-    {
+    for job in state.jobs.iter_mut().filter(|job| {
+        matches!(job.state, JobState::Running | JobState::WaitingQuota)
+            && job.target.as_deref() == Some(target)
+    }) {
         job.target_last_ok_at_ms = Some(now_ms);
         if !job
             .error
@@ -278,12 +292,14 @@ pub(crate) struct WithheldTarget {
     pub reason: String,
 }
 
-/// Running jobs that can no longer be observed because their member is gone or unreachable.
+/// Running or quota-paused jobs that can no longer be observed because their member is gone or
+/// unreachable. A quota-paused job cannot resume against a member that no longer exists, so it
+/// must settle as lost rather than wait forever.
 pub(crate) fn lost_targets(state: &HubState) -> Vec<LostTarget> {
     state
         .jobs
         .iter()
-        .filter(|job| job.state == JobState::Running)
+        .filter(|job| matches!(job.state, JobState::Running | JobState::WaitingQuota))
         .filter_map(|job| {
             let name = job.target.as_deref()?;
             match state.member(name) {
@@ -324,7 +340,9 @@ pub(crate) fn settle_lost_targets(
         let Some(job) = jobs.iter_mut().find(|job| job.job_id == target.job_id) else {
             continue;
         };
-        if job.state != JobState::Running || job.target.as_deref() != Some(target.member.as_str()) {
+        if !matches!(job.state, JobState::Running | JobState::WaitingQuota)
+            || job.target.as_deref() != Some(target.member.as_str())
+        {
             continue;
         }
         let last = target.last_probe_ok_at_ms.map_or_else(
@@ -369,7 +387,9 @@ pub(crate) fn settle_retired_lease(
 ) -> Vec<Value> {
     let mut failed = Vec::new();
     for job in jobs.iter_mut() {
-        if job.state != JobState::Running || job.target.as_deref() != Some(retirement.member) {
+        if !matches!(job.state, JobState::Running | JobState::WaitingQuota)
+            || job.target.as_deref() != Some(retirement.member)
+        {
             continue;
         }
         failed.push(fail_job(
@@ -406,6 +426,8 @@ pub(crate) fn settle_orphaned_lease(
 fn fail_job(job: &mut Job, now_ms: u64, classification: &str, detail: String) -> Value {
     job.reaper = None;
     job.state = JobState::Failed;
+    job.quota = None;
+    job.quota_attempts = 0;
     job.finished_at_ms = Some(now_ms);
     job.failure_reason = Some("target_lost".to_owned());
     job.failure_classification = Some(classification.to_owned());
@@ -478,11 +500,12 @@ pub(crate) fn confirm_lost_by_probe(
     (confirmed, withheld)
 }
 
-/// Record reaper notes on running jobs; `hub.warning` surfaces them.
+/// Record reaper notes on running or quota-paused jobs; `hub.warning` surfaces them.
 pub(crate) fn note_withheld(jobs: &mut [Job], withheld: &[WithheldTarget]) {
     for note in withheld {
         if let Some(job) = jobs.iter_mut().find(|job| job.job_id == note.job_id) {
-            if job.state == JobState::Running && job.target.as_deref() == Some(note.member.as_str())
+            if matches!(job.state, JobState::Running | JobState::WaitingQuota)
+                && job.target.as_deref() == Some(note.member.as_str())
             {
                 job.reaper = Some(note.reason.clone());
             }
@@ -660,6 +683,10 @@ pub(crate) fn record_cursor(job: &mut Job, status: &Value, now_ms: u64) {
 }
 
 /// Apply a run status projection to a running job. Returns true when the job finished.
+///
+/// A provider quota refusal is not a failed run for the hub: the job enters [`JobState::WaitingQuota`],
+/// keeps its machine held, and resumes the same node after the retry deadline. This is why a
+/// reviewer whose provider call was refused is never reported as `review_failed`.
 pub(crate) fn apply_status(job: &mut Job, status: &Value, now_ms: u64) -> bool {
     let Some(phase) = status.pointer("/status/phase").and_then(Value::as_str) else {
         return false;
@@ -670,11 +697,39 @@ pub(crate) fn apply_status(job: &mut Job, status: &Value, now_ms: u64) -> bool {
     let result = status
         .pointer("/status/terminalResult/status")
         .and_then(Value::as_str);
+    if result != Some("succeeded")
+        && let Some(failure) = quota::detect(status, now_ms)
+    {
+        let attempts = job.quota_attempts.saturating_add(1);
+        job.quota_attempts = attempts;
+        let backoff = quota::backoff_ms(attempts, &job.job_id);
+        let until_ms = failure
+            .retry_at_ms
+            .unwrap_or_else(|| now_ms.saturating_add(backoff))
+            .max(now_ms.saturating_add(backoff));
+        job.quota = Some(QuotaWait {
+            limit: failure.limit.clone(),
+            retry_at_ms: until_ms,
+            attempts,
+        });
+        job.state = JobState::WaitingQuota;
+        job.failure_reason = None;
+        job.failure_classification = None;
+        job.finished_at_ms = None;
+        job.token_usage = JobUsage::from_status(status);
+        job.error = Some(JobError::new(
+            JobErrorKind::ProviderQuota,
+            quota::wait_message(&failure, until_ms),
+        ));
+        return false;
+    }
     job.state = if result == Some("succeeded") {
         JobState::Succeeded
     } else {
         JobState::Failed
     };
+    job.quota = None;
+    job.quota_attempts = 0;
     job.failure_reason = status
         .pointer("/status/terminalResult/reason")
         .and_then(Value::as_str)
@@ -794,7 +849,107 @@ pub(crate) fn apply_polls(
             }));
         }
     }
+    // A quota-paused job keeps its machine through the derived automatic hold, separate from
+    // any operator `hub stop` hold on the same lease.
+    pool::sync_quota_holds(state);
     finished
+}
+
+/// A quota-paused job whose retry time has arrived and whose run can be resumed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct QuotaResume {
+    pub job_id: String,
+    pub target: String,
+    pub run_id: String,
+}
+
+/// Quota-paused jobs that may be resumed now. Only these wait; every other job is left alone.
+pub(crate) fn due_quota_waits(state: &HubState, now_ms: u64) -> Vec<QuotaResume> {
+    state
+        .jobs
+        .iter()
+        .filter(|job| job.state == JobState::WaitingQuota)
+        .filter(|job| {
+            job.quota
+                .as_ref()
+                .is_some_and(|quota| quota.retry_at_ms <= now_ms)
+        })
+        .filter_map(|job| {
+            Some(QuotaResume {
+                job_id: job.job_id.clone(),
+                target: job.target.clone()?,
+                run_id: job.run_id.clone()?,
+            })
+        })
+        .collect()
+}
+
+/// Record that a quota-paused run was resumed. The successor continues from the failed run's
+/// latest checkpoint, so the executing node is retried instead of the graph restarting.
+pub(crate) fn settle_quota_resumed(
+    jobs: &mut [Job],
+    resume: &QuotaResume,
+    successor_run_id: &str,
+    now_ms: u64,
+) -> Option<Value> {
+    let job = jobs.iter_mut().find(|job| {
+        job.job_id == resume.job_id
+            && job.state == JobState::WaitingQuota
+            && job.run_id.as_deref() == Some(resume.run_id.as_str())
+    })?;
+    job.state = JobState::Running;
+    job.run_id = Some(successor_run_id.to_owned());
+    job.dispatched_at_ms = Some(now_ms);
+    job.last_cursor = None;
+    job.last_cursor_at_ms = None;
+    job.target_last_ok_at_ms = Some(now_ms);
+    job.finished_at_ms = None;
+    job.failure_reason = None;
+    job.failure_classification = None;
+    job.reaper = None;
+    job.error = None;
+    Some(json!({
+        "jobId": job.job_id,
+        "target": job.target,
+        "runId": successor_run_id,
+        "resumedFrom": resume.run_id,
+    }))
+}
+
+/// Keep a quota-paused job waiting when its resume could not be submitted. The pause is extended
+/// with the next bounded backoff; a transport problem never turns the job into a failure.
+pub(crate) fn reschedule_quota_wait(
+    jobs: &mut [Job],
+    resume: &QuotaResume,
+    error: &str,
+    now_ms: u64,
+) {
+    let Some(job) = jobs.iter_mut().find(|job| {
+        job.job_id == resume.job_id
+            && job.state == JobState::WaitingQuota
+            && job.run_id.as_deref() == Some(resume.run_id.as_str())
+    }) else {
+        return;
+    };
+    let attempts = job.quota_attempts.saturating_add(1);
+    job.quota_attempts = attempts;
+    let limit = job
+        .quota
+        .as_ref()
+        .map_or_else(|| "provider".to_owned(), |quota| quota.limit.clone());
+    let until_ms = now_ms.saturating_add(quota::backoff_ms(attempts, &job.job_id));
+    job.quota = Some(QuotaWait {
+        limit: limit.clone(),
+        retry_at_ms: until_ms,
+        attempts,
+    });
+    job.error = Some(JobError::new(
+        JobErrorKind::ProviderQuota,
+        format!(
+            "provider quota {limit} is exhausted; resuming the held node failed ({error}); retrying at {}",
+            super::clock::rfc3339(until_ms)
+        ),
+    ));
 }
 
 /// Copy discovery results from `discovered` into the members of the same name.
@@ -813,11 +968,40 @@ pub(crate) fn merge_capabilities(members: &mut [Member], discovered: &[Member]) 
 /// Choose a member for each due job that fits now, highest priority first. Chosen jobs are
 /// marked running on their member without a run, so no other pass or request places them
 /// again while their submission is in flight.
+#[cfg(test)]
 pub(crate) fn choose(
     state: &mut HubState,
     now_ms: u64,
     loads: &mut BTreeMap<String, Load>,
 ) -> Vec<(String, String)> {
+    choose_with_quota(state, now_ms, loads, None)
+}
+
+/// Like [`choose`], with a provider-exhaustion refusal supplied by the owning hub service.
+pub(crate) fn choose_with_quota(
+    state: &mut HubState,
+    now_ms: u64,
+    loads: &mut BTreeMap<String, Load>,
+    quota_refusal: Option<&str>,
+) -> Vec<(String, String)> {
+    // A provider exhaustion owned by the hub blocks new placements until its retry time.
+    // Queued jobs stay parked and their `waiting` field says why; no target is asked to start
+    // work that the gateway would refuse.
+    if let Some(refusal) = quota_refusal {
+        for index in due_jobs(&state.jobs, now_ms) {
+            state.jobs[index].pool_wait = Some(refusal.to_owned());
+        }
+        return Vec::new();
+    }
+    for index in due_jobs(&state.jobs, now_ms) {
+        if state.jobs[index]
+            .pool_wait
+            .as_deref()
+            .is_some_and(|waiting| waiting.starts_with("provider quota"))
+        {
+            state.jobs[index].pool_wait = None;
+        }
+    }
     let mut chosen = Vec::new();
     for index in due_jobs(&state.jobs, now_ms) {
         let job = &state.jobs[index];
@@ -1106,6 +1290,21 @@ pub(crate) async fn tick(state: &mut HubState, driver: &dyn HubDriver, now_ms: u
     };
     let results = poll(polls(state), driver).await;
     report.finished = apply_polls(state, results, now_ms);
+    for resume in due_quota_waits(state, now_ms) {
+        match driver.resume(&resume.target, &resume.run_id).await {
+            Ok(successor) => {
+                if let Some(record) =
+                    settle_quota_resumed(&mut state.jobs, &resume, &successor, now_ms)
+                {
+                    report.resumed.push(record);
+                }
+            }
+            Err(error) => {
+                reschedule_quota_wait(&mut state.jobs, &resume, &error.to_string(), now_ms);
+            }
+        }
+    }
+    pool::sync_quota_holds(state);
     // Probe every member on every pass, so a placed job's member is observed even when no
     // queued job needs placement. Health failures accumulate across passes.
     let members = state.members.iter().collect::<Vec<_>>();
@@ -1114,6 +1313,7 @@ pub(crate) async fn tick(state: &mut HubState, driver: &dyn HubDriver, now_ms: u
     let (lost, withheld) = confirm_lost_by_probe(lost_targets(state), &loads);
     note_withheld(&mut state.jobs, &withheld);
     report.target_lost = settle_lost_targets(&mut state.jobs, now_ms, &lost);
+    pool::sync_quota_holds(state);
     for (job_id, member) in placing(state) {
         if let Some(job) = state.jobs.iter_mut().find(|job| job.job_id == job_id) {
             let dispatched =

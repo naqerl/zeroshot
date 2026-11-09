@@ -97,6 +97,8 @@ pub(crate) fn new_job(spec: &HubJobSpec, now_ms: u64) -> Result<Job, HubError> {
         archive_skipped: None,
         graph_hash: None,
         pool_wait: None,
+        quota: None,
+        quota_attempts: 0,
     })
 }
 
