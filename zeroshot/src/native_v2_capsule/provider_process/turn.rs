@@ -54,10 +54,12 @@ impl ActivityTracker {
     }
 
     pub(crate) fn finish(&mut self, id: Option<&str>) {
+        // Only one call is tracked, so a provider that omits the id on one side of the pair
+        // must still be able to end it.
         if self
             .active
             .as_ref()
-            .is_some_and(|active| active.id.as_deref() == id)
+            .is_some_and(|active| active.id.as_deref() == id || active.id.is_none() || id.is_none())
         {
             self.active = None;
         }

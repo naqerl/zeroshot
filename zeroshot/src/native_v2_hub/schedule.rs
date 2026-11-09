@@ -661,24 +661,27 @@ pub(crate) fn record_cursor(job: &mut Job, status: &Value, now_ms: u64) {
     }
     if let Some((reported_at_ms, activity)) = status_activity(status) {
         // Order by the producer timestamp so a repeated poll is not new evidence, but keep the
-        // stall clock on this hub's clock so target clock skew cannot extend the window.
-        if job
-            .last_activity_reported_at_ms
-            .is_none_or(|current| reported_at_ms > current)
-        {
-            job.last_activity_reported_at_ms = Some(reported_at_ms);
+        // stall clock on this hub's clock so target clock skew cannot extend the window. Older
+        // status documents carry no timestamp, so a changed activity is then the only evidence.
+        let new_evidence = match (reported_at_ms, job.last_activity_reported_at_ms) {
+            (Some(reported), Some(current)) => reported > current,
+            (Some(_), None) => true,
+            (None, _) => job.last_activity.as_ref() != Some(&activity),
+        };
+        if new_evidence {
+            job.last_activity_reported_at_ms = reported_at_ms.or(job.last_activity_reported_at_ms);
             job.last_activity_at_ms = Some(now_ms);
             job.last_activity = Some(activity);
         }
     }
 }
 
-fn status_activity(status: &Value) -> Option<(u64, JobActivity)> {
+fn status_activity(status: &Value) -> Option<(Option<u64>, JobActivity)> {
     let activity = status
         .pointer("/status/activity")
         .or_else(|| status.get("activity"))?;
     Some((
-        activity.get("timestamp").and_then(Value::as_u64)?,
+        activity.get("timestamp").and_then(Value::as_u64),
         JobActivity {
             node: activity.get("node").and_then(Value::as_str)?.to_owned(),
             command: activity.get("command").and_then(Value::as_str)?.to_owned(),

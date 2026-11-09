@@ -282,3 +282,32 @@ fn activity_tracker_coalesces_heartbeats_for_one_tool_call() {
         .assert_value_with("the next call has its own delayed heartbeat");
     assert_eq!(next.command, "git status");
 }
+
+#[test]
+fn activity_finish_accepts_a_missing_id_on_either_side() {
+    let mut tracker = ActivityTracker::default();
+    let now = Instant::now();
+    tracker.start(None, "cargo test");
+    assert!(tracker.heartbeat(now).is_some());
+    tracker.finish(Some("call-1"));
+    assert!(
+        tracker
+            .heartbeat(now + ACTIVITY_HEARTBEAT_INTERVAL)
+            .is_none(),
+        "a completion that names an id still ends an id-less start"
+    );
+
+    tracker.start(Some("call-2"), "git status");
+    assert!(
+        tracker
+            .heartbeat(now + ACTIVITY_HEARTBEAT_INTERVAL * 2)
+            .is_some()
+    );
+    tracker.finish(None);
+    assert!(
+        tracker
+            .heartbeat(now + ACTIVITY_HEARTBEAT_INTERVAL * 3)
+            .is_none(),
+        "an id-less completion still ends an identified start"
+    );
+}
