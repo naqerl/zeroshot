@@ -1219,6 +1219,8 @@ pub(super) struct FakeDriver {
     pub stop_delay: Option<std::time::Duration>,
     /// Makes every `force-stop` fail.
     pub fail_stops: std::sync::atomic::AtomicBool,
+    /// Makes every `force-stop` answer with a timeout (an uncertain transport failure).
+    pub unanswered_stops: std::sync::atomic::AtomicBool,
     /// Status reads that answer with a provider quota failure before normal status: run ID to the
     /// number of remaining refusals.
     pub quota_failures: Mutex<BTreeMap<String, usize>>,
@@ -1373,6 +1375,14 @@ impl HubDriver for FakeDriver {
             .lock()
             .expect("fake lock")
             .push((member.to_owned(), run_id.to_owned()));
+        if self
+            .unanswered_stops
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(HubError::Unanswered(
+                "zeroshot force-stop timed out".to_owned(),
+            ));
+        }
         if self.fail_stops.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(HubError::Target {
                 message: "stop refused".to_owned(),
@@ -2333,3 +2343,205 @@ fn placement_is_refused_while_the_provider_quota_is_exhausted() {
 
 #[path = "tests/hetzner.rs"]
 mod hetzner;
+
+#[tokio::test]
+async fn stopping_a_run_whose_member_is_absent_settles_runtime_lost() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let driver = std::sync::Arc::new(FakeDriver::default());
+    let service = super::service::HubService::open(
+        super::store::HubStore::new(directory.path().join("hub")),
+        driver.clone(),
+        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
+    )
+    .expect("service");
+    let now = super::clock::now_ms();
+    let mut running = job("hj_corpse", 0);
+    running.state = JobState::Running;
+    running.target = Some("zs-gone".to_owned());
+    running.run_id = Some("run-corpse".to_owned());
+    running.dispatched_at_ms = Some(now.saturating_sub(60_000));
+    running.target_last_ok_at_ms = Some(now.saturating_sub(30_000));
+    service
+        .mutate(|state| {
+            state.jobs.push(running);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+
+    let stopped = service.stop("hj_corpse").await.expect("stop settles");
+    assert_eq!(stopped["job"]["state"], json!("failed"));
+    assert_eq!(stopped["job"]["failureReason"], json!("runtime_lost"));
+    let settled = service.snapshot().await.jobs.remove(0);
+    assert_eq!(settled.state, JobState::Failed);
+    assert_eq!(settled.failure_reason.as_deref(), Some("runtime_lost"));
+    assert_eq!(
+        settled.failure_classification.as_deref(),
+        Some(super::schedule::CLASSIFIED_STOP_UNREACHABLE)
+    );
+    let error = settled.error.expect("runtime-lost error");
+    assert_eq!(error.kind, JobErrorKind::RuntimeLost);
+    assert!(error.message.contains("zs-gone"), "{}", error.message);
+    assert!(error.message.contains("run-corpse"), "{}", error.message);
+    assert!(
+        error.message.contains("no longer a hub member"),
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("last successful probe"),
+        "{}",
+        error.message
+    );
+    assert!(
+        driver.stops.lock().expect("fake lock").is_empty(),
+        "an absent member is settled without asking it to stop"
+    );
+}
+
+#[tokio::test]
+async fn stopping_a_run_on_a_slow_member_keeps_it_running() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let driver = std::sync::Arc::new(FakeDriver {
+        unanswered_stops: std::sync::atomic::AtomicBool::new(true),
+        ..FakeDriver::default()
+    });
+    let service = super::service::HubService::open(
+        super::store::HubStore::new(directory.path().join("hub")),
+        driver.clone(),
+        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
+    )
+    .expect("service");
+    let now = super::clock::now_ms();
+    let mut running = job("hj_slow", 0);
+    running.state = JobState::Running;
+    running.target = Some("box".to_owned());
+    running.run_id = Some("run-slow".to_owned());
+    running.dispatched_at_ms = Some(now.saturating_sub(5_000));
+    running.target_last_ok_at_ms = Some(now.saturating_sub(1_000));
+    let mut boxed = member("box", &[], 1, 0);
+    boxed.last_probe_ok_at_ms = Some(now.saturating_sub(1_000));
+    service
+        .mutate(|state| {
+            state.members.push(boxed);
+            state.jobs.push(running);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+
+    let error = service.stop("hj_slow").await.expect_err("stop fails");
+    assert!(
+        matches!(error, HubError::Unanswered(_)),
+        "a timeout keeps the same answer the target gave: {error:?}"
+    );
+    let state = service.snapshot().await;
+    assert_eq!(state.jobs[0].state, JobState::Running);
+    assert_eq!(state.jobs[0].failure_reason, None);
+    assert_eq!(state.jobs[0].finished_at_ms, None);
+    assert_eq!(driver.stops.lock().expect("fake lock").len(), 1);
+}
+
+#[tokio::test]
+async fn a_second_stop_on_a_settled_job_keeps_its_finished_time() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let driver = std::sync::Arc::new(FakeDriver::default());
+    let service = super::service::HubService::open(
+        super::store::HubStore::new(directory.path().join("hub")),
+        driver,
+        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
+    )
+    .expect("service");
+    let mut running = job("hj_settled", 0);
+    running.state = JobState::Running;
+    running.target = Some("zs-gone".to_owned());
+    running.run_id = Some("run-settled".to_owned());
+    service
+        .mutate(|state| {
+            state.jobs.push(running);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+
+    let first = service.stop("hj_settled").await.expect("first stop");
+    let finished_at = first["job"]["finishedAt"].clone();
+    assert!(finished_at.is_string(), "{first}");
+    let second = service.stop("hj_settled").await.expect("second stop");
+    assert_eq!(second["job"]["state"], json!("failed"));
+    assert_eq!(second["job"]["finishedAt"], finished_at);
+    assert_eq!(
+        second["job"]["failureReason"],
+        first["job"]["failureReason"]
+    );
+}
+
+#[tokio::test]
+async fn an_inconclusive_member_past_the_stall_limit_settles_runtime_lost() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let driver = std::sync::Arc::new(FakeDriver {
+        inconclusive: vec!["slow".to_owned()],
+        ..FakeDriver::default()
+    });
+    let service = super::service::HubService::open(
+        super::store::HubStore::new(directory.path().join("hub")),
+        driver,
+        crate::native_v2_target::FileTargetRegistry::new(directory.path().join("targets.json")),
+    )
+    .expect("service")
+    .with_max_stall(Some(100));
+    let now = super::clock::now_ms();
+    let mut running = job("hj_unobservable", 0);
+    running.state = JobState::Running;
+    running.target = Some("slow".to_owned());
+    running.run_id = Some("run-unobservable".to_owned());
+    running.dispatched_at_ms = Some(now.saturating_sub(5_000));
+    running.target_last_ok_at_ms = Some(now.saturating_sub(5_000));
+    running.last_cursor = Some("run-unobservable-cursor".to_owned());
+    // Keep the stall clock fresh: this test is about the inconclusive probe, not a silent run.
+    running.last_cursor_at_ms = Some(now.saturating_sub(10));
+    let mut slow = member("slow", &[], 1, 0);
+    slow.last_probe_ok_at_ms = Some(now.saturating_sub(5_000));
+    slow.unreachable_probes = UNREACHABLE_REAP_THRESHOLD;
+    service
+        .mutate(|state| {
+            state.members.push(slow);
+            state.jobs.push(running);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+
+    let (report, view) = service.pass().await.expect("pass");
+    assert_eq!(report.runtime_lost.len(), 1, "{report:?}");
+    assert_eq!(view["runtimeLost"], json!(report.runtime_lost));
+    let settled = service.snapshot().await.jobs.remove(0);
+    assert_eq!(settled.state, JobState::Failed);
+    assert_eq!(settled.failure_reason.as_deref(), Some("runtime_lost"));
+    assert_eq!(
+        settled.failure_classification.as_deref(),
+        Some(super::schedule::CLASSIFIED_INCONCLUSIVE)
+    );
+    let error = settled.error.expect("runtime-lost error");
+    assert_eq!(error.kind, JobErrorKind::RuntimeLost);
+    assert!(
+        error.message.contains("stayed inconclusive for "),
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("stall limit 100ms from hub default"),
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("probe 3x failed"),
+        "the reaper reason is in the diagnostic: {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("last successful probe"),
+        "{}",
+        error.message
+    );
+}

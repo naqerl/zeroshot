@@ -133,6 +133,10 @@ pub(crate) struct Member {
     /// When a load probe last succeeded, in Unix epoch milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_probe_ok_at_ms: Option<u64>,
+    /// When this member's probes first became inconclusive without a later success, in Unix
+    /// epoch milliseconds. A reachable or decisive failure clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inconclusive_since_ms: Option<u64>,
 }
 
 impl Member {
@@ -158,6 +162,7 @@ impl Member {
             data: None,
             unreachable_probes: 0,
             last_probe_ok_at_ms: None,
+            inconclusive_since_ms: None,
         }
     }
 
@@ -367,6 +372,11 @@ pub(crate) enum JobErrorKind {
     /// the hub confirmed the loss with the provider or a direct TCP refusal, so the hub cannot
     /// observe or stop its run.
     TargetLost,
+    /// The run's runtime no longer exists, so the job can never get a verdict: its member was
+    /// deleted with its pool lease, `stop` found the target gone, or its member answered only
+    /// inconclusive probes past the job's stall limit. Distinct from [`Self::TargetLost`]: this
+    /// records that the runtime itself is gone rather than an observation lost before a verdict.
+    RuntimeLost,
     /// The model gateway refused a call because its quota is exhausted. This is a wait, not a
     /// failure: the job holds its machine and resumes the same node after `retryAt`.
     ProviderQuota,
@@ -391,6 +401,7 @@ impl<'de> Deserialize<'de> for JobErrorKind {
             "pool_wait_timeout" => Self::PoolWaitTimeout,
             "stalled" => Self::Stalled,
             "target_lost" => Self::TargetLost,
+            "runtime_lost" => Self::RuntimeLost,
             "provider_quota" => Self::ProviderQuota,
             _ => Self::Unclassified,
         })

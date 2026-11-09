@@ -904,7 +904,12 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   `hub stop` deliberately stops a queued or running job as the terminal non-failing `stopped`
   state and holds its pool lease (`Lease.hold`), which suppresses only the idle teardown until a
   new placement or `hub pool release` clears it; `--max-stall` still fails a stalled job and tears
-  its lease down. Jobs placing when a daemon stops stay on their member as unconfirmed. A
+  its lease down. `hub stop` is idempotent and finalises a run whose member, lease, registration,
+  or post-placement probe proves the target gone as failed `runtime_lost` (error kind
+  `runtime_lost`), distinct from `target_lost`; a timeout with a currently probed member still
+  returns the target error. A lease deletion, or a member left inconclusive past the job's stall
+  limit, settles its jobs `runtime_lost` in the same pass. Jobs placing when a daemon stops stay
+  on their member as unconfirmed. A
   provider quota refusal in a failed run's bounded failure context is classified as
   `JobErrorKind::ProviderQuota`, naming the exhausted limit and any provider `retryAt`. The job
   enters nonterminal `waiting_quota`, holds its pool lease through an automatic quota hold that is

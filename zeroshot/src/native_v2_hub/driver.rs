@@ -3,7 +3,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::process::Command;
 use zeroshot_engine::native_v2_cli::{ERROR_FORMAT_ENV, JSON_ERROR_FORMAT};
 
@@ -11,7 +11,7 @@ use openengine_cluster_protocol::TARGET_DISCOVERY_PATH;
 
 use super::error::HubError;
 use super::model::{Job, LOCAL_MEMBER};
-use crate::native_v2_target::{FileTargetRegistry, TargetRegistry};
+use crate::native_v2_target::{FileTargetRegistry, TargetConnectorError, TargetRegistry};
 
 /// One placement attempt of a job on a member.
 pub(crate) struct SubmitRequest<'a> {
@@ -242,9 +242,30 @@ impl HubDriver for ProcessDriver {
     }
 
     async fn stop(&self, member: &str, run_id: &str) -> Result<(), HubError> {
-        self.call(force_stop_arguments(member, run_id), None)
-            .await?;
-        Ok(())
+        match self.call(force_stop_arguments(member, run_id), None).await {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                // The run cannot be stopped because its target is no longer registered. Mark
+                // that as structured proof rather than leaving the caller to match the text.
+                // The local controller is not a registered target and keeps its own errors.
+                if member != LOCAL_MEMBER
+                    && matches!(
+                        self.registry.get(member),
+                        Err(TargetConnectorError::NotFound(_))
+                    )
+                {
+                    return Err(HubError::Target {
+                        message: format!("target {member:?} not found: {error}"),
+                        diagnostic: Some(json!({
+                            "kind": "target",
+                            "code": "target.not_found",
+                            "message": format!("target {member:?} not found"),
+                        })),
+                    });
+                }
+                Err(error)
+            }
+        }
     }
 
     async fn resume(&self, member: &str, run_id: &str) -> Result<String, HubError> {
