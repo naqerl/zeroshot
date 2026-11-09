@@ -46,6 +46,7 @@ fn running_status() -> RunStatus {
             active("opaque-verifier-a", "verify-a"),
             active("opaque-verifier-b", "verify-b"),
         ],
+        activity: None,
     }
 }
 
@@ -301,6 +302,7 @@ fn force_is_the_only_stop_shape_and_returns_durable_status() {
         at_cursor: Cursor::new("v2:10"),
         status: RunStatus::Stopping {
             active_executions: vec![active("opaque-verifier-b", "verify-b")],
+            activity: None,
         },
         workspace_recovery: Default::default(),
     };

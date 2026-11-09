@@ -1,6 +1,9 @@
+use std::time::Instant;
+
 use serde_json::Value;
 
 use crate::native_v2_capsule::provider_json_lines::{ProviderJsonLine, ProviderJsonLines};
+use crate::native_v2_capsule::provider_process::turn::{ActivityTracker, ProviderActivity};
 use crate::native_v2_contract::{TokenUsageDelta, parse_token_usage_delta};
 use crate::native_v2_runner::{LiveOutputStream, NodeRunnerError};
 
@@ -32,6 +35,7 @@ pub(super) struct CodexOutput {
 pub(super) struct CodexOutputDecoder {
     lines: ProviderJsonLines,
     output: CodexOutput,
+    activity: ActivityTracker,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,7 +62,12 @@ impl CodexOutputDecoder {
         Self {
             lines: ProviderJsonLines::new(),
             output: CodexOutput::empty(),
+            activity: ActivityTracker::default(),
         }
+    }
+
+    pub(super) fn activity(&mut self, now: Instant) -> Option<ProviderActivity> {
+        self.activity.heartbeat(now)
     }
 
     pub(super) fn push(&mut self, bytes: &[u8]) -> Vec<CodexEmission> {
@@ -97,22 +106,76 @@ impl CodexOutputDecoder {
                 self.output.oversized_records = self.output.oversized_records.saturating_add(1);
                 None
             }
-            ProviderJsonLine::Record(line) => match self.output.accept_bytes(&line) {
-                AcceptedLine::Emission(emission) => Some(emission),
-                AcceptedLine::Ignored => None,
-                AcceptedLine::Malformed => {
-                    self.output.malformed_records = self.output.malformed_records.saturating_add(1);
-                    None
-                }
-                AcceptedLine::ThreadFailure(detail) => {
-                    if self.output.thread_failure.is_none() {
-                        self.output.thread_failure = Some(detail);
+            ProviderJsonLine::Record(line) => {
+                self.observe_activity(&line);
+                match self.output.accept_bytes(&line) {
+                    AcceptedLine::Emission(emission) => Some(emission),
+                    AcceptedLine::Ignored => None,
+                    AcceptedLine::Malformed => {
+                        self.output.malformed_records =
+                            self.output.malformed_records.saturating_add(1);
+                        None
                     }
-                    None
+                    AcceptedLine::ThreadFailure(detail) => {
+                        if self.output.thread_failure.is_none() {
+                            self.output.thread_failure = Some(detail);
+                        }
+                        None
+                    }
                 }
-            },
+            }
         }
     }
+
+    fn observe_activity(&mut self, line: &[u8]) {
+        let Ok(event) = serde_json::from_slice::<Value>(line) else {
+            return;
+        };
+        let Some(event_type) = event.get("type").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(item) = event.get("item") else {
+            return;
+        };
+        let Some(item_type) = item.get("type").and_then(Value::as_str) else {
+            return;
+        };
+        let id = item.get("id").and_then(Value::as_str);
+        match event_type {
+            "item.started" => {
+                if is_activity_item(item_type) {
+                    self.activity
+                        .start(id, &codex_activity_command(item, item_type));
+                }
+            }
+            "item.completed" if is_activity_item(item_type) => {
+                self.activity.finish(id);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn is_activity_item(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "command_execution" | "mcp_tool_call" | "file_change" | "web_search"
+    )
+}
+
+fn codex_activity_command(item: &Value, item_type: &str) -> String {
+    if let Some(command) = item.get("command").and_then(Value::as_str) {
+        return command.to_owned();
+    }
+    if item_type == "mcp_tool_call" {
+        let server = item.get("server").and_then(Value::as_str).unwrap_or("mcp");
+        let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
+        return format!("{server}.{tool}");
+    }
+    if let Some(query) = item.get("query").and_then(Value::as_str) {
+        return format!("{item_type} {query}");
+    }
+    item_type.to_owned()
 }
 
 impl CodexOutput {

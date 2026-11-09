@@ -11,7 +11,7 @@ use std::fmt;
 use async_trait::async_trait;
 use openengine_cluster_protocol::{
     Cursor, FailureContext, FailureDiagnosticKind, IdempotencyKey, Phase, PositiveInteger, RunId,
-    RunSize, RunTitle, Sha256Digest, ResolvedSource, TerminalResult, TokenUsage,
+    RunActivity, RunSize, RunTitle, Sha256Digest, ResolvedSource, TerminalResult, TokenUsage,
     UnixTimestampMillis, WorkerOutcome,
 };
 use serde::de;
@@ -39,6 +39,8 @@ pub const MAX_EVENT_BYTES: usize = 1024 * 1024;
 /// A prerequisite combines two independently bounded source events plus a small envelope.
 pub const MAX_PRIOR_EXECUTION_BYTES: usize = 2 * MAX_EVENT_BYTES + 1024;
 pub const MAX_SAFE_LOG_BYTES: usize = 16 * 1024;
+/// A heartbeat command is a single short line: enough to name the tool call, never a payload.
+pub const MAX_ACTIVITY_COMMAND_BYTES: usize = 120;
 /// Bounds one replay read independently of the size of retained history.
 pub const MAX_REPLAY_EVENTS: usize = 256;
 // Every accepted event must fit in an otherwise empty replay page.
@@ -120,6 +122,9 @@ pub struct RunSnapshot {
     pub token_usage: Option<TokenUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_context: Option<Box<FailureContext>>,
+    /// Newest in-flight tool/exec heartbeat, separate from cursor history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<RunActivity>,
 }
 
 impl RunSnapshot {
@@ -164,6 +169,7 @@ impl RunSnapshot {
             terminal: None,
             token_usage: None,
             failure_context: None,
+            last_activity: None,
         }
     }
 
@@ -254,6 +260,14 @@ pub enum RunEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diagnostic: Option<FailureDiagnosticKind>,
     },
+    /// A tool or exec is still running. It advances the durable cursor but is not public status
+    /// chatter: observers use it only to distinguish a long command from a silent run.
+    Activity {
+        reference: ExecutionRef,
+        command: ActivityCommand,
+        elapsed_ms: u64,
+        timestamp: UnixTimestampMillis,
+    },
     TokenUsageObserved {
         execution: ExecutionId,
         usage: Option<TokenUsageDelta>,
@@ -281,6 +295,67 @@ pub enum SafeLogStream {
     Output,
     Error,
     System,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct ActivityCommand(Box<str>);
+
+impl ActivityCommand {
+    pub fn new(value: impl Into<String>) -> Result<Self, RunLedgerError> {
+        let value = value.into();
+        match (
+            value.len() <= MAX_ACTIVITY_COMMAND_BYTES,
+            value.contains(['\0', '\n', '\r']),
+        ) {
+            (false, _) => Err(RunLedgerError::ActivityCommandTooLarge),
+            (_, true) => Err(RunLedgerError::InvalidActivityCommand),
+            (true, false) => Ok(Self(value.into_boxed_str())),
+        }
+    }
+
+    /// Producer-side safe form: collapse whitespace and keep at most the byte bound on a UTF-8
+    /// boundary, so a command name can never fail a heartbeat or grow a durable record.
+    #[must_use]
+    pub fn truncated(value: &str) -> Self {
+        let mut text = String::new();
+        let mut pending_space = false;
+        for character in value.chars() {
+            if character.is_whitespace() || character.is_control() {
+                pending_space = !text.is_empty();
+                continue;
+            }
+            if pending_space {
+                text.push(' ');
+                pending_space = false;
+            }
+            text.push(character);
+        }
+        let mut end = text.len().min(MAX_ACTIVITY_COMMAND_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        Self(text.into_boxed_str())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ActivityCommand {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match Self::new(value) {
+            Ok(line) => Ok(line),
+            Err(error) => Err(de::Error::custom(error)),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -394,6 +469,10 @@ pub enum RunLedgerError {
     SafeLogTooLarge,
     #[error("safe log line contains an invalid NUL byte")]
     InvalidSafeLog,
+    #[error("activity command exceeds the storage bound")]
+    ActivityCommandTooLarge,
+    #[error("activity command contains an invalid control character")]
+    InvalidActivityCommand,
     #[error("invalid run event: {0}")]
     InvalidEvent(&'static str),
     #[error("run ledger storage is unavailable")]

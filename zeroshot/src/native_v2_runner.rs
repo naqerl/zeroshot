@@ -23,6 +23,7 @@ use crate::native_v2_contract::{
     AdmittedRun, EnvironmentVariableName, ExecutionRef, NodeCompletion, NodeInvocation,
     NodeRuntimeBinding, TokenUsageDelta,
 };
+use crate::v2_run_ledger::ActivityCommand;
 
 const LIVE_OUTPUT_CAPACITY: usize = 256;
 pub(crate) const MAX_LIVE_OUTPUT_BYTES: usize = 16 * 1024;
@@ -43,7 +44,7 @@ pub(crate) use response::{
     AgentResponse, AgentResponseState, render_agent_prompt_with_schema, resolve_agent_response,
     resolve_agent_response_with_dialect, resolve_agent_response_with_schema,
 };
-pub(crate) use remote::{RemoteNodeHandleBridge, remote_node_handle};
+pub(crate) use remote::{RemoteActivity, RemoteNodeHandleBridge, remote_node_handle};
 
 mod plan;
 pub use plan::NodeRole;
@@ -112,6 +113,12 @@ impl LiveOutput {
 pub enum DurableNodeEvent {
     Output {
         output: LiveOutput,
+        timestamp: UnixTimestampMillis,
+    },
+    Activity {
+        reference: ExecutionRef,
+        command: ActivityCommand,
+        elapsed_ms: u64,
         timestamp: UnixTimestampMillis,
     },
     TokenUsage(Option<TokenUsageDelta>),
@@ -198,6 +205,7 @@ pub struct DriverControl {
     cancellation: watch::Receiver<bool>,
     live_output: broadcast::Sender<LiveOutput>,
     durable_output: DurableEventSender,
+    reference: ExecutionRef,
 }
 
 impl DriverControl {
@@ -253,6 +261,22 @@ impl DriverControl {
                 self.cancellation.clone(),
             )
             .await
+    }
+
+    /// Record one in-flight tool/exec heartbeat. The command is already producer-redacted; this
+    /// only enforces its single-line bound so a heartbeat can never fail a turn.
+    pub async fn record_activity(
+        &self,
+        command: &str,
+        elapsed_ms: u64,
+    ) -> Result<(), NodeRunnerError> {
+        self.send_durable(DurableNodeEvent::Activity {
+            reference: self.reference.clone(),
+            command: ActivityCommand::truncated(command),
+            elapsed_ms,
+            timestamp: current_timestamp(),
+        })
+        .await
     }
 
     async fn send_durable(&self, event: DurableNodeEvent) -> Result<(), NodeRunnerError> {
@@ -517,6 +541,7 @@ async fn execute(
         cancellation: task.cancellation.clone(),
         live_output: task.output,
         durable_output: task.durable_output,
+        reference: driver_invocation.node.reference.clone(),
     };
     let driver_result = runtime.driver.run(driver_invocation, control).await;
     match driver_result {

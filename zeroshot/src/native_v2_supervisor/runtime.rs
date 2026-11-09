@@ -296,6 +296,17 @@ pub(super) async fn bridge_durable_events(
                     line: SafeLogLine::new(output.text)?,
                     diagnostic: output.diagnostic,
                 },
+                DurableNodeEvent::Activity {
+                    reference,
+                    command,
+                    elapsed_ms,
+                    timestamp,
+                } => RunEvent::Activity {
+                    reference,
+                    command,
+                    elapsed_ms,
+                    timestamp,
+                },
                 DurableNodeEvent::TokenUsage(usage) => {
                     RunEvent::TokenUsageObserved { execution, usage }
                 }

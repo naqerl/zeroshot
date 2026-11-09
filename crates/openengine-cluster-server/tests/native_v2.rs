@@ -116,6 +116,7 @@ impl ClusterBackend for FakeBackend {
     ) -> Result<RunStatusResult, BackendError> {
         Ok(status(
             RunStatus::Running {
+                activity: None,
                 active_executions: vec![],
             },
             2,
@@ -144,6 +145,7 @@ impl ClusterBackend for FakeBackend {
                     cursor: cursor(3),
                     status: RunStatus::Running {
                         active_executions: vec![],
+                        activity: None,
                     },
                 }),
                 RunSubscriptionItem::Closed {
@@ -158,6 +160,7 @@ impl ClusterBackend for FakeBackend {
                     cursor: cursor(99),
                     status: RunStatus::Running {
                         active_executions: vec![],
+                        activity: None,
                     },
                 }),
             ]),
@@ -227,6 +230,7 @@ impl ClusterBackend for FakeBackend {
         let result = status(
             RunStatus::Stopping {
                 active_executions: vec![],
+                activity: None,
             },
             5,
         );

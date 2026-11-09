@@ -3,7 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
-use openengine_cluster_protocol::{FailureDiagnosticKind, IdempotencyKey, NodeName, RunSize, RunTitle};
+use openengine_cluster_protocol::{
+    FailureDiagnosticKind, IdempotencyKey, NodeName, RunSize, RunTitle, UnixTimestampMillis,
+};
 use openengine_cluster_testkit::assertions::{AssertError, AssertValue};
 use serde_json::{Value, json};
 use super::*;
@@ -654,7 +656,7 @@ async fn schema_permissions_usage_and_resume_preserve_the_session() {
         .iter()
         .filter_map(|event| match event {
             DurableNodeEvent::Output { output, .. } => Some(output.text.as_str()),
-            DurableNodeEvent::TokenUsage(_) => None,
+            DurableNodeEvent::Activity { .. } | DurableNodeEvent::TokenUsage(_) => None,
         })
         .collect::<Vec<_>>();
     assert!(logs.contains(&"Copilot tool: contract-check"));
@@ -987,6 +989,45 @@ async fn cancellation_preserves_usage_and_reaps_the_runtime() {
     let mut output = handle.take_initial_output().assert_value();
     let usage = output.recv_usage().await.assert_value().assert_value();
     assert_eq!(usage.input_tokens.get(), 7);
+    handle.cancel();
+    let completion = tokio::time::timeout(Duration::from_secs(10), handle.completion())
+        .await
+        .assert_value();
+    assert_eq!(completion, Err(NodeRunnerError::Cancelled));
+}
+
+#[tokio::test]
+async fn an_in_flight_copilot_tool_records_activity_without_public_status_chatter() {
+    let fixture = Fixture::new("cancel").await;
+    let mut handle = fixture.start(1).await;
+    let reference = handle.reference().clone();
+    let mut output = handle.take_initial_output().assert_value();
+    let (observed, command) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match output.recv().await.assert_value() {
+                DurableNodeEvent::Activity {
+                    reference, command, ..
+                } => break (reference, command),
+                DurableNodeEvent::Output { .. } | DurableNodeEvent::TokenUsage(_) => {}
+            }
+        }
+    })
+    .await
+    .assert_value_with("an in-flight Copilot tool must produce a heartbeat");
+    assert_eq!(observed, reference);
+    assert_eq!(command.as_str(), "ready");
+
+    let heartbeat = crate::v2_run_ledger::RunEvent::Activity {
+        reference: reference.clone(),
+        command: crate::v2_run_ledger::ActivityCommand::truncated(command.as_str()),
+        elapsed_ms: 0,
+        timestamp: UnixTimestampMillis::new(1).assert_value(),
+    };
+    assert!(
+        !crate::native_v2_observability::changes_public_status(&heartbeat),
+        "heartbeats must not add public hub.run events"
+    );
+
     handle.cancel();
     let completion = tokio::time::timeout(Duration::from_secs(10), handle.completion())
         .await

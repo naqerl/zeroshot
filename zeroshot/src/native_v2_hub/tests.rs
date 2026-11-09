@@ -9,8 +9,8 @@ use super::driver::{HubDriver, SubmitRequest};
 use super::error::{EXIT_NO_CAPACITY, EXIT_NO_ELIGIBLE_TARGET, HubError};
 use super::jobs::{repository_name, runtime_models};
 use super::model::{
-    HubState, Job, JobError, JobErrorKind, JobState, Member, MemberState, PlacementSpec,
-    Requirements, Strategy,
+    HubState, Job, JobActivity, JobError, JobErrorKind, JobState, Member, MemberState,
+    PlacementSpec, Requirements, Strategy,
 };
 use super::pool::{Lease, LeasePhase};
 use super::usage::{JobUsage, Tokens, reported};
@@ -95,6 +95,9 @@ pub(super) fn job(id: &str, submitted_at_ms: u64) -> Job {
         dispatched_at_ms: None,
         last_cursor: None,
         last_cursor_at_ms: None,
+        last_activity_at_ms: None,
+        last_activity_reported_at_ms: None,
+        last_activity: None,
         target_last_ok_at_ms: None,
         reaper: None,
         finished_at_ms: None,
@@ -342,6 +345,112 @@ async fn a_stalled_run_is_stopped_and_failed_with_its_cursor_and_still_time() {
     assert_eq!(
         driver.stops.lock().expect("fake lock").as_slice(),
         [("box".to_owned(), "run-stalled".to_owned())]
+    );
+}
+
+#[test]
+fn a_fresh_activity_heartbeat_keeps_a_long_tool_call_alive() {
+    let mut running = job("hj_active", 0);
+    running.state = JobState::Running;
+    running.target = Some("box".to_owned());
+    running.run_id = Some("run-active".to_owned());
+    running.last_cursor = Some("v2:5".to_owned());
+    running.last_cursor_at_ms = Some(0);
+    running.last_activity_at_ms = Some(90);
+    running.last_activity = Some(JobActivity {
+        node: "worker".to_owned(),
+        command: "cargo check --workspace --all-targets".to_owned(),
+        elapsed_ms: 90_000,
+    });
+    let limit = |job: &Job| super::schedule::StallLimit::for_job(job, Some(100));
+    assert!(
+        super::schedule::stalled_runs(std::slice::from_ref(&running), 150, limit).is_empty(),
+        "a still-running tool is activity even while the cursor is unchanged"
+    );
+}
+
+#[test]
+fn an_older_activity_heartbeat_still_stalls_and_names_the_last_command() {
+    let mut running = job("hj_stale_activity", 0);
+    running.state = JobState::Running;
+    running.target = Some("box".to_owned());
+    running.run_id = Some("run-stale-activity".to_owned());
+    running.last_cursor = Some("v2:5".to_owned());
+    running.last_cursor_at_ms = Some(0);
+    running.last_activity_at_ms = Some(20);
+    running.last_activity = Some(JobActivity {
+        node: "worker".to_owned(),
+        command: "cargo check --workspace --all-targets".to_owned(),
+        elapsed_ms: 90_000,
+    });
+    let limit = |job: &Job| super::schedule::StallLimit::for_job(job, Some(100));
+    let stalled = super::schedule::stalled_runs(std::slice::from_ref(&running), 150, limit);
+    assert_eq!(stalled.len(), 1);
+    assert_eq!(
+        stalled[0].still_ms, 130,
+        "the newest activity sets the clock"
+    );
+    assert_eq!(stalled[0].activity, running.last_activity);
+    let mut jobs = [job("hj_stale_activity", 0)];
+    jobs[0] = running;
+    let failed = super::schedule::settle_stalled(
+        &mut jobs,
+        super::schedule::StallSettlement {
+            now_ms: 150,
+            stalled: &stalled,
+            stop_errors: &BTreeMap::new(),
+        },
+    );
+    assert_eq!(failed.len(), 1);
+    let error = jobs[0].error.as_ref().expect("stall error");
+    assert_eq!(error.kind, JobErrorKind::Stalled);
+    assert!(
+        error.message.contains("no activity for 130ms"),
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains(
+            "last activity node 'worker' ran 'cargo check --workspace --all-targets' for 90s"
+        ),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn two_activity_heartbeats_five_seconds_apart_keep_only_the_newest_record() {
+    let mut running = job("hj_coalesced", 0);
+    running.state = JobState::Running;
+    running.target = Some("box".to_owned());
+    running.run_id = Some("run-coalesced".to_owned());
+    running.last_cursor = Some("v2:5".to_owned());
+    running.last_cursor_at_ms = Some(0);
+    let status = |timestamp: u64, elapsed_ms: u64| {
+        json!({
+            "atCursor": "v2:5",
+            "status": {
+                "phase": "running",
+                "activity": {
+                    "node": "worker",
+                    "command": "cargo check --workspace --all-targets",
+                    "elapsedMs": elapsed_ms,
+                    "timestamp": timestamp,
+                },
+            },
+        })
+    };
+    super::schedule::record_cursor(&mut running, &status(1000, 5000), 10_000);
+    super::schedule::record_cursor(&mut running, &status(6000, 10_000), 15_000);
+    assert_eq!(running.last_activity_at_ms, Some(15_000));
+    assert_eq!(running.last_activity_reported_at_ms, Some(6000));
+    assert_eq!(
+        running
+            .last_activity
+            .as_ref()
+            .map(|activity| activity.elapsed_ms),
+        Some(10_000),
+        "the newest heartbeat replaces the earlier one; there is no event list to grow"
     );
 }
 

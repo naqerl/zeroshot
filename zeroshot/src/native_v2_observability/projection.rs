@@ -32,9 +32,11 @@ pub(super) fn status_from_snapshot(
         RunPhase::Admitted => Ok(RunStatus::Admitted {}),
         RunPhase::Running => Ok(RunStatus::Running {
             active_executions: active_executions()?,
+            activity: snapshot.last_activity.clone(),
         }),
         RunPhase::Stopping => Ok(RunStatus::Stopping {
             active_executions: active_executions()?,
+            activity: snapshot.last_activity.clone(),
         }),
         RunPhase::Finished => Ok(RunStatus::Finished {
             terminal_result: snapshot
@@ -48,10 +50,11 @@ pub(super) fn status_from_snapshot(
     }
 }
 
-pub(super) fn changes_public_status(event: &RunEvent) -> bool {
+pub(crate) fn changes_public_status(event: &RunEvent) -> bool {
     !matches!(
         event,
         RunEvent::SafeLog { .. }
+            | RunEvent::Activity { .. }
             | RunEvent::TokenUsageObserved { .. }
             | RunEvent::RunTokenUsageObserved { .. }
             | RunEvent::PrimaryGraphCompleted { .. }

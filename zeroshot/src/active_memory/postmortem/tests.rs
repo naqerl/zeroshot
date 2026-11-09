@@ -80,6 +80,13 @@ impl NodeDriver for Driver {
             .lock()
             .assert_value()
             .push((name.clone(), invocation.provider_session_slot.get()));
+        if invocation.provider_session_slot.get() >= AUXILIARY_PROVIDER_SLOT_OFFSET {
+            // Auxiliary roles heartbeat like real agents; the bridge must not project those into
+            // the primary ledger, where their executions were never dispatched.
+            control
+                .record_activity("active-memory-postmortem-tool", 10)
+                .await?;
+        }
         control
             .record_token_usage(Some(TokenUsageDelta {
                 input_tokens: TokenCount::new(1).assert_value(),
@@ -864,6 +871,49 @@ async fn repeated_failed_main_completions_are_eligible_but_malformed_outputs_are
             );
         }
     }
+}
+
+#[tokio::test]
+async fn auxiliary_postmortem_activity_heartbeats_do_not_break_the_roles() {
+    let fixture = self::fixture(Default::default(), None, true).await;
+    fixture.drive().await;
+    let events = fixture
+        .ledger
+        .snapshot_and_tail(&fixture.run_id, None)
+        .await
+        .assert_value()
+        .events;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.event, RunEvent::Activity { .. })),
+        "auxiliary heartbeats must not enter the primary run snapshot"
+    );
+    let lines = events
+        .iter()
+        .filter_map(|event| match &event.event {
+            RunEvent::SafeLog { line, .. } => Some(line.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("Active Memory") && line.ends_with(" completed")),
+        "the postmortem role must complete: {lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("Active Memory") && line.ends_with(" failed")),
+        "no postmortem role may fail on an auxiliary heartbeat: {lines:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.event, RunEvent::RunTokenUsageObserved { .. })),
+        "the role must still record its SafeLog and usage"
+    );
 }
 
 #[tokio::test]

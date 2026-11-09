@@ -306,7 +306,9 @@ async fn bridge(
             Err(AttachReceiveError::Closed) => return Ok(()),
             Err(AttachReceiveError::Lagged) => return Err(PostmortemError::Storage),
         };
-        let event = global_event(role, event)?;
+        let Some(event) = global_event(role, event)? else {
+            continue;
+        };
         request
             .ledger
             .append(&request.run_id, vec![event])
@@ -315,9 +317,12 @@ async fn bridge(
     }
 }
 
-fn global_event(role: Role, event: DurableNodeEvent) -> Result<RunEvent, PostmortemError> {
-    Ok(match event {
+fn global_event(role: Role, event: DurableNodeEvent) -> Result<Option<RunEvent>, PostmortemError> {
+    Ok(Some(match event {
         DurableNodeEvent::TokenUsage(usage) => RunEvent::RunTokenUsageObserved { usage },
+        // Auxiliary executions are never dispatched in the primary ledger, so their liveness
+        // heartbeats have no valid run snapshot projection to advance.
+        DurableNodeEvent::Activity { .. } => return Ok(None),
         DurableNodeEvent::Output { output, timestamp } => RunEvent::SafeLog {
             execution: None,
             timestamp,
@@ -333,7 +338,7 @@ fn global_event(role: Role, event: DurableNodeEvent) -> Result<RunEvent, Postmor
             // Auxiliary failures do not establish the primary graph's failure context.
             diagnostic: None,
         },
-    })
+    }))
 }
 
 pub(super) async fn log(request: &PostmortemRequest, line: String) -> Result<(), PostmortemError> {

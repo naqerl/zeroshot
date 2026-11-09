@@ -431,6 +431,15 @@ impl From<StoredJobError> for JobError {
     }
 }
 
+/// The newest in-flight tool/exec heartbeat reported by a run's status.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct JobActivity {
+    pub node: String,
+    pub command: String,
+    pub elapsed_ms: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Job {
@@ -478,6 +487,15 @@ pub(crate) struct Job {
     pub last_cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_cursor_at_ms: Option<u64>,
+    /// When the hub first observed the newest activity heartbeat. This is the stall clock, so a
+    /// target clock cannot extend or shorten the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at_ms: Option<u64>,
+    /// Producer timestamp of the newest heartbeat, used only to order repeated status polls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_reported_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<JobActivity>,
     /// When a probe last found the job's member reachable; kept as target-lost evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_last_ok_at_ms: Option<u64>,
@@ -555,6 +573,7 @@ impl Job {
             Some(self.submitted_at_ms),
             self.dispatched_at_ms,
             self.last_cursor_at_ms,
+            self.last_activity_at_ms,
             self.finished_at_ms,
         ]
         .into_iter()
@@ -617,6 +636,8 @@ impl Job {
             "dispatchedAt": time(self.dispatched_at_ms),
             "lastCursor": self.last_cursor,
             "lastCursorAt": time(self.last_cursor_at_ms),
+            "lastActivityAt": time(self.last_activity_at_ms),
+            "lastActivity": self.last_activity,
             "reaper": self.reaper,
             "finishedAt": time(self.finished_at_ms),
             "failureReason": self.failure_reason,

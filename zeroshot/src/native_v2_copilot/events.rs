@@ -34,10 +34,16 @@ fn session_error(data: &Value) -> Result<(), NodeRunnerError> {
     Err(failure(message))
 }
 
-async fn tool_started(rpc: &CopilotRpc<'_>, data: &Value) -> Result<(), NodeRunnerError> {
+async fn tool_started(rpc: &mut CopilotRpc<'_>, data: &Value) -> Result<(), NodeRunnerError> {
     let name = data["toolName"]
         .as_str()
         .ok_or_else(|| failure("Copilot tool name is invalid"))?;
+    if data.get("parentToolCallId").is_none_or(Value::is_null) {
+        rpc.activity.start(
+            data["toolCallId"].as_str(),
+            &copilot_tool_command(data, name),
+        );
+    }
     emit(
         rpc,
         LiveOutputStream::System,
@@ -46,7 +52,10 @@ async fn tool_started(rpc: &CopilotRpc<'_>, data: &Value) -> Result<(), NodeRunn
     .await
 }
 
-async fn tool_completed(rpc: &CopilotRpc<'_>, data: &Value) -> Result<(), NodeRunnerError> {
+async fn tool_completed(rpc: &mut CopilotRpc<'_>, data: &Value) -> Result<(), NodeRunnerError> {
+    if data.get("parentToolCallId").is_none_or(Value::is_null) {
+        rpc.activity.finish(data["toolCallId"].as_str());
+    }
     if data["success"].as_bool() == Some(false) {
         let detail = data["error"]["message"]
             .as_str()
@@ -59,6 +68,29 @@ async fn tool_completed(rpc: &CopilotRpc<'_>, data: &Value) -> Result<(), NodeRu
         .await?;
     }
     Ok(())
+}
+
+fn copilot_tool_command(data: &Value, name: &str) -> String {
+    if let Some(command) = tool_field(data, "command")
+        .or_else(|| {
+            data.get("arguments")
+                .and_then(|args| tool_field(args, "command"))
+        })
+        .or_else(|| {
+            data.pointer("/toolCall/arguments/command")
+                .and_then(Value::as_str)
+        })
+    {
+        return command.to_owned();
+    }
+    name.to_owned()
+}
+
+fn tool_field<'a>(value: &'a Value, name: &str) -> Option<&'a str> {
+    value
+        .get(name)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn known_event(kind: &str) -> bool {

@@ -40,9 +40,10 @@ use runtime::RuntimeObservation;
 
 mod projection;
 use projection::{
-    bounded_attach_output, changes_public_status, log_notification, opaque_execution,
-    require_active_reference, resolve_public_execution, status_from_snapshot, status_result,
+    bounded_attach_output, log_notification, opaque_execution, require_active_reference,
+    resolve_public_execution, status_from_snapshot, status_result,
 };
+pub(crate) use projection::changes_public_status;
 
 #[cfg(test)]
 #[path = "native_v2_observability/tests.rs"]
