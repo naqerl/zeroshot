@@ -12,7 +12,7 @@ use super::pool::{Rig, TAG, job_named, rig, tagged};
 use super::{job, spec};
 
 fn with_tags(id: &str, tags: &[&str]) -> Job {
-    let mut queued = job(id, 1);
+    let mut queued = job(id, now_ms());
     let mut all = vec![TAG];
     all.extend_from_slice(tags);
     queued.placement = spec(None, &all, Strategy::FirstFree);

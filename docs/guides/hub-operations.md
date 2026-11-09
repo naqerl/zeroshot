@@ -129,8 +129,10 @@ is then accepted, the error also names the run ID so you can stop it on the targ
 
 ## Stalled runs
 
-Lifetimes are observable events, not deadlines: a queued or running job is never expired by the
-hub. Use `zeroshot hub dequeue` or `zeroshot hub force-stop` when a job should stop.
+Lifetimes are observable events, not deadlines: a placed job is never expired by the hub. The
+one exception is a queued job that never gets a lease of its own: after 24 hours waiting for a pool
+slot it fails with error kind `queue_expired`. Use `zeroshot hub dequeue` or `zeroshot hub
+force-stop` when a job should stop.
 
 `zeroshot hub daemon run --max-stall DURATION` is opt-in; without it, a running job is never
 failed for inactivity. With it, every running job records the target status's `atCursor` and when

@@ -179,8 +179,10 @@ pub(crate) struct PoolReport {
     pub shortages: Vec<(String, String)>,
     /// Pools stopped on an account limit or a rejected request: `(pool, error)`.
     pub blocked: Vec<(String, String)>,
-    /// Jobs that waited longer than their pool's `--wait-max`.
+    /// Jobs whose own lease attempt outlived their pool's `--wait-max`.
     pub expired: Vec<String>,
+    /// Jobs that waited out `capacity::QUEUE_EXPIRY_MS` for a slot without a lease.
+    pub queue_expired: Vec<String>,
     pub errors: Vec<String>,
 }
 
@@ -211,6 +213,7 @@ impl PoolReport {
                 "error": error,
             })).collect::<Vec<_>>(),
             "expired": self.expired,
+            "queueExpired": self.queue_expired,
             "errors": self.errors,
         })
     }
@@ -275,7 +278,8 @@ impl HubService {
         let now = now_ms();
         let (started, expired) = self.scale(now).await?;
         report.started = started;
-        report.expired = expired;
+        report.expired = expired.leases;
+        report.queue_expired = expired.queue;
         report.teardowns = self.begin_teardowns(now).await?;
         self.reconcile(runtime, &mut report).await?;
         for lease in self.snapshot().await.leases {
@@ -435,9 +439,9 @@ impl HubService {
     }
 
     /// Track idleness, record a lease for every server the queue needs, and tell queued pool
-    /// jobs why they wait, expiring those past their pool's `--wait-max`. Returns the started
-    /// leases and the expired jobs.
-    async fn scale(&self, now: u64) -> Result<(Vec<String>, Vec<String>), HubError> {
+    /// jobs why they wait. A `--wait-max` applies to a job's own lease attempt, while queue time
+    /// is bounded by `capacity::QUEUE_EXPIRY_MS`. Returns the started leases and the expiries.
+    async fn scale(&self, now: u64) -> Result<(Vec<String>, capacity::Expiries), HubError> {
         let mut ports = Vec::new();
         for _ in pool::scale_up(&self.snapshot().await, now) {
             ports.push(tunnel::free_port()?);
@@ -447,16 +451,14 @@ impl HubService {
             pool::update_idle(state, now);
             let expired = capacity::note_waiting(state, now);
             pool::expire_blocks(state, now);
-            // A job whose --wait-max expired while its server was still starting must not leave
-            // a lease silently connecting: mark the lease so the next teardown pass names the
-            // reason and deletes the box.
-            for job_id in &expired {
+            // A job whose --wait-max expired before its lease reached `connecting` must not
+            // leave that lease starting silently: mark it so the next teardown pass names the
+            // reason and deletes the box. A lease already `connecting` is retired by the
+            // bounded-wait reconciliation, which also confirms its server.
+            for job_id in &expired.leases {
                 let id = pool::lease_id(job_id);
                 if let Some(lease) = state.leases.iter_mut().find(|lease| lease.id == id)
-                    && matches!(
-                        lease.phase,
-                        LeasePhase::Creating | LeasePhase::Booting | LeasePhase::Connecting
-                    )
+                    && matches!(lease.phase, LeasePhase::Creating | LeasePhase::Booting)
                     && lease.reason.is_none()
                 {
                     lease.reason = Some(TeardownReason::WaitExpired);

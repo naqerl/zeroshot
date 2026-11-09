@@ -15,8 +15,8 @@ use serde_json::{Value, json};
 
 use super::clock::rfc3339;
 use super::error::HubError;
-use super::model::{HubState, JobError, JobErrorKind, JobState};
-use super::pool::{BlockedKind, Lease, Pool, serving};
+use super::model::{HubState, Job, JobError, JobErrorKind, JobState};
+use super::pool::{BlockedKind, Lease, LeasePhase, Pool, lease_id, serving};
 use super::profile::{self, Spec};
 use super::provision::{Architecture, Catalog};
 
@@ -27,6 +27,11 @@ const TAG_MIN_RAM_GB: &str = "min-ram-gb=";
 /// First wait after every candidate was out of capacity; it doubles up to [`MAX_SHORTAGE_MS`].
 pub(crate) const FIRST_SHORTAGE_MS: u64 = 30_000;
 pub(crate) const MAX_SHORTAGE_MS: u64 = 10 * 60_000;
+
+/// How long a queued job may wait for a free pool slot before [`JobErrorKind::QueueExpired`].
+/// This is deliberately much longer than any pool's `--wait-max`, which bounds one lease
+/// attempt rather than the queue.
+pub(crate) const QUEUE_EXPIRY_MS: u64 = 24 * 60 * 60_000;
 
 /// The server a job asks for. Empty asks for nothing beyond the pool's first type.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -307,24 +312,58 @@ pub(crate) fn may_start(pool: &Pool, now: u64) -> bool {
     !pool.is_blocked(now) && pool.paused_until_ms.is_none_or(|until| now >= until)
 }
 
-/// Resolve the machine of each queued pool job, show it why it waits, and expire those past
-/// their pool's `--wait-max`. Returns the expired job IDs.
-pub(crate) fn note_waiting(state: &mut HubState, now: u64) -> Vec<String> {
-    let mut expired = Vec::new();
+/// Jobs whose queue wait expired in one pass.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Expiries {
+    /// Jobs whose own lease attempt did not reach its target within the pool's `--wait-max`.
+    pub leases: Vec<String>,
+    /// Jobs that never got a lease and waited [`QUEUE_EXPIRY_MS`] for a slot.
+    pub queue: Vec<String>,
+}
+
+/// Resolve the machine of each queued pool job, show it why it waits, and expire a job only
+/// when its own lease attempt or its unplaced queue wait is past the applicable limit.
+///
+/// `--wait-max` bounds a lease attempt, measured from that lease's `created_at_ms`; a job that
+/// has no lease of its own is waiting for a slot and keeps waiting. Queue time has its own long
+/// [`QUEUE_EXPIRY_MS`] ceiling so an unplaceable queue cannot grow forever.
+pub(crate) fn note_waiting(state: &mut HubState, now: u64) -> Expiries {
+    let mut expired = Expiries::default();
     let pools = state.pools.clone();
     let leases = state.leases.clone();
+    // Which job started each lease, so a slot wait can name its holder when it is still known.
+    let owners = state
+        .jobs
+        .iter()
+        .map(|job| (lease_id(&job.job_id), job.job_id.clone()))
+        .collect::<BTreeMap<_, _>>();
     for job in &mut state.jobs {
         if job.state != JobState::Queued {
             job.pool_wait = None;
             continue;
         }
+        let own_id = lease_id(&job.job_id);
+        let own = leases.iter().find(|lease| lease.id == own_id);
+        let queued_since = job.not_before_ms.unwrap_or(0).max(job.submitted_at_ms);
+        let queue_expired = own.is_none() && now >= queued_since.saturating_add(QUEUE_EXPIRY_MS);
         let Some(pool) = serving(&pools, &job.placement, &job.requirements) else {
             job.pool_wait = None;
             job.requirements.machine = None;
+            if queue_expired {
+                expired.queue.push(expire_queue(
+                    job,
+                    now,
+                    format!(
+                        "no pool served this job within {}h in the queue",
+                        QUEUE_EXPIRY_MS / 3_600_000
+                    ),
+                ));
+            }
             continue;
         };
         let spec = profile::resolve_spec(pool, &job.placement.tags);
-        let reason = hold_reason(pool, Some(&spec), now).or_else(|| at_max(pool, &leases));
+        let reason =
+            hold_reason(pool, Some(&spec), now).or_else(|| at_max(pool, &leases, &own_id, &owners));
         job.requirements.machine = Some(spec);
         if let Some(detail) = pool.blocked.as_deref() {
             let kind = pool.blocked_kind.unwrap_or(BlockedKind::Unknown);
@@ -364,25 +403,46 @@ pub(crate) fn note_waiting(state: &mut HubState, now: u64) -> Vec<String> {
             job.error = None;
             job.failure_reason = None;
         }
-        let queued_since = job.not_before_ms.unwrap_or(0).max(job.submitted_at_ms);
-        if let Some(limit) = pool.wait_max_ms
-            && now >= queued_since.saturating_add(limit)
+        let detail = reason
+            .as_deref()
+            .map(|reason| format!(" ({reason})"))
+            .unwrap_or_default();
+        let setup = own.filter(|lease| {
+            matches!(
+                lease.phase,
+                LeasePhase::Creating | LeasePhase::Booting | LeasePhase::Connecting
+            )
+        });
+        if let Some(lease) = setup
+            && let Some(limit) = pool.wait_max_ms
+            && now >= lease.created_at_ms.saturating_add(limit)
         {
             job.state = JobState::Failed;
             job.finished_at_ms = Some(now);
             job.error = Some(JobError::new(
                 JobErrorKind::PoolWaitTimeout,
                 format!(
-                    "no server from pool {} within its --wait-max of {}s{}",
+                    "lease {} from pool {} did not reach the target within its --wait-max of \
+                     {}s{detail}",
+                    lease.name,
                     pool.name,
-                    limit / 1000,
-                    reason
-                        .map(|reason| format!(" ({reason})"))
-                        .unwrap_or_default()
+                    limit / 1000
                 ),
             ));
             job.pool_wait = None;
-            expired.push(job.job_id.clone());
+            expired.leases.push(job.job_id.clone());
+            continue;
+        }
+        if queue_expired {
+            expired.queue.push(expire_queue(
+                job,
+                now,
+                format!(
+                    "no server from pool {} after {}h in the queue{detail}",
+                    pool.name,
+                    QUEUE_EXPIRY_MS / 3_600_000
+                ),
+            ));
             continue;
         }
         job.pool_wait = reason;
@@ -390,17 +450,44 @@ pub(crate) fn note_waiting(state: &mut HubState, now: u64) -> Vec<String> {
     expired
 }
 
-fn at_max(pool: &Pool, leases: &[Lease]) -> Option<String> {
+/// Fail a job whose queue wait is over, and return its ID for the pass report.
+fn expire_queue(job: &mut Job, now: u64, message: String) -> String {
+    job.state = JobState::Failed;
+    job.finished_at_ms = Some(now);
+    job.error = Some(JobError::new(JobErrorKind::QueueExpired, message));
+    job.pool_wait = None;
+    job.job_id.clone()
+}
+
+fn at_max(
+    pool: &Pool,
+    leases: &[Lease],
+    own: &str,
+    owners: &BTreeMap<String, String>,
+) -> Option<String> {
+    // The job's own lease is its slot, not a reason to wait for one.
     let held = leases
         .iter()
-        .filter(|lease| lease.pool == pool.name)
-        .count();
-    (held >= usize::try_from(pool.max).unwrap_or(usize::MAX)).then(|| {
-        format!(
-            "waiting: pool {} runs its --max of {} servers",
-            pool.name, pool.max
-        )
-    })
+        .filter(|lease| lease.pool == pool.name && lease.id != own)
+        .collect::<Vec<_>>();
+    if held.len() < usize::try_from(pool.max).unwrap_or(usize::MAX) {
+        return None;
+    }
+    let mut holders = held
+        .iter()
+        .filter_map(|lease| owners.get(&lease.id).cloned())
+        .collect::<Vec<_>>();
+    holders.sort();
+    holders.dedup();
+    let held_by = match holders.as_slice() {
+        [] => String::new(),
+        [one] => format!("; held by {one}"),
+        many => format!("; held by {}", many.join(", ")),
+    };
+    Some(format!(
+        "waiting: pool {} runs its --max of {} servers{held_by}",
+        pool.name, pool.max
+    ))
 }
 
 /// The pool's server types and locations, checked against the provider's catalog: every type

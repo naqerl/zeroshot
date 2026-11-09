@@ -29,7 +29,8 @@ The type names above are only an example. There is no default type.
   target image runs on arm64 and you pass `--multi-arch`.
 - `--location` takes locations in the order to try them. Without it, the pool uses every
   location that offers one of its types.
-- `--wait-max` expires a queued job that waited this long for a server (see below).
+- `--wait-max` retires a job's own starting lease after this long without the target (see
+  below); it does not bound time spent waiting for a free slot.
 - `--image` is the server image: a snapshot ID or a system image such as `docker-ce`.
 - `--target-image` is the zeroshot target container. It must be pinned: a digest or a tag other
   than `latest`.
@@ -171,9 +172,15 @@ skipped without a create call. What happens next depends on how the provider ans
 A refused create can leave a half-made resource behind. The hub deletes everything under the
 lease's label once a create succeeds or the attempt is given up. The reaper is the backstop.
 
-With `--wait-max 30m`, a queued job that the pool has not served within 30 minutes expires with
-error kind `pool_wait_timeout`; its message carries the last waiting reason and a blocked pool's
-reason remains in `failureReason`. Without it, a job waits until its own expiry.
+`--wait-max` bounds one lease attempt. With `--wait-max 30m`, a lease a job started is retired and
+the job fails with error kind `pool_wait_timeout` when it has not reached the target 30 minutes
+after the lease was created; its message names the lease and carries the last waiting reason.
+A job with no lease of its own is waiting for a free slot, not for a server of its own, and is not
+failed by `--wait-max`. While the pool runs its `--max`, such a job stays `queued` with `waiting`
+naming the pool, its `--max`, and the job holding the slot. Queue time has its own 24-hour ceiling:
+a job still `queued` or `scheduled` without a lease of its own after 24 hours fails with error kind
+`queue_expired`, and its message names the wait. Without `--wait-max`, a lease attempt has no
+limit; the queue ceiling still applies.
 
 ## What happens
 
@@ -401,11 +408,12 @@ so it does not depend on the data folder's filesystem. Object Storage upload is 
 - `zeroshot_hub_pool_queued_jobs{pool,source,profile}` counts queued jobs by machine choice.
 - `zeroshot_hub_pool_events_total{event}` counts pool pass outcomes by event: `started`,
   `teardown`, `archived`, `deleted`, `reconciled`, `reaped`, `shortage`, `blocked`, `wait_timeout`,
-  or `error`. `reconciled` counts leases recorded as deleted because their server was gone or a
-  bounded wait expired, whether or not their pool still exists.
+  `queue_expired`, or `error`. `reconciled` counts leases recorded as deleted because their
+  server was gone or a bounded wait expired, whether or not their pool still exists.
 
 ## Cost
 
 Each type's hourly price per location is listed in `zeroshot hub pool types`. Hetzner bills by
-the hour, so a server is billed for at least one hour. `--max`, `--idle`, and `--wait-max` bound
-the spend; a long-running job costs its server's hourly price until that job finishes.
+the hour, so a server is billed for at least one hour. `--max` and `--idle` bound how many servers
+run and how long an idle one survives; `--wait-max` bounds a stuck lease attempt, not a queue wait.
+A long-running job costs its server's hourly price until that job finishes.

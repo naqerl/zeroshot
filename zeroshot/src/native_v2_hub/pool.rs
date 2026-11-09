@@ -174,7 +174,9 @@ pub(crate) struct Pool {
     /// Whether the target image runs on ARM too, so ARM server types are allowed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub multi_arch: bool,
-    /// A queued job this pool serves expires after waiting this long for a server.
+    /// A lease a job started is retired, and the job failed, when it has not reached the
+    /// target this long after the lease was created. A job waiting for a slot is not bounded
+    /// by this; queue time has the much longer `capacity::QUEUE_EXPIRY_MS` ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_max_ms: Option<u64>,
     /// A lease this old, or one that has made no progress for this long, is retired when the

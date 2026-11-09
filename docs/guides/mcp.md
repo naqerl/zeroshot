@@ -127,6 +127,9 @@ For live run events, use the events extension instead of those tools.
 
 `hub_submit` has no `wait` or `queue` option: it places the job now, parks it when a serving pool
 will start a server for it, and fails when nothing can take it. Use `hub_enqueue` to queue a run.
+While a pool runs its `--max`, a queued job stays `queued` with `waiting` naming the pool and the
+job holding the slot; a job that never gets a lease of its own expires after 24 hours as
+`queue_expired`.
 
 Read-only tools are `status`, `logs`, `watch`, `list`, `report`, `hub_list`, `hub_ps`,
 `hub_jobs`, `hub_status`, `hub_watch`, `hub_stats`, `hub_logs`, and `hub_daemon_status`. `run`,

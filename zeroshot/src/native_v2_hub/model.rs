@@ -358,8 +358,12 @@ pub(crate) enum JobErrorKind {
     PoolBlocked,
     /// Waited on a blocked pool whose backoff elapsed; the next dispatch retries it.
     PoolRetrying,
-    /// Waited longer than its pool's `--wait-max` for a server; the job expired.
+    /// A lease this job started did not reach its target within the pool's `--wait-max`.
+    /// Queue time itself is not bounded by that limit.
     PoolWaitTimeout,
+    /// The job waited `capacity::QUEUE_EXPIRY_MS` for a free pool slot without ever
+    /// getting a lease of its own.
+    QueueExpired,
     /// The run stopped making progress and is stopped by `hub daemon run --max-stall`; while a
     /// stop keeps failing the job stays running with this error.
     Stalled,
@@ -389,6 +393,7 @@ impl<'de> Deserialize<'de> for JobErrorKind {
             "pool_blocked" => Self::PoolBlocked,
             "pool_retrying" => Self::PoolRetrying,
             "pool_wait_timeout" => Self::PoolWaitTimeout,
+            "queue_expired" => Self::QueueExpired,
             "stalled" => Self::Stalled,
             "target_lost" => Self::TargetLost,
             "provider_quota" => Self::ProviderQuota,
