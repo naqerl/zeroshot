@@ -62,6 +62,29 @@ pub(crate) const TAILCAT_ARM64_SHA256: &str =
     "bbb1ab50f24f00effe1e1fd86d0501803fb80793a90785a2a16ff3428f03d8ef";
 /// Persistent tailcat server key, so a restarted server keeps its address.
 pub(crate) const TAILCAT_KEY: &str = "/var/lib/zeroshot-tailcat/tailcat.private.json";
+/// Set in the hub's environment to join a box to the tailnet. Absent (or malformed) means the
+/// boot script carries no tailnet step, so a hub without a key behaves exactly as before.
+pub(crate) const TAILSCALE_AUTHKEY_ENV: &str = "ZEROSHOT_TAILSCALE_AUTHKEY";
+/// Pinned Tailscale build the boot script installs so the box can reach the model gateway.
+pub(crate) const TAILSCALE_VERSION: &str = "1.104.4";
+/// Checksums from that release's `.tgz.sha256` files.
+pub(crate) const TAILSCALE_AMD64_SHA256: &str =
+    "624ea093d47d62cf56f17b8332d74b8decda4a1faa610ebc60a1de334b2b3dc9";
+pub(crate) const TAILSCALE_ARM64_SHA256: &str =
+    "a1c249ce6bdebef62e1ae3b997595555bce2ae4709bf95a718e9ca7a129dad7e";
+/// The tag every box carries: the ACL grants it the gateway's port and nothing else.
+pub(crate) const TAILSCALE_TAG: &str = "tag:zs-box";
+/// One reachability check after the join, so the lease log records whether the door opened.
+pub(crate) const TAILSCALE_PROBE_URL: &str = "https://magpie-lab.tail6dedc8.ts.net/v1/models";
+/// Whether a key read from the environment is safe to place in the boot script: alphanumeric
+/// with `-` and `_`, which is what a `tskey-auth-…` secret looks like. Anything else is refused
+/// rather than quoted into cloud-init.
+fn tailscale_key_ok(key: &str) -> bool {
+    (16..=200).contains(&key.len())
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
 
 /// What the boot script needs to know about one server.
 pub(crate) struct Boot<'a> {
@@ -100,6 +123,15 @@ pub(crate) fn boot_script(boot: &Boot<'_>) -> Result<String, HubError> {
         Transport::Ssh => String::new(),
         Transport::Tailcat => tailcat_boot(boot.target_port),
     };
+    // The gateway resolves to a tailnet address, so a box that is not on the tailnet answers no
+    // request at all: its agent fails before the first token. Read once, here, so the script is
+    // deterministic for the life of the call.
+    let tailnet = std::env::var(TAILSCALE_AUTHKEY_ENV)
+        .ok()
+        .map(|key| key.trim().to_string())
+        .filter(|key| tailscale_key_ok(key))
+        .map(|key| tailnet_boot(&key))
+        .unwrap_or_default();
     Ok(format!(
         r#"#!/bin/sh
 # zeroshot pool server boot, written by the hub: a btrfs data folder, then the pinned target.
@@ -228,7 +260,7 @@ else
     "$IMAGE" target serve --listen "127.0.0.1:{port}" --public-origin "$ORIGIN" \
     --storage /var/lib/zeroshot/native-v2 >/dev/null
 fi
-{tailcat}touch "$STATUS/ok"
+{tailcat}{tailnet}touch "$STATUS/ok"
 echo 'zeroshot boot finished'
 "#
     ))
@@ -339,4 +371,84 @@ fn shell_word(value: &str) -> Result<&str, HubError> {
         )));
     }
     Ok(value)
+}
+
+/// The boot steps that join the box to the tailnet.
+///
+/// The key arrives in the cloud-init user data, which is written `0700 root`, and is moved to a
+/// `0600` file the CLI reads with `--authkey=file:`, so it never appears on a command line. Every
+/// failure is a warning: the lease continues and the log says why the box cannot reach the
+/// gateway. The node is `--ephemeral`, so it leaves the tailnet when the box is destroyed.
+fn tailnet_boot(authkey: &str) -> String {
+    let version = TAILSCALE_VERSION;
+    let tag = TAILSCALE_TAG;
+    let probe = TAILSCALE_PROBE_URL;
+    format!(
+        r#"step='joining the tailnet'
+mkdir -p /run/zeroshot /run/tailscale /var/lib/zeroshot-tailscale /tmp/zeroshot-tailscale
+umask 077
+printf '%s' '{authkey}' >/run/zeroshot/ts-authkey
+if [ ! -x /usr/local/bin/tailscaled ] || [ ! -x /usr/local/bin/tailscale ]; then
+  case "$(uname -m)" in
+    x86_64|amd64) asset="tailscale_{version}_amd64.tgz"; sum='{amd64}' ;;
+    aarch64|arm64) asset="tailscale_{version}_arm64.tgz"; sum='{arm64}' ;;
+    *) asset=''; sum='' ;;
+  esac
+  if [ -z "$asset" ]; then
+    warn "tailscale has no build for $(uname -m); the box will not reach the gateway"
+  elif ! command -v curl >/dev/null 2>&1; then
+    warn 'curl is missing; the box will not reach the gateway'
+  elif curl -fsSL "https://pkgs.tailscale.com/stable/$asset" -o /run/zeroshot/tailscale.tgz; then
+    if echo "$sum  /run/zeroshot/tailscale.tgz" | sha256sum -c - >/dev/null 2>&1; then
+      rm -rf /tmp/zeroshot-tailscale
+      if tar -xzf /run/zeroshot/tailscale.tgz -C /tmp/zeroshot-tailscale --strip-components=1 2>/dev/null; then
+        install -m 0755 /tmp/zeroshot-tailscale/tailscale /usr/local/bin/tailscale
+        install -m 0755 /tmp/zeroshot-tailscale/tailscaled /usr/local/bin/tailscaled
+      else
+        warn 'tailscale could not be unpacked; the box will not reach the gateway'
+      fi
+      rm -rf /tmp/zeroshot-tailscale
+    else
+      warn 'tailscale failed its pinned checksum; the box will not reach the gateway'
+    fi
+    rm -f /run/zeroshot/tailscale.tgz
+  else
+    warn 'tailscale could not be downloaded; the box will not reach the gateway'
+  fi
+fi
+step='starting tailscaled'
+if [ -x /usr/local/bin/tailscaled ] && [ ! -S /run/tailscale/tailscaled.sock ]; then
+  /usr/local/bin/tailscaled --state=/var/lib/zeroshot-tailscale/tailscaled.state     --socket=/run/tailscale/tailscaled.sock >/var/log/zeroshot-tailscaled.log 2>&1 &
+  tries=0
+  while [ ! -S /run/tailscale/tailscaled.sock ] && [ "$tries" -lt 30 ]; do
+    tries=$((tries + 1))
+    sleep 1
+  done
+fi
+step='joining the tailnet'
+host=$(hostname | tr -cd 'a-z0-9-' | cut -c1-40)
+case "$host" in
+  zs-*) ;;
+  *) host="zs-$host" ;;
+esac
+if [ -S /run/tailscale/tailscaled.sock ]; then
+  if /usr/local/bin/tailscale --socket=/run/tailscale/tailscaled.sock up     --authkey=file:/run/zeroshot/ts-authkey     --hostname="$host"     --advertise-tags={tag}     --ephemeral     --accept-dns=true     --timeout=90s     --reset >/dev/null 2>&1; then
+    step='checking the gateway from the box'
+    code=$(curl -sS -o /dev/null -w '%{{http_code}}' --max-time 10 '{probe}' 2>/dev/null || echo 000)
+    echo "step='gateway' http=$code"
+    if [ "$code" = '000' ]; then
+      warn 'the gateway is unreachable from this box over the tailnet'
+    fi
+  else
+    warn 'tailscale up failed; the box will not reach the gateway'
+  fi
+else
+  warn 'tailscaled never opened its socket; the box will not reach the gateway'
+fi
+rm -f /run/zeroshot/ts-authkey
+step='tailnet ready'
+"#,
+        amd64 = TAILSCALE_AMD64_SHA256,
+        arm64 = TAILSCALE_ARM64_SHA256,
+    )
 }
