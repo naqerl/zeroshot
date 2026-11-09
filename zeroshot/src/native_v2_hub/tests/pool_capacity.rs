@@ -406,3 +406,68 @@ async fn a_starting_server_only_counts_its_spare_slots_for_other_jobs() {
         assert_eq!(rig.state().await.leases.len(), servers, "slots {slots}");
     }
 }
+
+#[tokio::test]
+async fn a_blocked_pool_wait_names_the_reason_and_keeps_it_when_the_job_times_out() {
+    let rig = rig();
+    let mut request = add_request(rig.directory.path(), 1);
+    request.wait_max_ms = Some(60_000);
+    rig.service.add_pool(request).await.expect("pool");
+    rig.cloud
+        .with(|cloud| cloud.refuse_all = Some(Refusal::Quota));
+    rig.enqueue("hj_one").await;
+    let submitted = now_ms();
+    rig.set(|state| {
+        for job in &mut state.jobs {
+            job.submitted_at_ms = submitted;
+        }
+    })
+    .await;
+    rig.pass().await;
+    rig.pass().await;
+
+    let state = rig.state().await;
+    let job = job_named(&state, "hj_one").clone();
+    assert_eq!(job.state, JobState::Queued);
+    let error = job.error.as_ref().expect("blocked error");
+    assert_eq!(error.kind, JobErrorKind::PoolBlocked);
+    let failure = job.failure_reason.clone().expect("failure reason");
+    assert!(failure.contains("burst"), "{failure}");
+    assert!(failure.contains("Quota"), "{failure}");
+    assert_eq!(
+        job.view(now_ms())["errorKind"],
+        json!("pool_blocked"),
+        "{}",
+        job.view(now_ms())
+    );
+    let waiting = job.pool_wait.clone().expect("waiting reason");
+    assert!(waiting.contains("blocked until"), "{waiting}");
+    assert!(
+        waiting.contains("zeroshot hub pool resume burst"),
+        "{waiting}"
+    );
+
+    rig.set(|state| {
+        for job in &mut state.jobs {
+            job.submitted_at_ms = job.submitted_at_ms.saturating_sub(120_000);
+        }
+    })
+    .await;
+    rig.pass().await;
+    let state = rig.state().await;
+    let job = job_named(&state, "hj_one");
+    assert_eq!(job.state, JobState::Failed);
+    let error = job.error.as_ref().expect("timeout error");
+    assert_eq!(error.kind, JobErrorKind::PoolWaitTimeout);
+    assert!(error.message.contains("burst"), "{}", error.message);
+    assert!(error.message.contains("Quota"), "{}", error.message);
+    let failure = job.failure_reason.clone().expect("timeout keeps the block");
+    assert!(failure.contains("burst"), "{failure}");
+    assert!(failure.contains("Quota"), "{failure}");
+    assert_eq!(
+        job.view(now_ms())["failureReason"],
+        json!(failure),
+        "{}",
+        job.view(now_ms())
+    );
+}

@@ -60,6 +60,7 @@ pub(crate) enum PoolPhase {
     Paused,
     Resumed,
     Blocked,
+    Retrying,
     Shortage,
 }
 
@@ -91,6 +92,18 @@ pub(crate) struct PoolEventRecord {
     pub at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// How a `blocked` event's cause was classified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_kind: Option<BlockedKind>,
+    /// When a `blocked` or `retrying` event's pool retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_until: Option<String>,
+    /// Consecutive block attempt number, on `blocked` and `retrying` events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<u32>,
+    /// The same expiry as an epoch deadline, on `blocked` and `retrying` events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -193,9 +206,19 @@ pub(crate) struct Pool {
     /// cannot start, and bill, a fresh server every pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_until_ms: Option<u64>,
-    /// Account limit or rejected request: no server starts until `hub pool resume`.
+    /// Account limit, credential or rejected request: no server starts until the block expires or
+    /// `hub pool resume` clears it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<String>,
+    /// How the block was classified from the provider's error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_kind: Option<BlockedKind>,
+    /// When the block may retry. A legacy block without one may retry on the next pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_until_ms: Option<u64>,
+    /// Consecutive blocks; a lease that succeeds resets it so the next block retries in a minute.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub blocked_attempts: u32,
     /// Machines every candidate was out of capacity for, by [`Spec::key`]: jobs needing them
     /// retry with backoff.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -212,6 +235,109 @@ pub(crate) struct Pool {
 pub(crate) const FIRST_PAUSE_MS: u64 = 5 * 60_000;
 pub(crate) const MAX_PAUSE_MS: u64 = 60 * 60_000;
 
+/// Retry waits for consecutive provider blocks of any kind: 1m, 2m, 5m, 15m, then 30m.
+pub(crate) const BLOCK_BACKOFF_MS: [u64; 5] = [60_000, 120_000, 300_000, 900_000, 1_800_000];
+
+/// Why the provider stopped a pool, from the text it returned.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BlockedKind {
+    /// A quota, account limit or `403` that is not about a credential.
+    Quota,
+    /// A `401`/`403` credential or authentication failure.
+    Auth,
+    /// No stock, a shortage, or an unavailable server type.
+    Capacity,
+    /// A `5xx`, timeout or transport failure.
+    Provider,
+    /// Nothing in the error identified a cause.
+    Unknown,
+}
+
+impl BlockedKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Quota => "quota",
+            Self::Auth => "auth",
+            Self::Capacity => "capacity",
+            Self::Provider => "provider",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Classify a provider refusal from its text at the point the block is set. Credential errors
+/// win over the generic quota words in the same message, and a bare `403` is a quota block.
+pub(crate) fn classify_block(error: &str) -> BlockedKind {
+    let text = error.to_ascii_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
+    if has(&[
+        "401",
+        "unauthorized",
+        "unauthenticated",
+        "authentication",
+        "credential",
+        "invalid token",
+        "token expired",
+        "api key",
+    ]) {
+        BlockedKind::Auth
+    } else if has(&[
+        "403",
+        "forbidden",
+        "quota",
+        "limit",
+        "exceeded",
+        "billing",
+        "payment",
+        "too many",
+    ]) {
+        BlockedKind::Quota
+    } else if has(&[
+        "no capacity",
+        "out of stock",
+        "sold out",
+        "not available",
+        "shortage",
+        "no stock",
+    ]) {
+        BlockedKind::Capacity
+    } else if has(&[
+        "500",
+        "502",
+        "503",
+        "504",
+        "5xx",
+        "timeout",
+        "timed out",
+        "bad gateway",
+        "service unavailable",
+        "unavailable",
+        "connection reset",
+        "connection refused",
+        "temporarily",
+    ]) {
+        BlockedKind::Provider
+    } else {
+        BlockedKind::Unknown
+    }
+}
+
+/// How long the next block waits, given how many consecutive blocks already happened. Every
+/// kind follows the same ladder: even an authentication or unclassified failure may be
+/// transient, and a permanent one still stops after the cap until an operator resumes it.
+pub(crate) fn block_backoff_ms(_kind: BlockedKind, previous: u32) -> u64 {
+    let index = usize::try_from(previous)
+        .unwrap_or(usize::MAX)
+        .min(BLOCK_BACKOFF_MS.len() - 1);
+    BLOCK_BACKOFF_MS[index]
+}
+
+/// The reason stored on a block and on its `blocked` event.
+pub(crate) fn block_reason(kind: BlockedKind, until: u64, error: &str) -> String {
+    format!("{}: {error}; next try at {}", kind.as_str(), rfc3339(until))
+}
+
 /// Record how a pool's boot ended: a failure pauses the pool's scale-up, with doubling pauses;
 /// a server that joined resets it. Both are recorded as pool events, so a caller sees why no
 /// server started instead of polling `hub pool ls`.
@@ -221,7 +347,7 @@ pub(crate) fn record_boot(state: &mut HubState, pool: &str, failed: bool, now: u
     };
     let change = {
         let slot = &mut state.pools[index];
-        let held = slot.paused_until_ms.is_some() || slot.blocked.is_some();
+        let paused = slot.paused_until_ms.is_some();
         if failed {
             slot.boot_failures = slot.boot_failures.saturating_add(1);
             let doublings = slot.boot_failures.saturating_sub(1).min(8);
@@ -240,7 +366,8 @@ pub(crate) fn record_boot(state: &mut HubState, pool: &str, failed: bool, now: u
         } else {
             slot.boot_failures = 0;
             slot.paused_until_ms = None;
-            held.then(|| (PoolPhase::Resumed, "a server joined the hub".to_owned()))
+            slot.blocked_attempts = 0;
+            paused.then(|| (PoolPhase::Resumed, "a server joined the hub".to_owned()))
         }
     };
     if let Some((phase, reason)) = change {
@@ -257,6 +384,36 @@ pub(crate) fn record_boot(state: &mut HubState, pool: &str, failed: bool, now: u
 }
 
 impl Pool {
+    /// Whether a block holds the pool at `now`. A legacy block without an expiry may retry now,
+    /// so an old state file cannot park a pool forever.
+    pub(crate) fn is_blocked(&self, now: u64) -> bool {
+        self.blocked.is_some() && self.blocked_until_ms.is_some_and(|until| now < until)
+    }
+
+    /// Stop starting servers after a provider refusal. Returns the kind and expiry when this is a
+    /// new block, so the caller records exactly one event per block; a retry while still blocked
+    /// records nothing.
+    pub(crate) fn start_block(&mut self, error: &str, now: u64) -> Option<(BlockedKind, u64)> {
+        if self.is_blocked(now) {
+            return None;
+        }
+        let kind = classify_block(error);
+        let until = now.saturating_add(block_backoff_ms(kind, self.blocked_attempts));
+        self.blocked = Some(error.to_owned());
+        self.blocked_kind = Some(kind);
+        self.blocked_until_ms = Some(until);
+        self.blocked_attempts = self.blocked_attempts.saturating_add(1);
+        Some((kind, until))
+    }
+
+    /// Clear a block, keeping the retry schedule unless the caller resets it.
+    pub(crate) fn clear_block(&mut self) -> Option<(BlockedKind, u64, String)> {
+        let error = self.blocked.take()?;
+        let kind = self.blocked_kind.take().unwrap_or(BlockedKind::Unknown);
+        let until = self.blocked_until_ms.take().unwrap_or(0);
+        Some((kind, until, error))
+    }
+
     /// Whether this pool can run a job: the job names at least one tag besides size requests,
     /// every one of them is a pool tag or a profiled tag, a server type fits its machine (see
     /// [`profile::resolve_spec`]), it pins no target, and named targets can run it.
@@ -309,7 +466,10 @@ impl Pool {
             "createdAt": rfc3339(self.created_at_ms),
             "bootFailures": self.boot_failures,
             "pausedUntil": self.paused_until_ms.map(rfc3339),
-            "blocked": self.blocked,
+            "blocked": self.is_blocked(now).then(|| self.blocked.clone()).flatten(),
+            "blockedKind": self.is_blocked(now).then_some(self.blocked_kind).flatten(),
+            "blockedUntil": self.is_blocked(now).then_some(self.blocked_until_ms).flatten().map(rfc3339),
+            "blockedAttempts": self.blocked_attempts,
             "shortages": self.shortages,
             "waiting": capacity::hold_reason(self, None, now),
             "profiles": self.profiles.iter().map(TagProfile::view).collect::<Vec<_>>(),
@@ -470,7 +630,137 @@ pub(crate) fn record_pool_phase(state: &mut HubState, pool: &str, change: PoolPh
         previous_phase: None,
         at: rfc3339(change.at),
         reason: change.reason,
+        blocked_kind: None,
+        blocked_until: None,
+        attempts: None,
+        until_ms: None,
     });
+}
+
+/// One new block to record, with its classification and expiry.
+pub(crate) struct BlockEvent<'a> {
+    pub pool: &'a str,
+    pub kind: BlockedKind,
+    pub until: u64,
+    pub reason: String,
+    pub at: u64,
+}
+
+/// Record one new block with its classification and expiry. Exactly one is recorded per block,
+/// however many provider attempts the block later suppresses.
+pub(crate) fn record_block(state: &mut HubState, event: BlockEvent<'_>) {
+    let BlockEvent {
+        pool,
+        kind,
+        until,
+        reason,
+        at,
+    } = event;
+    let attempts = state
+        .pools
+        .iter()
+        .find(|slot| slot.name == pool)
+        .map_or(1, |slot| slot.blocked_attempts.max(1));
+    state.push_pool_event(PoolEventRecord {
+        sequence: 0,
+        kind: PoolEventKind::Pool,
+        pool: pool.to_owned(),
+        lease_id: None,
+        server_id: None,
+        member_id: None,
+        machine: None,
+        phase: PoolPhase::Blocked,
+        previous_phase: None,
+        at: rfc3339(at),
+        reason: Some(reason),
+        blocked_kind: Some(kind),
+        blocked_until: Some(rfc3339(until)),
+        attempts: Some(attempts),
+        until_ms: Some(until),
+    });
+}
+
+/// One expired block that is retrying now, with its attempt count and next attempt.
+pub(crate) struct RetryEvent<'a> {
+    pub pool: &'a str,
+    pub kind: BlockedKind,
+    pub attempts: u32,
+    pub error: &'a str,
+    pub at: u64,
+}
+
+/// Record that an expired block is retrying now.
+pub(crate) fn record_retry(state: &mut HubState, event: RetryEvent<'_>) {
+    let RetryEvent {
+        pool,
+        kind,
+        attempts,
+        error,
+        at,
+    } = event;
+    state.push_pool_event(PoolEventRecord {
+        sequence: 0,
+        kind: PoolEventKind::Pool,
+        pool: pool.to_owned(),
+        lease_id: None,
+        server_id: None,
+        member_id: None,
+        machine: None,
+        phase: PoolPhase::Retrying,
+        previous_phase: None,
+        at: rfc3339(at),
+        reason: Some(format!(
+            "block expired after {error}; retrying ({})",
+            kind.as_str()
+        )),
+        blocked_kind: Some(kind),
+        blocked_until: Some(rfc3339(at)),
+        attempts: Some(attempts),
+        until_ms: Some(at),
+    });
+}
+
+/// Clear blocks whose expiry passed, recording one `retrying` and one `resumed` event each so a
+/// pool retries at the next boundary without an operator and the feed says why it started again.
+pub(crate) fn expire_blocks(state: &mut HubState, now: u64) {
+    let expired = state
+        .pools
+        .iter_mut()
+        .filter(|pool| pool.blocked.is_some() && !pool.is_blocked(now))
+        .filter_map(|pool| {
+            let attempts = pool.blocked_attempts.max(1);
+            pool.clear_block().map(|(kind, _, error)| {
+                (
+                    pool.name.clone(),
+                    kind,
+                    attempts,
+                    format!("block expired after {error}; retrying ({})", kind.as_str()),
+                    error,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    for (pool, kind, attempts, reason, error) in expired {
+        record_retry(
+            state,
+            RetryEvent {
+                pool: &pool,
+                kind,
+                attempts,
+                error: &error,
+                at: now,
+            },
+        );
+        record_pool_phase(
+            state,
+            &pool,
+            PoolPhaseChange {
+                phase: PoolPhase::Resumed,
+                reason: Some(reason),
+                at: now,
+            },
+        );
+    }
 }
 
 /// Record one lease change once, chaining every setup phase it passed through so a fast boot
@@ -526,6 +816,10 @@ pub(crate) fn record_lease_phase(
             previous_phase: prior,
             at: rfc3339(change.at),
             reason: last.then(|| change.reason.clone()).flatten(),
+            blocked_kind: None,
+            blocked_until: None,
+            attempts: None,
+            until_ms: None,
         });
         prior = Some(step);
     }

@@ -154,9 +154,13 @@ skipped without a create call. What happens next depends on how the provider ans
   `waiting: no capacity for cpx31/cx43 in fsn1/nbg1`. Jobs needing that machine are retried after
   30 seconds; the wait doubles each round, up to 10 minutes. This backoff is separate from the
   boot-failure pause and is kept per machine choice, so other jobs of the pool go on.
-- **Account limit or rejected request** (quota, invalid type or image). The pool is blocked
-  with the provider's error, and jobs show `blocked: …`. Fix the cause, then run
-  `zeroshot hub pool resume burst`. `resume` also clears capacity waits and the boot pause.
+- **Account limit, rejected request, or another provider refusal** (quota, invalid type or
+  image, or an unclassified error). The pool is blocked with the provider's error, and jobs
+  waiting on it report `errorKind: pool_blocked` with the pool name, reason, and attempt time in
+  `failureReason`. The block expires on its own: 1 minute, then 2, 5, 15, and at most 30 minutes
+  between consecutive failures. A successful lease resets the schedule. After expiry the job
+  reports `errorKind: pool_retrying` with the next attempt time. `zeroshot hub pool resume burst`
+  clears the block immediately and also clears capacity waits and the boot pause.
 - **Held machine.** `zeroshot hub stop <JOB>` deliberately stops a job and holds its lease, so
   the idle rule does not delete the server. Give it back with
   `zeroshot hub pool release <LEASE>` (the lease name is in `hub pool list`); the server then
@@ -168,8 +172,8 @@ A refused create can leave a half-made resource behind. The hub deletes everythi
 lease's label once a create succeeds or the attempt is given up. The reaper is the backstop.
 
 With `--wait-max 30m`, a queued job that the pool has not served within 30 minutes expires with
-error kind `pool_wait_timeout`, and the message carries the last waiting reason. Without it, a
-job waits until its own expiry.
+error kind `pool_wait_timeout`; its message carries the last waiting reason and a blocked pool's
+reason remains in `failureReason`. Without it, a job waits until its own expiry.
 
 ## What happens
 
@@ -277,11 +281,12 @@ confirms its own deletion and is never reconciled.
 
 Every `hub.pool` record carries `kind: "hub.pool"`, like every hub event, and `scope`: `"lease"`
 for a lease transition, `"pool"` for a pool-wide one. Pool-wide changes use `scope: "pool"` and the phases `added`, `removed`, `paused`, `resumed`,
-`blocked`, and `shortage`. They carry the pool name and no lease, and a `reason` for every phase
-except `added` and `removed`. `paused` follows a failed boot and says how many failures in a row
-stopped new servers and for how long; `resumed` follows a server that joined or a
-`hub pool resume` that cleared the pause, the block, and the shortages. `removed`
-is recorded only after every lease of the pool has recorded `deleted`.
+`blocked`, `retrying`, and `shortage`. They carry the pool name and no lease, and a `reason` for
+every phase except `added` and `removed`. `paused` follows a failed boot and says how many
+failures in a row stopped new servers and for how long; `blocked` and `retrying` carry the
+consecutive block `attempts` and the `untilMs` deadline; `resumed` follows an expired block, a
+server that joined, or a `hub pool resume` that cleared the pause, the block, and the shortages.
+`removed` is recorded only after every lease of the pool has recorded `deleted`.
 
 An example notification for a lease that just became ready:
 

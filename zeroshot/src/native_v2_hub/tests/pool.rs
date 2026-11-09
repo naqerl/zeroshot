@@ -2545,6 +2545,9 @@ pub(super) fn pool_fixture() -> Pool {
         boot_failures: 0,
         paused_until_ms: None,
         blocked: None,
+        blocked_kind: None,
+        blocked_until_ms: None,
+        blocked_attempts: 0,
         shortages: std::collections::BTreeMap::new(),
         profiles: Vec::new(),
         unavailable: BTreeMap::new(),
@@ -2918,4 +2921,145 @@ async fn releasing_a_lease_while_its_job_runs_does_not_mark_the_member_idle() {
         None,
         "an in-use lease is not marked idle before its job settles"
     );
+}
+
+/// Every create the fake provider saw.
+fn attempt_count(rig: &Rig) -> usize {
+    rig.cloud.with(|cloud| cloud.attempts.len())
+}
+
+/// Count pool-level events of one phase.
+fn pool_phase_count(state: &HubState, phase: PoolPhase) -> usize {
+    state
+        .pool_events
+        .iter()
+        .filter(|event| event.kind == PoolEventKind::Pool && event.phase == phase)
+        .count()
+}
+
+#[test]
+fn provider_text_selects_the_block_kind_and_the_backoff_schedule() {
+    use super::super::pool::{BlockedKind, block_backoff_ms, classify_block};
+
+    for (text, kind) in [
+        ("403 Primary IP limit exceeded", BlockedKind::Quota),
+        ("401 Unauthorized: invalid credential", BlockedKind::Auth),
+        ("no capacity for cpx31 in fsn1", BlockedKind::Capacity),
+        ("503 Service Unavailable", BlockedKind::Provider),
+        ("the provider said no", BlockedKind::Unknown),
+    ] {
+        assert_eq!(classify_block(text), kind, "{text}");
+    }
+    for (previous, wait) in [(0, 60_000), (1, 120_000), (2, 300_000), (3, 900_000)] {
+        assert_eq!(block_backoff_ms(BlockedKind::Quota, previous), wait);
+    }
+    assert_eq!(block_backoff_ms(BlockedKind::Quota, 4), 1_800_000);
+    assert_eq!(block_backoff_ms(BlockedKind::Quota, 50), 1_800_000);
+    assert_eq!(block_backoff_ms(BlockedKind::Auth, 0), 60_000);
+    assert_eq!(block_backoff_ms(BlockedKind::Unknown, 2), 300_000);
+    assert_eq!(block_backoff_ms(BlockedKind::Unknown, 5), 1_800_000);
+}
+
+#[tokio::test]
+async fn a_blocked_pool_expires_with_backoff_retries_and_resets_on_success() {
+    use super::super::pool::BlockedKind;
+
+    let rig = rig();
+    rig.add_pool(1).await;
+    rig.cloud
+        .with(|cloud| cloud.refuse_all = Some(Refusal::Quota));
+    rig.enqueue("hj_one").await;
+    rig.pass().await;
+
+    let state = rig.state().await;
+    let pool = &state.pools[0];
+    assert_eq!(pool.blocked_kind, Some(BlockedKind::Quota));
+    assert_eq!(pool.blocked_attempts, 1);
+    let first_until = pool.blocked_until_ms.expect("first deadline");
+    let first_wait = first_until - now_ms();
+    assert!(
+        first_wait <= 60_000 && first_wait + 5_000 >= 60_000,
+        "{first_wait}"
+    );
+    let blocked = state
+        .pool_events
+        .iter()
+        .find(|event| event.kind == PoolEventKind::Pool && event.phase == PoolPhase::Blocked)
+        .expect("blocked event");
+    assert_eq!(blocked.attempts, Some(1));
+    assert_eq!(blocked.until_ms, Some(first_until), "{blocked:?}");
+
+    // A pass records the block while creating the lease, so the queued job learns the reason
+    // on its next pass, without another create call.
+    rig.pass().await;
+    let state = rig.state().await;
+    let job = job_named(&state, "hj_one");
+    assert_eq!(
+        job.error.as_ref().map(|error| error.kind),
+        Some(JobErrorKind::PoolBlocked)
+    );
+    let reason = job.failure_reason.clone().expect("block reason on the job");
+    assert!(reason.contains("burst"), "{reason}");
+    assert!(reason.contains("Quota"), "{reason}");
+    assert_eq!(
+        job.view(now_ms())["errorKind"],
+        json!("pool_blocked"),
+        "{}",
+        job.view(now_ms())
+    );
+
+    rig.pass().await;
+    assert_eq!(attempt_count(&rig), 1, "no create before the expiry");
+
+    rig.set(|state| state.pools[0].blocked_until_ms = Some(1))
+        .await;
+    rig.pass().await;
+    let state = rig.state().await;
+    let pool = &state.pools[0];
+    assert_eq!(pool.blocked_attempts, 2);
+    let second_wait = pool.blocked_until_ms.expect("second deadline") - now_ms();
+    assert!(
+        second_wait <= 120_000 && second_wait + 5_000 >= 120_000,
+        "{second_wait}"
+    );
+    assert_eq!(attempt_count(&rig), 2, "the expiry retried the lease");
+    assert_eq!(pool_phase_count(&state, PoolPhase::Retrying), 1);
+    let retry = state
+        .pool_events
+        .iter()
+        .find(|event| event.phase == PoolPhase::Retrying)
+        .expect("retrying event");
+    assert_eq!(retry.attempts, Some(1));
+    assert!(retry.until_ms.is_some(), "{retry:?}");
+
+    rig.cloud.with(|cloud| cloud.refuse_all = None);
+    rig.set(|state| state.pools[0].blocked_until_ms = Some(1))
+        .await;
+    rig.pass().await;
+    let state = rig.state().await;
+    let pool = &state.pools[0];
+    assert!(pool.blocked.is_none(), "{pool:?}");
+    assert!(pool.blocked_kind.is_none(), "{pool:?}");
+    assert!(pool.blocked_until_ms.is_none(), "{pool:?}");
+    assert_eq!(pool.blocked_attempts, 0);
+    assert_eq!(rig.cloud.servers(), 1);
+}
+
+#[tokio::test]
+async fn a_legacy_block_without_a_deadline_retries_on_the_first_pass() {
+    let rig = rig();
+    rig.add_pool(1).await;
+    rig.set(|state| {
+        state.pools[0].blocked = Some("403 Primary IP limit exceeded".to_owned());
+        state.pools[0].blocked_kind = None;
+        state.pools[0].blocked_until_ms = None;
+    })
+    .await;
+    rig.enqueue("hj_one").await;
+
+    rig.pass().await;
+    let state = rig.state().await;
+    assert!(state.pools[0].blocked.is_none(), "{:?}", state.pools[0]);
+    assert_eq!(rig.cloud.servers(), 1, "the queued job got its server");
+    assert_eq!(pool_phase_count(&state, PoolPhase::Retrying), 1);
 }

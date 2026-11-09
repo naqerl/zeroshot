@@ -287,8 +287,10 @@ subscribers. The complete per-cursor trail is still durable and is delivered as 
 only to subscribers that ask for it by `detail: true` or by name. `hub.pool`
 reports each lease as `requested`, `creating`, `booting`, `preparing`, `ready`, `in_use`, `idle`,
 `draining`, `deleted`, or `failed`, with `previousPhase` chaining its transitions. Pool-level
-records use `scope: "pool"` (lease records `scope: "lease"`) and the phases `added`, `removed`, `paused`, `resumed`, `blocked`,
-and `shortage`. See
+records use `scope: "pool"` (lease records `scope: "lease"`) and the phases `added`, `removed`,
+`paused`, `resumed`, `blocked`, `retrying`, and `shortage`. Block and retry records carry the
+consecutive `attempts`, the `untilMs` deadline, and the `blockedKind`/`blockedUntil` pair so a
+client can show when the pool tries again. See
 [Watching a machine come up](hub-pools.md#watching-a-machine-come-up). A running job receives one
 `hub.warning` per hour; a run-watch or stream failure also produces `hub.warning`, and the
 subscription continues.

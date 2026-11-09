@@ -330,6 +330,10 @@ pub(crate) enum JobErrorKind {
     /// Dequeued while placing. A run with its submission key may exist on the member; the hub
     /// does not follow or adopt it.
     DequeuedWhilePlacing,
+    /// Waited on a pool that the provider blocked; the block names its reason and retry time.
+    PoolBlocked,
+    /// Waited on a blocked pool whose backoff elapsed; the next dispatch retries it.
+    PoolRetrying,
     /// Waited longer than its pool's `--wait-max` for a server; the job expired.
     PoolWaitTimeout,
     /// The run stopped making progress and is stopped by `hub daemon run --max-stall`; while a
@@ -355,6 +359,9 @@ impl<'de> Deserialize<'de> for JobErrorKind {
             "status_unavailable" => Self::StatusUnavailable,
             "unconfirmed_limit" => Self::UnconfirmedLimit,
             "dequeued_while_placing" => Self::DequeuedWhilePlacing,
+            "pool_blocked" => Self::PoolBlocked,
+            "pool_retrying" => Self::PoolRetrying,
+            "pool_wait_timeout" => Self::PoolWaitTimeout,
             "stalled" => Self::Stalled,
             "target_lost" => Self::TargetLost,
             _ => Self::Unclassified,

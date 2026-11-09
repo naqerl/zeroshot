@@ -2620,6 +2620,109 @@ async fn a_nameless_subscription_streams_jobs_runs_and_pool_phases() {
 }
 
 #[tokio::test]
+async fn pool_block_and_retry_events_forward_attempts_and_deadlines() {
+    let mut host = hub_feed_host();
+    host.pool_events.push(json!({
+        "sequence": 2,
+        "kind": "pool",
+        "pool": "burst",
+        "phase": "blocked",
+        "at": "2026-01-01T00:00:03Z",
+        "reason": "quota: shared core limit exceeded",
+        "blockedKind": "quota",
+        "blockedUntil": "2026-01-01T00:01:03Z",
+        "attempts": 1,
+        "untilMs": 1_700_000_000_000u64
+    }));
+    host.pool_events.push(json!({
+        "sequence": 3,
+        "kind": "pool",
+        "pool": "burst",
+        "phase": "retrying",
+        "at": "2026-01-01T00:01:03Z",
+        "reason": "block expired; retrying",
+        "blockedKind": "quota",
+        "blockedUntil": "2026-01-01T00:01:03Z",
+        "attempts": 1,
+        "untilMs": 1_700_000_060_000u64
+    }));
+    let mut session = Session::spawn(host);
+    initialize(&mut session).await;
+
+    let listed = session.request(4, "events/list", json!({})).await;
+    let pool_schema = listed["result"]["events"][0]["payloadSchema"]["properties"]["data"]["oneOf"]
+        .as_array()
+        .expect("data kinds")
+        .iter()
+        .find(|schema| schema["properties"]["kind"]["const"] == json!("hub.pool"))
+        .expect("pool schema");
+    assert!(
+        pool_schema["properties"]["phase"]["enum"]
+            .as_array()
+            .is_some_and(|phases| phases.contains(&json!("retrying"))),
+        "{pool_schema}"
+    );
+    for field in ["blockedKind", "blockedUntil", "attempts", "untilMs"] {
+        assert!(
+            pool_schema["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&json!(field))),
+            "{field} is required: {pool_schema}"
+        );
+    }
+
+    let response = session
+        .start_stream(&json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "events/subscribe",
+            "params": {}
+        }))
+        .await;
+    let frames = collect_stream(response, Duration::from_secs(5), |frames| {
+        let phases = stream_notifications(frames)
+            .into_iter()
+            .filter_map(|frame| frame["params"]["data"]["phase"].as_str().map(str::to_owned))
+            .collect::<std::collections::HashSet<_>>();
+        ["blocked", "retrying"]
+            .iter()
+            .all(|phase| phases.contains(*phase))
+    })
+    .await;
+    let notifications = stream_notifications(&frames);
+    let blocked = notifications
+        .iter()
+        .find(|frame| {
+            frame["params"]["data"]["kind"] == json!("hub.pool")
+                && frame["params"]["data"]["phase"] == json!("blocked")
+        })
+        .expect("blocked pool event");
+    assert_eq!(blocked["params"]["data"]["attempts"], json!(1));
+    assert_eq!(
+        blocked["params"]["data"]["untilMs"],
+        json!(1_700_000_000_000u64)
+    );
+    assert_eq!(blocked["params"]["data"]["blockedKind"], json!("quota"));
+    assert_eq!(
+        blocked["params"]["data"]["blockedUntil"],
+        json!("2026-01-01T00:01:03Z")
+    );
+
+    let retrying = notifications
+        .iter()
+        .find(|frame| {
+            frame["params"]["data"]["kind"] == json!("hub.pool")
+                && frame["params"]["data"]["phase"] == json!("retrying")
+        })
+        .expect("retrying pool event");
+    assert_eq!(retrying["params"]["data"]["attempts"], json!(1));
+    assert_eq!(
+        retrying["params"]["data"]["untilMs"],
+        json!(1_700_000_060_000u64)
+    );
+}
+
+#[tokio::test]
 async fn hub_run_selector_narrows_the_stream_without_ending_it() {
     let mut run_events = HashMap::new();
     run_events.insert(

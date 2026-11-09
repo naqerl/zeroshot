@@ -852,6 +852,8 @@ impl HubService {
             }
             job.state = JobState::Dequeued;
             job.finished_at_ms = Some(now);
+            job.error = None;
+            job.failure_reason = None;
             Ok(job_document(job, now, max_stall_ms))
         })
         .await
@@ -960,6 +962,8 @@ impl HubService {
                     None if job.state == JobState::Queued => {
                         job.state = JobState::Stopped;
                         job.finished_at_ms = Some(now);
+                        job.error = None;
+                        job.failure_reason = None;
                     }
                     None => {
                         return Err(HubError::InvalidState(format!(

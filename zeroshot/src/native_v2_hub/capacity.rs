@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use super::clock::rfc3339;
 use super::error::HubError;
 use super::model::{HubState, JobError, JobErrorKind, JobState};
-use super::pool::{Lease, Pool, serving};
+use super::pool::{BlockedKind, Lease, Pool, serving};
 use super::profile::{self, Spec};
 use super::provision::{Architecture, Catalog};
 
@@ -252,12 +252,28 @@ fn shortage_reason(spec: &Spec, tried: &[(String, String)]) -> String {
 }
 
 /// Why the pool creates no server now for jobs of `spec` (any spec when `None`): stopped by an
-/// account or request error, waiting out a capacity shortage, or paused after failed boots.
+/// account, credential or request error, waiting out a capacity shortage, or paused after failed
+/// boots. A block names its kind and expiry so a queued job explains itself.
 pub(crate) fn hold_reason(pool: &Pool, spec: Option<&Spec>, now: u64) -> Option<String> {
-    if let Some(blocked) = &pool.blocked {
+    if let Some(detail) = &pool.blocked {
+        let kind = pool.blocked_kind.unwrap_or(BlockedKind::Unknown);
+        if pool.is_blocked(now) {
+            let until = pool
+                .blocked_until_ms
+                .map_or_else(|| "soon".to_owned(), rfc3339);
+            return Some(format!(
+                "waiting: pool {} blocked until {until} ({}): {detail}; fix it, then run \
+                 `zeroshot hub pool resume {}`",
+                pool.name,
+                kind.as_str(),
+                pool.name
+            ));
+        }
         return Some(format!(
-            "blocked: {blocked}; fix it, then run `zeroshot hub pool resume {}`",
-            pool.name
+            "waiting: pool {} retrying after a {} block at {}: {detail}",
+            pool.name,
+            kind.as_str(),
+            rfc3339(now)
         ));
     }
     let shortages = pool
@@ -288,7 +304,7 @@ pub(crate) fn hold_reason(pool: &Pool, spec: Option<&Spec>, now: u64) -> Option<
 
 /// Whether the pool may start servers now; a shortage holds only the jobs of its spec.
 pub(crate) fn may_start(pool: &Pool, now: u64) -> bool {
-    pool.blocked.is_none() && pool.paused_until_ms.is_none_or(|until| now >= until)
+    !pool.is_blocked(now) && pool.paused_until_ms.is_none_or(|until| now >= until)
 }
 
 /// Resolve the machine of each queued pool job, show it why it waits, and expire those past
@@ -310,6 +326,44 @@ pub(crate) fn note_waiting(state: &mut HubState, now: u64) -> Vec<String> {
         let spec = profile::resolve_spec(pool, &job.placement.tags);
         let reason = hold_reason(pool, Some(&spec), now).or_else(|| at_max(pool, &leases));
         job.requirements.machine = Some(spec);
+        if let Some(detail) = pool.blocked.as_deref() {
+            let kind = pool.blocked_kind.unwrap_or(BlockedKind::Unknown);
+            let active = pool.is_blocked(now);
+            let message = if active {
+                let until = pool
+                    .blocked_until_ms
+                    .map_or_else(|| "soon".to_owned(), rfc3339);
+                format!(
+                    "pool {} is blocked until {until} ({}): {detail}",
+                    pool.name,
+                    kind.as_str()
+                )
+            } else {
+                format!(
+                    "pool {} is retrying after a {} block; next try at {}: {detail}",
+                    pool.name,
+                    kind.as_str(),
+                    rfc3339(now)
+                )
+            };
+            job.failure_reason = Some(message.clone());
+            job.error = Some(JobError::new(
+                if active {
+                    JobErrorKind::PoolBlocked
+                } else {
+                    JobErrorKind::PoolRetrying
+                },
+                message,
+            ));
+        } else if job.error.as_ref().is_some_and(|error| {
+            matches!(
+                error.kind,
+                JobErrorKind::PoolBlocked | JobErrorKind::PoolRetrying
+            )
+        }) {
+            job.error = None;
+            job.failure_reason = None;
+        }
         let queued_since = job.not_before_ms.unwrap_or(0).max(job.submitted_at_ms);
         if let Some(limit) = pool.wait_max_ms
             && now >= queued_since.saturating_add(limit)

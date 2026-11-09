@@ -248,6 +248,9 @@ enum Creation {
     Short(Vec<(String, String)>),
     /// The provider refused for a reason a retry cannot fix.
     Blocked(String),
+    /// Another lease in this pass found the pool blocked or paused; this one made no provider
+    /// call. Carries the reason so the abandoned lease does not mislabel a pause as a block.
+    Held(String),
 }
 
 impl HubService {
@@ -443,6 +446,7 @@ impl HubService {
         self.mutate(|state| {
             pool::update_idle(state, now);
             let expired = capacity::note_waiting(state, now);
+            pool::expire_blocks(state, now);
             // A job whose --wait-max expired while its server was still starting must not leave
             // a lease silently connecting: mark the lease so the next teardown pass names the
             // reason and deletes the box.
@@ -533,6 +537,10 @@ impl HubService {
                         lease.error = Some(format!("creating: {error}"));
                         return Ok(Step::Abandoned(Box::new(lease)));
                     }
+                    Creation::Held(reason) => {
+                        lease.error = Some(format!("creating: {reason}"));
+                        return Ok(Step::Abandoned(Box::new(lease)));
+                    }
                 }
             }
             LeasePhase::Booting => boot(runtime, &mut lease).await?,
@@ -593,6 +601,16 @@ impl HubService {
         (pool, hub_id): (&Pool, &str),
         lease: &mut Lease,
     ) -> Result<Creation, HubError> {
+        // A sibling lease may have blocked or paused this pool earlier in the same pass; never
+        // call the provider again while it cannot start servers.
+        let now = now_ms();
+        if !capacity::may_start(pool, now) {
+            let reason = capacity::hold_reason(pool, None, now).map_or_else(
+                || format!("pool {} cannot start servers now", pool.name),
+                |reason| reason.trim_start_matches("waiting: ").to_owned(),
+            );
+            return Ok(Creation::Held(reason));
+        }
         let existing = runtime
             .provisioner
             .list_by_label(&lease_selector(hub_id, lease))
@@ -679,13 +697,23 @@ impl HubService {
             let Some(index) = state.pools.iter().position(|pool| pool.name == pool_name) else {
                 return Ok(String::new());
             };
-            let mut change: Option<(PoolPhase, Option<String>)> = None;
+            let mut change: Option<PoolChange> = None;
             let reason = {
                 let pool = &mut state.pools[index];
                 match hold {
                     Hold::Clear(spec, tried) => {
                         capacity::count_unavailable(pool, tried);
                         pool.shortages.remove(&spec.key());
+                        pool.blocked_attempts = 0;
+                        if let Some((kind, _, _)) = pool.clear_block() {
+                            change = Some(PoolChange::Phase(
+                                PoolPhase::Resumed,
+                                Some(format!(
+                                    "a lease succeeded; cleared the {} block",
+                                    kind.as_str()
+                                )),
+                            ));
+                        }
                         String::new()
                     }
                     Hold::Count(tried) => {
@@ -702,21 +730,44 @@ impl HubService {
                             .map(|shortage| shortage.reason.clone())
                             .unwrap_or_default();
                         if !existed {
-                            change = Some((PoolPhase::Shortage, Some(reason.clone())));
+                            change =
+                                Some(PoolChange::Phase(PoolPhase::Shortage, Some(reason.clone())));
                         }
                         reason
                     }
                     Hold::Blocked(error) => {
-                        if pool.blocked.as_deref() != Some(error) {
-                            change = Some((PoolPhase::Blocked, Some(error.to_owned())));
+                        if let Some((kind, until)) = pool.start_block(error, now) {
+                            change = Some(PoolChange::Block {
+                                kind,
+                                until,
+                                reason: pool::block_reason(kind, until, error),
+                            });
                         }
-                        pool.blocked = Some(error.to_owned());
                         String::new()
                     }
                 }
             };
-            if let Some((phase, why)) = change {
-                pool::record_pool_phase(
+            match change {
+                Some(PoolChange::Block {
+                    kind,
+                    until,
+                    reason,
+                }) => {
+                    pool::record_block(
+                        state,
+                        pool::BlockEvent {
+                            pool: pool_name,
+                            kind,
+                            until,
+                            reason,
+                            at: now,
+                        },
+                    );
+                    // A block discovered while creating the lease is visible on its queued
+                    // jobs in this same pass, not only after the next one.
+                    capacity::note_waiting(state, now);
+                }
+                Some(PoolChange::Phase(phase, why)) => pool::record_pool_phase(
                     state,
                     pool_name,
                     pool::PoolPhaseChange {
@@ -724,7 +775,8 @@ impl HubService {
                         reason: why,
                         at: now,
                     },
-                );
+                ),
+                None => {}
             }
             Ok(reason)
         })
@@ -1532,6 +1584,17 @@ async fn delete(runtime: &PoolRuntime, lease: &mut Lease) -> Result<bool, HubErr
     Ok(true)
 }
 
+/// A pool change a create attempt records, so a phase and a block payload never share one
+/// value.
+enum PoolChange {
+    Phase(PoolPhase, Option<String>),
+    Block {
+        kind: pool::BlockedKind,
+        until: u64,
+        reason: String,
+    },
+}
+
 /// What a create attempt learned about a pool.
 enum Hold<'a> {
     /// A server of this spec was created after these candidates were out of capacity.
@@ -1737,6 +1800,9 @@ impl HubService {
             boot_failures: 0,
             paused_until_ms: None,
             blocked: None,
+            blocked_kind: None,
+            blocked_until_ms: None,
+            blocked_attempts: 0,
             shortages: std::collections::BTreeMap::new(),
             profiles: Vec::new(),
             unavailable: std::collections::BTreeMap::new(),
@@ -1810,14 +1876,20 @@ impl HubService {
                 .iter()
                 .position(|pool| pool.name == name)
                 .ok_or_else(|| HubError::Usage(format!("pool {name} does not exist")))?;
-            let pool = &mut state.pools[index];
-            let held = pool.blocked.take();
-            let paused = pool.paused_until_ms.take();
-            pool.shortages.clear();
-            pool.boot_failures = 0;
+            let (held, paused) = {
+                let pool = &mut state.pools[index];
+                let held = pool.clear_block();
+                let paused = pool.paused_until_ms.take();
+                pool.shortages.clear();
+                pool.boot_failures = 0;
+                pool.blocked_attempts = 0;
+                (held, paused)
+            };
             if held.is_some() || paused.is_some() {
                 let reason = held
-                    .map(|blocked| format!("block cleared: {blocked}"))
+                    .map(|(kind, _, blocked)| {
+                        format!("block cleared ({}): {blocked}", kind.as_str())
+                    })
                     .or_else(|| paused.map(|_| "boot pause cleared".to_owned()));
                 pool::record_pool_phase(
                     state,

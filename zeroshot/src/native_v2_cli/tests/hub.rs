@@ -329,6 +329,12 @@ fn events_command_mirrors_subscription_filters() {
     assert!(parse(&["hub", "events", "--states", "not-a-state"]).is_err());
     assert!(parse(&["hub", "events", "--phases", "not-a-phase"]).is_err());
     assert!(parse(&["hub", "events", "--label", "novalue"]).is_err());
+    let HubCommand::Events(retrying) =
+        parse(&["hub", "events", "--phases", "blocked,retrying"]).expect("pool block phases")
+    else {
+        panic!("expected events");
+    };
+    assert_eq!(retrying.phases, ["blocked", "retrying"]);
 }
 
 #[test]

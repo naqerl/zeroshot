@@ -69,6 +69,7 @@ pub(crate) const POOL_PHASES: &[&str] = &[
     "paused",
     "resumed",
     "blocked",
+    "retrying",
     "shortage",
 ];
 /// The states a `hub.job` occurrence can carry; the CLI hub event filter accepts this vocabulary.
@@ -2325,6 +2326,10 @@ fn publish_pool(feed: &HubFeed, record: &Value) {
         "previousPhase": record.get("previousPhase").cloned().unwrap_or(Value::Null),
         "at": at,
         "reason": record.get("reason").cloned().unwrap_or(Value::Null),
+        "blockedKind": record.get("blockedKind").cloned().unwrap_or(Value::Null),
+        "blockedUntil": record.get("blockedUntil").cloned().unwrap_or(Value::Null),
+        "attempts": record.get("attempts").cloned().unwrap_or(Value::Null),
+        "untilMs": record.get("untilMs").cloned().unwrap_or(Value::Null),
     });
     feed.publish(HubEvent {
         sequence: 0,
@@ -3058,7 +3063,7 @@ fn payload_schema(name: &str) -> Value {
     let pool_data = json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["kind", "scope", "pool", "leaseId", "serverId", "memberId", "machine", "phase", "previousPhase", "at", "reason", "cursor", "summary"],
+        "required": ["kind", "scope", "pool", "leaseId", "serverId", "memberId", "machine", "phase", "previousPhase", "at", "reason", "blockedKind", "blockedUntil", "attempts", "untilMs", "cursor", "summary"],
         "properties": {
             "kind": {"const": HUB_POOL},
             "scope": {"type": "string", "enum": ["lease", "pool"], "description": "Whether the transition is one lease's or the pool's own."},
@@ -3079,10 +3084,14 @@ fn payload_schema(name: &str) -> Value {
             },
             "phase": {
                 "type": "string",
-                "enum": ["requested", "creating", "booting", "preparing", "ready", "in_use", "idle", "draining", "deleted", "failed", "added", "removed", "paused", "resumed", "blocked", "shortage"]
+                "enum": ["requested", "creating", "booting", "preparing", "ready", "in_use", "idle", "draining", "deleted", "failed", "added", "removed", "paused", "resumed", "blocked", "retrying", "shortage"]
             },
             "previousPhase": {"type": ["string", "null"]},
             "reason": {"type": ["string", "null"]},
+            "blockedKind": {"type": ["string", "null"]},
+            "blockedUntil": {"type": ["string", "null"]},
+            "attempts": {"type": ["integer", "null"]},
+            "untilMs": {"type": ["integer", "null"]},
             "at": {"type": "string"},
             "summary": {"type": "object"},
             "sequence": {"type": "integer", "minimum": 1}

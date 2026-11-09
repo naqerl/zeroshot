@@ -941,7 +941,10 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   `pool_events` records every lease and pool transition from the code that performs it: leases
   report `requested`, `creating`, `booting`, `preparing`, `ready`, `in_use`, `idle`, `draining`,
   `deleted`, or `failed` with `previousPhase`, and pools report `added`, `removed`, `paused`,
-  `resumed`, `blocked`, `shortage`; `removed` waits for every lease of the pool to be deleted.
+  `resumed`, `blocked`, `retrying`, `shortage`; block and retry records carry their consecutive
+  `attempts` and `untilMs`. A blocked pool retries on its own after 1m, 2m, 5m, 15m, then at most
+  30m, and a successful lease resets the ladder; `removed` waits for every lease of the pool to be
+  deleted.
   Each pass reconciles a lease whose pool was removed and whose server the provider no longer lists
   into `deleted` with its reason, failing any run still placing there with
   `failureClassification: provider_confirmed_absent`. A lease in an existing pool is retired the
@@ -974,8 +977,9 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   (`Spec`): job size tags (`server-type=`, `min-vcpu=`, `min-ram-gb=`), else the highest-ranked
   profiled tag (priority, then vCPU, then memory; ties rejected at `tag set`), else the pool's
   lists. `capacity.rs` owns catalog validation, candidate order, create-error classes, per-spec
-  shortages (30 s doubling to 10 min, separate from the boot pause), blocking (quota/invalid until
-  `hub pool resume`) and `--wait-max`. `placement.rs` never places a tag-profile job on an
+  shortages (30 s doubling to 10 min, separate from the boot pause), blocking (a provider refusal
+  expires on the 1m/2m/5m/15m/30m ladder unless `hub pool resume` clears it first) and
+  `--wait-max`. `placement.rs` never places a tag-profile job on an
   undersized member. A pool's `transport` is `ssh` (default) or `tailcat`: `tunnel.rs` keeps
   `SshTunnels` as the script path and fallback, and adds `TailcatTunnels`, which runs
   `tailcat forward` as the job data path. A tailcat pool's boot script downloads the pinned

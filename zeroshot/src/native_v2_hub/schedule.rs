@@ -595,6 +595,7 @@ pub(crate) async fn dispatch(
             job.run_id = Some(run_id);
             job.dispatched_at_ms = Some(now_ms);
             job.error = None;
+            job.failure_reason = None;
             Dispatched::Placed
         }
         Err(error @ HubError::Unanswered(_)) => {
@@ -602,6 +603,7 @@ pub(crate) async fn dispatch(
             if job.unconfirmed_submissions >= limit {
                 job.state = JobState::Failed;
                 job.finished_at_ms = Some(now_ms);
+                job.failure_reason = None;
                 job.error = Some(JobError::new(
                     JobErrorKind::UnconfirmedLimit,
                     format!(
@@ -613,6 +615,7 @@ pub(crate) async fn dispatch(
                 return Dispatched::Rejected(error);
             }
             job.state = JobState::Running;
+            job.failure_reason = None;
             job.error = Some(JobError::new(
                 JobErrorKind::SubmissionUnconfirmed,
                 error.to_string(),
@@ -623,6 +626,7 @@ pub(crate) async fn dispatch(
             job.attempts = attempt;
             job.state = JobState::Failed;
             job.finished_at_ms = Some(now_ms);
+            job.failure_reason = None;
             job.error = Some(JobError::new(
                 JobErrorKind::SubmissionRejected,
                 error.to_string(),
