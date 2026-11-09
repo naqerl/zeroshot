@@ -167,6 +167,18 @@ impl HubError {
         }
     }
 
+    /// Whether a failed target call carries the structured proof that the target itself is no
+    /// longer registered. A transport timeout or refusal is not such proof.
+    pub(crate) fn target_missing(&self) -> bool {
+        matches!(
+            self,
+            Self::Target {
+                diagnostic: Some(diagnostic),
+                ..
+            } if diagnostic.get("code").and_then(Value::as_str) == Some("target.not_found")
+        )
+    }
+
     pub(crate) fn storage(action: &str, error: impl std::fmt::Display) -> Self {
         Self::Storage(format!("{action}: {error}"))
     }

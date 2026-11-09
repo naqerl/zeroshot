@@ -37,6 +37,7 @@ pub(crate) struct TickReport {
     pub finished: Vec<Value>,
     pub stalled: Vec<Value>,
     pub target_lost: Vec<Value>,
+    pub runtime_lost: Vec<Value>,
     pub failed: Vec<Value>,
     pub unconfirmed: Vec<Value>,
     pub resumed: Vec<Value>,
@@ -69,6 +70,7 @@ impl TickReport {
             "finished": self.finished,
             "stalled": self.stalled,
             "targetLost": self.target_lost,
+            "runtimeLost": self.runtime_lost,
             "dispatchFailed": self.failed,
             "dispatchUnconfirmed": self.unconfirmed,
             "resumed": self.resumed,
@@ -205,11 +207,19 @@ pub(crate) fn record_health(
             Reachability::Reachable => {
                 member.unreachable_probes = 0;
                 member.last_probe_ok_at_ms = Some(now_ms);
+                member.inconclusive_since_ms = None;
             }
             Reachability::Unreachable => {
                 member.unreachable_probes = member.unreachable_probes.saturating_add(1);
+                member.inconclusive_since_ms = None;
             }
-            Reachability::Inconclusive => {}
+            Reachability::Inconclusive => {
+                // The clock starts at the member's last success (or now for a member that never
+                // answered), so an inconclusive member cannot hide a vanished runtime forever.
+                member
+                    .inconclusive_since_ms
+                    .get_or_insert_with(|| member.last_probe_ok_at_ms.unwrap_or(now_ms));
+            }
         }
     }
     for job in jobs
@@ -245,6 +255,7 @@ pub(crate) fn record_target_health(state: &mut HubState, target: &str, now_ms: u
     {
         member.unreachable_probes = 0;
         member.last_probe_ok_at_ms = Some(now_ms);
+        member.inconclusive_since_ms = None;
     }
     for job in state.jobs.iter_mut().filter(|job| {
         matches!(job.state, JobState::Running | JobState::WaitingQuota)
@@ -284,6 +295,12 @@ pub(crate) const CLASSIFIED_ENDPOINT_REFUSED: &str = "endpoint_refused";
 /// A bounded wait retired a lease whose provider server still existed.
 pub(crate) const CLASSIFIED_LEASE_RETIRED: &str = "lease_retired";
 pub(crate) const CLASSIFIED_STALLED: &str = "stalled";
+/// A lease whose deletion the hub confirmed while a job still pointed at its member.
+pub(crate) const CLASSIFIED_LEASE_GONE: &str = "lease_gone";
+/// `hub stop` proved the target no longer exists to stop the run.
+pub(crate) const CLASSIFIED_STOP_UNREACHABLE: &str = "stop_unreachable";
+/// A member answered only inconclusive probes past the job's stall limit.
+pub(crate) const CLASSIFIED_INCONCLUSIVE: &str = "probe_inconclusive";
 
 /// A lost-target candidate the reaper kept running, with the reason it withheld action.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -425,15 +442,62 @@ pub(crate) fn settle_orphaned_lease(
 /// Record one target-lost failure, naming the observation that decided it. `detail` explains
 /// what the hub saw; `classification` says which observation it was.
 fn fail_job(job: &mut Job, now_ms: u64, classification: &str, detail: String) -> Value {
+    fail_job_as(
+        job,
+        now_ms,
+        FailedJob {
+            failure_reason: "target_lost",
+            kind: JobErrorKind::TargetLost,
+            classification,
+            detail,
+        },
+    )
+}
+
+/// Record one runtime-lost failure. A runtime-lost job never got a verdict because its runtime
+/// no longer exists; this stays distinct from `target_lost` so `hub stats` can separate them.
+pub(crate) fn fail_runtime_lost(
+    job: &mut Job,
+    now_ms: u64,
+    classification: &str,
+    detail: String,
+) -> Value {
+    fail_job_as(
+        job,
+        now_ms,
+        FailedJob {
+            failure_reason: "runtime_lost",
+            kind: JobErrorKind::RuntimeLost,
+            classification,
+            detail,
+        },
+    )
+}
+
+/// One terminal job failure: its failure reason, error kind, classification, and diagnostic.
+struct FailedJob<'a> {
+    failure_reason: &'a str,
+    kind: JobErrorKind,
+    classification: &'a str,
+    detail: String,
+}
+
+fn fail_job_as(job: &mut Job, now_ms: u64, failure: FailedJob<'_>) -> Value {
+    let FailedJob {
+        failure_reason,
+        kind,
+        classification,
+        detail,
+    } = failure;
     job.reaper = None;
     job.state = JobState::Failed;
     job.quota = None;
     job.quota_attempts = 0;
     job.finished_at_ms = Some(now_ms);
-    job.failure_reason = Some("target_lost".to_owned());
+    job.failure_reason = Some(failure_reason.to_owned());
     job.failure_classification = Some(classification.to_owned());
     job.error = Some(JobError::new(
-        JobErrorKind::TargetLost,
+        kind,
         format!("{detail}; the hub cannot observe or stop its run ({classification})"),
     ));
     json!({
@@ -441,9 +505,119 @@ fn fail_job(job: &mut Job, now_ms: u64, classification: &str, detail: String) ->
         "state": job.display_state(now_ms),
         "target": job.target,
         "runId": job.run_id,
-        "reason": "target_lost",
+        "reason": failure_reason,
         "classification": job.failure_classification,
     })
+}
+
+/// Fail the runs still pointing at a lease the hub deleted. Deletion is proof the runtime is
+/// gone, so the jobs settle `runtime_lost` in the same pass instead of being left attached to a
+/// member the hub can no longer observe.
+pub(crate) fn settle_torn_down_lease(
+    jobs: &mut [Job],
+    now_ms: u64,
+    member: &str,
+    reason: &str,
+) -> Vec<Value> {
+    let mut failed = Vec::new();
+    for job in jobs.iter_mut() {
+        if !matches!(job.state, JobState::Running | JobState::WaitingQuota)
+            || job.target.as_deref() != Some(member)
+        {
+            continue;
+        }
+        failed.push(fail_runtime_lost(
+            job,
+            now_ms,
+            CLASSIFIED_LEASE_GONE,
+            format!("{reason}; {member} is gone"),
+        ));
+    }
+    failed
+}
+
+/// A running job whose member has answered only inconclusive probes for longer than the job's
+/// stall limit. An inconclusive probe says nothing about whether the member exists, so it must
+/// not keep a corpse running forever.
+pub(crate) struct UnobservableRun {
+    pub job_id: String,
+    pub member: String,
+    pub still_ms: u64,
+    pub max_stall_ms: u64,
+    pub limit_source: StallLimitSource,
+    pub last_probe_ok_at_ms: Option<u64>,
+    pub reaper: Option<String>,
+}
+
+/// Running jobs whose member has been inconclusive past their effective stall limit. The clock
+/// starts at the later of the member's first inconclusive probe and the job's placement, so a
+/// long-broken member does not fail a job that just started there.
+pub(crate) fn unobservable_runs(
+    state: &HubState,
+    now_ms: u64,
+    limit_for: impl Fn(&Job) -> Option<StallLimit>,
+) -> Vec<UnobservableRun> {
+    state
+        .jobs
+        .iter()
+        .filter(|job| job.state == JobState::Running)
+        .filter_map(|job| {
+            let name = job.target.as_deref()?;
+            let member = state.member(name)?;
+            let since = member.inconclusive_since_ms?;
+            let placed_at = job.dispatched_at_ms.unwrap_or(job.submitted_at_ms);
+            let since = since.max(placed_at);
+            let limit = limit_for(job)?;
+            let still_ms = now_ms.saturating_sub(since);
+            (still_ms >= limit.max_stall_ms).then_some(UnobservableRun {
+                job_id: job.job_id.clone(),
+                member: name.to_owned(),
+                still_ms,
+                max_stall_ms: limit.max_stall_ms,
+                limit_source: limit.source,
+                last_probe_ok_at_ms: member.last_probe_ok_at_ms.or(job.target_last_ok_at_ms),
+                reaper: job.reaper.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Fail unobservable runs as `runtime_lost`, naming the limit, the reaper's reason, the probe
+/// history, and the last successful probe.
+pub(crate) fn settle_unobservable_runs(
+    jobs: &mut [Job],
+    now_ms: u64,
+    runs: &[UnobservableRun],
+) -> Vec<Value> {
+    let mut failed = Vec::new();
+    for run in runs {
+        let Some(job) = jobs.iter_mut().find(|job| job.job_id == run.job_id) else {
+            continue;
+        };
+        if job.state != JobState::Running || job.target.as_deref() != Some(run.member.as_str()) {
+            continue;
+        }
+        let last = run.last_probe_ok_at_ms.map_or_else(
+            || "no successful probe was recorded".to_owned(),
+            |at| format!("last successful probe at {}", super::clock::rfc3339(at)),
+        );
+        let reaper = run.reaper.clone().unwrap_or_else(|| {
+            format!(
+                "{} answered only inconclusive probes for {}ms",
+                run.member, run.still_ms
+            )
+        });
+        let detail = format!(
+            "{} stayed inconclusive for {}ms (stall limit {}ms from {}): {reaper}; {last}",
+            run.member,
+            run.still_ms,
+            run.max_stall_ms,
+            run.limit_source.description()
+        );
+        let record = fail_runtime_lost(job, now_ms, CLASSIFIED_INCONCLUSIVE, detail);
+        failed.push(record);
+    }
+    failed
 }
 
 /// The deciding observation when only a failed load probe proves a member is gone.
@@ -1369,6 +1543,8 @@ pub(crate) async fn tick(state: &mut HubState, driver: &dyn HubDriver, now_ms: u
     let (lost, withheld) = confirm_lost_by_probe(lost_targets(state), &loads);
     note_withheld(&mut state.jobs, &withheld);
     report.target_lost = settle_lost_targets(&mut state.jobs, now_ms, &lost);
+    let unobservable = unobservable_runs(state, now_ms, |job| StallLimit::for_job(job, None));
+    report.runtime_lost = settle_unobservable_runs(&mut state.jobs, now_ms, &unobservable);
     pool::sync_quota_holds(state);
     for (job_id, member) in placing(state) {
         if let Some(job) = state.jobs.iter_mut().find(|job| job.job_id == job_id) {

@@ -3065,3 +3065,42 @@ async fn a_legacy_block_without_a_deadline_retries_on_the_first_pass() {
     assert_eq!(rig.cloud.servers(), 1, "the queued job got its server");
     assert_eq!(pool_phase_count(&state, PoolPhase::Retrying), 1);
 }
+
+#[tokio::test]
+async fn a_lease_deleted_while_a_job_runs_settles_that_job_runtime_lost() {
+    let rig = rig();
+    let lease = rig.running_job_on_server().await;
+    let server_id = lease.server_id.expect("server id");
+    rig.set(|state| {
+        let lease = &mut state.leases[0];
+        lease.phase = LeasePhase::Deleting;
+        lease.event_phase = Some(PoolPhase::Draining);
+        lease.action_id = None;
+        lease.server_id = Some(server_id);
+    })
+    .await;
+
+    rig.pass().await;
+    // A provider delete first records its action, then a later pass observes it finish.
+    rig.pass().await;
+    let state = rig.state().await;
+    assert!(
+        state.leases.is_empty(),
+        "the deleted lease is not left behind: {:?}",
+        state.leases
+    );
+    assert!(
+        state.members.iter().all(|member| member.name != lease.name),
+        "the deleted member is not left behind"
+    );
+    let job = job_named(&state, "hj_one");
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(job.failure_reason.as_deref(), Some("runtime_lost"));
+    assert_eq!(
+        job.failure_classification.as_deref(),
+        Some(super::super::schedule::CLASSIFIED_LEASE_GONE)
+    );
+    let error = job.error.as_ref().expect("runtime-lost error");
+    assert_eq!(error.kind, JobErrorKind::RuntimeLost);
+    assert!(error.message.contains(&lease.name), "{error:?}");
+}

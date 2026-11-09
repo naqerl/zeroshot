@@ -940,16 +940,21 @@ impl HubService {
 
     /// Stop a job deliberately without deleting its pool machine. A queued job never starts;
     /// a running job's run is stopped through the same target call as `hub force-stop` and the
-    /// lease that ran it is held for reuse. A failed stop leaves the job running.
+    /// lease that ran it is held for reuse. A failed stop that proves the target is gone settles
+    /// the job `runtime_lost` instead of leaving a corpse running.
     ///
     /// Placement is serialized for the whole stop: a dispatcher pass cannot poll the run to a
     /// terminal state between reading the job and recording the stop, and cannot choose and
     /// dispatch a job that was read as queued. A concurrent status read still may settle the
     /// run while the target stop is in flight, so [`Self::settle_stop`] accepts the exact run
-    /// in a terminal state and records the deliberate stop over it.
+    /// in a terminal state and records the deliberate stop over it. Stopping an already settled
+    /// job answers its settled state, so a retry is idempotent.
     pub(crate) async fn stop(&self, job_id: &str) -> Result<Value, HubError> {
         let _placing = self.placement.lock().await;
         let job = self.job(job_id).await?;
+        if job.state.is_terminal() {
+            return Ok(job_document(&job, now_ms(), self.max_stall_ms));
+        }
         match job.state {
             JobState::Queued => self.settle_stop(job_id, None, None).await,
             JobState::WaitingQuota => {
@@ -966,9 +971,25 @@ impl HubService {
                         job.target.as_deref().unwrap_or("its member")
                     )));
                 };
+                // A member that left the hub (or whose lease was deleted) cannot run the job.
+                if let Some(evidence) = self.stop_gone_evidence(&job, target, false).await {
+                    return self
+                        .settle_runtime_lost_stop(RuntimeLostStop {
+                            job_id,
+                            member: target,
+                            run_id,
+                            detail: format!("stopping run {run_id} on {target} failed: {evidence}"),
+                        })
+                        .await;
+                }
                 if let Err(error) = self.driver().stop(target, run_id).await {
                     let error = unanswered_when_uncertain(error);
-                    return Err(match error {
+                    // A timeout is not proof by itself: only a typed missing target, or a
+                    // missing/unprobed member, turns a failed stop into a runtime loss.
+                    let missing_target = error.target_missing();
+                    let unreachable = matches!(error, HubError::Unanswered(_)) || missing_target;
+                    let stop_reason = error.to_string();
+                    let mapped = match error {
                         HubError::Unanswered(message) => HubError::Unanswered(format!(
                             "hub job {job_id}: could not stop run {run_id} on {target}: {message}"
                         )),
@@ -982,7 +1003,42 @@ impl HubService {
                             diagnostic,
                         },
                         other => other,
-                    });
+                    };
+                    if unreachable {
+                        // A missing registration is proof even when a stale member record still
+                        // shows a successful probe; otherwise a timeout only settles a member
+                        // the hub has not observed since placement.
+                        let evidence = if missing_target {
+                            Some(format!(
+                                "{target} is no longer a registered target ({})",
+                                probe_label(job.target_last_ok_at_ms)
+                            ))
+                        } else {
+                            self.stop_gone_evidence(&job, target, true).await
+                        };
+                        if let Some(evidence) = evidence {
+                            return self
+                                .settle_runtime_lost_stop(RuntimeLostStop {
+                                    job_id,
+                                    member: target,
+                                    run_id,
+                                    detail: format!(
+                                        "stopping run {run_id} on {target} failed \
+                                         ({stop_reason}): {evidence}"
+                                    ),
+                                })
+                                .await;
+                        }
+                    }
+                    // A status read may have settled this exact run while the stop was in
+                    // flight. Its real outcome is authoritative over the failed stop.
+                    if let Ok(current) = self.job(job_id).await
+                        && current.state.is_terminal()
+                        && current.run_id.as_deref() == Some(run_id.as_str())
+                    {
+                        return Ok(job_document(&current, now_ms(), self.max_stall_ms));
+                    }
+                    return Err(mapped);
                 }
                 self.settle_stop(job_id, Some(target.as_str()), Some(run_id.as_str()))
                     .await
@@ -992,6 +1048,83 @@ impl HubService {
                 job.display_state(now_ms())
             ))),
         }
+    }
+
+    /// Evidence that the run's runtime no longer exists. Before a stop attempt only a missing
+    /// member or lease counts; after a failed stop an unprobed member counts too, because the
+    /// hub has never seen it answer since placement.
+    async fn stop_gone_evidence(
+        &self,
+        job: &Job,
+        member: &str,
+        after_failure: bool,
+    ) -> Option<String> {
+        let state = self.state.lock().await;
+        let Some(member_state) = state.member(member) else {
+            return Some(format!(
+                "{member} is no longer a hub member ({})",
+                probe_label(job.target_last_ok_at_ms)
+            ));
+        };
+        if member_state.pool.is_some() && !state.leases.iter().any(|lease| lease.name == member) {
+            return Some(format!(
+                "{member}'s pool lease no longer exists ({})",
+                probe_label(
+                    member_state
+                        .last_probe_ok_at_ms
+                        .or(job.target_last_ok_at_ms)
+                )
+            ));
+        }
+        if !after_failure {
+            return None;
+        }
+        let placed_at = job.dispatched_at_ms.unwrap_or(job.submitted_at_ms);
+        let last_ok = member_state
+            .last_probe_ok_at_ms
+            .or(job.target_last_ok_at_ms);
+        if !last_ok.is_some_and(|at| at >= placed_at) {
+            return Some(format!(
+                "{member} has not answered a probe since the job was placed at {} ({})",
+                clock::rfc3339(placed_at),
+                probe_label(last_ok)
+            ));
+        }
+        None
+    }
+
+    /// Settle a running job whose target is gone as `runtime_lost`, keeping an outcome a
+    /// concurrent status read already recorded for the same run.
+    async fn settle_runtime_lost_stop(&self, stop: RuntimeLostStop<'_>) -> Result<Value, HubError> {
+        let RuntimeLostStop {
+            job_id,
+            member,
+            run_id,
+            detail,
+        } = stop;
+        let max_stall_ms = self.max_stall_ms;
+        let member = member.to_owned();
+        let run_id = run_id.to_owned();
+        self.mutate(move |state| {
+            let now = now_ms();
+            let position = state
+                .jobs
+                .iter()
+                .position(|job| job.job_id == job_id)
+                .ok_or_else(|| HubError::JobNotFound(job_id.to_owned()))?;
+            let job = &mut state.jobs[position];
+            if job.state != JobState::Running || job.run_id.as_deref() != Some(run_id.as_str()) {
+                return Ok(job_document(job, now, max_stall_ms));
+            }
+            schedule::fail_runtime_lost(
+                job,
+                now,
+                schedule::CLASSIFIED_STOP_UNREACHABLE,
+                format!("{detail}; run {run_id} on {member} can no longer be observed"),
+            );
+            Ok(job_document(job, now, max_stall_ms))
+        })
+        .await
     }
 
     /// Record a deliberate stop and hold the lease that ran the job, if it was a pool member.
@@ -1279,6 +1412,22 @@ impl HubService {
                 })
                 .await?;
         }
+        // A member that only ever answers inconclusively cannot keep a corpse running past
+        // the job's stall limit. The reaper has already recorded why it withheld action, so
+        // that reason travels into the runtime-lost diagnostic.
+        let hub_max_stall_ms = self.max_stall_ms;
+        report.runtime_lost = self
+            .mutate(|state| {
+                let unobservable = schedule::unobservable_runs(state, now, |job| {
+                    schedule::StallLimit::for_job(job, hub_max_stall_ms)
+                });
+                Ok(schedule::settle_unobservable_runs(
+                    &mut state.jobs,
+                    now,
+                    &unobservable,
+                ))
+            })
+            .await?;
         let placing = schedule::placing(&self.snapshot().await);
         for (job_id, member) in placing {
             let (job, dispatched) = self.dispatch(&job_id, &member, now).await?;
@@ -1551,10 +1700,26 @@ fn withhold(target: &LostTarget, count: u32, reason: String) -> WithheldTarget {
     }
 }
 
+/// The last successful probe wording shared by stop and reaper diagnostics.
+fn probe_label(last_ok: Option<u64>) -> String {
+    last_ok.map_or_else(
+        || "no successful probe was recorded".to_owned(),
+        |at| format!("last successful probe at {}", clock::rfc3339(at)),
+    )
+}
+
 enum EndpointCheck {
     Alive(String),
     Refused(String),
     Unknown(String),
+}
+
+/// A `hub stop` that proved the run's runtime is gone, plus the diagnostic to record.
+struct RuntimeLostStop<'a> {
+    job_id: &'a str,
+    member: &'a str,
+    run_id: &'a str,
+    detail: String,
 }
 
 /// Dequeue a job placing on its member. The target may hold a run under the job's submission key

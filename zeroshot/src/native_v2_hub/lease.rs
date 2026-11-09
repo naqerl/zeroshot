@@ -307,6 +307,10 @@ impl HubService {
                         finished.server_id = lease_server_id;
                     }
                     self.mutate(|state| {
+                        let settle_reason = finished
+                            .retirement_reason
+                            .clone()
+                            .unwrap_or_else(|| format!("the hub deleted lease {name}"));
                         let reason = finished.retirement_reason.take();
                         pool::record_lease_phase(
                             state,
@@ -317,7 +321,16 @@ impl HubService {
                                 at: now_ms(),
                             },
                         );
+                        // Deletion is proof the runtime is gone: never leave a running job
+                        // pointing at a member the hub just removed.
+                        schedule::settle_torn_down_lease(
+                            &mut state.jobs,
+                            now_ms(),
+                            &name,
+                            &settle_reason,
+                        );
                         state.leases.retain(|lease| lease.name != name);
+                        state.members.retain(|member| member.name != name);
                         if failed_boot {
                             pool::record_boot(state, &pool_name, true, now_ms());
                         }
