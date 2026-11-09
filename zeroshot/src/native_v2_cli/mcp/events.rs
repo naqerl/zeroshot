@@ -284,6 +284,9 @@ struct WarningEntry {
     execution: Option<String>,
     execution_since_ms: Option<u64>,
     announced_cursor: Option<String>,
+    /// The last watch failure announced for this job. Repeating it while it still holds is a
+    /// tick, not a transition; a successful record or a different reason resets it.
+    watch_failure: Option<String>,
 }
 
 /// Which runs currently have a live watch, and when a failed one may be retried.
@@ -323,6 +326,24 @@ impl WatchBook {
 }
 
 impl WarningBook {
+    /// Remember a watch failure for a job. Returns whether this is a new (job, reason) pair.
+    fn note_watch_failure(&mut self, job_id: &str, reason: &str) -> bool {
+        let entry = self.jobs.entry(job_id.to_owned()).or_default();
+        if entry.watch_failure.as_deref() == Some(reason) {
+            return false;
+        }
+        entry.watch_failure = Some(reason.to_owned());
+        true
+    }
+
+    /// A successful watch record proves the failure condition no longer holds, so the same
+    /// reason may be announced again if it returns later.
+    fn clear_watch_failure(&mut self, job_id: &str) {
+        if let Some(entry) = self.jobs.get_mut(job_id) {
+            entry.watch_failure = None;
+        }
+    }
+
     /// Learn the current execution from a run event. An empty `activeExecutions` means the run
     /// is between executions, so the next one starts its own clock.
     fn observe(&mut self, job_id: &str, event: &Value, now: u64) {
@@ -2041,7 +2062,7 @@ async fn poll_jobs<H>(
         let command = match watch_command(&run_id, target.as_deref(), None) {
             Ok(command) => command,
             Err(failure) => {
-                feed.publish_warning(&job_id, &run_id, json!({"message": rpc_error(failure).1}));
+                feed.publish_watch_failure(&job_id, &run_id, rpc_error(failure).1.to_owned());
                 watched.borrow_mut().retry(&run_id, now);
                 continue;
             }
@@ -2049,7 +2070,7 @@ async fn poll_jobs<H>(
         let mut stream = match host.open_watch(&command).await {
             Ok(stream) => stream,
             Err(failure) => {
-                feed.publish_warning(&job_id, &run_id, json!({"message": failure.message}));
+                feed.publish_watch_failure(&job_id, &run_id, failure.message);
                 watched.borrow_mut().retry(&run_id, Instant::now());
                 continue;
             }
@@ -2061,20 +2082,19 @@ async fn poll_jobs<H>(
         tokio::task::spawn_local(async move {
             while let Some(item) = stream.recv().await {
                 match item {
-                    Ok(event) => feed.publish_run(
-                        RunOrigin {
-                            run_id: &watched_run,
-                            job_id: &job_id,
-                            target: target.clone(),
-                        },
-                        event,
-                    ),
-                    Err(failure) => {
-                        feed.publish_warning(
-                            &job_id,
-                            &watched_run,
-                            json!({"message": failure.message}),
+                    Ok(event) => {
+                        feed.clear_watch_failure(&job_id);
+                        feed.publish_run(
+                            RunOrigin {
+                                run_id: &watched_run,
+                                job_id: &job_id,
+                                target: target.clone(),
+                            },
+                            event,
                         );
+                    }
+                    Err(failure) => {
+                        feed.publish_watch_failure(&job_id, &watched_run, failure.message);
                         break;
                     }
                 }
@@ -2719,6 +2739,22 @@ impl HubFeed {
             "lastActivity": last_activity,
             "lastActivityAt": view.get("lastActivityAt").cloned().unwrap_or(Value::Null),
         })
+    }
+
+    /// Announce a watch failure once per (job, reason) transition. A wedged job therefore
+    /// produces one warning, not one per polling tick.
+    fn publish_watch_failure(&self, job_id: &str, run_id: &str, reason: String) {
+        let changed = self
+            .warnings
+            .borrow_mut()
+            .note_watch_failure(job_id, &reason);
+        if changed {
+            self.publish_warning(job_id, run_id, json!({"message": reason}));
+        }
+    }
+
+    fn clear_watch_failure(&self, job_id: &str) {
+        self.warnings.borrow_mut().clear_watch_failure(job_id);
     }
 
     fn publish_warning(&self, job_id: &str, run_id: &str, facts: Value) {
@@ -3585,6 +3621,85 @@ mod warning_tests {
                     assert!(message.contains(terminal), "{message}");
                     assert!(!message.contains("resuming"), "{message}");
                 }
+            })
+            .await;
+    }
+
+    struct FailingWatchHost {
+        calls: StdMutex<usize>,
+        reason: StdMutex<String>,
+    }
+
+    #[async_trait(?Send)]
+    impl McpHost for FailingWatchHost {
+        async fn execute(&self, command: NativeV2CliCommand) -> Result<String, McpFailure> {
+            match command {
+                NativeV2CliCommand::Hub(HubRequest {
+                    command: HubCommand::Ps(_),
+                    ..
+                }) => Ok(json!({
+                    "schema": "zeroshot.hub.jobs/v1",
+                    "jobs": [{
+                        "jobId": "hj_wedged",
+                        "runId": "run-wedged",
+                        "state": "running",
+                        "target": "zs-wedged",
+                        "submittedAt": "2026-01-01T00:00:00Z",
+                        "dispatchedAt": "2026-01-01T00:00:01Z",
+                    }],
+                })
+                .to_string()),
+                _ => Err(McpFailure::invalid("failing watch host only lists jobs")),
+            }
+        }
+
+        async fn open_watch(&self, _command: &RunWatchCommand) -> Result<WatchStream, McpFailure> {
+            *self.calls.lock().expect("calls") += 1;
+            Err(McpFailure::invalid(
+                self.reason.lock().expect("reason").clone(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wedged_job_warns_once_per_reason_across_watch_ticks() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let feed = Rc::new(HubFeed::new());
+                let host = FailingWatchHost {
+                    calls: StdMutex::new(0),
+                    reason: StdMutex::new(
+                        "target operation failed: target \"zs-wedged\" not found".to_owned(),
+                    ),
+                };
+                let mut jobs = HashMap::new();
+                let watched = Rc::new(RefCell::new(WatchBook::default()));
+                for _ in 0..4 {
+                    super::poll_jobs(&host, &feed, &mut jobs, &watched).await;
+                    // WatchBook backs off after a failure; a real retry tick arrives later.
+                    watched.borrow_mut().retry_at.clear();
+                }
+                let warnings = feed
+                    .test_deliver(None, json!({}))
+                    .into_iter()
+                    .filter(|event| event["data"]["kind"] == json!("hub.warning"))
+                    .collect::<Vec<_>>();
+                assert_eq!(warnings.len(), 1, "{warnings:?}");
+                assert_eq!(
+                    warnings[0]["data"]["message"],
+                    json!("target operation failed: target \"zs-wedged\" not found")
+                );
+                assert_eq!(*host.calls.lock().expect("calls"), 4);
+
+                *host.reason.lock().expect("reason") =
+                    "target operation failed: discovery timed out".to_owned();
+                super::poll_jobs(&host, &feed, &mut jobs, &watched).await;
+                let warnings = feed
+                    .test_deliver(None, json!({}))
+                    .into_iter()
+                    .filter(|event| event["data"]["kind"] == json!("hub.warning"))
+                    .collect::<Vec<_>>();
+                assert_eq!(warnings.len(), 2, "a new reason is a new transition");
             })
             .await;
     }

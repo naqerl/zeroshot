@@ -205,6 +205,13 @@ hourly in-progress warning through `hub.warning`. The `target_lost` error messag
 deciding signal and the last successful probe. A member that is merely in the `drain` state still
 answers probes, so its jobs keep running.
 
+After a hub restart, an `Active` pool lease whose target registration was lost is re-registered
+automatically: the hub reopens the tunnel if needed, registers the direct target, discovers its
+capabilities, and restores the member before runs dispatch. A box that does not answer discovery
+within a bounded retry count is reconciled once: its runs fail with `errorKind` `runtime_lost` and
+`failureReason` `runtime_lost`, and its lease is deleted. The same failure is announced once per
+job and reason through `hub.warning`, not once per polling tick.
+
 `zeroshot hub remove MEMBER` refuses while any job is placed on that member and names the job IDs.
 Stop placed jobs with `zeroshot hub force-stop JOB`, or dequeue jobs that are still placing, before
 removing the member. This keeps removal from orphaning a running job.

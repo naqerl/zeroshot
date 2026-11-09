@@ -41,6 +41,9 @@ pub(crate) const REAP_INTERVAL_MS: u64 = 5 * 60_000;
 const DRAIN_TIMEOUT_MS: u64 = 10 * 60_000;
 /// Retry count reaching the same bound when passes run without waiting for wall-clock time.
 const DRAIN_MAX_ATTEMPTS: u32 = 12;
+/// Discovery attempts allowed when a restored `Active` lease has to re-register its target.
+/// Past this bound the lease is reconciled instead of retried forever.
+const READOPT_MAX_ATTEMPTS: u32 = 3;
 
 /// Provider and tunnel effects of a hub's pools.
 pub(crate) struct PoolRuntime {
@@ -219,10 +222,49 @@ impl PoolReport {
     }
 }
 
+/// How a retired lease's runs are settled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetirementLoss {
+    /// The target is no longer observable in the ordinary target-lost sense.
+    TargetLost,
+    /// The runtime that held the runs is gone, so they can never produce a verdict.
+    RuntimeLost,
+}
+
+/// Prefix marking a lease whose target registration is still being restored.
+pub(super) const READOPT_ERROR_PREFIX: &str = "re-adopting: ";
+
+/// Outcome of registering a lease's target.
+enum Registration {
+    Ready(Vec<String>),
+    Unanswered(String),
+}
+
+/// The data health and capabilities a freshly registered target answers with.
+struct JoinedTarget {
+    data: DataHealth,
+    capabilities: Vec<String>,
+}
+
+/// A failed target re-registration and the report that should record its cleanup.
+struct ReadoptFailure<'a> {
+    reason: String,
+    report: &'a mut PoolReport,
+}
+
+/// Outcome of re-registering a restored `Active` lease.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Readopt {
+    Registered,
+    Retry,
+    Reconciled,
+}
+
 /// A lease being given up and the operator-facing reason recorded for it.
 struct Retirement {
     lease: Lease,
     reason: String,
+    loss: RetirementLoss,
 }
 
 /// Outcome of one lease step.
@@ -234,6 +276,8 @@ enum Step {
     Done(Box<Lease>),
     /// The lease never got a server; it is removed after cleaning up what its attempts left.
     Abandoned(Box<Lease>),
+    /// The step already settled and removed or retired the lease; the caller must not store it.
+    Reconciled,
 }
 
 /// Whether draining finished, and why any archive was skipped if it did.
@@ -257,6 +301,49 @@ enum Creation {
 }
 
 impl HubService {
+    /// Re-register restored `Active` leases before the dispatcher probes their members. This is
+    /// deliberately narrower than a pool pass: the regular pass later in the tick still owns
+    /// reaping, scaling, teardown, and its report.
+    pub(super) async fn recover_active_leases(&self) -> Result<PoolReport, HubError> {
+        let mut report = PoolReport::default();
+        let Some(runtime) = self.pool_runtime() else {
+            return Ok(report);
+        };
+        let state = self.snapshot().await;
+        let now = now_ms();
+        for lease in state.leases.clone() {
+            if lease.phase != LeasePhase::Active || !lease.due(now) {
+                continue;
+            }
+            let Some(pool) = state.pools.iter().find(|pool| pool.name == lease.pool) else {
+                continue;
+            };
+            if !self.needs_readopt(&state, &lease) {
+                continue;
+            }
+            let mut lease = lease;
+            let outcome = match self.readopt((runtime, pool), &mut lease, &mut report).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.readopt_failure(
+                        runtime,
+                        &mut lease,
+                        ReadoptFailure {
+                            reason: error.to_string(),
+                            report: &mut report,
+                        },
+                    )
+                    .await?
+                }
+            };
+            match outcome {
+                Readopt::Registered | Readopt::Retry => self.store_lease(lease).await?,
+                Readopt::Reconciled => {}
+            }
+        }
+        Ok(report)
+    }
+
     /// One pool pass: reap, track idleness, scale up, start due teardowns and step every due
     /// lease. Runs outside the placement lock except where it changes what placement may use.
     pub(crate) async fn pool_pass(&self) -> Result<PoolReport, HubError> {
@@ -339,6 +426,7 @@ impl HubService {
                     .await?;
                     report.deleted.push(name);
                 }
+                Ok(Step::Reconciled) => {}
                 Ok(Step::Abandoned(lease)) => {
                     self.sweep(runtime, &lease, &mut report).await;
                     let mut failed = *lease;
@@ -565,7 +653,30 @@ impl HubService {
             }
             LeasePhase::Active => {
                 let pool = pool.ok_or_else(|| removed(&lease))?;
-                if !runtime.tunnels.is_open(&lease.name) && !runtime.tailcat.is_open(&lease.name) {
+                if self.needs_readopt(&state, &lease) {
+                    // A restarted hub keeps its lease (and usually its member) but not the
+                    // target registration. Re-run the same registration a fresh connect does
+                    // before the dispatcher treats the missing member as a lost runtime.
+                    let outcome = match self.readopt((runtime, pool), &mut lease, report).await {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            self.readopt_failure(
+                                runtime,
+                                &mut lease,
+                                ReadoptFailure {
+                                    reason: error.to_string(),
+                                    report,
+                                },
+                            )
+                            .await?
+                        }
+                    };
+                    if outcome == Readopt::Reconciled {
+                        return Ok(Step::Reconciled);
+                    }
+                } else if !runtime.tunnels.is_open(&lease.name)
+                    && !runtime.tailcat.is_open(&lease.name)
+                {
                     let (tunnels, spec) = self.connect_tunnels(runtime, pool, &mut lease).await?;
                     open_selected(runtime, &mut lease, &tunnels, &spec)?;
                 }
@@ -897,8 +1008,16 @@ impl HubService {
                         lease.pool
                     )
                 };
-                self.settle_reconciled(runtime, Retirement { lease, reason }, report)
-                    .await?;
+                self.settle_reconciled(
+                    runtime,
+                    Retirement {
+                        lease,
+                        reason,
+                        loss: RetirementLoss::TargetLost,
+                    },
+                    report,
+                )
+                .await?;
                 continue;
             }
             // A live server is only retired when a bounded wait, not age alone, requires it.
@@ -906,8 +1025,16 @@ impl HubService {
                 continue;
             }
             if let Some(reason) = bounded {
-                self.retire_live(runtime, Retirement { lease, reason }, report)
-                    .await?;
+                self.retire_live(
+                    runtime,
+                    Retirement {
+                        lease,
+                        reason,
+                        loss: RetirementLoss::TargetLost,
+                    },
+                    report,
+                )
+                .await?;
             }
         }
         Ok(())
@@ -921,7 +1048,11 @@ impl HubService {
         retirement: Retirement,
         report: &mut PoolReport,
     ) -> Result<(), HubError> {
-        let Retirement { lease, reason } = retirement;
+        let Retirement {
+            lease,
+            reason,
+            loss,
+        } = retirement;
         let name = lease.name.clone();
         let mut finished = lease;
         self.mutate(|state| {
@@ -934,7 +1065,22 @@ impl HubService {
                     at: now_ms(),
                 },
             );
-            schedule::settle_orphaned_lease(&mut state.jobs, now_ms(), &name, &reason);
+            match loss {
+                RetirementLoss::TargetLost => {
+                    schedule::settle_orphaned_lease(&mut state.jobs, now_ms(), &name, &reason);
+                }
+                RetirementLoss::RuntimeLost => {
+                    schedule::settle_runtime_lost_lease(
+                        &mut state.jobs,
+                        now_ms(),
+                        schedule::LeaseRetirement {
+                            member: &name,
+                            reason: &reason,
+                            classification: schedule::CLASSIFIED_RE_REGISTRATION_FAILED,
+                        },
+                    );
+                }
+            }
             state.members.retain(|member| member.name != name);
             state.leases.retain(|slot| slot.name != name);
             for job in state.jobs.iter_mut() {
@@ -970,7 +1116,11 @@ impl HubService {
         retirement: Retirement,
         report: &mut PoolReport,
     ) -> Result<(), HubError> {
-        let Retirement { lease, reason } = retirement;
+        let Retirement {
+            lease,
+            reason,
+            loss,
+        } = retirement;
         let name = lease.name.clone();
         let now = now_ms();
         let mut intent = lease.clone();
@@ -1029,15 +1179,30 @@ impl HubService {
                 let target_name = name.clone();
                 let settle_reason = reason.clone();
                 self.mutate(move |state| {
-                    schedule::settle_retired_lease(
-                        &mut state.jobs,
-                        now_ms(),
-                        schedule::LeaseRetirement {
-                            member: &target_name,
-                            reason: &settle_reason,
-                            classification: schedule::CLASSIFIED_LEASE_RETIRED,
-                        },
-                    );
+                    match loss {
+                        RetirementLoss::TargetLost => {
+                            schedule::settle_retired_lease(
+                                &mut state.jobs,
+                                now_ms(),
+                                schedule::LeaseRetirement {
+                                    member: &target_name,
+                                    reason: &settle_reason,
+                                    classification: schedule::CLASSIFIED_LEASE_RETIRED,
+                                },
+                            );
+                        }
+                        RetirementLoss::RuntimeLost => {
+                            schedule::settle_runtime_lost_lease(
+                                &mut state.jobs,
+                                now_ms(),
+                                schedule::LeaseRetirement {
+                                    member: &target_name,
+                                    reason: &settle_reason,
+                                    classification: schedule::CLASSIFIED_RE_REGISTRATION_FAILED,
+                                },
+                            );
+                        }
+                    }
                     state.members.retain(|member| member.name != target_name);
                     for job in state.jobs.iter_mut() {
                         if job.target.as_deref() == Some(target_name.as_str())
@@ -1106,6 +1271,205 @@ impl HubService {
         let Some(data) = check_data(Arc::clone(&runtime.tunnels), spec, lease).await? else {
             return Ok(());
         };
+        let capabilities = match self.register_target(lease).await? {
+            Registration::Ready(capabilities) => capabilities,
+            Registration::Unanswered(error) => {
+                lease.retry(
+                    now_ms(),
+                    Some(format!(
+                        "preparing: target did not answer discovery: {error}"
+                    )),
+                );
+                return Ok(());
+            }
+        };
+        self.add_member(pool, lease, JoinedTarget { data, capabilities })
+            .await
+    }
+
+    /// Re-register a restored `Active` lease whose target registration did not survive the
+    /// restart, using the same steps as a fresh connect. A target that never answers is retired
+    /// after a bounded number of attempts instead of being retried forever.
+    async fn readopt(
+        &self,
+        (runtime, pool): (&PoolRuntime, &Pool),
+        lease: &mut Lease,
+        report: &mut PoolReport,
+    ) -> Result<Readopt, HubError> {
+        let state = self.snapshot().await;
+        if let Some(hub_id) = state.hub_id.as_deref()
+            && let Ok(false) = runtime.server_exists(hub_id, lease).await
+        {
+            let reason = format!(
+                "pool {} still held lease {} but the provider no longer lists its server",
+                lease.pool, lease.name
+            );
+            self.settle_reconciled(
+                runtime,
+                Retirement {
+                    lease: lease.clone(),
+                    reason,
+                    loss: RetirementLoss::RuntimeLost,
+                },
+                report,
+            )
+            .await?;
+            return Ok(Readopt::Reconciled);
+        }
+        if let Err(error) = self.ensure_tunnels(runtime, pool, lease).await {
+            return self
+                .readopt_failure(
+                    runtime,
+                    lease,
+                    ReadoptFailure {
+                        reason: format!("the tunnel could not be opened: {error}"),
+                        report,
+                    },
+                )
+                .await;
+        }
+        let data = match state
+            .member(&lease.name)
+            .and_then(|member| member.data.clone())
+        {
+            Some(data) => data,
+            None => {
+                let spec = self.tunnel_spec(pool, lease)?;
+                match check_data(Arc::clone(&runtime.tunnels), spec, lease).await {
+                    Ok(Some(data)) => data,
+                    Ok(None) if lease.phase != LeasePhase::Active => return Ok(Readopt::Retry),
+                    Ok(None) => {
+                        return self
+                            .readopt_failure(
+                                runtime,
+                                lease,
+                                ReadoptFailure {
+                                    reason: "the data health check is still pending".to_owned(),
+                                    report,
+                                },
+                            )
+                            .await;
+                    }
+                    Err(error) => {
+                        return self
+                            .readopt_failure(
+                                runtime,
+                                lease,
+                                ReadoptFailure {
+                                    reason: format!("the data health check failed: {error}"),
+                                    report,
+                                },
+                            )
+                            .await;
+                    }
+                }
+            }
+        };
+        let capabilities = match self.register_target(lease).await {
+            Ok(Registration::Ready(capabilities)) => capabilities,
+            Ok(Registration::Unanswered(error)) => {
+                return self
+                    .readopt_failure(
+                        runtime,
+                        lease,
+                        ReadoptFailure {
+                            reason: format!("target did not answer discovery: {error}"),
+                            report,
+                        },
+                    )
+                    .await;
+            }
+            Err(error) => {
+                return self
+                    .readopt_failure(
+                        runtime,
+                        lease,
+                        ReadoptFailure {
+                            reason: format!("the target could not be registered: {error}"),
+                            report,
+                        },
+                    )
+                    .await;
+            }
+        };
+        self.add_member(pool, lease, JoinedTarget { data, capabilities })
+            .await?;
+        Ok(Readopt::Registered)
+    }
+
+    /// Whether this `Active` lease still needs its target registration. A failed readoption keeps
+    /// its marker in `error` until a successful registration clears it, so a registry entry
+    /// written before discovery failed cannot make the next pass look healthy.
+    fn needs_readopt(&self, state: &HubState, lease: &Lease) -> bool {
+        self.registry().get(&lease.name).is_err()
+            || state.member(&lease.name).is_none()
+            || lease
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with(READOPT_ERROR_PREFIX))
+    }
+
+    async fn readopt_failure(
+        &self,
+        runtime: &PoolRuntime,
+        lease: &mut Lease,
+        failure: ReadoptFailure<'_>,
+    ) -> Result<Readopt, HubError> {
+        let ReadoptFailure { reason, report } = failure;
+        let now = now_ms();
+        lease.error = Some(format!("{READOPT_ERROR_PREFIX}{reason}"));
+        lease.retry(now, lease.error.clone());
+        if lease.attempts < READOPT_MAX_ATTEMPTS {
+            return Ok(Readopt::Retry);
+        }
+        let reason = format!(
+            "lease {} could not re-register its target after {} attempts: {reason}",
+            lease.name, lease.attempts
+        );
+        if lease.server_id.is_none() {
+            self.settle_reconciled(
+                runtime,
+                Retirement {
+                    lease: lease.clone(),
+                    reason,
+                    loss: RetirementLoss::RuntimeLost,
+                },
+                report,
+            )
+            .await?;
+        } else {
+            self.retire_live(
+                runtime,
+                Retirement {
+                    lease: lease.clone(),
+                    reason,
+                    loss: RetirementLoss::RuntimeLost,
+                },
+                report,
+            )
+            .await?;
+        }
+        Ok(Readopt::Reconciled)
+    }
+
+    /// Open the lease's data path if it is not already open, returning the SSH tunnel used for
+    /// scripts and its spec.
+    async fn ensure_tunnels(
+        &self,
+        runtime: &PoolRuntime,
+        pool: &Pool,
+        lease: &mut Lease,
+    ) -> Result<(Arc<dyn Tunnels>, TunnelSpec), HubError> {
+        if runtime.tunnels.is_open(&lease.name) || runtime.tailcat.is_open(&lease.name) {
+            return Ok((Arc::clone(&runtime.tunnels), self.tunnel_spec(pool, lease)?));
+        }
+        let (tunnels, spec) = self.connect_tunnels(runtime, pool, lease).await?;
+        open_selected(runtime, lease, &tunnels, &spec)?;
+        Ok((tunnels, spec))
+    }
+
+    /// Add the lease's direct target and discover its capabilities, without changing the member.
+    async fn register_target(&self, lease: &Lease) -> Result<Registration, HubError> {
         let origin = format!("http://127.0.0.1:{}", lease.local_port);
         match self.registry().get(&lease.name) {
             Ok(record) if record.origin.trim_end_matches('/') == origin => {}
@@ -1122,18 +1486,20 @@ impl HubService {
                 .add_direct(&lease.name, &origin)
                 .map_err(target_registry)?,
         }
-        let capabilities = match self.driver().capabilities(&lease.name).await {
-            Ok(capabilities) => capabilities,
-            Err(error) => {
-                lease.retry(
-                    now_ms(),
-                    Some(format!(
-                        "preparing: target did not answer discovery: {error}"
-                    )),
-                );
-                return Ok(());
-            }
-        };
+        match self.driver().capabilities(&lease.name).await {
+            Ok(capabilities) => Ok(Registration::Ready(capabilities)),
+            Err(error) => Ok(Registration::Unanswered(error.to_string())),
+        }
+    }
+
+    /// Publish a lease's member once its target answers discovery.
+    async fn add_member(
+        &self,
+        pool: &Pool,
+        lease: &mut Lease,
+        joined: JoinedTarget,
+    ) -> Result<(), HubError> {
+        let JoinedTarget { data, capabilities } = joined;
         let now = now_ms();
         let member = Member {
             tags: profile::member_tags(pool),

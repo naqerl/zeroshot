@@ -1320,6 +1320,8 @@ pub(super) struct FakeDriver {
     /// Discovery answer for members absent from `capabilities`, such as pool servers whose
     /// names the hub chooses.
     pub discover_any: Option<Vec<String>>,
+    /// Makes every discovery call fail, like a target that no longer answers.
+    pub discovery_fails: std::sync::atomic::AtomicBool,
     /// Watch cursor by run ID; defaults to `<run>-cursor`.
     pub cursors: Mutex<BTreeMap<String, String>>,
     /// `force-stop` calls as (member, run ID).
@@ -1520,6 +1522,15 @@ impl HubDriver for FakeDriver {
     }
 
     async fn capabilities(&self, member: &str) -> Result<Vec<String>, HubError> {
+        if self
+            .discovery_fails
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(HubError::Target {
+                message: format!("{member} discovery timed out"),
+                diagnostic: None,
+            });
+        }
         self.capabilities
             .get(member)
             .cloned()

@@ -25,7 +25,7 @@ use super::model::{
     PlacementSpec, Requirements, Schedule, ScheduleState,
 };
 use super::placement::{Fit, Placement, Rejection, describe, fit, matching_members, place, rejections};
-use super::lease::{PoolReport, PoolRuntime};
+use super::lease::{PoolReport, PoolRuntime, READOPT_ERROR_PREFIX};
 use super::pool;
 use super::profile;
 use super::quota;
@@ -1310,6 +1310,11 @@ impl HubService {
     /// discovery, probes, and submissions run between phases.
     pub(crate) async fn pass(&self) -> Result<(TickReport, Value), HubError> {
         let started = std::time::Instant::now();
+        // A restarted hub keeps `Active` leases but can lose their target registration. Register
+        // them before the dispatcher can mistake the missing member for a lost runtime.
+        if self.needs_pool_recovery().await {
+            self.recover_active_leases().await?;
+        }
         let result = match self.pass_phases().await {
             Ok((report, mut view)) => match self.pool_pass().await {
                 Ok(pools) => {
@@ -1326,6 +1331,20 @@ impl HubService {
         self.metrics
             .record_pass(started.elapsed().as_secs_f64(), result.is_err());
         result
+    }
+
+    /// Whether a restored `Active` lease still needs its target registration or member.
+    async fn needs_pool_recovery(&self) -> bool {
+        let state = self.snapshot().await;
+        state.leases.iter().any(|lease| {
+            lease.phase == pool::LeasePhase::Active
+                && (self.registry.get(&lease.name).is_err()
+                    || state.member(&lease.name).is_none()
+                    || lease
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.starts_with(READOPT_ERROR_PREFIX)))
+        })
     }
 
     async fn pass_phases(&self) -> Result<(TickReport, Value), HubError> {

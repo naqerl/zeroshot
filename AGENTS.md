@@ -958,7 +958,10 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   `ssh -N -L`, `archive.rs`) create Hetzner servers for queued jobs only a pool matches. An empty
   pool is eligible, so such jobs queue rather than exit 4, and `hub submit` parks a job a pool
   serves instead of failing as no-capacity. A lease steps one phase per pass:
-  Creating, Booting, Connecting, Active, Draining, Deleting, Done. A server is deleted only after
+  Creating, Booting, Connecting, Active, Draining, Deleting, Done. An `Active` lease whose target
+  registration did not survive a restart re-runs the tunnel, direct-target, discovery, and member
+  path before dispatch; one that cannot re-register is reconciled once as `runtime_lost` after a
+  bounded retry count. A server is deleted only after
   each of its runs is terminal, has its postmortem, and is archived to `hub/archive/JOB_ID/`. The
   reaper (start, then every 5 min) deletes resources labelled `zeroshot/hub=ID` that state does not
   own or that are past `zeroshot/expires`. Failed boots pause the pool (5 min doubling to 1 h).

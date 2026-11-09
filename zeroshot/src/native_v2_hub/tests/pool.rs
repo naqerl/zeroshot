@@ -1716,7 +1716,19 @@ async fn the_reaper_deletes_orphans_but_keeps_live_leases() {
         ..Lease::new(&state.pools[0], "hj_held", 40000, now_ms())
     };
     let held_id = held.id.clone();
-    rig.set(|state| state.leases.push(held)).await;
+    let held_name = held.name.clone();
+    let held_port = held.local_port;
+    rig.service
+        .registry()
+        .add_direct(&held_name, &format!("http://127.0.0.1:{held_port}"))
+        .expect("held target registered");
+    rig.set(|state| {
+        state.leases.push(held);
+        // This test is about the reaper, so the live lease is already registered and joined;
+        // restored-lease re-registration has its own tests.
+        state.members.push(member(&held_name, &[], 1, 0));
+    })
+    .await;
     let hub = hub_id.as_str();
     let orphan = rig.cloud.plant(
         ResourceKind::Server,
@@ -1795,6 +1807,15 @@ async fn the_reaper_deletes_orphans_but_keeps_live_leases() {
     gone_member.pool = Some(pool.name.clone());
     gone_member.unreachable_probes = UNREACHABLE_REAP_THRESHOLD;
     gone_member.last_probe_ok_at_ms = Some(1);
+    for candidate in [&live, &gone] {
+        rig.service
+            .registry()
+            .add_direct(
+                &candidate.name,
+                &format!("http://127.0.0.1:{}", candidate.local_port),
+            )
+            .expect("target registered");
+    }
     rig.set(|state| {
         state.leases.push(live.clone());
         state.leases.push(gone.clone());
@@ -1874,6 +1895,13 @@ async fn the_reaper_deletes_orphans_but_keeps_live_leases() {
     error_member.pool = Some(pool.name.clone());
     error_member.unreachable_probes = UNREACHABLE_REAP_THRESHOLD;
     error_member.last_probe_ok_at_ms = Some(1);
+    rig.service
+        .registry()
+        .add_direct(
+            &error_lease.name,
+            &format!("http://127.0.0.1:{}", error_lease.local_port),
+        )
+        .expect("error target registered");
     rig.set(|state| {
         state.leases.push(error_lease.clone());
         state.members.push(error_member);
@@ -3103,4 +3131,140 @@ async fn a_lease_deleted_while_a_job_runs_settles_that_job_runtime_lost() {
     let error = job.error.as_ref().expect("runtime-lost error");
     assert_eq!(error.kind, JobErrorKind::RuntimeLost);
     assert!(error.message.contains(&lease.name), "{error:?}");
+}
+
+#[tokio::test]
+async fn a_restored_active_lease_re_registers_its_target_and_member() {
+    let rig = rig_with_driver(
+        FakeCloud::default(),
+        FakeDriver {
+            capabilities: BTreeMap::from([(
+                "zs-one".to_owned(),
+                vec!["comment-delivery".to_owned()],
+            )]),
+            ..FakeDriver::default()
+        },
+    );
+    let lease = rig.running_job_on_server().await;
+    rig.service
+        .registry()
+        .remove(&lease.name)
+        .expect("forget the target");
+    rig.set(|state| state.members.retain(|member| member.name != lease.name))
+        .await;
+
+    rig.pass().await;
+
+    let state = rig.state().await;
+    assert_eq!(state.leases[0].phase, LeasePhase::Active);
+    let member = state.member(&lease.name).expect("member restored");
+    assert_eq!(member.pool.as_deref(), Some("burst"));
+    assert_eq!(member.server_id, lease.server_id);
+    assert_eq!(
+        member.capabilities.as_deref(),
+        Some(["comment-delivery".to_owned()].as_slice())
+    );
+    assert!(
+        rig.service.registry().get(&lease.name).is_ok(),
+        "the target registration is restored"
+    );
+    assert_eq!(rig.cloud.servers(), 1, "the restored box is reused");
+    assert_eq!(
+        rig.cloud.with(|cloud| cloud.created.len()),
+        1,
+        "no new server is booted"
+    );
+    assert_eq!(job_named(&state, "hj_one").state, JobState::Running);
+}
+
+#[tokio::test]
+async fn a_restored_active_lease_whose_server_is_gone_settles_runtime_lost_once() {
+    let rig = rig();
+    let lease = rig.running_job_on_server().await;
+    let server_id = lease.server_id.expect("server id");
+    rig.service
+        .registry()
+        .remove(&lease.name)
+        .expect("forget the target");
+    rig.cloud.with(|cloud| {
+        cloud.resources.remove(&(ResourceKind::Server, server_id));
+    });
+    rig.set(|state| state.members.retain(|member| member.name != lease.name))
+        .await;
+
+    rig.pass().await;
+
+    let state = rig.state().await;
+    assert!(state.leases.is_empty(), "{:?}", state.leases);
+    assert!(state.member(&lease.name).is_none());
+    let job = job_named(&state, "hj_one");
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(job.failure_reason.as_deref(), Some("runtime_lost"));
+    let error = job.error.as_ref().expect("runtime-lost error");
+    assert_eq!(error.kind, JobErrorKind::RuntimeLost);
+    let deleted = state
+        .pool_events
+        .iter()
+        .filter(|event| {
+            event.lease_id.as_deref() == Some(lease.id.as_str())
+                && event.phase == PoolPhase::Deleted
+        })
+        .count();
+    assert_eq!(deleted, 1, "the lost lease is reconciled exactly once");
+
+    rig.pass().await;
+    let again = rig.state().await;
+    assert_eq!(job_named(&again, "hj_one").state, JobState::Failed);
+    assert!(again.leases.is_empty());
+}
+
+#[tokio::test]
+async fn an_unanswerable_restored_lease_retries_then_settles_runtime_lost() {
+    let rig = rig();
+    let lease = rig.running_job_on_server().await;
+    rig.service
+        .registry()
+        .remove(&lease.name)
+        .expect("forget the target");
+    rig.set(|state| state.members.retain(|member| member.name != lease.name))
+        .await;
+    rig.driver.discovery_fails.store(true, Ordering::SeqCst);
+
+    for _ in 0..2 {
+        rig.pass().await;
+    }
+    let retrying = rig.state().await;
+    assert_eq!(retrying.leases[0].phase, LeasePhase::Active);
+    assert_eq!(
+        job_named(&retrying, "hj_one").state,
+        JobState::Running,
+        "the reaper must not fail the job before the bounded retry count"
+    );
+
+    rig.pass().await;
+    let state = rig.state().await;
+    let job = job_named(&state, "hj_one");
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(job.failure_reason.as_deref(), Some("runtime_lost"));
+    assert_eq!(
+        job.error.as_ref().expect("runtime-lost error").kind,
+        JobErrorKind::RuntimeLost
+    );
+    assert!(
+        state.leases.is_empty(),
+        "the unanswerable lease is released: {:?}",
+        state.leases
+    );
+    assert_eq!(
+        state
+            .pool_events
+            .iter()
+            .filter(|event| {
+                event.lease_id.as_deref() == Some(lease.id.as_str())
+                    && event.phase == PoolPhase::Deleted
+            })
+            .count(),
+        1,
+        "the lost lease is reconciled once"
+    );
 }

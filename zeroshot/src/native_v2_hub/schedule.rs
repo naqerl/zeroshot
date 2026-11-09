@@ -5,10 +5,11 @@ use futures_util::future::join_all;
 use serde_json::{Value, json};
 
 use super::driver::{HubDriver, SubmitRequest};
+use super::lease::READOPT_ERROR_PREFIX;
 use super::error::HubError;
 use super::model::{
-    HubState, Job, JobActivity, JobError, JobErrorKind, JobState, LOCAL_MEMBER, Member, MemberState,
-    QuotaWait,
+    HubState, Job, JobActivity, JobError, JobErrorKind, JobState, LOCAL_MEMBER, Member,
+    MemberState, QuotaWait,
 };
 use super::usage::JobUsage;
 use super::placement::{Load, Placement, Reachability, place};
@@ -301,6 +302,8 @@ pub(crate) const CLASSIFIED_LEASE_GONE: &str = "lease_gone";
 pub(crate) const CLASSIFIED_STOP_UNREACHABLE: &str = "stop_unreachable";
 /// A member answered only inconclusive probes past the job's stall limit.
 pub(crate) const CLASSIFIED_INCONCLUSIVE: &str = "probe_inconclusive";
+/// A restored lease could not re-register its target within the bounded retry count.
+pub(crate) const CLASSIFIED_RE_REGISTRATION_FAILED: &str = "reregistration_failed";
 
 /// A lost-target candidate the reaper kept running, with the reason it withheld action.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -321,6 +324,19 @@ pub(crate) fn lost_targets(state: &HubState) -> Vec<LostTarget> {
         .filter_map(|job| {
             let name = job.target.as_deref()?;
             match state.member(name) {
+                None if state.leases.iter().any(|lease| {
+                    lease.name == name
+                        && lease.phase == pool::LeasePhase::Active
+                        && lease
+                            .error
+                            .as_deref()
+                            .is_some_and(|error| error.starts_with(READOPT_ERROR_PREFIX))
+                }) =>
+                {
+                    // The member is between a restart and its target re-registration; the pool
+                    // pass owns the bounded decision, so the reaper must not fail it first.
+                    None
+                }
                 None => Some(LostTarget {
                     job_id: job.job_id.clone(),
                     member: name.to_owned(),
@@ -437,6 +453,35 @@ pub(crate) fn settle_orphaned_lease(
             classification: CLASSIFIED_PROVIDER_ABSENT,
         },
     )
+}
+
+/// Fail the runs still placing on a lease whose target can no longer be registered, as
+/// `runtime_lost`: the runtime that held them is gone even if no provider had to confirm it.
+pub(crate) fn settle_runtime_lost_lease(
+    jobs: &mut [Job],
+    now_ms: u64,
+    retirement: LeaseRetirement<'_>,
+) -> Vec<Value> {
+    let LeaseRetirement {
+        member,
+        reason,
+        classification,
+    } = retirement;
+    let mut failed = Vec::new();
+    for job in jobs.iter_mut() {
+        if !matches!(job.state, JobState::Running | JobState::WaitingQuota)
+            || job.target.as_deref() != Some(member)
+        {
+            continue;
+        }
+        failed.push(fail_runtime_lost(
+            job,
+            now_ms,
+            classification,
+            format!("{reason}; {member} is gone"),
+        ));
+    }
+    failed
 }
 
 /// Record one target-lost failure, naming the observation that decided it. `detail` explains
