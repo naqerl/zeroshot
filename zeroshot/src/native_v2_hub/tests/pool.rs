@@ -424,7 +424,7 @@ pub(super) fn add_request(folder: &Path, max: u32) -> AddPool {
 }
 
 pub(super) fn tagged(id: &str) -> Job {
-    let mut queued = job(id, 1);
+    let mut queued = job(id, now_ms());
     queued.placement = spec(None, &[TAG], Strategy::FirstFree);
     queued
 }
@@ -2122,7 +2122,7 @@ async fn a_boot_timeout_and_a_removed_pool_tear_leases_down() {
 }
 
 #[tokio::test]
-async fn a_wait_max_expiry_tears_down_its_connecting_lease_with_a_reason() {
+async fn a_wait_max_expiry_tears_down_its_starting_lease_with_a_reason() {
     let rig = rig();
     let request = add_request(rig.directory.path(), 1);
     rig.service.add_pool(request).await.expect("add pool");
@@ -2133,10 +2133,12 @@ async fn a_wait_max_expiry_tears_down_its_connecting_lease_with_a_reason() {
     rig.pass().await;
     rig.set(|state| {
         state.pools[0].wait_max_ms = Some(60_000);
-        state.jobs[0].submitted_at_ms = now_ms().saturating_sub(120_000);
+        // The queue clock is not the lease clock: the job is recent but its lease is not.
+        state.jobs[0].submitted_at_ms = now_ms();
         state.jobs[0].not_before_ms = None;
-        state.leases[0].created_at_ms = now_ms();
-        state.leases[0].phase = LeasePhase::Connecting;
+        state.leases[0].created_at_ms = now_ms().saturating_sub(120_000);
+        state.leases[0].progress_at_ms = now_ms().saturating_sub(120_000);
+        state.leases[0].phase = LeasePhase::Booting;
     })
     .await;
     let view = rig.pass().await;

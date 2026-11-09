@@ -2970,7 +2970,7 @@ Options:
           The target image runs on arm64 as well as amd64, so ARM server types are allowed
 
       --wait-max <DURATION>
-          Expire a queued job this pool serves once it has waited this long for a server, such as 30m; its error kind is pool_wait_timeout. Default: wait until the job's own expiry
+          Retire a job's own starting lease when it has not reached the target this long after the lease was created, such as 30m; its error kind is pool_wait_timeout. This bounds a lease attempt, not queue time: a job waiting for a free slot is not failed by it. Default: no limit on a lease attempt
 
       --image <IMAGE>
           Server image: a snapshot id or a system image such as docker-ce

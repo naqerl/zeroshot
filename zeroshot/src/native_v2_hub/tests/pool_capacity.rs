@@ -2,14 +2,16 @@
 
 use serde_json::json;
 
+use super::super::capacity::QUEUE_EXPIRY_MS;
 use super::super::clock::now_ms;
 use super::super::model::{HubState, Job, JobErrorKind, JobState, Strategy};
-use super::super::provision::Refusal;
+use super::super::pool::ResourceKind;
+use super::super::provision::{Progress, Refusal};
 use super::pool::{Rig, TAG, add_request, catalog_fixture, job_named, rig};
 use super::{job, spec};
 
 fn sized(id: &str, tags: &[&str]) -> Job {
-    let mut queued = job(id, 1);
+    let mut queued = job(id, now_ms());
     let mut all = vec![TAG];
     all.extend_from_slice(tags);
     queued.placement = spec(None, &all, Strategy::FirstFree);
@@ -246,48 +248,178 @@ async fn rate_limits_and_catalog_failures_retry_the_lease_without_holding_the_po
 }
 
 #[tokio::test]
-async fn wait_max_expires_a_job_that_found_no_server() {
+async fn wait_max_keeps_a_job_queued_behind_a_busy_pool_and_it_starts_when_the_slot_frees() {
+    let rig = rig();
+    let mut request = add_request(rig.directory.path(), 1);
+    request.wait_max_ms = Some(60_000);
+    rig.service.add_pool(request).await.expect("pool");
+    rig.running_job_on_server_of_added_pool().await;
+    rig.enqueue("hj_two").await;
+    // Far past the pool's --wait-max, but this job has no lease of its own: the slot is busy,
+    // so it must keep queueing instead of failing for waiting.
+    rig.set(|state| {
+        let job = state
+            .jobs
+            .iter_mut()
+            .find(|job| job.job_id == "hj_two")
+            .expect("queued job");
+        job.submitted_at_ms = now_ms().saturating_sub(120_000);
+        job.not_before_ms = None;
+    })
+    .await;
+    rig.pass().await;
+    let state = rig.state().await;
+    let waiting_job = job_named(&state, "hj_two");
+    assert_eq!(waiting_job.state, JobState::Queued);
+    assert!(waiting_job.error.is_none(), "{:?}", waiting_job.error);
+    let waiting = waiting_job.pool_wait.clone().expect("waiting reason");
+    assert!(waiting.contains("burst"), "{waiting}");
+    assert!(waiting.contains("--max of 1"), "{waiting}");
+    assert!(waiting.contains("hj_one"), "{waiting}");
+    assert_eq!(waiting_job.view(now_ms())["waiting"], json!(waiting));
+    assert_eq!(state.leases.len(), 1, "the busy slot is untouched");
+
+    // The first job finishing drains its lease; the waiting job starts on the freed slot.
+    rig.driver.finish_all();
+    for _ in 0..4 {
+        rig.pass().await;
+    }
+    let state = rig.state().await;
+    let started = job_named(&state, "hj_two");
+    assert_eq!(started.state, JobState::Running, "{started:?}");
+    assert!(started.error.is_none(), "{:?}", started.error);
+    let active = state
+        .leases
+        .iter()
+        .find(|lease| lease.phase == super::super::pool::LeasePhase::Active)
+        .expect("a lease for the second job");
+    assert_eq!(started.target.as_deref(), Some(active.name.as_str()));
+}
+
+#[tokio::test]
+async fn wait_max_expires_a_lease_that_never_reached_its_target() {
     let rig = rig();
     let mut request = add_request(rig.directory.path(), 1);
     request.wait_max_ms = Some(60_000);
     rig.service.add_pool(request).await.expect("pool");
     rig.cloud
-        .with(|cloud| cloud.refuse_all = Some(Refusal::Capacity));
+        .with(|cloud| cloud.ready = Some(Progress::Pending));
     rig.enqueue("hj_one").await;
-    let submitted = now_ms();
-    rig.set(|state| {
-        for job in &mut state.jobs {
-            job.submitted_at_ms = submitted;
-        }
-    })
-    .await;
     rig.pass().await;
-    assert_eq!(
-        job_named(&rig.state().await, "hj_one").state,
-        JobState::Queued
-    );
+    let lease = rig.lease().await;
+    let server_id = lease.server_id.expect("server id");
     rig.set(|state| {
-        for job in &mut state.jobs {
-            job.submitted_at_ms = job.submitted_at_ms.saturating_sub(120_000);
-        }
+        // The queue clock is irrelevant here: this job's own lease attempt ran out.
+        state.jobs[0].submitted_at_ms = now_ms();
+        let lease = &mut state.leases[0];
+        lease.phase = super::super::pool::LeasePhase::Connecting;
+        lease.event_phase = Some(super::super::pool::PoolPhase::Preparing);
+        lease.created_at_ms = now_ms().saturating_sub(120_000);
+        lease.progress_at_ms = now_ms().saturating_sub(120_000);
+        lease.drain_started_ms = None;
     })
     .await;
+
     let view = rig.pass().await;
     assert_eq!(view["pools"]["expired"], json!(["hj_one"]), "{view}");
-    let job = job_named(&rig.state().await, "hj_one").clone();
+    let state = rig.state().await;
+    let job = job_named(&state, "hj_one").clone();
     assert_eq!(job.state, JobState::Failed);
-    let error = job.error.expect("error");
+    let error = job.error.expect("timeout error");
     assert_eq!(error.kind, JobErrorKind::PoolWaitTimeout);
+    assert!(error.message.contains(&lease.name), "{}", error.message);
     assert!(
         error.message.contains("--wait-max of 60s"),
         "{}",
         error.message
     );
-    assert!(error.message.contains("no capacity"), "{}", error.message);
+    assert!(!error.message.contains("queue"), "{}", error.message);
     assert!(
-        rig.state().await.leases.is_empty(),
-        "no server for an expired job"
+        state.leases.iter().all(|slot| slot.name != lease.name),
+        "the expired lease was retired"
     );
+    assert!(
+        rig.cloud
+            .with(|cloud| cloud.destroyed.contains(&(ResourceKind::Server, server_id))),
+        "the live server behind the failed attempt was deleted"
+    );
+}
+
+#[tokio::test]
+async fn a_job_unplaced_for_a_day_expires_with_queue_expired() {
+    let rig = rig();
+    let mut request = add_request(rig.directory.path(), 1);
+    request.wait_max_ms = Some(60_000);
+    rig.service.add_pool(request).await.expect("pool");
+    rig.enqueue("hj_one").await;
+    rig.set(|state| {
+        state.jobs[0].submitted_at_ms =
+            now_ms().saturating_sub(QUEUE_EXPIRY_MS.saturating_add(60_000));
+        state.jobs[0].not_before_ms = None;
+    })
+    .await;
+    let view = rig.pass().await;
+    assert_eq!(view["pools"]["expired"], json!([]), "{view}");
+    assert_eq!(view["pools"]["queueExpired"], json!(["hj_one"]), "{view}");
+    let state = rig.state().await;
+    assert!(
+        state.leases.is_empty(),
+        "an expired queue never got a lease"
+    );
+    let job = job_named(&state, "hj_one");
+    assert_eq!(job.state, JobState::Failed);
+    let error = job.error.as_ref().expect("expiry error");
+    assert_eq!(error.kind, JobErrorKind::QueueExpired);
+    assert!(error.message.contains("24h"), "{}", error.message);
+    assert!(error.message.contains("queue"), "{}", error.message);
+    assert!(error.message.contains("burst"), "{}", error.message);
+    assert!(job.pool_wait.is_none());
+    assert_eq!(
+        job.view(now_ms())["errorKind"],
+        json!("queue_expired"),
+        "{}",
+        job.view(now_ms())
+    );
+
+    let stored = serde_json::to_value(&state).expect("state json");
+    let loaded: HubState = serde_json::from_value(stored).expect("state loads");
+    assert_eq!(
+        job_named(&loaded, "hj_one")
+            .error
+            .as_ref()
+            .map(|error| error.kind),
+        Some(JobErrorKind::QueueExpired),
+        "the kind round-trips through state.json"
+    );
+}
+
+#[tokio::test]
+async fn a_due_scheduled_job_keeps_queueing_instead_of_consuming_the_lease_budget() {
+    let rig = rig();
+    let mut request = add_request(rig.directory.path(), 1);
+    request.wait_max_ms = Some(60_000);
+    rig.service.add_pool(request).await.expect("pool");
+    rig.running_job_on_server_of_added_pool().await;
+    rig.enqueue("hj_two").await;
+    // It was submitted and became due two minutes ago; a clock longer than --wait-max must
+    // still not fail it while it waits for the busy slot.
+    rig.set(|state| {
+        let job = state
+            .jobs
+            .iter_mut()
+            .find(|job| job.job_id == "hj_two")
+            .expect("queued job");
+        job.submitted_at_ms = now_ms().saturating_sub(120_000);
+        job.not_before_ms = Some(now_ms().saturating_sub(120_000));
+    })
+    .await;
+    rig.pass().await;
+    let state = rig.state().await;
+    let job = job_named(&state, "hj_two");
+    assert_eq!(job.state, JobState::Queued);
+    assert!(job.error.is_none(), "{:?}", job.error);
+    let waiting = job.pool_wait.clone().expect("waiting reason");
+    assert!(waiting.contains("--max of 1"), "{waiting}");
 }
 
 #[tokio::test]
@@ -408,7 +540,7 @@ async fn a_starting_server_only_counts_its_spare_slots_for_other_jobs() {
 }
 
 #[tokio::test]
-async fn a_blocked_pool_wait_names_the_reason_and_keeps_it_when_the_job_times_out() {
+async fn a_blocked_pool_wait_names_the_reason_and_wait_max_does_not_expire_it() {
     let rig = rig();
     let mut request = add_request(rig.directory.path(), 1);
     request.wait_max_ms = Some(60_000);
@@ -456,17 +588,21 @@ async fn a_blocked_pool_wait_names_the_reason_and_keeps_it_when_the_job_times_ou
     rig.pass().await;
     let state = rig.state().await;
     let job = job_named(&state, "hj_one");
-    assert_eq!(job.state, JobState::Failed);
-    let error = job.error.as_ref().expect("timeout error");
-    assert_eq!(error.kind, JobErrorKind::PoolWaitTimeout);
+    assert_eq!(
+        job.state,
+        JobState::Queued,
+        "a blocked pool wait is queue time, not a lease attempt"
+    );
+    let error = job.error.as_ref().expect("blocked error stays");
+    assert_eq!(error.kind, JobErrorKind::PoolBlocked);
     assert!(error.message.contains("burst"), "{}", error.message);
     assert!(error.message.contains("Quota"), "{}", error.message);
-    let failure = job.failure_reason.clone().expect("timeout keeps the block");
+    let failure = job.failure_reason.clone().expect("block reason stays");
     assert!(failure.contains("burst"), "{failure}");
     assert!(failure.contains("Quota"), "{failure}");
     assert_eq!(
-        job.view(now_ms())["failureReason"],
-        json!(failure),
+        job.view(now_ms())["errorKind"],
+        json!("pool_blocked"),
         "{}",
         job.view(now_ms())
     );

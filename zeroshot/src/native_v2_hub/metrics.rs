@@ -262,6 +262,7 @@ impl Metrics {
                 ("shortage", report.shortages.len()),
                 ("blocked", report.blocked.len()),
                 ("wait_timeout", report.expired.len()),
+                ("queue_expired", report.queue_expired.len()),
                 ("error", report.errors.len()),
             ] {
                 *counters.pool_events.entry(event).or_default() += count as u64;

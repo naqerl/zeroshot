@@ -890,9 +890,11 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   without a run ID, `errorKind` `submission_unconfirmed`) on its member with no attempt counted,
   so every pass resubmits it there with the same key, counted in `unconfirmed_submissions` apart
   from `attempts`, until `--unconfirmed-limit` (default 30) fails it as `unconfirmed_limit`; and
-  `Rejected`, the only other kind that fails the job. Hub jobs have no expiry: a job ends only when
-  its run ends, it is force-stopped, or it is reaped with its member. Lifetimes are observable
-  events rather than deadlines, and active runs are reported hourly through `hub.warning`. The
+  `Rejected`, the only other kind that fails the job. A placed hub job has no expiry: it ends only
+  when its run ends, it is force-stopped, or it is reaped with its member. The one exception is a
+  queued job that never got a lease of its own, which fails as `queue_expired` after 24 hours
+  without a slot. Lifetimes are observable events rather than deadlines, and active runs are
+  reported hourly through `hub.warning`. The
   opt-in `hub daemon run --max-stall` persists each running job's watch cursor and cursor-change
   time, resets both when the cursor advances, and force-stops a run whose watch cursor **or newest
   tool/exec heartbeat** stayed unchanged for the configured duration, failing it with reason and
@@ -996,8 +998,11 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   lists. `capacity.rs` owns catalog validation, candidate order, create-error classes, per-spec
   shortages (30 s doubling to 10 min, separate from the boot pause), blocking (a provider refusal
   expires on the 1m/2m/5m/15m/30m ladder unless `hub pool resume` clears it first) and
-  `--wait-max`. `placement.rs` never places a tag-profile job on an
-  undersized member. A pool's `transport` is `ssh` (default) or `tailcat`: `tunnel.rs` keeps
+  `--wait-max`, which bounds a job's own lease attempt from the lease's `created_at_ms`, never
+  time spent queueing for a slot. A queued job without a lease reports `waiting` with the pool,
+  its `--max` and the known slot holder, and only the separate 24-hour `queue_expired` ceiling
+  ends its wait. `placement.rs` never places a tag-profile job on an undersized member. A pool's
+  `transport` is `ssh` (default) or `tailcat`: `tunnel.rs` keeps
   `SshTunnels` as the script path and fallback, and adds `TailcatTunnels`, which runs
   `tailcat forward` as the job data path. A tailcat pool's boot script downloads the pinned
   tailcat release, verifies its checksum, and starts `tailcat serve 8080` beside the target with

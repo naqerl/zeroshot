@@ -353,8 +353,10 @@ pub(super) struct HubPoolAddArgs {
     #[arg(long)]
     multi_arch: bool,
 
-    /// Expire a queued job this pool serves once it has waited this long for a server, such as
-    /// 30m; its error kind is pool_wait_timeout. Default: wait until the job's own expiry.
+    /// Retire a job's own starting lease when it has not reached the target this long after the
+    /// lease was created, such as 30m; its error kind is pool_wait_timeout. This bounds a lease
+    /// attempt, not queue time: a job waiting for a free slot is not failed by it. Default: no
+    /// limit on a lease attempt.
     #[arg(long, value_name = "DURATION")]
     wait_max: Option<String>,
 
