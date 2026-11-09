@@ -243,3 +243,42 @@ async fn recorded_cleanup_failure(
     assert!(!diagnostic.text.contains("private-token"));
     diagnostic
 }
+
+#[test]
+fn activity_tracker_coalesces_heartbeats_for_one_tool_call() {
+    let mut tracker = ActivityTracker::default();
+    tracker.start(Some("call-1"), "cargo check --workspace --all-targets");
+    let now = Instant::now();
+    let first = tracker
+        .heartbeat(now)
+        .assert_value_with("the first heartbeat is immediate");
+    assert_eq!(first.command, "cargo check --workspace --all-targets");
+    assert_eq!(first.elapsed_ms, 0);
+    assert!(
+        tracker.heartbeat(now + Duration::from_secs(5)).is_none(),
+        "two heartbeats five seconds apart coalesce into one record"
+    );
+    let later = tracker
+        .heartbeat(now + ACTIVITY_HEARTBEAT_INTERVAL)
+        .assert_value_with("a later heartbeat is due");
+    assert!(later.elapsed_ms >= 60_000);
+    tracker.finish(Some("call-1"));
+    assert!(
+        tracker
+            .heartbeat(now + ACTIVITY_HEARTBEAT_INTERVAL * 2)
+            .is_none()
+    );
+
+    // A new short call must not reset the execution-wide budget and emit immediately.
+    tracker.start(Some("call-2"), "git status");
+    assert!(
+        tracker
+            .heartbeat(now + ACTIVITY_HEARTBEAT_INTERVAL + Duration::from_secs(5))
+            .is_none(),
+        "consecutive short calls share one heartbeat budget"
+    );
+    let next = tracker
+        .heartbeat(now + ACTIVITY_HEARTBEAT_INTERVAL * 2)
+        .assert_value_with("the next call has its own delayed heartbeat");
+    assert_eq!(next.command, "git status");
+}

@@ -321,6 +321,9 @@ impl DurableEventSender {
             Err(mpsc::error::TrySendError::Closed(_)) => Err(NodeRunnerError::DurableOutputClosed),
             Err(mpsc::error::TrySendError::Full(event)) => {
                 match event {
+                    // A heartbeat is only liveness evidence; losing one during cancellation
+                    // must not make diagnostics or usage look incomplete.
+                    DurableNodeEvent::Activity { .. } => return Ok(()),
                     DurableNodeEvent::TokenUsage(_) => &self.terminal_overflow.usage,
                     DurableNodeEvent::Output { .. } => &self.terminal_overflow.diagnostics,
                 }

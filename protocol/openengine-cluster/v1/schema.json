@@ -4346,6 +4346,38 @@
       ],
       "type": "object"
     },
+    "RunActivity": {
+      "additionalProperties": false,
+      "description": "The latest tool/exec activity reported by a running node.\n\n`command` is producer-redacted, single-line, and bounded; `elapsed_ms` is how long the tool had\nbeen running when the heartbeat was recorded. The hub uses `timestamp` only to order\nheartbeats, never to infer a run outcome.",
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "elapsedMs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "node": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$",
+          "type": "string"
+        },
+        "timestamp": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "node",
+        "command",
+        "elapsedMs",
+        "timestamp"
+      ],
+      "type": "object"
+    },
     "RunAttachEventNotification": {
       "additionalProperties": false,
       "description": "One live read-only attach event. Carrying both identities prevents events from simultaneous\nverifier attachments being confused on a multiplexed transport.",
@@ -4900,6 +4932,16 @@
               },
               "type": "array"
             },
+            "activity": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/RunActivity"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "phase": {
               "const": "running",
               "type": "string"
@@ -4919,6 +4961,16 @@
                 "$ref": "#/$defs/ActiveExecution"
               },
               "type": "array"
+            },
+            "activity": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/RunActivity"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "phase": {
               "const": "stopping",

@@ -97,6 +97,7 @@ fn status() -> RunStatusResult {
         size: RunSize::Medium,
         at_cursor: cursor(7),
         status: RunStatus::Running {
+            activity: None,
             active_executions: vec![
                 ActiveExecution {
                     execution: execution("opaque-verifier-a"),
@@ -205,11 +206,17 @@ fn force_fixture() -> Value {
     let mut result = status();
     result.at_cursor = cursor(10);
     let active_executions = match result.status {
-        RunStatus::Running { active_executions } => Some(active_executions),
+        RunStatus::Running {
+            active_executions,
+            activity: _,
+        } => Some(active_executions),
         _ => None,
     }
     .assert_value_with("fixture status must be running");
-    result.status = RunStatus::Stopping { active_executions };
+    result.status = RunStatus::Stopping {
+        active_executions,
+        activity: None,
+    };
     json!({
         "params": RunForceParams { run_id: run_id() },
         "result": RunForceResult {

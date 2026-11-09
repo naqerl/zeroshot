@@ -894,11 +894,18 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   its run ends, it is force-stopped, or it is reaped with its member. Lifetimes are observable
   events rather than deadlines, and active runs are reported hourly through `hub.warning`. The
   opt-in `hub daemon run --max-stall` persists each running job's watch cursor and cursor-change
-  time, resets both when the cursor advances, and force-stops a run whose cursor stayed unchanged for
-  the configured duration, failing it with reason and error kind `stalled`. Its heartbeat reports
-  the duration as `maxStallMs` (`null` when disabled). A job may override that budget for itself
-  with `--max-stall-ms` on `hub submit`/`hub enqueue`; the job value wins over the hub's
-  `--max-stall`, and the diagnostic and `hub status` name the effective limit and its source.
+  time, resets both when the cursor advances, and force-stops a run whose watch cursor **or newest
+  tool/exec heartbeat** stayed unchanged for the configured duration, failing it with reason and
+  error kind `stalled`. Providers record an `Activity` ledger event immediately when a tool call
+  starts and at most once per minute while it runs; it advances the durable cursor but is filtered
+  from public `hub.run` events like a safe log. The hub keeps `lastCursorAt` apart from
+  `lastActivityAt`/`lastActivity` (node, command, elapsed); `lastActivityAt` is the hub's observation
+  time, while the producer timestamp only orders repeated status polls. Its stall diagnostic names
+  the last activity when one exists, falling back to the cursor wording otherwise. A silent
+  heartbeat is still silence: a dead process stalls. Its heartbeat reports the duration as `maxStallMs` (`null`
+  when disabled). A job may override that budget for itself with `--max-stall-ms` on `hub
+  submit`/`hub enqueue`; the job value wins over the hub's `--max-stall`, and the diagnostic and
+  `hub status` name the effective limit and its source.
   `hub dequeue` also removes placing jobs
   (`dequeued_while_placing`); a run the target accepts under their key is noted, never adopted.
   `hub stop` deliberately stops a queued or running job as the terminal non-failing `stopped`

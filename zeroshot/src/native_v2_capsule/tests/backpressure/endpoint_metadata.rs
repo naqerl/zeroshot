@@ -152,6 +152,7 @@ async fn proxy_terminal_lane_overflow_is_sticky_and_marks_usage_incomplete() {
                 incomplete_events += 1;
             }
             crate::native_v2_runner::DurableNodeEvent::Output { .. } => unexpected_outputs += 1,
+            crate::native_v2_runner::DurableNodeEvent::Activity { .. } => {}
         }
     }
 

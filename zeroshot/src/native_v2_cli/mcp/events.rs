@@ -2618,6 +2618,25 @@ impl HubFeed {
             message.push_str("; reaper withheld action: ");
             message.push_str(reason);
         }
+        let last_activity = view.get("lastActivity").filter(|value| value.is_object());
+        if let Some(activity) = last_activity {
+            let node = activity
+                .get("node")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let command = activity
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let elapsed = activity
+                .get("elapsedMs")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+                / 1000;
+            message.push_str(&format!(
+                "; last activity node '{node}' ran '{command}' for {elapsed}s"
+            ));
+        }
 
         json!({
             "message": message,
@@ -2632,6 +2651,8 @@ impl HubFeed {
             "runCursor": cursor,
             "previousRunCursor": previous_cursor,
             "cursorDelta": cursor_delta,
+            "lastActivity": last_activity,
+            "lastActivityAt": view.get("lastActivityAt").cloned().unwrap_or(Value::Null),
         })
     }
 

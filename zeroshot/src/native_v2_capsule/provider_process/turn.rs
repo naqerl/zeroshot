@@ -1,6 +1,7 @@
 //! Shared streamed-turn exchange, cancellation, usage, and confirmed cleanup.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use futures_util::FutureExt;
 
 use crate::execution::process::{ProcessRunnerError, ProcessSessionCommand, ProcessSessionOutput};
@@ -16,12 +17,84 @@ use crate::execution::process::ProcessStdout;
 use crate::native_v2_contract::TokenUsageDelta;
 use super::{ProviderAttempt, ProviderEmission};
 
+/// One heartbeat per in-flight tool call, not per output chunk.
+pub(crate) const ACTIVITY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+/// A cheap poll so the first heartbeat follows a tool start even when the tool is silent.
+pub(crate) const ACTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderActivity {
+    pub(crate) command: String,
+    pub(crate) elapsed_ms: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct ActivityTracker {
+    active: Option<ActiveActivity>,
+    /// Last heartbeat for the execution, not the individual call: a run with many short calls
+    /// still emits at most one record per interval.
+    last_beat: Option<Instant>,
+}
+
+struct ActiveActivity {
+    id: Option<String>,
+    command: String,
+    started: Instant,
+}
+
+impl ActivityTracker {
+    pub(crate) fn start(&mut self, id: Option<&str>, command: &str) {
+        if self.active.is_none() && !command.trim().is_empty() {
+            self.active = Some(ActiveActivity {
+                id: id.map(str::to_owned),
+                command: command.to_owned(),
+                started: Instant::now(),
+            });
+        }
+    }
+
+    pub(crate) fn finish(&mut self, id: Option<&str>) {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.id.as_deref() == id)
+        {
+            self.active = None;
+        }
+    }
+
+    pub(crate) fn finish_any(&mut self) {
+        self.active = None;
+    }
+
+    pub(crate) fn heartbeat(&mut self, now: Instant) -> Option<ProviderActivity> {
+        let active = self.active.as_mut()?;
+        if self
+            .last_beat
+            .is_some_and(|last| now.saturating_duration_since(last) < ACTIVITY_HEARTBEAT_INTERVAL)
+        {
+            return None;
+        }
+        self.last_beat = Some(now);
+        let elapsed_ms = u64::try_from(now.saturating_duration_since(active.started).as_millis())
+            .unwrap_or(u64::MAX);
+        Some(ProviderActivity {
+            command: active.command.clone(),
+            elapsed_ms,
+        })
+    }
+}
+
 /// Native event parsing and terminal interpretation remain owned by each harness.
 pub(crate) trait ProviderTranscript: Send {
     fn push(&mut self, bytes: &[u8]) -> Vec<ProviderEmission>;
     fn finish_stream(&mut self) -> Vec<ProviderEmission>;
     fn token_usage(&self) -> Option<TokenUsageDelta>;
     fn is_success(&self) -> bool;
+    /// Newest in-flight tool activity that is due for a heartbeat at `now`.
+    fn activity(&mut self, _now: Instant) -> Option<ProviderActivity> {
+        None
+    }
     /// Returns only producer-redacted failure evidence, without consuming the transcript.
     fn failure_diagnostic(&self, _process_detail: Option<&str>) -> Option<String> {
         None
@@ -273,10 +346,31 @@ async fn collect_transcript<T: ProviderTranscript>(
 ) -> Result<(), NodeRunnerError> {
     let mut failed = Some(failed);
     let mut delivery_error = None;
-    while let Some(chunk) = stdout.recv().await {
+    let mut heartbeat = tokio::time::interval(ACTIVITY_POLL_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let chunk = tokio::select! {
+            chunk = stdout.recv() => chunk,
+            _ = heartbeat.tick() => {
+                if delivery_error.is_none() {
+                    delivery_error = emit_activity(control, transcript).await.err();
+                    if delivery_error.is_some() {
+                        signal_output_failure(&mut failed);
+                    }
+                }
+                continue;
+            }
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         let emissions = transcript.push(chunk.as_slice());
         if delivery_error.is_none() {
             delivery_error = emit_provider(control, emissions).await.err();
+            if delivery_error.is_none() {
+                // The first heartbeat is immediate when a tool starts; later ones are coalesced.
+                delivery_error = emit_activity(control, transcript).await.err();
+            }
             if delivery_error.is_some() {
                 signal_output_failure(&mut failed);
             }
@@ -298,6 +392,20 @@ async fn collect_transcript<T: ProviderTranscript>(
 fn signal_output_failure(failed: &mut Option<tokio::sync::oneshot::Sender<()>>) {
     if let Some(failed) = failed.take() {
         let _ = failed.send(());
+    }
+}
+
+async fn emit_activity<T: ProviderTranscript>(
+    control: &DriverControl,
+    transcript: &mut T,
+) -> Result<(), NodeRunnerError> {
+    match transcript.activity(Instant::now()) {
+        Some(activity) => {
+            control
+                .record_activity(&activity.command, activity.elapsed_ms)
+                .await
+        }
+        None => Ok(()),
     }
 }
 

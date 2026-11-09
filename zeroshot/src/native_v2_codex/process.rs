@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::execution::process::{
     ProcessRunnerError, ProcessSessionCommand, ProcessSessionOutput, ProcessStdout,
@@ -7,7 +8,7 @@ use crate::native_v2_capsule::provider_process::{
     ProcessExchange, ProcessInputFailure, ProviderExecutionFiles, ProviderProcess,
     exchange_process_io, open_provider_process, process_failure_evidence,
     provider_failure_diagnostic, report_cleanup_failure, require_process_cleanup,
-    text::ProviderText,
+    text::ProviderText, turn::ACTIVITY_POLL_INTERVAL,
 };
 use crate::native_v2_contract::TokenUsageDelta;
 use crate::native_v2_runner::{DriverControl, LiveOutput, LiveOutputStream, NodeRunnerError};
@@ -54,8 +55,23 @@ async fn collect_output(
     redactions: &[String],
 ) -> CollectedOutput {
     let mut decoder = CodexOutputDecoder::new();
+    let redactor = ProviderText::new(redactions);
     let mut delivery_error = None;
-    while let Some(chunk) = stdout.recv().await {
+    let mut heartbeat = tokio::time::interval(ACTIVITY_POLL_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let chunk = tokio::select! {
+            chunk = stdout.recv() => chunk,
+            _ = heartbeat.tick() => {
+                if delivery_error.is_none() {
+                    delivery_error = emit_activity(control, &mut decoder, &redactor).await.err();
+                }
+                continue;
+            }
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         for emission in decoder.push(chunk.as_slice()) {
             if delivery_error.is_some() {
                 continue;
@@ -65,8 +81,26 @@ async fn collect_output(
                 delivery_error = Some(error);
             }
         }
+        if delivery_error.is_none() {
+            delivery_error = emit_activity(control, &mut decoder, &redactor).await.err();
+        }
     }
     finish_collection(decoder, delivery_error)
+}
+
+async fn emit_activity(
+    control: &DriverControl,
+    decoder: &mut CodexOutputDecoder,
+    redactor: &ProviderText,
+) -> Result<(), NodeRunnerError> {
+    match decoder.activity(Instant::now()) {
+        Some(activity) => {
+            control
+                .record_activity(&redactor.redact(&activity.command), activity.elapsed_ms)
+                .await
+        }
+        None => Ok(()),
+    }
 }
 
 pub(super) async fn exchange_turn(

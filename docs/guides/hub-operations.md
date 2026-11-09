@@ -134,9 +134,14 @@ hub. Use `zeroshot hub dequeue` or `zeroshot hub force-stop` when a job should s
 
 `zeroshot hub daemon run --max-stall DURATION` is opt-in; without it, a running job is never
 failed for inactivity. With it, every running job records the target status's `atCursor` and when
-that cursor last changed. If the cursor stays unchanged for the configured duration, the daemon
-force-stops the run and fails the job with `failureReason` `stalled` and `errorKind` `stalled`.
-The error names the cursor and how long it stayed unchanged. A new cursor resets both fields.
+that cursor last changed, plus the newest tool/exec `activity` heartbeat and when the hub first
+observed it. Providers emit at most one heartbeat per minute while a tool call is running; the
+heartbeat advances the durable cursor but is not a public `hub.run` event. The stall clock uses the
+newer of the cursor change and the heartbeat observation, so a long build stays alive while a
+silent or dead process still goes quiet. If that newest evidence stays unchanged for the configured
+duration, the daemon force-stops the run and fails the job with `failureReason` `stalled` and
+`errorKind` `stalled`. The error and `hub.warning` name the cursor, how long it stayed unchanged,
+and the last activity (node, command, elapsed seconds) when one was recorded.
 When a successful status read does not carry `atCursor`, it still resets the inactivity clock, and
 a job that has never produced a cursor falls back to its last successful target contact before its
 placement time.
@@ -149,9 +154,11 @@ over the hub's `--max-stall`; omitting both leaves that run unlimited. `zeroshot
 reports the effective `maxStallMs` and its `maxStallSource` (`job` or `hub`). The failure names
 the limit, its source, and the measured silence.
 
-Both fields are persisted in hub state as `lastCursor` and `lastCursorAt`, so a daemon restart
-does not lose the stall clock. The daemon heartbeat (`daemon.json` and the `started` record)
-reports the configured duration in milliseconds as `maxStallMs`; it is `null` when disabled.
+The cursor fields are persisted as `lastCursor` and `lastCursorAt`; activity is persisted as
+`lastActivityAt` (hub observation time) and `lastActivity` (`node`, `command`, `elapsedMs`), so a
+daemon restart does not lose the stall clock. Producer timestamps order repeated status polls; they
+do not set the stall clock. The daemon heartbeat (`daemon.json` and the `started` record) reports the
+configured duration in milliseconds as `maxStallMs`; it is `null` when disabled.
 `zeroshot hub install` passes `--max-stall` through to the installed service.
 
 ## Lost members and removing a member

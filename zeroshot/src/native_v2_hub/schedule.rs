@@ -6,7 +6,9 @@ use serde_json::{Value, json};
 
 use super::driver::{HubDriver, SubmitRequest};
 use super::error::HubError;
-use super::model::{HubState, Job, JobError, JobErrorKind, JobState, LOCAL_MEMBER, Member, MemberState};
+use super::model::{
+    HubState, Job, JobActivity, JobError, JobErrorKind, JobState, LOCAL_MEMBER, Member, MemberState,
+};
 use super::usage::JobUsage;
 use super::placement::{Load, Placement, Reachability, place};
 #[cfg(test)]
@@ -636,27 +638,60 @@ pub(crate) async fn dispatch(
     }
 }
 
-/// Record the status document's watch cursor on a running job. An unchanged cursor keeps the
-/// time it last advanced; a new cursor resets both fields.
+/// Record the status document's watch cursor and newest activity heartbeat on a running job.
+/// An unchanged cursor keeps the time it last advanced; a new cursor resets it. Activity is
+/// ordered by the producer timestamp, so repeated polls of the same heartbeat are not new
+/// evidence and cannot keep a dead run alive.
 pub(crate) fn record_cursor(job: &mut Job, status: &Value, now_ms: u64) {
-    let cursor = status
+    match status
         .get("atCursor")
         .or_else(|| status.pointer("/status/atCursor"))
-        .and_then(Value::as_str);
-    let Some(cursor) = cursor else {
-        // A successful status read without a cursor still proves the run was observed, so it
-        // resets the stall clock without inventing a cursor value.
-        job.last_cursor_at_ms = Some(now_ms);
-        return;
-    };
-    if job.last_cursor.as_deref() == Some(cursor) {
-        if job.last_cursor_at_ms.is_none() {
+        .and_then(Value::as_str)
+    {
+        None => {
+            // A successful status read without a cursor still proves the run was observed, so it
+            // resets the stall clock without inventing a cursor value.
             job.last_cursor_at_ms = Some(now_ms);
         }
-        return;
+        Some(cursor) if job.last_cursor.as_deref() == Some(cursor) => {
+            if job.last_cursor_at_ms.is_none() {
+                job.last_cursor_at_ms = Some(now_ms);
+            }
+        }
+        Some(cursor) => {
+            job.last_cursor = Some(cursor.to_owned());
+            job.last_cursor_at_ms = Some(now_ms);
+        }
     }
-    job.last_cursor = Some(cursor.to_owned());
-    job.last_cursor_at_ms = Some(now_ms);
+    if let Some((reported_at_ms, activity)) = status_activity(status) {
+        // Order by the producer timestamp so a repeated poll is not new evidence, but keep the
+        // stall clock on this hub's clock so target clock skew cannot extend the window.
+        if job
+            .last_activity_reported_at_ms
+            .is_none_or(|current| reported_at_ms > current)
+        {
+            job.last_activity_reported_at_ms = Some(reported_at_ms);
+            job.last_activity_at_ms = Some(now_ms);
+            job.last_activity = Some(activity);
+        }
+    }
+}
+
+fn status_activity(status: &Value) -> Option<(u64, JobActivity)> {
+    let activity = status
+        .pointer("/status/activity")
+        .or_else(|| status.get("activity"))?;
+    Some((
+        activity.get("timestamp").and_then(Value::as_u64)?,
+        JobActivity {
+            node: activity.get("node").and_then(Value::as_str)?.to_owned(),
+            command: activity.get("command").and_then(Value::as_str)?.to_owned(),
+            elapsed_ms: activity
+                .get("elapsedMs")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+        },
+    ))
 }
 
 /// Apply a run status projection to a running job. Returns true when the job finished.
@@ -963,6 +998,7 @@ pub(crate) struct StalledRun {
     pub still_ms: u64,
     pub max_stall_ms: u64,
     pub limit_source: StallLimitSource,
+    pub activity: Option<JobActivity>,
 }
 
 /// Running jobs whose cursor has stayed unchanged for at least their own effective limit.
@@ -981,13 +1017,16 @@ pub(crate) fn stalled_runs(
         .filter(|job| job.state == JobState::Running)
         .filter_map(|job| {
             let limit = limit_for(job)?;
-            // Prefer the cursor clock, then the last successful contact (a status read without
-            // `atCursor` or a load probe), and only then placement. A reachable member whose
-            // status omits its cursor is observed work, not a silent run.
-            let at = job
-                .last_cursor_at_ms
-                .or(job.target_last_ok_at_ms)
-                .or(job.dispatched_at_ms)?;
+            // The newest of the cursor clock, an in-flight heartbeat, and the last successful
+            // contact (a status read without `atCursor` or a load probe), and only then
+            // placement. A reachable member whose status omits its cursor is observed work, not
+            // a silent run.
+            let at = match (job.last_cursor_at_ms, job.last_activity_at_ms) {
+                (Some(cursor), Some(activity)) => Some(cursor.max(activity)),
+                (cursor, activity) => cursor.or(activity),
+            }
+            .or(job.target_last_ok_at_ms)
+            .or(job.dispatched_at_ms)?;
             let still_ms = now_ms.saturating_sub(at);
             (still_ms >= limit.max_stall_ms).then_some(StalledRun {
                 job_id: job.job_id.clone(),
@@ -997,6 +1036,7 @@ pub(crate) fn stalled_runs(
                 still_ms,
                 max_stall_ms: limit.max_stall_ms,
                 limit_source: limit.source,
+                activity: job.last_activity.clone(),
             })
         })
         .collect()
@@ -1038,8 +1078,21 @@ pub(crate) fn settle_stalled(jobs: &mut [Job], settlement: StallSettlement<'_>) 
         } else {
             format!("cursor {}", run.cursor)
         };
+        let activity = run.activity.as_ref().map_or_else(String::new, |activity| {
+            format!(
+                "; last activity node '{}' ran '{}' for {}s",
+                activity.node,
+                activity.command,
+                activity.elapsed_ms / 1000
+            )
+        });
+        let silence = if run.activity.is_some() {
+            "no activity for"
+        } else {
+            "no cursor movement for"
+        };
         let detail = format!(
-            "no cursor movement for {}ms (limit {}ms from {}); {run_label} on {} at {cursor_label}",
+            "{silence} {}ms (limit {}ms from {}); {run_label} on {} at {cursor_label}{activity}",
             run.still_ms,
             run.max_stall_ms,
             run.limit_source.description(),
@@ -1069,6 +1122,7 @@ pub(crate) fn settle_stalled(jobs: &mut [Job], settlement: StallSettlement<'_>) 
             "stillMs": run.still_ms,
             "maxStallMs": run.max_stall_ms,
             "maxStallSource": run.limit_source.as_str(),
+            "lastActivity": run.activity,
         }));
     }
     failed

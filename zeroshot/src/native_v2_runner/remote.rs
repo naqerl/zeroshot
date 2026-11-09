@@ -4,6 +4,7 @@ use super::{
     DurableEventSender, DurableNodeEvent, LIVE_OUTPUT_CAPACITY, LiveOutput, NodeHandle,
     NodeRunnerError, durable_event_channel,
 };
+use crate::v2_run_ledger::ActivityCommand;
 #[cfg(test)]
 use super::output::current_timestamp;
 use crate::native_v2_contract::{ExecutionRef, NodeCompletion, TokenUsageDelta};
@@ -41,6 +42,14 @@ pub(crate) fn remote_node_handle(reference: ExecutionRef) -> (NodeHandle, Remote
     (handle, bridge)
 }
 
+/// A heartbeat forwarded from the capsule transport.
+pub(crate) struct RemoteActivity {
+    pub(crate) reference: ExecutionRef,
+    pub(crate) command: ActivityCommand,
+    pub(crate) elapsed_ms: u64,
+    pub(crate) timestamp: UnixTimestampMillis,
+}
+
 impl RemoteNodeHandleBridge {
     pub(crate) fn cancellation_signal(&self) -> watch::Sender<bool> {
         self.cancellation_signal.clone()
@@ -73,6 +82,19 @@ impl RemoteNodeHandleBridge {
             let _ = live.send(output);
         }
         Ok(())
+    }
+
+    pub(crate) async fn record_activity(
+        &self,
+        activity: RemoteActivity,
+    ) -> Result<(), NodeRunnerError> {
+        self.send_durable(DurableNodeEvent::Activity {
+            reference: activity.reference,
+            command: activity.command,
+            elapsed_ms: activity.elapsed_ms,
+            timestamp: activity.timestamp,
+        })
+        .await
     }
 
     pub(crate) async fn record_token_usage(

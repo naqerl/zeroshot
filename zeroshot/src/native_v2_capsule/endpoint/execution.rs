@@ -247,6 +247,17 @@ async fn apply_local_output(
             output: output.into(),
             timestamp,
         },
+        DurableNodeEvent::Activity {
+            reference,
+            command,
+            elapsed_ms,
+            timestamp,
+        } => CapsuleNodeEvent::Activity {
+            reference,
+            command,
+            elapsed_ms,
+            timestamp,
+        },
         DurableNodeEvent::TokenUsage(usage) => CapsuleNodeEvent::TokenUsage { usage },
     };
     if *context.consumer_gone {

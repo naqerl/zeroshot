@@ -147,6 +147,20 @@ pub struct ActiveExecution {
     pub node: NodeName,
 }
 
+/// The latest tool/exec activity reported by a running node.
+///
+/// `command` is producer-redacted, single-line, and bounded; `elapsed_ms` is how long the tool had
+/// been running when the heartbeat was recorded. The hub uses `timestamp` only to order
+/// heartbeats, never to infer a run outcome.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RunActivity {
+    pub node: NodeName,
+    pub command: String,
+    pub elapsed_ms: u64,
+    pub timestamp: UnixTimestampMillis,
+}
+
 /// Public run state. The closed phase variants make impossible combinations unrepresentable:
 /// admitted runs have no execution, stopping means force was requested, and finished runs have
 /// exactly one terminal result and no active execution. Running/stopping report every active
@@ -158,10 +172,14 @@ pub enum RunStatus {
     Running {
         #[serde(rename = "activeExecutions")]
         active_executions: Vec<ActiveExecution>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity: Option<RunActivity>,
     },
     Stopping {
         #[serde(rename = "activeExecutions")]
         active_executions: Vec<ActiveExecution>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity: Option<RunActivity>,
     },
     Finished {
         #[serde(rename = "terminalResult")]

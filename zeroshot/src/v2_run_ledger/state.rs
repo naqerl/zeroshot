@@ -1,6 +1,6 @@
 use openengine_cluster_protocol::{
     ActiveExecution, BoundedLogMessage, Cursor, FailureDiagnostic, FailureDiagnosticKind,
-    PositiveInteger, TerminalResult, TokenCount, TokenUsage,
+    PositiveInteger, RunActivity, TerminalResult, TokenCount, TokenUsage,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -110,6 +110,21 @@ fn apply_event_kind(
         RunEvent::ExecutionVoided {
             reference, reason, ..
         } => apply_execution_voided(snapshot, reference, *reason, sequence),
+        RunEvent::Activity {
+            reference,
+            command,
+            elapsed_ms,
+            timestamp,
+        } => {
+            active_node_mut(snapshot, reference)?;
+            snapshot.last_activity = Some(RunActivity {
+                node: reference.node.clone(),
+                command: command.as_str().to_owned(),
+                elapsed_ms: *elapsed_ms,
+                timestamp: *timestamp,
+            });
+            Ok(())
+        }
         RunEvent::SafeLog { .. }
         | RunEvent::TokenUsageObserved { .. }
         | RunEvent::RunTokenUsageObserved { .. } => {

@@ -28,6 +28,7 @@ fn control_with_capacity(capacity: usize) -> (watch::Sender<bool>, DriverControl
             cancellation,
             live_output,
             durable_output,
+            reference: crate::native_v2_runner::test_support::control_reference(),
         },
         durable,
     )
