@@ -376,9 +376,11 @@ fn shell_word(value: &str) -> Result<&str, HubError> {
 /// The boot steps that join the box to the tailnet.
 ///
 /// The key arrives in the cloud-init user data, which is written `0700 root`, and is moved to a
-/// `0600` file the CLI reads with `--authkey=file:`, so it never appears on a command line. Every
+/// `0600` file the CLI reads with `--auth-key=file:`, so it never appears on a command line. Every
 /// failure is a warning: the lease continues and the log says why the box cannot reach the
-/// gateway. The node is `--ephemeral`, so it leaves the tailnet when the box is destroyed.
+/// gateway. `up` in this build has no `--ephemeral`, so the node stays in the tailnet after the
+/// box is destroyed: it is named `zs-<lease>` and carries `tag:zs-box`, which is what the ACL
+/// and any manual prune key off.
 fn tailnet_boot(authkey: &str) -> String {
     let version = TAILSCALE_VERSION;
     let tag = TAILSCALE_TAG;
@@ -401,7 +403,8 @@ if [ ! -x /usr/local/bin/tailscaled ] || [ ! -x /usr/local/bin/tailscale ]; then
   elif curl -fsSL "https://pkgs.tailscale.com/stable/$asset" -o /run/zeroshot/tailscale.tgz; then
     if echo "$sum  /run/zeroshot/tailscale.tgz" | sha256sum -c - >/dev/null 2>&1; then
       rm -rf /tmp/zeroshot-tailscale
-      if tar -xzf /run/zeroshot/tailscale.tgz -C /tmp/zeroshot-tailscale --strip-components=1 2>/dev/null; then
+      mkdir -p /tmp/zeroshot-tailscale
+      if tar -xzf /run/zeroshot/tailscale.tgz -C /tmp/zeroshot-tailscale --strip-components=1; then
         install -m 0755 /tmp/zeroshot-tailscale/tailscale /usr/local/bin/tailscale
         install -m 0755 /tmp/zeroshot-tailscale/tailscaled /usr/local/bin/tailscaled
       else
@@ -432,7 +435,7 @@ case "$host" in
   *) host="zs-$host" ;;
 esac
 if [ -S /run/tailscale/tailscaled.sock ]; then
-  if /usr/local/bin/tailscale --socket=/run/tailscale/tailscaled.sock up     --authkey=file:/run/zeroshot/ts-authkey     --hostname="$host"     --advertise-tags={tag}     --ephemeral     --accept-dns=true     --timeout=90s     --reset >/dev/null 2>&1; then
+  if /usr/local/bin/tailscale --socket=/run/tailscale/tailscaled.sock up --auth-key=file:/run/zeroshot/ts-authkey --hostname="$host" --advertise-tags={tag} --accept-dns=true --timeout=90s --reset >/dev/null 2>&1; then
     step='checking the gateway from the box'
     code=$(curl -sS -o /dev/null -w '%{{http_code}}' --max-time 10 '{probe}' 2>/dev/null || echo 000)
     echo "step='gateway' http=$code"
