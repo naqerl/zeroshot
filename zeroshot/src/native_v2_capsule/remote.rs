@@ -1,4 +1,5 @@
 use super::*;
+use crate::native_v2_runner::RemoteActivity;
 
 mod activity;
 mod execution;
@@ -222,6 +223,25 @@ async fn handle_remote_event(
         Some(CapsuleNodeEvent::Output { output, timestamp }) => {
             handle_remote_output(output, timestamp, context).await
         }
+        Some(CapsuleNodeEvent::Activity {
+            reference,
+            command,
+            elapsed_ms,
+            timestamp,
+        }) if reference == *context.reference => {
+            let result = await_remote_bridge(
+                context.bridge.record_activity(RemoteActivity {
+                    reference,
+                    command,
+                    elapsed_ms,
+                    timestamp,
+                }),
+                context.connection_loss,
+            )
+            .await;
+            handle_remote_bridge(result, context).await
+        }
+        Some(CapsuleNodeEvent::Activity { .. }) => Some(Err(NodeRunnerError::Driver)),
         Some(CapsuleNodeEvent::TokenUsage { usage }) => {
             let result = await_remote_bridge(
                 context.bridge.record_token_usage(usage),

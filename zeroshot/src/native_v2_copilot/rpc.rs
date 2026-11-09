@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use openengine_cluster_protocol::{FailureDiagnosticKind, WorkerOutcome};
@@ -10,6 +11,7 @@ use crate::execution::process::{
 use crate::native_v2_capsule::provider_process::{
     ProviderProcess, ProviderExecutionFiles, provider_error_output, redact_agent_response,
     redaction_values, report_provider_error, safe_provider_text,
+    turn::{ACTIVITY_POLL_INTERVAL, ActivityTracker},
 };
 use crate::native_v2_runner::{
     AgentResponseState, DriverControl, DriverInvocation, NodeRunnerError, ProviderSchemaDialect,
@@ -87,6 +89,7 @@ pub(super) struct CopilotRpc<'a> {
     pub(super) session_id: String,
     pub(super) response: Option<String>,
     pub(super) redactions: Vec<String>,
+    pub(super) activity: ActivityTracker,
     authentication: auth::CopilotAuthentication<'a>,
     provider: Option<&'a provider::LocalProvider>,
     active_memory: Option<Arc<crate::active_memory::hooks::ActiveMemoryHooks>>,
@@ -125,6 +128,7 @@ impl<'a> CopilotRpc<'a> {
             session_id: String::new(),
             response: None,
             redactions,
+            activity: ActivityTracker::default(),
             authentication: native.authentication,
             provider: native.provider,
             active_memory: None,
@@ -364,6 +368,8 @@ impl<'a> CopilotRpc<'a> {
     }
 
     async fn next(&mut self) -> Result<Option<Value>, NodeRunnerError> {
+        let mut heartbeat = tokio::time::interval(ACTIVITY_POLL_INTERVAL);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             if let Some(message) = self.frames.pop() {
                 if message["jsonrpc"].as_str() != Some("2.0") {
@@ -371,12 +377,29 @@ impl<'a> CopilotRpc<'a> {
                 }
                 return Ok(Some(message));
             }
-            let Some(chunk) = self.stdout.recv().await else {
+            let chunk = tokio::select! {
+                chunk = self.stdout.recv() => chunk,
+                _ = heartbeat.tick() => {
+                    self.record_activity().await?;
+                    continue;
+                }
+            };
+            let Some(chunk) = chunk else {
                 self.frames.finish()?;
                 return Ok(None);
             };
             self.frames.push(chunk.as_slice())?;
         }
+    }
+
+    async fn record_activity(&mut self) -> Result<(), NodeRunnerError> {
+        let Some(activity) = self.activity.heartbeat(Instant::now()) else {
+            return Ok(());
+        };
+        let command = safe_provider_text(&activity.command, &self.redactions);
+        self.control
+            .record_activity(&command, activity.elapsed_ms)
+            .await
     }
 
     pub(super) fn failure_diagnostic(

@@ -1,4 +1,5 @@
 use super::*;
+use crate::v2_run_ledger::ActivityCommand;
 
 #[tokio::test]
 async fn status_lists_every_parallel_execution_with_opaque_selectors() {
@@ -25,7 +26,10 @@ async fn status_lists_every_parallel_execution_with_opaque_selectors() {
     assert_eq!(&status.source, &admitted.source);
     assert_eq!(status.size, admitted.runtime.size());
     let active_executions = match status.status {
-        RunStatus::Running { active_executions } => Some(active_executions),
+        RunStatus::Running {
+            active_executions,
+            activity: _,
+        } => Some(active_executions),
         _ => None,
     };
     let active_executions = active_executions.assert_value_with("run must be running");
@@ -307,4 +311,56 @@ async fn failure_fallback_refreshes_recorded_evidence_without_replacing_its_firs
     ));
     service.runtime_failed_with_cause(&run_id, "still later failure");
     assert_eq!(service.status(params).await.assert_value(), terminal);
+}
+
+#[tokio::test]
+async fn activity_heartbeat_advances_the_cursor_without_a_public_status_event() {
+    let (ledger, run_id) = ledger_run("activity-status").await;
+    let worker = reference(&run_id, "worker", 1);
+    let initial = ledger
+        .append(&run_id, vec![RunEvent::RunStarted, started(&worker)])
+        .await
+        .assert_value();
+    let heartbeat = RunEvent::Activity {
+        reference: worker,
+        command: ActivityCommand::truncated("cargo check --workspace --all-targets"),
+        elapsed_ms: 5_000,
+        timestamp: UnixTimestampMillis::new(1_725_000_000_123).assert_value(),
+    };
+    let updated = ledger
+        .append(&run_id, vec![heartbeat.clone()])
+        .await
+        .assert_value();
+    assert_eq!(
+        updated
+            .snapshot
+            .last_activity
+            .as_ref()
+            .map(|activity| activity.command.as_str()),
+        Some("cargo check --workspace --all-targets")
+    );
+    assert_ne!(
+        updated.snapshot.cursor, initial.snapshot.cursor,
+        "a heartbeat is a durable cursor advance"
+    );
+    assert!(
+        !super::super::projection::changes_public_status(&heartbeat),
+        "a heartbeat must not grow the public hub.run stream"
+    );
+
+    let service = NativeV2Observability::new(ledger);
+    let status = service
+        .status(RunStatusParams {
+            run_id: run_id.clone(),
+        })
+        .await
+        .assert_value();
+    assert_eq!(status.at_cursor, updated.snapshot.cursor);
+    let RunStatus::Running { activity, .. } = status.status else {
+        panic!("run must still be running");
+    };
+    let activity = activity.assert_value_with("status carries the newest activity");
+    assert_eq!(activity.node.as_str(), "worker");
+    assert_eq!(activity.command, "cargo check --workspace --all-targets");
+    assert_eq!(activity.elapsed_ms, 5_000);
 }

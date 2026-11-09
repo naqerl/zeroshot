@@ -20,7 +20,7 @@ impl DurableOutput {
         loop {
             match self.recv().await? {
                 DurableNodeEvent::Output { output, .. } => return Ok(output),
-                DurableNodeEvent::TokenUsage(_) => {}
+                DurableNodeEvent::Activity { .. } | DurableNodeEvent::TokenUsage(_) => {}
             }
         }
     }
@@ -30,7 +30,7 @@ impl DurableOutput {
     ) -> Result<Option<TokenUsageDelta>, AttachReceiveError> {
         loop {
             match self.recv().await? {
-                DurableNodeEvent::Output { .. } => {}
+                DurableNodeEvent::Output { .. } | DurableNodeEvent::Activity { .. } => {}
                 DurableNodeEvent::TokenUsage(usage) => return Ok(usage),
             }
         }
@@ -454,6 +454,15 @@ fn configured_runner(owner_scoped: bool) -> (NativeNodeRunner, Arc<FakeDriver>, 
 
 use openengine_cluster_testkit::assertions::{AssertValue};
 
+pub(crate) fn control_reference() -> ExecutionRef {
+    ExecutionRef {
+        run_id: RunId::new("control-run"),
+        node: NodeName::new("worker").assert_value(),
+        node_instance: NodeInstanceId::new(1).assert_value(),
+        execution: ExecutionId::new(1).assert_value(),
+    }
+}
+
 /// A driver control for tests that drive one turn directly: nothing is cancelled, the live channel
 /// holds one event, and the caller drains the durable channel it gets back.
 pub(crate) fn control() -> (watch::Sender<bool>, DriverControl, DurableOutput) {
@@ -466,6 +475,7 @@ pub(crate) fn control() -> (watch::Sender<bool>, DriverControl, DurableOutput) {
             cancellation,
             live_output,
             durable_output,
+            reference: control_reference(),
         },
         durable,
     )

@@ -127,7 +127,7 @@ async fn proxy_preserves_durable_live_and_normalized_completion() {
 
     let (durable_output, timestamp) = match durable.recv().await.assert_value() {
         DurableNodeEvent::Output { output, timestamp } => (output, timestamp),
-        DurableNodeEvent::TokenUsage(_) => None.assert_value(),
+        DurableNodeEvent::Activity { .. } | DurableNodeEvent::TokenUsage(_) => None.assert_value(),
     };
     let live_output = live.recv().await.assert_value();
     assert_eq!(durable_output.text, "working");

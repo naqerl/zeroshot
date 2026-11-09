@@ -1,6 +1,12 @@
+use std::time::Instant;
+
 use crate::native_v2_capsule::{
     provider_json_lines::{ProviderJsonLine, ProviderJsonLines},
-    provider_process::{text::ProviderText, turn::ProviderTranscript, ProviderProcessFailure},
+    provider_process::{
+        text::ProviderText,
+        turn::{ActivityTracker, ProviderActivity, ProviderTranscript},
+        ProviderProcessFailure,
+    },
 };
 use serde_json::Value;
 
@@ -47,6 +53,7 @@ pub(super) struct ClaudeTranscript {
     malformed_records: usize,
     oversized_records: usize,
     pending: ProviderText,
+    tool_activity: ActivityTracker,
 }
 
 impl ClaudeTranscript {
@@ -64,6 +71,7 @@ impl ClaudeTranscript {
             malformed_records: 0,
             oversized_records: 0,
             pending: ProviderText::new(&redactions),
+            tool_activity: ActivityTracker::default(),
         }
     }
 }
@@ -89,6 +97,10 @@ impl ProviderTranscript for ClaudeTranscript {
             .map_or_else(Vec::new, |record| self.accept_records([record]));
         self.pending.finish(&mut emissions);
         emissions
+    }
+
+    fn activity(&mut self, now: Instant) -> Option<ProviderActivity> {
+        self.tool_activity.heartbeat(now)
     }
 
     fn token_usage(&self) -> Option<TokenUsageDelta> {
@@ -135,6 +147,23 @@ impl ProviderTranscript for ClaudeTranscript {
             }
         }
     }
+}
+
+fn claude_tool_command(name: &str, input: Option<&Value>) -> String {
+    let input = input.and_then(Value::as_object);
+    let field = |name: &str| {
+        input
+            .and_then(|input| input.get(name))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+    };
+    if let Some(command) = field("command").or_else(|| field("cmd")) {
+        return command.to_owned();
+    }
+    if let Some(path) = field("file_path").or_else(|| field("path")) {
+        return format!("{name} {path}");
+    }
+    name.to_owned()
 }
 
 impl ClaudeTranscript {
@@ -408,12 +437,26 @@ impl ClaudeTranscript {
             return;
         };
         self.record_assistant_usage(event, message);
-        if self.visible_text_emitted {
-            return;
-        }
         let Some(content) = message.get("content").and_then(Value::as_array) else {
             return;
         };
+        let tool = content
+            .iter()
+            .find(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"));
+        if let Some(tool) = tool {
+            let name = tool.get("name").and_then(Value::as_str).unwrap_or("tool");
+            let command = self
+                .pending
+                .redact(&claude_tool_command(name, tool.get("input")));
+            self.tool_activity
+                .start(tool.get("id").and_then(Value::as_str), &command);
+        } else {
+            // The next assistant message follows the tool result; a turn result settles it too.
+            self.tool_activity.finish_any();
+        }
+        if self.visible_text_emitted {
+            return;
+        }
         for block in content {
             let Some(block) = block.as_object() else {
                 continue;
@@ -450,6 +493,7 @@ impl ClaudeTranscript {
     }
 
     fn parse_result(&mut self, event: &serde_json::Map<String, Value>) {
+        self.tool_activity.finish_any();
         match parse_terminal_usage(
             event.get("modelUsage"),
             event.get("model_usage"),

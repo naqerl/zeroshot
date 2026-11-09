@@ -4,11 +4,14 @@
 //! response value itself is taken from the authoritative final assistant message. Only the last
 //! assistant message is the node's response: Pi can emit several per run.
 
+use std::time::Instant;
+
 use crate::native_v2_capsule::{
     provider_json_lines::{ProviderJsonLine, ProviderJsonLines},
     provider_process::{
-        text::ProviderText, turn::ProviderTranscript, ProviderProcessFailure,
-        ProviderProcessFailureKind,
+        text::ProviderText,
+        turn::{ActivityTracker, ProviderActivity, ProviderTranscript},
+        ProviderProcessFailure, ProviderProcessFailureKind,
     },
 };
 use serde_json::Value;
@@ -42,6 +45,7 @@ pub(crate) struct PiTranscript {
     /// Malformed counts or overflow make the turn total permanently incomplete.
     usage_invalid: bool,
     output: ProviderText,
+    tool_activity: ActivityTracker,
 }
 
 impl PiTranscript {
@@ -54,6 +58,7 @@ impl PiTranscript {
             current_usage: None,
             usage_invalid: false,
             output: ProviderText::new(&redactions),
+            tool_activity: ActivityTracker::default(),
         }
     }
 }
@@ -71,6 +76,10 @@ impl ProviderTranscript for PiTranscript {
             .map_or_else(Vec::new, |record| self.accept([record]));
         self.output.finish(&mut emissions);
         emissions
+    }
+
+    fn activity(&mut self, now: Instant) -> Option<ProviderActivity> {
+        self.tool_activity.heartbeat(now)
     }
 
     fn token_usage(&self) -> Option<TokenUsageDelta> {
@@ -233,6 +242,24 @@ impl PiTranscript {
                     &format!("Pi is retrying the model turn (attempt {attempt})"),
                 );
             }
+            "tool_execution_start" => {
+                // A nested codemode call runs inside an outer tool; heartbeat the outer one so its
+                // elapsed time covers the whole call.
+                if value.get("parentToolCallId").is_none() {
+                    let name = value
+                        .get("toolName")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool");
+                    let command = pi_tool_command(name, value.get("args"));
+                    let command = self.safe(&command);
+                    let id = value.get("toolCallId").and_then(Value::as_str);
+                    self.tool_activity.start(id, &command);
+                }
+            }
+            "tool_execution_end" if value.get("parentToolCallId").is_none() => {
+                let id = value.get("toolCallId").and_then(Value::as_str);
+                self.tool_activity.finish(id);
+            }
             // Unknown future event types are ignored before any provider-owned field is validated.
             _ => {}
         }
@@ -311,6 +338,23 @@ impl PiTranscript {
     fn safe(&self, text: &str) -> String {
         self.output.redact(text)
     }
+}
+
+/// The single-line command a heartbeat names, without provider payloads.
+fn pi_tool_command(name: &str, args: Option<&Value>) -> String {
+    let args = args.and_then(Value::as_object);
+    let field = |name: &str| {
+        args.and_then(|args| args.get(name))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+    };
+    if let Some(command) = field("command").or_else(|| field("cmd")) {
+        return command.to_owned();
+    }
+    if let Some(path) = field("path").or_else(|| field("file_path")) {
+        return format!("{name} {path}");
+    }
+    name.to_owned()
 }
 
 /// Pi usage records are complete cumulative snapshots in provider-native field names.

@@ -130,6 +130,12 @@ pub enum CapsuleNodeEvent {
         output: CapsuleOutput,
         timestamp: UnixTimestampMillis,
     },
+    Activity {
+        reference: ExecutionRef,
+        command: crate::v2_run_ledger::ActivityCommand,
+        elapsed_ms: u64,
+        timestamp: UnixTimestampMillis,
+    },
     TokenUsage {
         usage: Option<TokenUsageDelta>,
     },
