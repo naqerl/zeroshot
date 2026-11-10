@@ -2811,6 +2811,81 @@ async fn hub_stream_sends_heartbeats_while_idle() {
 }
 
 #[tokio::test]
+async fn reinitialize_keeps_a_live_stream_until_cancellation_ends_it() {
+    let host = HubLifecycleHost::new(vec![Vec::new()], Vec::new(), HashMap::new());
+    let mut session = Session::spawn(host);
+    initialize(&mut session).await;
+    let session_id = session.session.clone().expect("initial session id");
+    let response = session
+        .start_stream(&json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "events/stream",
+            "params": {"arguments": {}}
+        }))
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let mut body = response.bytes_stream();
+    let mut pending = String::new();
+
+    let mut saw_heartbeat = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !saw_heartbeat {
+        let chunk = tokio::time::timeout_at(deadline, body.next())
+            .await
+            .expect("a heartbeat before re-initialize")
+            .expect("stream chunk")
+            .expect("stream body");
+        pending.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(index) = pending.find("\n\n") {
+            let block: String = pending.drain(..index + 2).collect();
+            saw_heartbeat |= block.contains("\"notifications/events/heartbeat\"");
+        }
+    }
+
+    let returned = session.send(&initialize_message(2)).await;
+    assert_eq!(returned.as_deref(), Some(session_id.as_str()));
+    let reply = session.read().await;
+    assert_eq!(reply["id"], json!(2));
+    assert!(reply.get("error").is_none(), "{reply}");
+    assert_eq!(reply["result"]["serverInfo"]["name"], json!("zeroshot"));
+
+    let mut saw_heartbeat = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !saw_heartbeat {
+        let chunk = tokio::time::timeout_at(deadline, body.next())
+            .await
+            .expect("the re-initialized session keeps heartbeating")
+            .expect("stream chunk")
+            .expect("stream body");
+        pending.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(index) = pending.find("\n\n") {
+            let block: String = pending.drain(..index + 2).collect();
+            saw_heartbeat |= block.contains("\"notifications/events/heartbeat\"");
+        }
+    }
+
+    session
+        .send(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": 6}
+        }))
+        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match tokio::time::timeout_at(deadline, body.next()).await {
+            Ok(None) => break,
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(error))) => {
+                panic!("the cancelled stream failed instead of closing: {error}")
+            }
+            Err(_) => panic!("the cancelled stream is still open"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn hub_poll_clipping_is_has_more_without_reporting_truncation() {
     let host = HubLifecycleHost::new(
         vec![

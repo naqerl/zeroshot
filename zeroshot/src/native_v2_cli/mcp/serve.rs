@@ -86,9 +86,10 @@ impl SessionState {
     }
 
     pub(super) fn reset_for_initialize(&mut self) {
-        // The initialize request is itself an in-flight job; resetting a session cancels its
-        // streams but must never abort the job that is answering the reset.
-        self.shutdown_streams();
+        // A re-initialize is a re-negotiation of a session that is not ending, so its live
+        // streams must survive it. The initialize request is itself an in-flight job, and leaving
+        // streams alone also keeps the job answering the reset alive. Only cancellation,
+        // unsubscribe, transport close, the idle sweeper, and process shutdown end a stream.
         self.initialized = false;
     }
 
