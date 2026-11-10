@@ -209,6 +209,23 @@ limit; the queue ceiling still applies.
    `zeroshot/hub=<hub id>`. It deletes servers, legacy Volumes, primary IPs, and firewalls that state
    does not know about. It never deletes a resource whose lease state still holds.
 
+The idle clock survives a restart. `idleSince` on the member record is the live observation, but
+job records outlive it: when the member record is gone, or every job on the lease is terminal, the
+clock starts at the newest `finishedAt` on that lease, and at the lease's creation time when it
+never had a job. A restored lease therefore drains after `--idle` instead of being read as busy
+forever because no member record carries its clock. A lease that still has a nonterminal job keeps
+the member's own clock rather than a derived one, so a busy server is not torn down by age.
+
+A restored lease also judges its runs by liveness rather than by the ledger. `state.json` can still
+say `Running` for a run whose runtime is gone, so every pass checks the runs an `Active` lease holds
+against the runs its own target lists. A run the target still lists answers for its job; a run the
+target no longer lists is over, and the job fails `runtime_lost` with `failureClassification`
+`run_unreachable` through the same settlement a deleted lease uses. A target that cannot be reached
+at all proves nothing about its runs and stays with the
+[lost member](hub-operations.md#lost-members-and-removing-a-member) path. Failing the run is what
+starts the lease's idle clock, so the machine then drains after `--idle`. The settlement never
+overrides `hold` or a provider-quota hold.
+
 A server whose boot fails or times out is deleted. Its pool then pauses for 5 minutes, and the
 pause doubles on each further failure up to an hour, so a broken image does not keep creating
 billed servers.

@@ -1412,6 +1412,8 @@ impl HubService {
         // Probe every member on this pass, so a placed job's member is observed even when no
         // queued job needs placement. Health failures accumulate across passes.
         let snapshot = self.snapshot().await;
+        // Taken before the probe: a job placed later in this same pass is not judged by it.
+        let lease_runs = schedule::lease_runs(&snapshot);
         let probed = snapshot.members.iter().collect::<Vec<_>>();
         let mut loads = schedule::probe(&probed, &snapshot.jobs, self.driver()).await;
         self.metrics.record_loads(&loads);
@@ -1447,6 +1449,21 @@ impl HubService {
                 ))
             })
             .await?;
+        // A restored pool lease can still point at a run its own target no longer lists: the
+        // ledger says `Running`, but that runtime is gone. Settle it so the lease's idle clock
+        // can start, instead of keeping the machine busy forever.
+        if !lease_runs.is_empty() {
+            report.runtime_lost.extend(
+                self.mutate(|state| {
+                    let failed =
+                        schedule::settle_unlisted_runs(&mut state.jobs, now, &lease_runs, &loads);
+                    // A settled quota wait no longer holds its machine.
+                    pool::sync_quota_holds(state);
+                    Ok(failed)
+                })
+                .await?,
+            );
+        }
         let placing = schedule::placing(&self.snapshot().await);
         for (job_id, member) in placing {
             let (job, dispatched) = self.dispatch(&job_id, &member, now).await?;

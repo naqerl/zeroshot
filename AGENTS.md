@@ -979,7 +979,15 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   its server, and a bounded `waitMaxMs`/drain deadline retires it even while the server exists by
   recording the draining intent and deleting that server; a failed delete keeps it draining with
   the provider error and backoff, and its runs are classified `lease_retired`. An inconclusive
-  provider answer always leaves the lease alone.
+  provider answer always leaves the lease alone. Leased runs are judged by liveness, not by the
+  ledger: each pass compares the nonterminal runs an `Active` lease holds with the runs its own
+  target lists, and a lease all of whose runs are unlisted (while that target answers) is settled
+  through the existing `runtime_lost` settlement as `run_unreachable`; a target that cannot be
+  reached at all stays with the lost-member path, and an unlisted decision never crosses a
+  co-tenant still listed. Teardown derives the idle clock from the newest `finishedAt` on the
+  lease when the member record is missing or every job is terminal, falling back to the lease's
+  creation time when it never had a job, so a restored lease drains after `idle_ms` instead of
+  staying busy forever, while `hold` and `quota_hold` still block it.
   MCP publishes them as `hub.pool` events from `hub pool list`, so no caller polls for readiness. The
   API token comes from `--hetzner-token-file` or `HCLOUD_TOKEN` and is never stored. Labels carry
   IDs, server type and location only. The hub registers the pool's public key with the provider,

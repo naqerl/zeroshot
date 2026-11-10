@@ -23,6 +23,9 @@ pub(crate) struct Load {
     pub reachability: Reachability,
     pub active: u32,
     pub error: Option<String>,
+    /// Run IDs the member listed, empty unless this probe reached it. The pool uses them to judge
+    /// whether a run its ledger still calls `Running` exists at all.
+    pub runs: Vec<String>,
 }
 
 impl Load {

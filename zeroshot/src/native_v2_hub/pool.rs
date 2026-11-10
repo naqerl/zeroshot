@@ -1124,6 +1124,44 @@ pub(crate) fn sync_quota_holds(state: &mut HubState) {
     }
 }
 
+/// The idle clock of an `Active` lease: the moment its work provably ended.
+///
+/// The member record holds the live clock while the hub observes the member. Job records survive
+/// a restart even when the member record is gone, or when its `idleSince` was never stamped, so
+/// the newest `finishedAt` on the lease is the fallback. A lease with no work at all is idle since
+/// it was created rather than busy forever.
+fn idle_clock_ms(state: &HubState, lease: &Lease) -> Option<u64> {
+    let member_idle = state
+        .member(&lease.name)
+        .and_then(|member| member.idle_since_ms);
+    let mut newest_finished: Option<u64> = None;
+    let mut any_job = false;
+    for job in state
+        .jobs
+        .iter()
+        .filter(|job| job.target.as_deref() == Some(lease.name.as_str()))
+    {
+        any_job = true;
+        if !job.state.is_terminal() {
+            // A job still holds the lease; the member record is the only live observation.
+            return member_idle;
+        }
+        newest_finished = newest_finished.max(job.finished_at_ms);
+    }
+    // A warm spare has no work to derive a clock from, so it keeps the member's own idle mark.
+    if !any_job {
+        return member_idle.or(Some(lease.created_at_ms));
+    }
+    // `idleSince` is stamped when a pass first sees the member free, which is never earlier than
+    // the last finish; deriving from the finish lets a restored lease drain without another
+    // full idle window.
+    Some(
+        newest_finished
+            .unwrap_or(lease.created_at_ms)
+            .min(member_idle.unwrap_or(u64::MAX)),
+    )
+}
+
 /// Leases that must start their teardown now, with the reason.
 pub(crate) fn teardown_due(state: &HubState, now: u64) -> Vec<(String, TeardownReason)> {
     let mut due = Vec::new();
@@ -1146,9 +1184,7 @@ pub(crate) fn teardown_due(state: &HubState, now: u64) -> Vec<(String, TeardownR
                     None
                 } else {
                     let idle_ms = pool.map_or(0, |pool| pool.idle_ms);
-                    state
-                        .member(&lease.name)
-                        .and_then(|member| member.idle_since_ms)
+                    idle_clock_ms(state, lease)
                         .filter(|since| now >= since.saturating_add(idle_ms))
                         .map(|_| TeardownReason::Idle)
                 }

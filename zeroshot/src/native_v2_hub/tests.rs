@@ -167,6 +167,7 @@ pub(super) fn loads(entries: &[(&str, bool, u32)]) -> BTreeMap<String, Load> {
                     },
                     active: *active,
                     error: None,
+                    runs: Vec::new(),
                 },
             )
         })
@@ -1088,6 +1089,7 @@ fn only_decisive_probes_extend_the_unreachable_streak() {
                 reachability,
                 active: 1,
                 error: Some("probe failed".to_owned()),
+                runs: Vec::new(),
             },
         )])
     };
@@ -1375,7 +1377,7 @@ impl HubDriver for FakeDriver {
             .get(member)
             .map(|runs| {
                 runs.iter()
-                    .map(|(_, phase)| json!({"status": {"phase": phase}}))
+                    .map(|(run_id, phase)| json!({"runId": run_id, "status": {"phase": phase}}))
                     .collect()
             })
             .unwrap_or_default())

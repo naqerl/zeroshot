@@ -250,6 +250,7 @@ fn record_activity(metrics: &Metrics) {
                 reachability: Reachability::Reachable,
                 active: 1,
                 error: None,
+                runs: vec!["run-a".to_owned()],
             },
         ),
         (
@@ -258,6 +259,7 @@ fn record_activity(metrics: &Metrics) {
                 reachability: Reachability::Unreachable,
                 active: 0,
                 error: Some("down".to_owned()),
+                runs: Vec::new(),
             },
         ),
     ]));

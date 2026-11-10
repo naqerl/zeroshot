@@ -189,7 +189,10 @@ therefore inconclusive rather than evidence that the target is gone. A failed st
 fails the job: it is recorded as `errorKind` `status_unavailable`, the job keeps running, and the
 retryable warning stays visible through `hub.warning` until a later status read succeeds. A
 completed status read is direct proof that the member is alive, so it clears the member's load
-failure streak even when its `list` route fails.
+failure streak even when its `list` route fails. The one exception is a run on a pool lease: a
+restored lease fails a run its answering target no longer lists as `runtime_lost` with
+`failureClassification` `run_unreachable`, because the ledger row saying `Running` is a record of
+the past; see [when a server is deleted](hub-pools.md#what-happens).
 
 A running job is failed with `failureReason` `target_lost` and `errorKind` `target_lost` only after
 decisive confirmation: its member is gone from the hub, or it failed three consecutive decisive

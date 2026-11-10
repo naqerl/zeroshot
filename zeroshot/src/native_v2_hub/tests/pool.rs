@@ -3268,3 +3268,172 @@ async fn an_unanswerable_restored_lease_retries_then_settles_runtime_lost() {
         "the lost lease is reconciled once"
     );
 }
+
+/// A restored `Active` lease whose last job already finished, and whose member record did not
+/// survive the restart, must drain after `idle_ms` measured from that finish. Without the
+/// derived clock the missing member was read as busy forever and the box was billed forever.
+#[tokio::test]
+async fn a_restored_lease_without_its_member_drains_from_its_last_finish() {
+    let rig = rig();
+    let lease = rig.finished_job_on_server().await;
+    rig.set(|state| state.members.retain(|member| member.name != lease.name))
+        .await;
+    let state = rig.state().await;
+    let finished = job_named(&state, "hj_one")
+        .finished_at_ms
+        .expect("the finished job names when it ended");
+    let idle_ms = state.pools[0].idle_ms;
+    assert!(
+        pool::teardown_due(&state, finished.saturating_add(idle_ms).saturating_sub(1)).is_empty(),
+        "the pool's idle window still applies to a derived clock"
+    );
+    assert_eq!(
+        pool::teardown_due(&state, finished.saturating_add(idle_ms)),
+        [(lease.name.clone(), TeardownReason::Idle)],
+        "no member record means idle since the last job ended"
+    );
+
+    // With no idle window left, the next pool pass starts the drain.
+    rig.set(|state| state.pools[0].idle_ms = 0).await;
+    rig.service.pool_pass().await.expect("pool pass");
+    let state = rig.state().await;
+    assert!(
+        state
+            .leases
+            .first()
+            .is_none_or(|lease| lease.phase != LeasePhase::Active),
+        "the restored lease drains: {:?}",
+        state.leases
+    );
+}
+
+/// A restored `Active` lease whose job still says `Running` but whose run its own target no
+/// longer lists is over: it settles `runtime_lost` through the existing path, and its idle clock
+/// then starts so the pool can drain the machine.
+#[tokio::test]
+async fn a_restored_lease_whose_run_is_gone_settles_runtime_lost_and_drains() {
+    let rig = rig();
+    let lease = rig.running_job_on_server().await;
+    // The target still answers, but its ledger no longer holds the run: the ledger row saying
+    // `Running` is a record of the past, not a liveness fact.
+    rig.driver
+        .runs
+        .lock()
+        .expect("fake lock")
+        .remove(&lease.name);
+    rig.set(|state| state.pools[0].idle_ms = 0).await;
+
+    let view = rig.pass().await;
+    assert_eq!(view["runtimeLost"][0]["jobId"], json!("hj_one"), "{view}");
+    assert_eq!(
+        view["pools"]["teardowns"][0]["lease"],
+        json!(lease.name),
+        "{view}"
+    );
+    assert_eq!(view["pools"]["teardowns"][0]["reason"], json!("idle"));
+
+    let state = rig.state().await;
+    let job = job_named(&state, "hj_one");
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(job.failure_reason.as_deref(), Some("runtime_lost"));
+    assert_eq!(
+        job.error.as_ref().expect("runtime-lost error").kind,
+        JobErrorKind::RuntimeLost
+    );
+    assert_eq!(
+        job.failure_classification.as_deref(),
+        Some("run_unreachable")
+    );
+    let message = &job.error.as_ref().expect("runtime-lost error").message;
+    assert!(message.contains("restored lease"), "{message}");
+    assert!(message.contains("no longer lists"), "{message}");
+}
+
+/// A run the target still lists answers for its job, so the lease keeps its machine however
+/// small its idle window is.
+#[tokio::test]
+async fn a_live_run_keeps_its_lease_however_short_the_idle_window() {
+    let rig = rig();
+    rig.running_job_on_server().await;
+    rig.set(|state| state.pools[0].idle_ms = 0).await;
+
+    let view = rig.pass().await;
+    assert_eq!(
+        view["pools"]["teardowns"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0),
+        0,
+        "{view}"
+    );
+    let state = rig.state().await;
+    assert_eq!(state.leases[0].phase, LeasePhase::Active);
+    assert_eq!(job_named(&state, "hj_one").state, JobState::Running);
+    let far_future = now_ms().saturating_add(365 * 24 * 60 * 60 * 1000);
+    assert!(
+        pool::teardown_due(&state, far_future).is_empty(),
+        "a lease that still has work is never torn down by a clock"
+    );
+    assert_eq!(rig.cloud.servers(), 1);
+}
+
+/// A deliberate `hold` keeps the box even when its job is over and long past `idle_ms`, whether
+/// or not the member record survived.
+#[tokio::test]
+async fn a_held_lease_with_a_finished_job_is_never_drained() {
+    let rig = rig();
+    rig.finished_job_on_server().await;
+    rig.set(|state| {
+        state.pools[0].idle_ms = 0;
+        state.leases[0].hold = true;
+    })
+    .await;
+    let state = rig.state().await;
+    let far_future = now_ms().saturating_add(365 * 24 * 60 * 60 * 1000);
+    assert_eq!(state.leases[0].phase, LeasePhase::Active);
+    assert!(pool::teardown_due(&state, far_future).is_empty());
+
+    rig.pass().await;
+    let state = rig.state().await;
+    assert_eq!(
+        state.leases[0].phase,
+        LeasePhase::Active,
+        "{:?}",
+        state.leases
+    );
+    assert!(state.leases[0].hold);
+    assert_eq!(job_named(&state, "hj_one").state, JobState::Succeeded);
+    assert_eq!(rig.cloud.servers(), 1, "the held box stays");
+}
+
+/// A member record whose idle mark was never stamped must not keep a finished lease either: the
+/// newest `finishedAt` on the lease is the clock that survives a restart.
+#[test]
+fn a_member_without_an_idle_mark_still_drains_from_its_last_finish() {
+    let pool = pool_fixture();
+    let lease = Lease {
+        phase: LeasePhase::Active,
+        ..Lease::new(&pool, "hj_done", 40110, 1_000)
+    };
+    let mut done = job("hj_done", 1_000);
+    done.target = Some(lease.name.clone());
+    done.state = JobState::Succeeded;
+    done.finished_at_ms = Some(50_000);
+    let mut busy_member = member(&lease.name, &[TAG], 1, 0);
+    busy_member.pool = Some(pool.name.clone());
+    busy_member.idle_since_ms = None;
+    let idle_ms = pool.idle_ms;
+    let state = HubState {
+        pools: vec![pool],
+        leases: vec![lease.clone()],
+        members: vec![busy_member],
+        jobs: vec![done],
+        ..HubState::default()
+    };
+    assert!(pool::teardown_due(&state, 50_000 + idle_ms - 1).is_empty());
+    assert_eq!(
+        pool::teardown_due(&state, 50_000 + idle_ms),
+        [(lease.name.clone(), TeardownReason::Idle)],
+        "every job is terminal, so the finish is the idle clock"
+    );
+}

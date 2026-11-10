@@ -94,6 +94,14 @@ pub(crate) fn active_runs(runs: &[Value]) -> u32 {
     u32::try_from(active).unwrap_or(u32::MAX)
 }
 
+/// Run IDs a `zeroshot list` result retains. A run that is still listed exists at the target,
+/// whatever phase it reports.
+pub(crate) fn listed_runs(runs: &[Value]) -> Vec<String> {
+    runs.iter()
+        .filter_map(|run| run.get("runId").and_then(Value::as_str).map(str::to_owned))
+        .collect()
+}
+
 /// Probe members in parallel. Load is the larger of the observed active runs and the hub's own
 /// running jobs on that member, so a target that lags behind admission is not oversubscribed.
 pub(crate) async fn probe(
@@ -108,16 +116,19 @@ pub(crate) async fn probe(
                 reachability: Reachability::Reachable,
                 active: active_runs(&runs),
                 error: None,
+                runs: listed_runs(&runs),
             },
             Ok(Err(error)) => Load {
                 reachability: classify_probe_error(&error),
                 active: 0,
                 error: Some(error.to_string()),
+                runs: Vec::new(),
             },
             Err(_) => Load {
                 reachability: Reachability::Inconclusive,
                 active: 0,
                 error: Some("probe timed out".to_owned()),
+                runs: Vec::new(),
             },
         };
         (member.name.clone(), load)
@@ -479,6 +490,101 @@ pub(crate) fn settle_runtime_lost_lease(
             now_ms,
             classification,
             format!("{reason}; {member} is gone"),
+        ));
+    }
+    failed
+}
+
+/// A restored lease whose run its own target no longer lists: the runtime that held it is gone
+/// even though the ledger still says `Running`.
+pub(crate) const CLASSIFIED_RUN_UNREACHABLE: &str = "run_unreachable";
+
+/// A nonterminal job's run on an `Active` pool lease, captured before a pass probes its members
+/// so a job placed later in the same pass is never judged by that probe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LeaseRun {
+    pub lease: String,
+    pub run_id: String,
+}
+
+/// Nonterminal runs on `Active` pool leases, as the pass saw them before probing.
+pub(crate) fn lease_runs(state: &HubState) -> Vec<LeaseRun> {
+    state
+        .leases
+        .iter()
+        .filter(|lease| lease.phase == pool::LeasePhase::Active)
+        .flat_map(|lease| {
+            state.jobs.iter().filter_map(move |job| {
+                if job.target.as_deref() != Some(lease.name.as_str())
+                    || !matches!(job.state, JobState::Running | JobState::WaitingQuota)
+                {
+                    return None;
+                }
+                Some(LeaseRun {
+                    lease: lease.name.clone(),
+                    run_id: job.run_id.clone()?,
+                })
+            })
+        })
+        .collect()
+}
+
+/// Settle jobs whose run their answering pool target no longer lists. A run that is still listed
+/// answers for its job, so the lease keeps its machine; a target that could not be reached at all
+/// proves nothing about its runs and is left to the target-lost path. A lease is settled only
+/// when every run it currently holds was probed and unlisted, so a live co-tenant is never failed
+/// by another job's silence.
+pub(crate) fn settle_unlisted_runs(
+    jobs: &mut [Job],
+    now_ms: u64,
+    probed: &[LeaseRun],
+    loads: &BTreeMap<String, Load>,
+) -> Vec<Value> {
+    let mut by_lease: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for run in probed {
+        by_lease
+            .entry(run.lease.as_str())
+            .or_default()
+            .push(run.run_id.as_str());
+    }
+    let mut failed = Vec::new();
+    for (lease, runs) in by_lease {
+        let Some(load) = loads.get(lease).filter(|load| load.reachable()) else {
+            continue;
+        };
+        if runs
+            .iter()
+            .any(|run| load.runs.iter().any(|listed| listed == run))
+        {
+            continue;
+        }
+        let current = jobs
+            .iter()
+            .filter(|job| job.target.as_deref() == Some(lease))
+            .filter(|job| matches!(job.state, JobState::Running | JobState::WaitingQuota))
+            .collect::<Vec<_>>();
+        if current.is_empty()
+            || current.iter().any(|job| {
+                job.run_id
+                    .as_deref()
+                    .is_none_or(|run_id| !runs.contains(&run_id))
+            })
+        {
+            continue;
+        }
+        let reason = format!(
+            "the hub restored lease {lease} after a restart and its target no longer lists {} {}",
+            if runs.len() == 1 { "run" } else { "runs" },
+            runs.join(", "),
+        );
+        failed.extend(settle_runtime_lost_lease(
+            jobs,
+            now_ms,
+            LeaseRetirement {
+                member: lease,
+                reason: &reason,
+                classification: CLASSIFIED_RUN_UNREACHABLE,
+            },
         ));
     }
     failed
