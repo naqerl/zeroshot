@@ -220,8 +220,9 @@ A restored lease also judges its runs by liveness rather than by the ledger. `st
 say `Running` for a run whose runtime is gone, so every pass checks the runs an `Active` lease holds
 against the runs its own target lists. A run the target still lists answers for its job; a run the
 target no longer lists is over, and the job fails `runtime_lost` with `failureClassification`
-`run_unreachable` through the same settlement a deleted lease uses. A target that cannot be reached
-at all proves nothing about its runs and stays with the
+`run_unreachable` through the same settlement a deleted lease uses. A lease is settled only once
+every run it still holds is unlisted, so a live co-tenant is never failed by another job's silence;
+a target that cannot be reached at all proves nothing about its runs and stays with the
 [lost member](hub-operations.md#lost-members-and-removing-a-member) path. Failing the run is what
 starts the lease's idle clock, so the machine then drains after `--idle`. The settlement never
 overrides `hold` or a provider-quota hold.

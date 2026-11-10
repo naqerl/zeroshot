@@ -273,7 +273,17 @@ impl Metrics {
     pub(crate) fn record_loads(&self, loads: &BTreeMap<String, Load>) {
         self.with(|counters| {
             for (member, load) in loads {
-                counters.loads.insert(member.clone(), load.clone());
+                // Metrics read only reachability and the active count; keeping each member's
+                // run-ID list would retain a target's whole inventory on every pass.
+                counters.loads.insert(
+                    member.clone(),
+                    Load {
+                        reachability: load.reachability,
+                        active: load.active,
+                        error: load.error.clone(),
+                        runs: Vec::new(),
+                    },
+                );
             }
         });
     }
