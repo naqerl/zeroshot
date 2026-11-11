@@ -5,6 +5,7 @@ use futures_util::future::join_all;
 use serde_json::{Value, json};
 
 use super::driver::{HubDriver, SubmitRequest};
+use super::delivery::{self, Inspection};
 use super::lease::{BOOT_RECONCILE_PREFIX, READOPT_ERROR_PREFIX};
 use super::error::HubError;
 use super::model::{
@@ -1087,7 +1088,8 @@ pub(crate) fn apply_status(job: &mut Job, status: &Value, now_ms: u64) -> bool {
         ));
         return false;
     }
-    job.state = if result == Some("succeeded") {
+    let succeeded = result == Some("succeeded");
+    job.state = if succeeded {
         JobState::Succeeded
     } else {
         JobState::Failed
@@ -1099,11 +1101,33 @@ pub(crate) fn apply_status(job: &mut Job, status: &Value, now_ms: u64) -> bool {
         .and_then(Value::as_str)
         .map(str::to_owned);
     job.token_usage = JobUsage::from_status(status);
-    if job.labels.contains_key(super::eval::ROLE_LABEL) {
+    // A run that says it succeeded only settles the job when its Git delivery produced a new
+    // commit. A delivery that stayed at the pin is a hub-side failure even though the run's own
+    // terminal result is successful; an empty (lockfile-only) commit remains a success and is
+    // marked in the terminal output so callers can tell it apart.
+    let inspection = if job.state == JobState::Succeeded {
+        delivery::inspect(job, status)
+    } else {
+        Inspection::Absent
+    };
+    if inspection.is_empty() {
+        job.state = JobState::Failed;
+        job.failure_reason = inspection.reason().map(str::to_owned);
+    }
+    if let Some(outcome) = inspection.outcome() {
+        job.output = Some(outcome.view());
+    } else if job.labels.contains_key(super::eval::ROLE_LABEL) {
         job.output = status.pointer("/status/terminalResult/output").cloned();
     }
     job.finished_at_ms = Some(now_ms);
-    job.error = None;
+    job.error = if inspection.is_empty() {
+        inspection
+            .outcome()
+            .map(delivery::DeliveryOutcome::failure_message)
+            .map(|message| JobError::new(JobErrorKind::DeliveryEmpty, message))
+    } else {
+        None
+    };
     true
 }
 
@@ -1207,13 +1231,22 @@ pub(crate) fn apply_polls(
         }) else {
             continue;
         };
-        apply_refresh(job, result, now_ms);
+        let status = apply_refresh(job, result, now_ms);
         if job.state.is_terminal() {
+            // The run's own terminal result is separate from the job verdict. A delivery-empty
+            // correction fails the job even though the provider calls succeeded, so quota
+            // recovery must still see the successful run.
+            let run_succeeded = status
+                .as_ref()
+                .and_then(|status| status.pointer("/status/terminalResult/status"))
+                .and_then(Value::as_str)
+                == Some("succeeded");
             finished.push(json!({
                 "jobId": job.job_id,
                 "state": job.display_state(now_ms),
                 "target": job.target,
                 "runId": job.run_id,
+                "runSucceeded": run_succeeded,
             }));
         }
     }

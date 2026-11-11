@@ -166,6 +166,23 @@ do not set the stall clock. The daemon heartbeat (`daemon.json` and the `started
 configured duration in milliseconds as `maxStallMs`; it is `null` when disabled.
 `zeroshot hub install` passes `--max-stall` through to the installed service.
 
+## Delivery verification
+
+A run can finish successfully without producing anything to merge: its delivery node may be
+skipped, or its managed branch may still point at the pinned revision. The hub therefore checks
+every successful terminal result whose run requested push, pull-request, or merge delivery (or
+whose delivery receipt reports one). The delivered `headRevision` must differ from the job's
+pinned revision and must have at least one commit not reachable from that pin. When the hub has
+the checkout, it proves this with `git rev-list --count PIN..HEAD`; a commit produced on a named
+target that the hub has not fetched leaves the distinct head as the available evidence.
+
+A delivery that cannot meet that rule fails with `failureReason` `delivery_empty` and `errorKind`
+`delivery_empty`. Its terminal `output` records `mode`, `headRevision`, `pinnedRevision`, and
+`emptyDiff: false`, and its error names the equality or missing head, so `hub.job` events and the
+chat chip explain why a successful run is not a successful job. A delivery with a real new commit
+stays `succeeded`. A commit that changes no source file, or only a lockfile, is legitimate empty
+history: it stays `succeeded` and its terminal `output` carries `emptyDiff: true`.
+
 ## Provider quota pauses
 
 When a model gateway refuses a call because a provider quota is exhausted, the failed run's

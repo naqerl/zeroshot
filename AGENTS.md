@@ -1038,6 +1038,13 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   `tests/pool_profiles.rs`, `tests/pool_data.rs` and `tests/pool_health.rs`, `tests/tunnel.rs` for
   the tailcat proxy and transport choice, and a local mock API in `tests/hetzner.rs`. Never call the real
   API from tests.
+- A successful terminal run whose job requested push, pull-request, or merge delivery settles only
+  when its delivery receipt's `headRevision` differs from the pinned revision and at least one
+  commit is not reachable from that pin. Otherwise the job fails with `failureReason` and
+  `errorKind` `delivery_empty`, records `headRevision`/`pinnedRevision`/`emptyDiff: false` in its
+  terminal `output`, and publishes that reason through `hub.job`. A new commit that changes no
+  source file, or only a lockfile, stays `succeeded` and sets `emptyDiff: true`. The hub proves the
+  range with the local checkout when it can and otherwise relies on the distinct receipt head.
 - `zeroshot/src/private_file.rs` owns owner-only file replacement for the shipped CLI: a random
   `create_new` sibling with mode `0600`, fsync, rename over the destination, and cleanup on failure,
   so readers never see a partial file and a link is replaced rather than written through. The target

@@ -384,6 +384,8 @@ pub(crate) enum JobErrorKind {
     /// The model gateway refused a call because its quota is exhausted. This is a wait, not a
     /// failure: the job holds its machine and resumes the same node after `retryAt`.
     ProviderQuota,
+    /// The run succeeded but its Git delivery produced no commit beyond the pinned revision.
+    DeliveryEmpty,
     /// Recorded as plain text by an earlier hub, or a kind this hub no longer produces.
     Unclassified,
 }
@@ -408,6 +410,7 @@ impl<'de> Deserialize<'de> for JobErrorKind {
             "target_lost" => Self::TargetLost,
             "runtime_lost" => Self::RuntimeLost,
             "provider_quota" => Self::ProviderQuota,
+            "delivery_empty" => Self::DeliveryEmpty,
             _ => Self::Unclassified,
         })
     }
@@ -542,7 +545,8 @@ pub(crate) struct Job {
     /// Recurring schedule that created this job, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule_id: Option<String>,
-    /// Terminal result output, kept only for eval judge jobs (`eval.role=judge`).
+    /// Terminal result output: an eval judge's verdict, or the normalized Git delivery outcome
+    /// (`mode`, `headRevision`, `pinnedRevision`, `emptyDiff`) of a job that requested delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<Value>,
     /// Folder holding the run's report, status, watch replay and logs, saved before the pool
@@ -673,6 +677,7 @@ impl Job {
             "graphHash": self.graph_hash,
             "waiting": self.pool_wait,
             "quota": self.quota.as_ref().map(QuotaWait::view),
+            "output": self.output,
             "spec": self.requirements.machine,
         })
     }

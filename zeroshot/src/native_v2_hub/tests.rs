@@ -1375,6 +1375,240 @@ fn finished_status_records_outcome_and_tokens() {
     assert_eq!(running.finished_at_ms, Some(9));
 }
 
+fn delivery_status(mode: &str, head: &str) -> Value {
+    json!({"status": {
+        "phase": "finished",
+        "terminalResult": {
+            "status": "succeeded",
+            "output": {
+                "version": "v2",
+                "mode": mode,
+                "outcome": "ready",
+                "repository": "acme/project",
+                "targetBranch": "main",
+                "headBranch": "zeroshot/run",
+                "headRevision": head,
+                "pullRequestId": "42",
+            },
+        },
+    }})
+}
+
+fn nested_delivery_status(mode: &str, head: &str) -> Value {
+    json!({"status": {
+        "phase": "finished",
+        "terminalResult": {
+            "status": "succeeded",
+            "output": {
+                "delivery": {
+                    "version": "v2",
+                    "mode": mode,
+                    "outcome": "ready",
+                    "repository": "acme/project",
+                    "targetBranch": "main",
+                    "headBranch": "zeroshot/run",
+                    "headRevision": head,
+                    "pullRequestId": "42",
+                },
+            },
+        },
+    }})
+}
+
+fn delivery_job(folder: &std::path::Path, pin: &str) -> Job {
+    let mut job = job("hj_delivery", 0);
+    job.state = JobState::Running;
+    job.cwd = folder.to_path_buf();
+    job.pinned_revision = Some(pin.to_owned());
+    job.run_args = vec![
+        "--title".to_owned(),
+        "delivery".to_owned(),
+        "--push".to_owned(),
+    ];
+    job
+}
+
+fn git_in(folder: &std::path::Path, arguments: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(folder)
+        .args(arguments)
+        .output()
+        .expect("git starts");
+    assert!(
+        output.status.success(),
+        "git {arguments:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("utf8")
+        .trim()
+        .to_owned()
+}
+
+fn commit_file(folder: &std::path::Path, path: &str, contents: &str, message: &str) -> String {
+    let target = folder.join(path);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).expect("parent");
+    }
+    std::fs::write(&target, contents).expect("write");
+    git_in(folder, &["add", path]);
+    git_in(
+        folder,
+        &[
+            "-c",
+            "user.name=Zeroshot",
+            "-c",
+            "user.email=delivery@zeroshot.invalid",
+            "commit",
+            "--message",
+            message,
+        ],
+    );
+    git_in(folder, &["rev-parse", "HEAD"])
+}
+
+fn delivery_repository() -> (tempfile::TempDir, String) {
+    let directory = tempfile::tempdir().expect("tempdir");
+    git_in(directory.path(), &["init"]);
+    let base = commit_file(directory.path(), "src/lib.rs", "pub fn one() {}\n", "base");
+    (directory, base)
+}
+
+#[test]
+fn a_delivery_that_stays_at_the_pin_fails_as_delivery_empty() {
+    let pin = "a".repeat(40);
+    let mut running = delivery_job(std::path::Path::new("/"), &pin);
+    let status = delivery_status("push", &pin);
+    assert!(apply_status(&mut running, &status, 9));
+    assert_eq!(running.state, JobState::Failed);
+    assert_eq!(
+        running.failure_reason.as_deref(),
+        Some("delivery_empty"),
+        "the job names why a succeeded run is not a delivery"
+    );
+    let error = running.error.as_ref().expect("delivery error");
+    assert_eq!(error.kind, JobErrorKind::DeliveryEmpty);
+    assert!(
+        error
+            .message
+            .contains(&format!("headRevision {pin} == pinnedRevision {pin}")),
+        "{}",
+        error.message
+    );
+    let output = running.output.as_ref().expect("terminal output");
+    assert_eq!(output["headRevision"], json!(pin));
+    assert_eq!(output["pinnedRevision"], json!(pin));
+    assert_eq!(output["emptyDiff"], json!(false));
+    assert_eq!(running.view(9)["failureReason"], json!("delivery_empty"));
+    assert_eq!(running.view(9)["errorKind"], json!("delivery_empty"));
+    assert_eq!(running.view(9)["output"]["headRevision"], json!(pin));
+}
+
+#[test]
+fn a_delivery_with_a_real_commit_stays_succeeded() {
+    let (directory, pin) = delivery_repository();
+    let head = commit_file(
+        directory.path(),
+        "src/lib.rs",
+        "pub fn two() {}\n",
+        "change",
+    );
+    let mut running = delivery_job(directory.path(), &pin);
+    let status = delivery_status("push", &head);
+    assert!(apply_status(&mut running, &status, 9));
+    assert_eq!(running.state, JobState::Succeeded);
+    assert_eq!(running.failure_reason, None);
+    assert_eq!(running.error, None);
+    let output = running.output.as_ref().expect("terminal output");
+    assert_eq!(output["headRevision"], json!(head));
+    assert_eq!(output["pinnedRevision"], json!(pin));
+    assert_eq!(
+        output["emptyDiff"],
+        json!(false),
+        "a source change is not an empty diff"
+    );
+}
+
+#[test]
+fn a_delivery_empty_finish_still_reports_the_run_as_succeeded() {
+    let pin = "a".repeat(40);
+    let mut running = delivery_job(std::path::Path::new("/"), &pin);
+    running.target = Some("box".to_owned());
+    running.run_id = Some("run-delivery".to_owned());
+    let mut state = HubState::default();
+    state.jobs.push(running);
+    let finished = super::schedule::apply_polls(
+        &mut state,
+        vec![(
+            super::schedule::Poll {
+                job_id: "hj_delivery".to_owned(),
+                target: "box".to_owned(),
+                run_id: "run-delivery".to_owned(),
+            },
+            Ok(delivery_status("push", &pin)),
+        )],
+        9,
+    );
+    assert_eq!(state.jobs[0].state, JobState::Failed);
+    assert_eq!(finished[0]["state"], json!("failed"));
+    assert_eq!(
+        finished[0]["runSucceeded"],
+        json!(true),
+        "the provider call succeeded even though the delivery did not"
+    );
+}
+
+#[test]
+fn a_nested_delivery_receipt_with_a_real_commit_stays_succeeded() {
+    let (directory, pin) = delivery_repository();
+    let head = commit_file(
+        directory.path(),
+        "src/lib.rs",
+        "pub fn two() {}\n",
+        "change",
+    );
+    let mut running = delivery_job(directory.path(), &pin);
+    // The delivery came from a profile, not a run-argument flag: the nested receipt itself must
+    // supply the mode. The supervisor accepts that exact receipt under a wrapper field, so the
+    // hub must find it there rather than calling the job delivery-empty (or skipping the check).
+    running
+        .run_args
+        .retain(|argument| argument.as_str() != "--push");
+    let status = nested_delivery_status("push", &head);
+    assert!(apply_status(&mut running, &status, 9));
+    assert_eq!(running.state, JobState::Succeeded);
+    assert_eq!(running.failure_reason, None);
+    let output = running.output.as_ref().expect("terminal output");
+    assert_eq!(output["headRevision"], json!(head));
+    assert_eq!(output["pinnedRevision"], json!(pin));
+    assert_eq!(output["emptyDiff"], json!(false));
+}
+
+#[test]
+fn a_lockfile_only_delivery_succeeds_with_empty_diff() {
+    let (directory, _) = delivery_repository();
+    let pin = commit_file(directory.path(), "Cargo.lock", "version = 1\n", "lock base");
+    let head = commit_file(
+        directory.path(),
+        "Cargo.lock",
+        "version = 1\n# bumped\n",
+        "bump lockfile",
+    );
+    let mut running = delivery_job(directory.path(), &pin);
+    let status = delivery_status("push", &head);
+    assert!(apply_status(&mut running, &status, 9));
+    assert_eq!(running.state, JobState::Succeeded);
+    assert_eq!(running.failure_reason, None);
+    let output = running.output.as_ref().expect("terminal output");
+    assert_eq!(output["headRevision"], json!(head));
+    assert_eq!(
+        output["emptyDiff"],
+        json!(true),
+        "a lockfile-only commit has new history but no source diff"
+    );
+}
+
 #[test]
 fn active_runs_count_nonterminal_phases() {
     let runs = [
