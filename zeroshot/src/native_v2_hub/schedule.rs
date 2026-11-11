@@ -5,7 +5,7 @@ use futures_util::future::join_all;
 use serde_json::{Value, json};
 
 use super::driver::{HubDriver, SubmitRequest};
-use super::lease::READOPT_ERROR_PREFIX;
+use super::lease::{BOOT_RECONCILE_PREFIX, READOPT_ERROR_PREFIX};
 use super::error::HubError;
 use super::model::{
     HubState, Job, JobActivity, JobError, JobErrorKind, JobState, LOCAL_MEMBER, Member,
@@ -337,11 +337,13 @@ pub(crate) fn lost_targets(state: &HubState) -> Vec<LostTarget> {
             match state.member(name) {
                 None if state.leases.iter().any(|lease| {
                     lease.name == name
-                        && lease.phase == pool::LeasePhase::Active
-                        && lease
-                            .error
-                            .as_deref()
-                            .is_some_and(|error| error.starts_with(READOPT_ERROR_PREFIX))
+                        && (matches!(
+                            lease.phase,
+                            pool::LeasePhase::Booting | pool::LeasePhase::Connecting
+                        ) || lease.error.as_deref().is_some_and(|error| {
+                            error.starts_with(READOPT_ERROR_PREFIX)
+                                || error.starts_with(BOOT_RECONCILE_PREFIX)
+                        }))
                 }) =>
                 {
                     // The member is between a restart and its target re-registration; the pool

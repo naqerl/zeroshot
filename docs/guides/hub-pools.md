@@ -279,6 +279,18 @@ health check, image pull, and target startup; there are no probe-by-probe events
 lease that failed before it had a machine never records `deleted`, so its pool does not report
 `removed`.
 
+Every lease restored in `booting`, `preparing`, `ready`, or `in_use` is verified once before
+the dispatcher probes it: the hub asks the provider for a fresh server listing instead of trusting
+an in-memory confirmation from before the restart. A server the provider no longer lists settles
+the lease through the ordinary `runtime_lost` retirement, which records one `deleted` event and
+settles every run it held, while a live server keeps the box and its boot or target
+re-registration continues. A lease that is already `ready`/`in_use`, or that had published a member
+before the restart, is checked and adopted through target re-registration without provisioning a
+new server; a member that no longer answers is retired by the same bounded `runtime_lost` path.
+A provider answer the hub cannot read is kept as a note on the lease, so a later tick never
+announces the same suspicion as a new error. The lease stays tracked and is checked again after its
+backoff expires; only a readable listing may adopt the member or settle `runtime_lost`.
+
 Every pass also reconciles leases the hub can no longer act on. A lease whose pool was removed
 and whose server the provider no longer lists records `deleted` with a `reason` naming both
 facts, even when a drain never finished: with no pool and no server there is nothing left to

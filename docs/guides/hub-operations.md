@@ -215,6 +215,16 @@ within a bounded retry count is reconciled once: its runs fail with `errorKind` 
 `failureReason` `runtime_lost`, and its lease is deleted. The same failure is announced once per
 job and reason through `hub.warning`, not once per polling tick.
 
+Every lease restored in `booting`, `preparing`, `ready`, or `in_use` is confirmed with a fresh
+provider listing before the dispatcher probes it, even when its member and registry records
+survived. A server the provider no longer lists takes the same `runtime_lost` path and leaves
+exactly one `deleted` event; a live server keeps its machine, and a lease that is already active or
+had published a member verifies and adopts that member instead of booting again. A member that no
+longer answers is retired by the bounded re-adoption path. An inconclusive provider answer is
+recorded on the lease rather than reported as a new per-tick error, and the lease is checked again
+after its backoff expires. A missing member plus an unreadable provider answer keeps the run
+running instead of failing it as `member_absent`.
+
 `zeroshot hub remove MEMBER` refuses while any job is placed on that member and names the job IDs.
 Stop placed jobs with `zeroshot hub force-stop JOB`, or dequeue jobs that are still placing, before
 removing the member. This keeps removal from orphaning a running job.
