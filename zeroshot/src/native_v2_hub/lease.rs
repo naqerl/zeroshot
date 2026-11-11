@@ -8,7 +8,7 @@
 //! Nothing is deleted while a run on it is unarchived, unless the target never answers: drains
 //! are bounded, and an unreachable target's archives are recorded as skipped instead.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -190,6 +190,21 @@ pub(crate) struct PoolReport {
 }
 
 impl PoolReport {
+    /// Fold another report from the same pass into this one, preserving every observation.
+    pub(crate) fn absorb(&mut self, other: Self) {
+        self.started.extend(other.started);
+        self.teardowns.extend(other.teardowns);
+        self.archived.extend(other.archived);
+        self.deleted.extend(other.deleted);
+        self.reconciled.extend(other.reconciled);
+        self.reaped.extend(other.reaped);
+        self.shortages.extend(other.shortages);
+        self.blocked.extend(other.blocked);
+        self.expired.extend(other.expired);
+        self.queue_expired.extend(other.queue_expired);
+        self.errors.extend(other.errors);
+    }
+
     pub(crate) fn view(&self) -> Value {
         json!({
             "started": self.started,
@@ -233,6 +248,9 @@ enum RetirementLoss {
 
 /// Prefix marking a lease whose target registration is still being restored.
 pub(super) const READOPT_ERROR_PREFIX: &str = "re-adopting: ";
+/// Prefix marking a restored `booting`/`preparing` lease whose member the hub is waiting to
+/// re-register, so the dispatcher does not read the missing member as a lost runtime first.
+pub(super) const BOOT_RECONCILE_PREFIX: &str = "re-adopting boot: ";
 
 /// Outcome of registering a lease's target.
 enum Registration {
@@ -301,6 +319,170 @@ enum Creation {
 }
 
 impl HubService {
+    /// Verify every lease loaded from `state.json` before the dispatcher probes it. A restored
+    /// lease can point at a box, a member record or a target registration that did not survive
+    /// the restart, and resolving it must not repeat or re-emit the terminal event later.
+    /// `ready`/`in_use` (`Active`) leases verify their member through the ordinary re-adoption
+    /// path; a member that no longer answers is retired through the existing `runtime_lost`
+    /// settlement, which also deletes any box the provider still lists. `booting`/`preparing`
+    /// leases are confirmed against a fresh provider listing, because their ordinary step would
+    /// otherwise retry a dead box forever. An unconfirmed provider answer only leaves a note on
+    /// the lease and keeps it tracked for a later check under the lease's backoff; it is never a
+    /// fresh per-tick error and never settles the run.
+    pub(super) async fn reconcile_restored_leases(&self) -> Result<PoolReport, HubError> {
+        let mut report = PoolReport::default();
+        let restored = self.restored_leases();
+        if restored.is_empty() {
+            return Ok(report);
+        }
+        let Some(runtime) = self.pool_runtime() else {
+            return Ok(report);
+        };
+        let state = self.snapshot().await;
+        let Some(hub_id) = state.hub_id.as_deref() else {
+            return Ok(report);
+        };
+        let now = now_ms();
+        let mut seen = BTreeSet::new();
+        for lease in state.leases.clone() {
+            if !restored.contains(&lease.name) {
+                continue;
+            }
+            let name = lease.name.clone();
+            seen.insert(name.clone());
+            if !matches!(
+                lease.phase,
+                LeasePhase::Booting | LeasePhase::Connecting | LeasePhase::Active
+            ) {
+                self.resolve_restored_lease(&lease.name);
+                continue;
+            }
+            // A lease backing off after an inconclusive provider answer keeps its note and is
+            // retried when that backoff expires, not on every dispatcher tick.
+            if !lease.due(now) {
+                continue;
+            }
+            // A removed pool has an authored teardown, and a lease without a server has no
+            // provider resource to confirm.
+            let Some(pool) = state.pools.iter().find(|pool| pool.name == lease.pool) else {
+                self.resolve_restored_lease(&lease.name);
+                continue;
+            };
+            if lease.server_id.is_none() {
+                self.resolve_restored_lease(&lease.name);
+                continue;
+            }
+            // Confirm with a fresh listing rather than the confirmation cache, which can still
+            // hold the answer from before the restart and must never turn a vanished server into
+            // a live one.
+            let listed = runtime
+                .provisioner
+                .list_servers_by_label(&lease_selector(hub_id, &lease))
+                .await;
+            match listed {
+                Ok(resources) => {
+                    let exists = resources.iter().any(|resource| {
+                        resource.kind == ResourceKind::Server
+                            && lease.server_id.is_none_or(|id| resource.id == id)
+                    });
+                    if !exists {
+                        let reason = format!(
+                            "the hub restored lease {} in {} but could not reach member {}: the provider no longer lists its server",
+                            lease.name,
+                            phase_label(&lease),
+                            lease.name
+                        );
+                        self.settle_reconciled(
+                            runtime,
+                            Retirement {
+                                lease,
+                                reason,
+                                loss: RetirementLoss::RuntimeLost,
+                            },
+                            &mut report,
+                        )
+                        .await?;
+                    } else if lease.phase == LeasePhase::Active
+                        || self.restored_had_member(&state, &lease)
+                    {
+                        // Verify and adopt the member. A live target keeps its registration and
+                        // run cursor; an unanswerable one enters the existing bounded readoption
+                        // path and settles `runtime_lost` there.
+                        self.adopt_restored_target((runtime, pool), lease, &mut report)
+                            .await?;
+                    } else {
+                        // A box that had not joined yet still needs its normal boot/connect step,
+                        // but mark the lease so a stale member record cannot fail its job first.
+                        self.adopt_restored_member(&lease).await?;
+                    }
+                    self.resolve_restored_lease(&name);
+                }
+                Err(error) => {
+                    // An unreadable provider answer is not proof the member is gone. Keep the
+                    // lease and its runs, record why on the lease, and leave it tracked for a
+                    // later verification once the provider answers again.
+                    let note = format!(
+                        "{BOOT_RECONCILE_PREFIX}the provider could not confirm member {}: {error}",
+                        lease.name
+                    );
+                    self.note_lease(&lease.name, note).await?;
+                }
+            }
+        }
+        for name in restored.difference(&seen) {
+            self.resolve_restored_lease(name);
+        }
+        Ok(report)
+    }
+
+    /// Re-adopt one restored lease's target registration, storing the lease on a retry and
+    /// letting the existing retirement path settle a target that cannot be registered.
+    async fn adopt_restored_target(
+        &self,
+        (runtime, pool): (&PoolRuntime, &Pool),
+        lease: Lease,
+        report: &mut PoolReport,
+    ) -> Result<(), HubError> {
+        let mut lease = lease;
+        let previous_event = lease.event_phase;
+        // A restored lease that had already published a member is Active for reconciliation
+        // purposes, even if its persisted phase went backwards; otherwise a failed readoption
+        // would be retried by the boot/connect step instead of the bounded runtime-lost path.
+        if lease.phase != LeasePhase::Active {
+            lease.advance(LeasePhase::Active);
+        }
+        let outcome = match self.readopt((runtime, pool), &mut lease, report).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.readopt_failure(
+                    runtime,
+                    &mut lease,
+                    ReadoptFailure {
+                        reason: error.to_string(),
+                        report,
+                    },
+                )
+                .await?
+            }
+        };
+        match outcome {
+            Readopt::Registered | Readopt::Retry => {
+                // A healthy lease that was already ready/in_use must not replay an older event
+                // on every restart; only a lease that had not reached that phase records it.
+                if outcome == Readopt::Registered
+                    && matches!(
+                        previous_event,
+                        Some(PoolPhase::Ready | PoolPhase::InUse | PoolPhase::Idle)
+                    )
+                {
+                    lease.event_phase = previous_event;
+                }
+                self.store_lease(lease).await
+            }
+            Readopt::Reconciled => Ok(()),
+        }
+    }
+
     /// Re-register restored `Active` leases before the dispatcher probes their members. This is
     /// deliberately narrower than a pool pass: the regular pass later in the tick still owns
     /// reaping, scaling, teardown, and its report.
@@ -347,7 +529,7 @@ impl HubService {
     /// One pool pass: reap, track idleness, scale up, start due teardowns and step every due
     /// lease. Runs outside the placement lock except where it changes what placement may use.
     pub(crate) async fn pool_pass(&self) -> Result<PoolReport, HubError> {
-        let mut report = PoolReport::default();
+        let mut report = self.reconcile_restored_leases().await?;
         // A removed pool is reported once its last lease is gone, even when that pass finds
         // nothing left to do.
         self.publish_pool_removals(now_ms()).await?;
@@ -456,6 +638,46 @@ impl HubService {
             }
         }
         Ok(report)
+    }
+
+    /// Keep a note on a lease and defer its next step, without emitting a fresh per-pass error
+    /// event. A provider answer the hub cannot read is not a deleted server, so booting must not
+    /// continue on it as if the member were confirmed.
+    async fn note_lease(&self, name: &str, note: String) -> Result<(), HubError> {
+        let now = now_ms();
+        self.mutate(move |state| {
+            if let Some(lease) = state.leases.iter_mut().find(|lease| lease.name == name) {
+                lease.retry(now, Some(note));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Whether a restored `booting`/`preparing` lease had already published a member before
+    /// the restart, so its target must be verified and adopted instead of booted from scratch.
+    fn restored_had_member(&self, state: &HubState, lease: &Lease) -> bool {
+        state.member(&lease.name).is_some()
+            || matches!(
+                lease.event_phase,
+                Some(PoolPhase::Ready | PoolPhase::InUse | PoolPhase::Idle)
+            )
+    }
+
+    /// Keep a restored `booting`/`preparing` lease whose server is alive, drop the member record
+    /// it has not re-registered yet, and mark the lease so the dispatcher does not fail its runs
+    /// as member-absent before the boot/connect step re-publishes the target.
+    async fn adopt_restored_member(&self, lease: &Lease) -> Result<(), HubError> {
+        let name = lease.name.clone();
+        let note = format!("{BOOT_RECONCILE_PREFIX}waiting for member {name} to re-register");
+        self.mutate(|state| {
+            state.members.retain(|member| member.name != name);
+            if let Some(slot) = state.leases.iter_mut().find(|slot| slot.name == name) {
+                slot.error = Some(note);
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn store_lease(&self, mut next: Lease) -> Result<(), HubError> {

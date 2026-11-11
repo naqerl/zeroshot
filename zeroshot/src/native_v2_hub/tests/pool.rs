@@ -459,6 +459,18 @@ impl Rig {
         self.service.snapshot().await
     }
 
+    /// Re-open the hub from its durable state, like a daemon restart. The driver, provider,
+    /// tunnels and target registry stay the same, so only the restart is simulated.
+    pub(super) fn restart(&mut self) {
+        self.service = HubService::open(
+            HubStore::new(self.directory.path().join("hub")),
+            self.driver.clone(),
+            FileTargetRegistry::new(self.directory.path().join("targets.json")),
+        )
+        .expect("restart service")
+        .with_pools(PoolRuntime::new(self.cloud.clone(), self.tunnels.clone()));
+    }
+
     pub(super) async fn lease(&self) -> Lease {
         self.state().await.leases.first().cloned().expect("a lease")
     }
@@ -3435,5 +3447,404 @@ fn a_member_without_an_idle_mark_still_drains_from_its_last_finish() {
         pool::teardown_due(&state, 50_000 + idle_ms),
         [(lease.name.clone(), TeardownReason::Idle)],
         "every job is terminal, so the finish is the idle clock"
+    );
+}
+
+/// A restart can restore a lease in `booting` whose provider server is already gone. Its boot
+/// step would retry a dead box forever and a stale member would answer every probe with
+/// `target not found`, so the hub reconciles it once through the existing `runtime_lost` path.
+#[tokio::test]
+async fn a_restored_booting_lease_whose_server_is_gone_settles_runtime_lost_once() {
+    let mut rig = rig();
+    let lease = rig.running_job_on_server().await;
+    let server_id = lease.server_id.expect("server id");
+    rig.service
+        .registry()
+        .remove(&lease.name)
+        .expect("forget the target");
+    rig.cloud.with(|cloud| {
+        cloud.resources.remove(&(ResourceKind::Server, server_id));
+    });
+    rig.set(|state| {
+        state.members.retain(|member| member.name != lease.name);
+        let restored = &mut state.leases[0];
+        restored.phase = LeasePhase::Booting;
+        restored.event_phase = Some(PoolPhase::Booting);
+        restored.reason = None;
+        restored.error = None;
+        restored.attempts = 0;
+        restored.next_attempt_ms = None;
+    })
+    .await;
+    rig.restart();
+
+    let view = rig.pass().await;
+    let retired = reconciled(&view);
+    assert_eq!(retired.len(), 1, "{view}");
+    let reason = retired[0]["reason"].as_str().unwrap_or_default();
+    assert!(reason.contains(&lease.name), "{reason}");
+    assert!(reason.contains("no longer lists its server"), "{reason}");
+
+    let state = rig.state().await;
+    assert!(state.leases.is_empty(), "{:?}", state.leases);
+    assert!(state.member(&lease.name).is_none());
+    let job = job_named(&state, "hj_one");
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(job.failure_reason.as_deref(), Some("runtime_lost"));
+    assert_eq!(
+        job.error.as_ref().expect("runtime-lost error").kind,
+        JobErrorKind::RuntimeLost
+    );
+    let deleted = |state: &HubState| {
+        state
+            .pool_events
+            .iter()
+            .filter(|event| {
+                event.lease_id.as_deref() == Some(lease.id.as_str())
+                    && event.phase == PoolPhase::Deleted
+            })
+            .count()
+    };
+    assert_eq!(
+        deleted(&state),
+        1,
+        "the lost boot is reconciled exactly once"
+    );
+
+    let view = rig.pass().await;
+    assert!(reconciled(&view).is_empty(), "{view}");
+    let again = rig.state().await;
+    assert_eq!(deleted(&again), 1, "a later pass repeats no event");
+    assert_eq!(job_named(&again, "hj_one").state, JobState::Failed);
+}
+
+/// A restored `booting` lease whose provider server still exists keeps its machine: the hub
+/// adopts the box instead of provisioning another one, then reconnects its member.
+#[tokio::test]
+async fn a_restored_booting_lease_with_a_live_server_is_reused_without_a_create() {
+    let mut rig = rig();
+    let lease = rig.running_job_on_server().await;
+    rig.service
+        .registry()
+        .remove(&lease.name)
+        .expect("forget the target");
+    rig.set(|state| {
+        state.members.retain(|member| member.name != lease.name);
+        let restored = &mut state.leases[0];
+        restored.phase = LeasePhase::Booting;
+        restored.event_phase = Some(PoolPhase::Booting);
+        restored.reason = None;
+        restored.error = None;
+        restored.attempts = 0;
+        restored.next_attempt_ms = None;
+    })
+    .await;
+    rig.restart();
+
+    for _ in 0..3 {
+        rig.pass().await;
+    }
+
+    let state = rig.state().await;
+    let restored = state.leases.first().expect("the restored lease is kept");
+    assert_eq!(restored.phase, LeasePhase::Active, "{restored:?}");
+    assert_eq!(restored.server_id, lease.server_id);
+    assert!(
+        state.member(&lease.name).is_some(),
+        "the member is re-adopted"
+    );
+    assert_eq!(
+        rig.cloud.with(|cloud| cloud.created.len()),
+        1,
+        "the live server is reused, not provisioned again"
+    );
+    assert!(
+        state
+            .pool_events
+            .iter()
+            .all(|event| event.phase != PoolPhase::Deleted),
+        "the live box is never reconciled away"
+    );
+    assert_eq!(job_named(&state, "hj_one").state, JobState::Running);
+}
+
+/// A restart can restore a lease in `booting` even though it had already published a member.
+/// When that member then cannot be reached, the hub verifies it, deletes the still-existing box
+/// through the ordinary retirement path, and announces the loss once instead of every tick.
+#[tokio::test]
+async fn a_restored_booting_lease_with_an_unreachable_member_is_retired_once() {
+    let mut rig = rig();
+    let lease = rig.running_job_on_server().await;
+    let server_id = lease.server_id.expect("server id");
+    rig.service
+        .registry()
+        .remove(&lease.name)
+        .expect("forget the target");
+    rig.set(|state| {
+        state.members.retain(|member| member.name != lease.name);
+        let restored = &mut state.leases[0];
+        restored.phase = LeasePhase::Booting;
+        // The lease had joined before the restart; only its phase went backwards.
+        restored.event_phase = Some(PoolPhase::InUse);
+        restored.reason = None;
+        restored.error = None;
+        restored.attempts = 0;
+        restored.next_attempt_ms = None;
+    })
+    .await;
+    rig.driver.discovery_fails.store(true, Ordering::SeqCst);
+    rig.restart();
+
+    let mut views = Vec::new();
+    for _ in 0..3 {
+        views.push(rig.pass().await);
+    }
+    let state = rig.state().await;
+    assert!(state.leases.is_empty(), "{:?}", state.leases);
+    assert!(
+        rig.cloud
+            .with(|cloud| cloud.destroyed.contains(&(ResourceKind::Server, server_id))),
+        "the unreachable member's live box is deleted"
+    );
+    let job = job_named(&state, "hj_one");
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(job.failure_reason.as_deref(), Some("runtime_lost"));
+    assert_eq!(
+        job.error.as_ref().expect("runtime-lost error").kind,
+        JobErrorKind::RuntimeLost
+    );
+    let deleted = state
+        .pool_events
+        .iter()
+        .filter(|event| {
+            event.lease_id.as_deref() == Some(lease.id.as_str())
+                && event.phase == PoolPhase::Deleted
+        })
+        .count();
+    assert_eq!(deleted, 1, "the lost lease is reconciled exactly once");
+    for view in &views {
+        assert!(
+            view["pools"]["errors"].as_array().is_none_or(Vec::is_empty),
+            "per-pass retries never become fresh error events: {view}"
+        );
+    }
+
+    rig.pass().await;
+    let again = rig.state().await;
+    assert_eq!(
+        again
+            .pool_events
+            .iter()
+            .filter(|event| {
+                event.lease_id.as_deref() == Some(lease.id.as_str())
+                    && event.phase == PoolPhase::Deleted
+            })
+            .count(),
+        1,
+        "a later pass repeats no event"
+    );
+}
+
+/// A restart with an `Active` lease whose member record and registry entry both survived, but
+/// whose target no longer answers, must verify the member and settle `runtime_lost` through the
+/// bounded re-adoption path. The still-existing box is deleted and the loss is announced once.
+#[tokio::test]
+async fn a_restored_active_lease_with_a_dead_target_is_retired_once() {
+    let mut rig = rig();
+    let lease = rig.running_job_on_server().await;
+    let server_id = lease.server_id.expect("server id");
+    // The member record and registry entry stay intact: only the target is unreachable.
+    rig.driver.discovery_fails.store(true, Ordering::SeqCst);
+    rig.restart();
+
+    let mut views = Vec::new();
+    for _ in 0..3 {
+        views.push(rig.pass().await);
+    }
+    let state = rig.state().await;
+    assert!(state.leases.is_empty(), "{:?}", state.leases);
+    assert!(
+        rig.cloud
+            .with(|cloud| cloud.destroyed.contains(&(ResourceKind::Server, server_id))),
+        "the live box behind an unreachable member is deleted"
+    );
+    let job = job_named(&state, "hj_one");
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(job.failure_reason.as_deref(), Some("runtime_lost"));
+    assert_eq!(
+        job.error.as_ref().expect("runtime-lost error").kind,
+        JobErrorKind::RuntimeLost
+    );
+    let deleted = |state: &HubState| {
+        state
+            .pool_events
+            .iter()
+            .filter(|event| {
+                event.lease_id.as_deref() == Some(lease.id.as_str())
+                    && event.phase == PoolPhase::Deleted
+            })
+            .count()
+    };
+    assert_eq!(deleted(&state), 1, "the lost member is retired once");
+    for view in &views {
+        assert!(
+            view["pools"]["errors"].as_array().is_none_or(Vec::is_empty),
+            "per-pass retries never become fresh error events: {view}"
+        );
+    }
+
+    rig.pass().await;
+    let again = rig.state().await;
+    assert_eq!(deleted(&again), 1, "a later pass repeats no event");
+}
+
+/// The same intact `Active` lease, but its provider server is gone while the member record and
+/// registry entry still exist. Boot reconciliation must confirm the provider rather than trust
+/// the surviving records, settle `runtime_lost`, and not repeat the event.
+#[tokio::test]
+async fn a_restored_active_lease_with_intact_records_and_a_gone_server_settles_runtime_lost_once() {
+    let mut rig = rig();
+    let lease = rig.running_job_on_server().await;
+    let server_id = lease.server_id.expect("server id");
+    rig.cloud.with(|cloud| {
+        cloud.resources.remove(&(ResourceKind::Server, server_id));
+    });
+    rig.restart();
+
+    let view = rig.pass().await;
+    assert_eq!(
+        reconciled(&view).len(),
+        1,
+        "only the startup pass reconciles: {view}"
+    );
+    let state = rig.state().await;
+    assert!(state.leases.is_empty(), "{:?}", state.leases);
+    assert!(state.member(&lease.name).is_none());
+    let job = job_named(&state, "hj_one");
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(job.failure_reason.as_deref(), Some("runtime_lost"));
+    assert_eq!(
+        job.error.as_ref().expect("runtime-lost error").kind,
+        JobErrorKind::RuntimeLost
+    );
+    let deleted = |state: &HubState| {
+        state
+            .pool_events
+            .iter()
+            .filter(|event| {
+                event.lease_id.as_deref() == Some(lease.id.as_str())
+                    && event.phase == PoolPhase::Deleted
+            })
+            .count()
+    };
+    assert_eq!(deleted(&state), 1, "the lost server is reconciled once");
+
+    let view = rig.pass().await;
+    assert!(reconciled(&view).is_empty(), "{view}");
+    assert_eq!(
+        deleted(&rig.state().await),
+        1,
+        "a later pass repeats no event"
+    );
+}
+
+/// A restart with an `Active` lease whose member still answers adopts it: the lease is kept, no
+/// server is provisioned again, and the run continues from the cursor it already had.
+#[tokio::test]
+async fn a_restored_active_lease_with_a_live_member_is_adopted_without_a_create() {
+    let mut rig = rig();
+    let lease = rig.running_job_on_server().await;
+    let run_id = job_named(&rig.state().await, "hj_one")
+        .run_id
+        .clone()
+        .expect("the run has an id");
+    rig.restart();
+
+    rig.pass().await;
+
+    let state = rig.state().await;
+    let restored = state.leases.first().expect("the restored lease is kept");
+    assert_eq!(restored.phase, LeasePhase::Active, "{restored:?}");
+    assert_eq!(restored.server_id, lease.server_id);
+    assert!(state.member(&lease.name).is_some(), "the member is adopted");
+    assert_eq!(
+        rig.cloud.with(|cloud| cloud.created.len()),
+        1,
+        "the live server is reused, not provisioned again"
+    );
+    let job = job_named(&state, "hj_one");
+    assert_eq!(job.state, JobState::Running);
+    assert_eq!(job.run_id.as_deref(), Some(run_id.as_str()));
+    assert!(
+        state
+            .pool_events
+            .iter()
+            .all(|event| event.phase != PoolPhase::Deleted),
+        "the live box is never reconciled away"
+    );
+}
+
+/// A restored `Active` lease with a missing member and an unreadable provider listing must not
+/// fail its run on the missing member. The inconclusive answer is only a lease note; a later
+/// pass with a healthy listing re-adopts the member without provisioning or settling the lease.
+#[tokio::test]
+async fn a_restored_active_lease_with_an_inconclusive_provider_is_adopted_later() {
+    let mut rig = rig();
+    let lease = rig.running_job_on_server().await;
+    rig.service
+        .registry()
+        .remove(&lease.name)
+        .expect("forget the target");
+    rig.set(|state| state.members.retain(|member| member.name != lease.name))
+        .await;
+    rig.cloud.with(|cloud| cloud.list_fails = true);
+    rig.restart();
+
+    let view = rig.pass().await;
+    assert!(
+        view["targetLost"].as_array().is_none_or(Vec::is_empty),
+        "an unreadable provider answer is not proof the member is gone: {view}"
+    );
+    let state = rig.state().await;
+    let restored = state.leases.first().expect("the lease is kept");
+    assert_eq!(restored.phase, LeasePhase::Active, "{restored:?}");
+    assert!(
+        restored
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("could not confirm")),
+        "{restored:?}"
+    );
+    assert!(state.member(&lease.name).is_none());
+    assert_eq!(job_named(&state, "hj_one").state, JobState::Running);
+    assert!(
+        state.pool_events.iter().all(|event| {
+            event.lease_id.as_deref() != Some(lease.id.as_str())
+                || event.phase != PoolPhase::Deleted
+        }),
+        "the inconclusive pass never settles the lease"
+    );
+
+    rig.cloud.with(|cloud| cloud.list_fails = false);
+    rig.pass().await;
+
+    let state = rig.state().await;
+    assert_eq!(state.leases[0].phase, LeasePhase::Active);
+    assert!(
+        state.member(&lease.name).is_some(),
+        "the member is re-adopted"
+    );
+    assert_eq!(job_named(&state, "hj_one").state, JobState::Running);
+    assert_eq!(
+        rig.cloud.with(|cloud| cloud.created.len()),
+        1,
+        "the live box is reused, not provisioned again"
+    );
+    assert!(
+        state.pool_events.iter().all(|event| {
+            event.lease_id.as_deref() != Some(lease.id.as_str())
+                || event.phase != PoolPhase::Deleted
+        }),
+        "a later healthy pass adopts instead of settling"
     );
 }

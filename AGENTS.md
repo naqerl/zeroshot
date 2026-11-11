@@ -972,6 +972,11 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   `attempts` and `untilMs`. A blocked pool retries on its own after 1m, 2m, 5m, 15m, then at most
   30m, and a successful lease resets the ladder; `removed` waits for every lease of the pool to be
   deleted.
+  Every lease loaded from `state.json` in `booting`/`preparing` or `ready`/`in_use` is verified
+  once before any probe, even when its member and registry records survived. A vanished provider
+  server is settled through the existing `runtime_lost` retirement with one `deleted` event; a
+  live server keeps its box, and an `Active` or previously joined lease verifies and adopts its
+  member without re-provisioning. An unconfirmed provider answer only notes the lease.
   Each pass reconciles a lease whose pool was removed and whose server the provider no longer lists
   into `deleted` with its reason, failing any run still placing there with
   `failureClassification: provider_confirmed_absent`. A lease in an existing pool is retired the

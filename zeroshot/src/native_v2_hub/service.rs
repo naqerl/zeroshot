@@ -6,7 +6,7 @@
 //! job ID or member name, so reads never wait for a slow target. A second mutex serializes
 //! placement decisions (dispatcher passes and `submit`), so a job is never placed twice.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,6 +64,10 @@ pub(crate) struct HubService {
     pools: Option<PoolRuntime>,
     /// Process-wide provider exhaustion for this hub's placements, owned by the service.
     quota: quota::QuotaDeadline,
+    /// Leases present when durable state was loaded that still need startup verification. A
+    /// successful check removes the name; an inconclusive provider answer keeps it so a later
+    /// pass can verify the box once the provider answers again.
+    restored_leases: std::sync::Mutex<BTreeSet<String>>,
 }
 
 pub(crate) fn member_document(member: &Member) -> Value {
@@ -111,6 +115,21 @@ impl HubService {
         // carry, or new placements would start work the gateway refuses.
         let quota = quota::QuotaDeadline::new();
         quota.record_jobs(&state.jobs);
+        // These leases were loaded from disk: they can point at boxes or registrations that did
+        // not survive the restart. New leases created after this point own their own boot path.
+        let restored_leases = state
+            .leases
+            .iter()
+            .filter(|lease| {
+                matches!(
+                    lease.phase,
+                    pool::LeasePhase::Booting
+                        | pool::LeasePhase::Connecting
+                        | pool::LeasePhase::Active
+                )
+            })
+            .map(|lease| lease.name.clone())
+            .collect();
         Ok(Self {
             store,
             driver,
@@ -123,6 +142,7 @@ impl HubService {
             eval_claims: std::sync::Mutex::default(),
             pools: None,
             quota,
+            restored_leases: std::sync::Mutex::new(restored_leases),
         })
     }
 
@@ -149,6 +169,23 @@ impl HubService {
 
     pub(super) fn pool_runtime(&self) -> Option<&PoolRuntime> {
         self.pools.as_ref()
+    }
+
+    /// The restored leases still awaiting verification.
+    pub(super) fn restored_leases(&self) -> BTreeSet<String> {
+        self.restored_leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Stop tracking a restored lease once its startup verification has an answer, or once the
+    /// lease no longer exists in a live phase.
+    pub(super) fn resolve_restored_lease(&self, name: &str) {
+        self.restored_leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(name);
     }
 
     pub(super) fn registry(&self) -> &FileTargetRegistry {
@@ -1310,6 +1347,11 @@ impl HubService {
     /// discovery, probes, and submissions run between phases.
     pub(crate) async fn pass(&self) -> Result<(TickReport, Value), HubError> {
         let started = std::time::Instant::now();
+        // A restarted hub can keep `booting`/`preparing` or `ready`/`in_use` leases whose box,
+        // member or target registration did not survive. Verify them once before any probe runs,
+        // so a dead box cannot be retried forever and a stale member is not announced as
+        // `target not found` on every tick.
+        let restored = self.reconcile_restored_leases().await?;
         // A restarted hub keeps `Active` leases but can lose their target registration. Register
         // them before the dispatcher can mistake the missing member for a lost runtime.
         if self.needs_pool_recovery().await {
@@ -1317,7 +1359,8 @@ impl HubService {
         }
         let result = match self.pass_phases().await {
             Ok((report, mut view)) => match self.pool_pass().await {
-                Ok(pools) => {
+                Ok(mut pools) => {
+                    pools.absorb(restored);
                     self.metrics.record_pool_pass(&pools);
                     if pools != PoolReport::default() {
                         view["pools"] = pools.view();
