@@ -8,6 +8,9 @@
 //! (mean ± 1.96·s/√n, none below two samples); nothing more is claimed about significance.
 //! Pass rate and judge score deltas are absolute; tokens, cost, and duration deltas are
 //! relative to the baseline mean. A delta beyond its threshold flags `improved` or `regressed`.
+//! Next to those per-metric deltas a report carries one composite [`loss`]: the weighted mean of
+//! the five candidate/baseline ratios, where `1.0` is "no change", above it the candidate is
+//! worse, and below it better.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -35,6 +38,24 @@ const METRICS: [(&str, f64, Better); 5] = [
     ("costUsd", 0.10, Better::Lower),
     ("durationMs", 0.25, Better::Lower),
 ];
+
+/// Weights of the composite [`Loss`], keyed by the metric names of [`METRICS`].
+///
+/// Pass rate and judge score dominate because they answer whether the change worked at all: a
+/// candidate that fails cases or reads worse to the judge is worse however few tokens it spent.
+/// Tokens, cost, and duration only separate candidates that already work, so they share the
+/// remaining 0.30.
+const LOSS_WEIGHTS: [(&str, f64); 5] = [
+    ("passRate", 0.35),
+    ("judgeScore", 0.35),
+    ("tokens", 0.10),
+    ("costUsd", 0.10),
+    ("durationMs", 0.10),
+];
+
+/// Bounds of one component ratio. Without them a near-zero metric mean would contribute a
+/// meaningless 500x (or 0x) and hide the remaining metrics.
+const LOSS_RATIO_BOUNDS: (f64, f64) = (0.25, 4.0);
 
 pub(crate) fn metric_names() -> Vec<&'static str> {
     METRICS.iter().map(|(name, _, _)| *name).collect()
@@ -249,6 +270,121 @@ fn compare(
     (Value::Object(deltas), flags, verdict)
 }
 
+/// One metric's contribution to a [`Loss`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LossComponent {
+    /// The ratio, rounded to six decimals: `baseline / candidate` for a `Better::Higher` metric
+    /// and `candidate / baseline` for a `Better::Lower` one, so above `1.0` the candidate is
+    /// worse on this metric. The value is clamped to [`LOSS_RATIO_BOUNDS`].
+    pub ratio: f64,
+    /// The component's share of the total: its [`LOSS_WEIGHTS`] weight, renormalised over the
+    /// metrics that survived.
+    pub weight: f64,
+}
+
+/// One scalar for "is `candidate` better than `baseline`, and by how much".
+///
+/// `value` is the weighted mean of the per-metric [`LossComponent::ratio`]s. Equal means give
+/// exactly `1.0` for every component and for the total, so a caller reads `value > 1.0` as "the
+/// candidate is worse" and `value < 1.0` as "better". A component whose candidate or baseline
+/// mean is missing, or whose baseline mean is zero (nothing to compare against), is dropped and
+/// the surviving weights are renormalised; `renormalised` says so. Fewer than two surviving
+/// components is not a loss at all, and [`loss`] returns `None`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Loss {
+    pub value: f64,
+    pub weights: BTreeMap<&'static str, f64>,
+    pub components: BTreeMap<&'static str, LossComponent>,
+    pub renormalised: bool,
+}
+
+impl Loss {
+    fn view(&self) -> Value {
+        let components = self
+            .components
+            .iter()
+            .map(|(metric, component)| {
+                (
+                    (*metric).to_owned(),
+                    json!({ "ratio": component.ratio, "weight": component.weight }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let weights = self
+            .weights
+            .iter()
+            .map(|(metric, weight)| ((*metric).to_owned(), json!(weight)))
+            .collect::<serde_json::Map<_, _>>();
+        json!({
+            "value": self.value,
+            "renormalised": self.renormalised,
+            "components": components,
+            "weights": weights,
+        })
+    }
+}
+
+/// The composite loss of `candidate` against `baseline`, or `None` when fewer than two metrics
+/// can be compared.
+pub(crate) fn loss(candidate: &[Stat; 5], baseline: &[Stat; 5]) -> Option<Loss> {
+    let mut ratios = BTreeMap::<&'static str, (f64, f64)>::new();
+    let mut surviving = 0.0;
+    for ((name, _, better), (candidate, baseline)) in
+        METRICS.iter().zip(candidate.iter().zip(baseline))
+    {
+        let (Some(candidate), Some(baseline)) = (candidate.mean, baseline.mean) else {
+            continue;
+        };
+        // A zero baseline cannot say whether the candidate improved or regressed.
+        if baseline == 0.0 {
+            continue;
+        }
+        let Some((_, weight)) = LOSS_WEIGHTS.iter().find(|(metric, _)| metric == name) else {
+            continue;
+        };
+        let ratio = match better {
+            Better::Higher => baseline / candidate,
+            Better::Lower => candidate / baseline,
+        };
+        let ratio = ratio.clamp(LOSS_RATIO_BOUNDS.0, LOSS_RATIO_BOUNDS.1);
+        // Only an undefined ratio (0/0) is unusable; clamping already folded the infinities in.
+        if !ratio.is_finite() {
+            continue;
+        }
+        ratios.insert(name, (ratio, *weight));
+        surviving += weight;
+    }
+    if ratios.len() < 2 || surviving <= 0.0 {
+        return None;
+    }
+    let renormalised = ratios.len() != METRICS.len();
+    let mut weights = BTreeMap::new();
+    let mut components = BTreeMap::new();
+    let mut value = 0.0;
+    for (name, (ratio, weight)) in ratios {
+        let weight = if renormalised {
+            weight / surviving
+        } else {
+            weight
+        };
+        value += weight * ratio;
+        weights.insert(name, round(weight));
+        components.insert(
+            name,
+            LossComponent {
+                ratio: round(ratio),
+                weight: round(weight),
+            },
+        );
+    }
+    Some(Loss {
+        value: round(value),
+        weights,
+        components,
+        renormalised,
+    })
+}
+
 /// What the variants are compared with.
 pub(crate) struct Against<'a> {
     /// `{runId, variant}` of the baseline, echoed in the report.
@@ -301,6 +437,7 @@ pub(crate) fn report(
                 json!({ "variant": name, "aggregate": aggregate_view(&samples, &stats, judged) });
             if Some(*name) == baseline_name {
                 view["role"] = json!("baseline");
+                view["loss"] = Value::Null;
                 return view;
             }
             if let (Some(against), Some(cases)) = (against, &baseline_cases) {
@@ -325,6 +462,12 @@ pub(crate) fn report(
                 view["delta"] = delta;
                 view["flags"] = json!(flags);
                 view["verdict"] = json!(verdict);
+                view["loss"] = match loss(&candidate, &baseline) {
+                    Some(loss) => loss.view(),
+                    None => Value::Null,
+                };
+            } else {
+                view["loss"] = Value::Null;
             }
             view
         })
@@ -409,6 +552,12 @@ pub(crate) fn table(report: &Value) -> String {
             .as_f64()
             .map_or_else(|| "-".to_owned(), |value| format!("{value:.digits$}"))
     };
+    // A star marks a loss whose weights were renormalised because a metric was unavailable.
+    let loss_cell = |row: &Value| match row["loss"]["value"].as_f64() {
+        None => "-".to_owned(),
+        Some(value) if row["loss"]["renormalised"] == json!(true) => format!("{value:.3}*"),
+        Some(value) => format!("{value:.3}"),
+    };
     let cell = |row: &Value, metric: &str, digits: usize| {
         let mean = number(&row["aggregate"][metric]["mean"], digits);
         match &row["delta"][metric] {
@@ -440,13 +589,22 @@ pub(crate) fn table(report: &Value) -> String {
             ),
     )];
     let header = format!(
-        "{:<22} {:<16} {:>4} {:<18} {:<18} {:<20} {:<20} {:<20} {}",
-        "CASE", "VARIANT", "N", "PASS", "JUDGE", "TOKENS", "COST_USD", "DURATION_MS", "VERDICT"
+        "{:<22} {:<16} {:>4} {:<18} {:<18} {:<20} {:<20} {:<20} {:<7} {}",
+        "CASE",
+        "VARIANT",
+        "N",
+        "PASS",
+        "JUDGE",
+        "TOKENS",
+        "COST_USD",
+        "DURATION_MS",
+        "LOSS",
+        "VERDICT"
     );
     lines.push(header);
     let mut push = |case: &str, row: &Value| {
         lines.push(format!(
-            "{:<22} {:<16} {:>4} {:<18} {:<18} {:<20} {:<20} {:<20} {}",
+            "{:<22} {:<16} {:>4} {:<18} {:<18} {:<20} {:<20} {:<20} {:<7} {}",
             case,
             row["variant"].as_str().unwrap_or("-"),
             row["aggregate"]["samples"],
@@ -455,6 +613,7 @@ pub(crate) fn table(report: &Value) -> String {
             cell(row, "tokens", 0),
             cell(row, "costUsd", 4),
             cell(row, "durationMs", 0),
+            loss_cell(row),
             row["verdict"]
                 .as_str()
                 .or_else(|| row["role"].as_str())
@@ -473,5 +632,165 @@ pub(crate) fn table(report: &Value) -> String {
         "improvements={} regressions={}",
         report["improvements"], report["regressions"]
     ));
+    lines.push("loss: <1.0 better, >1.0 worse, 1.0 unchanged; * = renormalised".to_owned());
     lines.join("\n") + "\n"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One mean per metric in [`METRICS`] order; `None` means the metric was not measured.
+    fn stats(means: [Option<f64>; 5]) -> [Stat; 5] {
+        means.map(|mean| Stat {
+            mean,
+            ci95: None,
+            n: usize::from(mean.is_some()),
+        })
+    }
+
+    /// `(passRate, judgeScore, tokens, costUsd, durationMs)`.
+    fn baseline() -> [Stat; 5] {
+        stats([Some(0.8), Some(0.6), Some(1000.0), Some(0.5), Some(5000.0)])
+    }
+
+    fn worse() -> [Stat; 5] {
+        stats([Some(0.4), Some(0.3), Some(2000.0), Some(1.0), Some(10000.0)])
+    }
+
+    fn better() -> [Stat; 5] {
+        stats([Some(1.0), Some(0.9), Some(500.0), Some(0.25), Some(2500.0)])
+    }
+
+    fn sum_weights(loss: &Loss) -> f64 {
+        loss.weights.values().sum()
+    }
+
+    #[test]
+    fn every_metric_has_exactly_one_weight() {
+        assert_eq!(
+            LOSS_WEIGHTS
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            metric_names()
+        );
+        let total = LOSS_WEIGHTS.iter().map(|(_, weight)| weight).sum::<f64>();
+        assert!((total - 1.0).abs() < 1e-9, "{total}");
+    }
+
+    #[test]
+    fn identical_inputs_are_a_loss_of_exactly_one() {
+        let baseline = baseline();
+        let loss = loss(&baseline, &baseline).expect("loss");
+        assert_eq!(loss.value, 1.0);
+        assert!(!loss.renormalised);
+        assert_eq!(loss.components.len(), METRICS.len());
+        for (name, component) in &loss.components {
+            assert_eq!(component.ratio, 1.0, "{name}");
+        }
+        // Nothing was dropped, so the authored weights survive unchanged.
+        for (name, weight) in LOSS_WEIGHTS {
+            assert_eq!(loss.weights[name], weight, "{name}");
+            assert_eq!(loss.components[name].weight, weight, "{name}");
+        }
+        assert_eq!(sum_weights(&loss), 1.0);
+    }
+
+    #[test]
+    fn worse_is_above_one_and_better_is_below_one() {
+        let baseline = baseline();
+        let worse = loss(&worse(), &baseline).expect("loss");
+        assert!(worse.value > 1.0, "{}", worse.value);
+        assert!(
+            worse
+                .components
+                .values()
+                .all(|component| component.ratio > 1.0)
+        );
+        let better = loss(&better(), &baseline).expect("loss");
+        assert!(better.value < 1.0, "{}", better.value);
+        assert!(
+            better
+                .components
+                .values()
+                .all(|component| component.ratio < 1.0)
+        );
+        assert_eq!(sum_weights(&worse), 1.0);
+        assert!(!worse.renormalised && !better.renormalised);
+    }
+
+    #[test]
+    fn a_missing_metric_drops_its_weight_and_renormalises() {
+        let mut without_cost = baseline();
+        without_cost[3].mean = None;
+        let mut candidate = worse();
+        candidate[3].mean = None;
+        let loss = loss(&candidate, &without_cost).expect("loss");
+        assert!(loss.renormalised);
+        assert!(!loss.components.contains_key("costUsd"));
+        assert!(!loss.weights.contains_key("costUsd"));
+        assert_eq!(loss.components.len(), 4);
+        assert!(
+            (sum_weights(&loss) - 1.0).abs() < 1e-9,
+            "{:?}",
+            loss.weights
+        );
+        // The remaining four keep their relative weights (0.35/0.9, 0.35/0.9, 0.1/0.9, 0.1/0.9).
+        assert_eq!(loss.components["passRate"].weight, 0.388889);
+        assert_eq!(loss.components["tokens"].weight, 0.111111);
+    }
+
+    #[test]
+    fn fewer_than_two_components_is_not_a_loss() {
+        // Only pass rate survives.
+        let baseline = stats([Some(0.8), None, None, None, None]);
+        let candidate = stats([Some(0.4), None, None, None, None]);
+        assert_eq!(loss(&candidate, &baseline), None);
+        // A zero baseline cannot be compared against, so it drops like a missing mean.
+        let baseline = stats([Some(0.8), Some(0.0), None, None, None]);
+        let candidate = stats([Some(0.4), Some(0.5), None, None, None]);
+        assert_eq!(loss(&candidate, &baseline), None);
+        // Nothing measured at all.
+        assert_eq!(loss(&stats([None; 5]), &stats([None; 5])), None);
+    }
+
+    #[test]
+    fn a_ratio_is_clamped_so_one_metric_cannot_dominate() {
+        let baseline = stats([Some(1.0), Some(1.0), Some(1000.0), Some(1.0), Some(1000.0)]);
+        let extreme = stats([
+            Some(1.0),
+            Some(1.0),
+            Some(100_000.0),
+            Some(1.0),
+            Some(1000.0),
+        ]);
+        let beyond = stats([
+            Some(1.0),
+            Some(1.0),
+            Some(1_000_000.0),
+            Some(1.0),
+            Some(1000.0),
+        ]);
+        let first = loss(&extreme, &baseline).expect("loss");
+        assert_eq!(first.components["tokens"].ratio, 4.0);
+        // 0.9 * 1.0 + 0.1 * 4.0, and the total stops reacting past the clamp.
+        assert_eq!(first.value, 1.3);
+        let second = loss(&beyond, &baseline).expect("loss");
+        assert_eq!(second.value, first.value);
+        assert_eq!(second.components["tokens"].ratio, 4.0);
+        assert_eq!(second.view(), first.view());
+    }
+
+    #[test]
+    fn loss_is_deterministic() {
+        let (candidate, baseline) = (worse(), baseline());
+        let first = loss(&candidate, &baseline).expect("loss").view();
+        let second = loss(&candidate, &baseline).expect("loss").view();
+        assert_eq!(first, second);
+        assert_eq!(
+            serde_json::to_string(&first).expect("json"),
+            serde_json::to_string(&second).expect("json")
+        );
+    }
 }
