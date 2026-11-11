@@ -512,6 +512,11 @@ pub(crate) struct Job {
     pub last_activity_reported_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity: Option<JobActivity>,
+    /// When a status probe last failed. A failed probe, most notably a timeout, is not evidence
+    /// that the run stopped working: the job is not re-evaluated for a stall while this is set.
+    /// A successful status read clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_status_error_at_ms: Option<u64>,
     /// When a probe last found the job's member reachable; kept as target-lost evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_last_ok_at_ms: Option<u64>,
@@ -590,6 +595,7 @@ impl Job {
             self.dispatched_at_ms,
             self.last_cursor_at_ms,
             self.last_activity_at_ms,
+            self.last_status_error_at_ms,
             self.finished_at_ms,
         ]
         .into_iter()
@@ -654,6 +660,7 @@ impl Job {
             "lastCursorAt": time(self.last_cursor_at_ms),
             "lastActivityAt": time(self.last_activity_at_ms),
             "lastActivity": self.last_activity,
+            "lastStatusErrorAt": time(self.last_status_error_at_ms),
             "reaper": self.reaper,
             "finishedAt": time(self.finished_at_ms),
             "failureReason": self.failure_reason,

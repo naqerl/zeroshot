@@ -7,6 +7,7 @@ use crate::native_v2_capsule::provider_process::turn::ProviderTranscript;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use openengine_cluster_protocol::{
     NodeInstructions, NodeName, PayloadType, PullRequestFeedback, RunId, WorkerRef,
@@ -1257,6 +1258,48 @@ fn coverage_contract_pi_tool_output_and_retries_surface_as_system_output() {
         panic!("expected a complete attempt");
     };
     assert_eq!(result.message, "ok");
+}
+
+#[test]
+fn coverage_contract_pi_heartbeats_while_one_tool_call_is_open() {
+    let mut transcript = super::PiTranscript::new(Vec::new());
+    transcript.push(
+        br#"{"type":"tool_execution_start","toolCallId":"call-1","toolName":"bash","args":{"command":"cargo build --release"}}
+"#
+        .as_slice(),
+    );
+    let start = Instant::now();
+    let first = transcript
+        .activity(start)
+        .assert_value_with("a tool start emits its first heartbeat immediately");
+    assert_eq!(first.command, "cargo build --release");
+    assert!(
+        transcript
+            .activity(start + Duration::from_secs(59))
+            .is_none(),
+        "heartbeats coalesce within the 60s interval"
+    );
+    // The tool call is silent for two hours; the transcript itself must keep ticking.
+    let later = transcript
+        .activity(start + Duration::from_secs(60 * 60 * 2))
+        .assert_value_with("a silent in-flight tool still heartbeats");
+    assert_eq!(later.command, "cargo build --release");
+    assert!(
+        later.elapsed_ms >= 60 * 60 * 2 * 1_000,
+        "the heartbeat carries this call's elapsed time: {}",
+        later.elapsed_ms
+    );
+    transcript.push(
+        br#"{"type":"tool_execution_end","toolCallId":"call-1"}
+"#
+        .as_slice(),
+    );
+    assert!(
+        transcript
+            .activity(start + Duration::from_secs(60 * 60 * 3))
+            .is_none(),
+        "a finished tool call stops heartbeating"
+    );
 }
 
 #[test]

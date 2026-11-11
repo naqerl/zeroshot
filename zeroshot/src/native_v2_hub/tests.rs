@@ -98,6 +98,7 @@ pub(super) fn job(id: &str, submitted_at_ms: u64) -> Job {
         last_activity_at_ms: None,
         last_activity_reported_at_ms: None,
         last_activity: None,
+        last_status_error_at_ms: None,
         target_last_ok_at_ms: None,
         reaper: None,
         finished_at_ms: None,
@@ -412,11 +413,108 @@ fn an_older_activity_heartbeat_still_stalls_and_names_the_last_command() {
     );
     assert!(
         error.message.contains(
+            "run stuck at worker (cargo check --workspace --all-targets), no heartbeat for 130ms"
+        ),
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains(
             "last activity node 'worker' ran 'cargo check --workspace --all-targets' for 90s"
         ),
         "{}",
         error.message
     );
+    assert_eq!(
+        failed[0]["noHeartbeatMs"],
+        json!(130),
+        "the event carries the heartbeat silence"
+    );
+    assert!(
+        failed[0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("run stuck at worker (cargo check")),
+        "the event names the node and the command: {}",
+        failed[0]["reason"]
+    );
+}
+
+#[test]
+fn a_long_tool_call_that_keeps_heartbeating_never_stalls() {
+    let mut running = job("hj_long_tool", 0);
+    running.state = JobState::Running;
+    running.target = Some("box".to_owned());
+    running.run_id = Some("run-long-tool".to_owned());
+    running.last_cursor = Some("v2:1".to_owned());
+    running.last_cursor_at_ms = Some(0);
+    let limit = |job: &Job| super::schedule::StallLimit::for_job(job, Some(30 * 60 * 1_000));
+    // Two hours of one silent tool call, with the runner's once-a-minute heartbeat.
+    for minute in 1..=120u64 {
+        let now = minute * 60_000;
+        let status = json!({
+            "atCursor": "v2:1",
+            "status": {
+                "phase": "running",
+                "activity": {
+                    "node": "worker",
+                    "command": "cargo build",
+                    "elapsedMs": now,
+                    "timestamp": now,
+                },
+            },
+        });
+        super::schedule::record_cursor(&mut running, &status, now);
+        assert!(
+            super::schedule::stalled_runs(std::slice::from_ref(&running), now, limit).is_empty(),
+            "a heartbeat every minute keeps a two-hour tool call alive at {now}ms"
+        );
+    }
+}
+
+#[test]
+fn a_status_probe_timeout_is_not_evidence_of_a_stall() {
+    let mut running = job("hj_probe_timeout", 0);
+    running.state = JobState::Running;
+    running.target = Some("box".to_owned());
+    running.run_id = Some("run-probe-timeout".to_owned());
+    running.last_cursor = Some("v2:5".to_owned());
+    running.last_cursor_at_ms = Some(0);
+    let limit = |job: &Job| super::schedule::StallLimit::for_job(job, Some(100));
+    // A status probe that never answers is not an observation of silence: each timed-out poll
+    // keeps the job out of the stall check instead of letting a probe problem reap the run.
+    for now in [200u64, 400, 800] {
+        let read = super::schedule::apply_refresh(
+            &mut running,
+            Err(HubError::Target {
+                message: "zeroshot status run-probe-timeout timed out".to_owned(),
+                diagnostic: None,
+            }),
+            now,
+        );
+        assert!(read.is_none());
+        assert_eq!(running.last_status_error_at_ms, Some(now));
+        assert!(
+            super::schedule::stalled_runs(std::slice::from_ref(&running), now, limit).is_empty(),
+            "a timed-out status probe alone never reaps at {now}ms"
+        );
+    }
+    // Only a successful status read ends the exemption; it then shows the cursor is unchanged.
+    assert!(
+        super::schedule::apply_refresh(
+            &mut running,
+            Ok(json!({"atCursor": "v2:5", "status": {"phase": "running"}})),
+            900,
+        )
+        .is_some()
+    );
+    assert_eq!(running.last_status_error_at_ms, None);
+    let stalled = super::schedule::stalled_runs(std::slice::from_ref(&running), 1_000, limit);
+    assert_eq!(
+        stalled.len(),
+        1,
+        "a successful read with an unchanged cursor resumes the original clock"
+    );
+    assert_eq!(stalled[0].still_ms, 1_000);
 }
 
 #[test]
