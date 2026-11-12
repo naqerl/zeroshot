@@ -19,7 +19,7 @@ use super::super::eval::judge::HostCommand;
 use super::super::eval::judge::{Ended, Finished};
 #[cfg(unix)]
 use zeroshot_engine::native_v2_cli::hub::HubEvalReport;
-use super::super::eval::report::{Against, Thresholds, report, stat};
+use super::super::eval::report::{Against, Thresholds, report, stat, table};
 use super::super::eval::variant::{Change, Material, Request, merge_patch};
 use super::super::eval::{
     Baseline, Case, EvalRun, JudgeMode, Outcome, Sample, SampleState, Score, Verdict, canonical,
@@ -392,6 +392,22 @@ fn report_deltas_flag_regressions_and_improvements_by_threshold() {
     assert_eq!(document["regressed"], true);
     assert_eq!(report_exit_code(&document, true), 6);
     assert_eq!(report_exit_code(&document, false), 0);
+    // Every row names one composite loss next to its verdict; the baseline itself compares with
+    // nothing. No price table is configured here, so `costUsd` has no mean and its weight is
+    // renormalised away.
+    assert_eq!(variant_row(&document, "baseline")["loss"], Value::Null);
+    let cheap_loss = &variant_row(&document, "cheap")["loss"];
+    assert!(cheap_loss["value"].as_f64().expect("value") < 1.0);
+    assert!(cheap_loss["components"]["costUsd"].is_null());
+    let broken_loss = &variant_row(&document, "broken")["loss"];
+    assert!(broken_loss["value"].as_f64().expect("value") > 1.0);
+    assert_eq!(broken_loss["renormalised"], true);
+    let text = table(&document);
+    assert!(text.contains("LOSS"), "{text}");
+    assert!(
+        text.contains(&format!("{:.3}", broken_loss["value"].as_f64().unwrap())),
+        "{text}"
+    );
     // Per case: broken is unchanged on case a for pass rate but regresses on case b.
     let case_b = document["cases"]
         .as_array()

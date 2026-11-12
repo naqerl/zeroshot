@@ -403,6 +403,16 @@ Each row has these fields:
 - `flags`: the deltas that pass a threshold, each `improved` or `regressed`.
 - `verdict`: `improved`, `regressed`, `mixed`, `unchanged`, or `insufficient` (nothing to
   compare). The baseline row has `role: baseline` instead.
+- `loss`: one composite number for "is the candidate better, and by how much", or `null` when
+  fewer than two metrics can be compared (and on the baseline row). `value` is the weighted mean
+  of the per-metric `components` ratios, where `1.0` is no change, above `1.0` the candidate is
+  worse, and below `1.0` better. Each component is `baseline / candidate` for `passRate` and
+  `judgeScore` and `candidate / baseline` for `tokens`, `costUsd`, and `durationMs`, clamped to
+  `[0.25, 4.0]` so one near-zero mean cannot hide the rest. A metric whose candidate or baseline
+  mean is missing, or whose baseline mean is zero, is dropped and the remaining `weights` are
+  renormalised to sum to 1, which `renormalised: true` reports. The weights themselves are
+  `passRate` 0.35, `judgeScore` 0.35, `tokens` 0.10, `costUsd` 0.10, and `durationMs` 0.10:
+  whether the change worked outranks what it cost.
 
 | Metric | Better | Compared | Default threshold |
 |---|---|---|---|
@@ -416,7 +426,8 @@ Each row has these fields:
 - `--baseline VARIANT` compares against another variant of the run. `--baseline er_RUN[:VARIANT]`
   compares against another run's samples, matched by case. Use this to track a candidate against
   last week's champion.
-- `--table` prints a fixed-width summary instead of JSON.
+- `--table` prints a fixed-width summary instead of JSON, with the loss in its own column and
+  `*` marking a renormalised loss.
 - `--wait[=DURATION]` polls until every sample is settled.
 
 | Exit code | Meaning (with `--fail-on-regression`) |
