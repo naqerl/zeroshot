@@ -902,8 +902,11 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   starts and at most once per minute while it runs; it advances the durable cursor but is filtered
   from public `hub.run` events like a safe log. The hub keeps `lastCursorAt` apart from
   `lastActivityAt`/`lastActivity` (node, command, elapsed); `lastActivityAt` is the hub's observation
-  time, while the producer timestamp only orders repeated status polls. Its stall diagnostic names
-  the last activity when one exists, falling back to the cursor wording otherwise. A silent
+  time, while the producer timestamp only orders repeated status polls. A failed status probe, a
+  timeout included, never counts as evidence of a stall; the job is not re-evaluated until a
+  successful status read, which then resumes the original clock. Its stall diagnostic names the node, the
+  in-flight command and the heartbeat silence when activity exists (`run stuck at <node>
+  (<command>), no heartbeat for <t>`), falling back to the cursor wording otherwise. A silent
   heartbeat is still silence: a dead process stalls. Its heartbeat reports the duration as `maxStallMs` (`null`
   when disabled). A job may override that budget for itself with `--max-stall-ms` on `hub
   submit`/`hub enqueue`; the job value wins over the hub's `--max-stall`, and the diagnostic and

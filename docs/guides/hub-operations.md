@@ -143,10 +143,13 @@ newer of the cursor change and the heartbeat observation, so a long build stays 
 silent or dead process still goes quiet. If that newest evidence stays unchanged for the configured
 duration, the daemon force-stops the run and fails the job with `failureReason` `stalled` and
 `errorKind` `stalled`. The error and `hub.warning` name the cursor, how long it stayed unchanged,
-and the last activity (node, command, elapsed seconds) when one was recorded.
+and the last activity (node, command, elapsed seconds) when one was recorded. A stall with an
+in-flight heartbeat reports `run stuck at <node> (<command>), no heartbeat for <duration>`.
 When a successful status read does not carry `atCursor`, it still resets the inactivity clock, and
 a job that has never produced a cursor falls back to its last successful target contact before its
-placement time.
+placement time. A failed status probe, including a timeout, is not evidence of inactivity: the
+job is not re-evaluated for a stall until a status read succeeds, so a probe problem alone never
+reaps a run.
 If the force-stop does not succeed, the job stays `running` with that `errorKind`; the next
 dispatcher pass retries the stop, and the job settles only after the target confirms it.
 

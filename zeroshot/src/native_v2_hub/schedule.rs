@@ -1116,6 +1116,7 @@ pub(crate) fn apply_refresh(
     match result {
         Ok(status) => {
             job.reaper = None;
+            job.last_status_error_at_ms = None;
             if job
                 .error
                 .as_ref()
@@ -1128,6 +1129,9 @@ pub(crate) fn apply_refresh(
             Some(status)
         }
         Err(error) => {
+            // A failed status probe, and a timeout in particular, did not observe the run at
+            // all. It cannot prove silence, so it refreshes the stall clock rather than aging it.
+            job.last_status_error_at_ms = Some(now_ms);
             job.reaper = Some(format!(
                 "status probe was unavailable ({error}): job kept running"
             ));
@@ -1266,6 +1270,7 @@ pub(crate) fn settle_quota_resumed(
     job.dispatched_at_ms = Some(now_ms);
     job.last_cursor = None;
     job.last_cursor_at_ms = None;
+    job.last_status_error_at_ms = None;
     job.target_last_ok_at_ms = Some(now_ms);
     job.finished_at_ms = None;
     job.failure_reason = None;
@@ -1511,6 +1516,9 @@ pub(crate) struct StalledRun {
     pub still_ms: u64,
     pub max_stall_ms: u64,
     pub limit_source: StallLimitSource,
+    /// When the hub observed the newest heartbeat, so the diagnostic can name the heartbeat
+    /// silence separately from the cursor silence.
+    pub activity_at_ms: Option<u64>,
     pub activity: Option<JobActivity>,
 }
 
@@ -1530,16 +1538,22 @@ pub(crate) fn stalled_runs(
         .filter(|job| job.state == JobState::Running)
         .filter_map(|job| {
             let limit = limit_for(job)?;
+            // A failed status probe observed nothing, so it can never be evidence that the run
+            // went silent. The job is re-evaluated only after a successful status read; this is
+            // what keeps a probe timeout (or a status route that hangs) from reaping a live run.
+            if job.last_status_error_at_ms.is_some() {
+                return None;
+            }
             // The newest of the cursor clock, an in-flight heartbeat, and the last successful
             // contact (a status read without `atCursor` or a load probe), and only then
             // placement. A reachable member whose status omits its cursor is observed work, not
             // a silent run.
-            let at = match (job.last_cursor_at_ms, job.last_activity_at_ms) {
-                (Some(cursor), Some(activity)) => Some(cursor.max(activity)),
-                (cursor, activity) => cursor.or(activity),
-            }
-            .or(job.target_last_ok_at_ms)
-            .or(job.dispatched_at_ms)?;
+            let at = [job.last_cursor_at_ms, job.last_activity_at_ms]
+                .into_iter()
+                .flatten()
+                .max()
+                .or(job.target_last_ok_at_ms)
+                .or(job.dispatched_at_ms)?;
             let still_ms = now_ms.saturating_sub(at);
             (still_ms >= limit.max_stall_ms).then_some(StalledRun {
                 job_id: job.job_id.clone(),
@@ -1549,6 +1563,7 @@ pub(crate) fn stalled_runs(
                 still_ms,
                 max_stall_ms: limit.max_stall_ms,
                 limit_source: limit.source,
+                activity_at_ms: job.last_activity_at_ms,
                 activity: job.last_activity.clone(),
             })
         })
@@ -1591,6 +1606,9 @@ pub(crate) fn settle_stalled(jobs: &mut [Job], settlement: StallSettlement<'_>) 
         } else {
             format!("cursor {}", run.cursor)
         };
+        let heartbeat_silence_ms = run
+            .activity_at_ms
+            .map_or(run.still_ms, |at| now_ms.saturating_sub(at));
         let activity = run.activity.as_ref().map_or_else(String::new, |activity| {
             format!(
                 "; last activity node '{}' ran '{}' for {}s",
@@ -1599,14 +1617,24 @@ pub(crate) fn settle_stalled(jobs: &mut [Job], settlement: StallSettlement<'_>) 
                 activity.elapsed_ms / 1000
             )
         });
+        // The required diagnostic names the node, the in-flight command, and how long the
+        // heartbeat has been silent, rather than only the cursor's age.
+        let heartbeat = run.activity.as_ref().map_or_else(
+            || format!("no cursor movement for {}ms", run.still_ms),
+            |activity| {
+                format!(
+                    "run stuck at {} ({}), no heartbeat for {}ms",
+                    activity.node, activity.command, heartbeat_silence_ms
+                )
+            },
+        );
         let silence = if run.activity.is_some() {
-            "no activity for"
+            format!("{heartbeat}; no activity for {}ms", run.still_ms)
         } else {
-            "no cursor movement for"
+            heartbeat
         };
         let detail = format!(
-            "{silence} {}ms (limit {}ms from {}); {run_label} on {} at {cursor_label}{activity}",
-            run.still_ms,
+            "{silence} (limit {}ms from {}); {run_label} on {} at {cursor_label}{activity}",
             run.max_stall_ms,
             run.limit_source.description(),
             run.target,
@@ -1633,8 +1661,10 @@ pub(crate) fn settle_stalled(jobs: &mut [Job], settlement: StallSettlement<'_>) 
             "runId": job.run_id,
             "cursor": run.cursor,
             "stillMs": run.still_ms,
+            "noHeartbeatMs": run.activity.as_ref().map(|_| heartbeat_silence_ms),
             "maxStallMs": run.max_stall_ms,
             "maxStallSource": run.limit_source.as_str(),
+            "reason": job.error.as_ref().map(|error| &error.message),
             "lastActivity": run.activity,
         }));
     }
