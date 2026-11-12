@@ -1209,6 +1209,7 @@ async fn hub_events_multiplex_a_whole_hub_on_one_cursor() {
     }
     let mut sequences = Vec::new();
     for event in &events {
+        let cursor = event["data"]["cursor"].as_str().expect("hub event cursor");
         let event_id = event["eventId"].as_str().expect("hub event id");
         let sequence = event["data"]["sequence"]
             .as_u64()
@@ -1223,7 +1224,11 @@ async fn hub_events_multiplex_a_whole_hub_on_one_cursor() {
         for key in ["eventId", "name", "timestamp", "data", "_meta"] {
             assert!(envelope.contains_key(key), "{key} is in the envelope");
         }
-        assert_eq!(event["data"]["cursor"], json!(event_id));
+        assert!(cursor.starts_with("hub:"), "{event}");
+        assert_ne!(
+            cursor, event_id,
+            "an occurrence's id identifies it; the cursor only resumes the feed: {event}"
+        );
     }
     assert!(sequences.windows(2).all(|pair| pair[0] <= pair[1]));
     let run = events
@@ -1368,7 +1373,13 @@ async fn events_stream_pushes_a_hub_run_notification() {
     assert!(
         event["params"]["eventId"]
             .as_str()
-            .is_some_and(|event_id| event_id.starts_with("hub:"))
+            .is_some_and(|event_id| !event_id.starts_with("hub:")),
+        "the event id is minted, not the resume cursor"
+    );
+    assert!(
+        event["params"]["data"]["cursor"]
+            .as_str()
+            .is_some_and(|cursor| cursor.starts_with("hub:"))
     );
     assert_eq!(
         event["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
@@ -1518,7 +1529,13 @@ async fn events_poll_with_a_null_cursor_starts_from_now() {
     assert!(
         events[0]["eventId"]
             .as_str()
-            .is_some_and(|event_id| event_id.starts_with("hub:")),
+            .is_some_and(|event_id| !event_id.starts_with("hub:")),
+        "{events:?}"
+    );
+    assert!(
+        events[0]["data"]["cursor"]
+            .as_str()
+            .is_some_and(|cursor| cursor.starts_with("hub:")),
         "{events:?}"
     );
 }
@@ -1552,7 +1569,7 @@ async fn events_poll_snapshot_opt_in_returns_bootstrap_state() {
         .as_str()
         .expect("bootstrap record cursor");
     assert!(record_cursor.starts_with("hub:snapshot:"), "{response}");
-    assert_eq!(events[0]["eventId"], json!(record_cursor));
+    assert_ne!(events[0]["eventId"], json!(record_cursor));
     assert!(
         response["result"]["cursor"].as_str().is_some_and(|cursor| {
             cursor.starts_with("hub:") && !cursor.starts_with("hub:snapshot:")
@@ -1667,7 +1684,7 @@ async fn events_stream_with_a_null_cursor_delivers_only_events_produced_after_it
     );
     assert!(
         notifications.iter().all(|frame| {
-            !frame["params"]["eventId"]
+            !frame["params"]["data"]["cursor"]
                 .as_str()
                 .unwrap_or_default()
                 .starts_with("hub:snapshot:")
@@ -1747,8 +1764,7 @@ async fn hub_subscription_opens_before_any_job_and_follows_its_lifecycle() {
     );
     let mut sequences = job_events
         .iter()
-        .filter_map(|frame| frame["params"]["eventId"].as_str())
-        .map(|event_id| sequence_from_cursor(event_id).expect("hub sequence"))
+        .filter_map(|frame| frame["params"]["data"]["sequence"].as_u64())
         .collect::<Vec<_>>();
     let sorted = {
         let mut sorted = sequences.clone();
@@ -1795,8 +1811,12 @@ async fn hub_bootstrap_snapshots_every_known_job_in_submission_order() {
     let mut sequences = Vec::new();
     for (index, event) in snapshots.iter().enumerate() {
         let identity = format!("hub:snapshot:{}:0", index + 1);
-        assert_eq!(event["eventId"], json!(identity));
         assert_eq!(event["data"]["cursor"], json!(identity));
+        assert_ne!(
+            event["eventId"],
+            json!(identity),
+            "a bootstrap occurrence's id is minted, not its progress cursor"
+        );
         sequences.push(event["data"]["sequence"].as_u64().expect("sequence"));
         for field in [
             "jobId",
@@ -2405,8 +2425,7 @@ async fn hub_poll_resumes_from_a_cursor_captured_before_a_terminal_event() {
         .expect("resumed events");
     assert!(!events.is_empty(), "{later}");
     assert!(events.iter().all(|event| {
-        sequence_from_cursor(event["eventId"].as_str().unwrap_or_default()).unwrap_or_default()
-            > sequence_from_cursor(&cursor).unwrap_or_default()
+        sequence(event).unwrap_or_default() > sequence_from_cursor(&cursor).unwrap_or_default()
     }));
     assert!(
         events.iter().any(|event| {
@@ -2943,7 +2962,7 @@ async fn hub_poll_clipping_is_has_more_without_reporting_truncation() {
         sequence(&second).unwrap() > sequence(&first).unwrap(),
         "{resumed}"
     );
-    assert_eq!(
+    assert_ne!(
         second["data"]["cursor"], second["eventId"],
         "the resumed batch starts at the next unread hub event: {resumed}"
     );
@@ -3027,7 +3046,11 @@ async fn hub_replay_reports_the_exact_evicted_range_and_starts_at_the_front() {
         .find(|frame| frame["method"] == json!("notifications/events/event"))
         .expect("replayed event");
     assert_eq!(
-        sequence_from_cursor(streamed["params"]["eventId"].as_str().unwrap_or_default()),
+        sequence_from_cursor(
+            streamed["params"]["data"]["cursor"]
+                .as_str()
+                .unwrap_or_default()
+        ),
         Some(front),
         "stream replay starts at the retained log front"
     );

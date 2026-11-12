@@ -47,9 +47,12 @@ const HUB_LOG_LIMIT: usize = 4096;
 const HUB_RECENT_JOBS: usize = 512;
 /// Every delivered cursor is either a durable `hub:<sequence>` position or the resumable
 /// bootstrap progress identity `hub:snapshot:<delivered>:<start>` synthesized before the first
-/// occurrence. Advertised schemas must accept both, because bootstrap records carry the latter
-/// as their `eventId` and `data.cursor`.
+/// occurrence. Advertised schemas must accept both, because `data.cursor` carries either form.
 const HUB_CURSOR_PATTERN: &str = "^hub:(snapshot:[0-9]+:[0-9]+|[0-9]+)$";
+/// An occurrence's `eventId` is the daemon start stamp and the feed sequence that minted it.
+/// Bootstrap records are synthesized outside the ring buffer, so their id names the job they
+/// describe instead.
+const HUB_EVENT_ID_PATTERN: &str = "^[0-9a-f]+-(snapshot-.+|[0-9]+)$";
 const HUB_BROADCAST_LIMIT: usize = 1024;
 pub(crate) const PHASES: &[&str] = &["admitted", "running", "stopping", "finished"];
 /// Phases a pool lease or pool record can carry; the CLI hub event filter also accepts these.
@@ -210,6 +213,11 @@ enum HubPosition {
 #[derive(Clone)]
 pub(super) struct HubEvent {
     sequence: u64,
+    /// Identity for deduplication, minted when the event enters the ring buffer. The resume
+    /// cursor cannot serve as one: a restarted daemon renumbers its sequence, so a cursor is
+    /// reused for a different event while the same logical event may be re-issued under a new
+    /// cursor. An id is never derived from the cursor for exactly that reason.
+    event_id: String,
     name: &'static str,
     timestamp: String,
     data: Value,
@@ -249,6 +257,9 @@ struct HubLog {
 /// Resident hub event log shared by every subscription on one MCP worker. A slow
 /// subscriber reads the bounded log after a broadcast lag instead of blocking dispatch.
 pub(super) struct HubFeed {
+    /// The daemon's start stamp disambiguates every id this feed mints from another run's
+    /// otherwise-identical sequence.
+    started_unix_nanos: u128,
     log: RefCell<HubLog>,
     snapshot: RefCell<Vec<Arc<HubEvent>>>,
     sender: broadcast::Sender<Arc<HubEvent>>,
@@ -400,8 +411,13 @@ impl HubFeed {
     }
 
     pub(super) fn new() -> Self {
+        Self::with_start_nanos(daemon_start_nanos())
+    }
+
+    fn with_start_nanos(started_unix_nanos: u128) -> Self {
         let (sender, _) = broadcast::channel(HUB_BROADCAST_LIMIT);
         Self {
+            started_unix_nanos,
             log: RefCell::new(HubLog {
                 events: VecDeque::new(),
                 next_sequence: 1,
@@ -449,6 +465,7 @@ impl HubFeed {
         }
         let mut log = self.log.borrow_mut();
         event.sequence = log.next_sequence;
+        event.event_id = hub_event_id(self.started_unix_nanos, log.next_sequence);
         log.next_sequence = log.next_sequence.saturating_add(1);
         let event = Arc::new(event);
         log.events.push_back(Arc::clone(&event));
@@ -478,6 +495,13 @@ impl HubFeed {
 
     fn head(&self) -> u64 {
         self.log.borrow().next_sequence.saturating_sub(1)
+    }
+
+    /// Bootstrap records never enter the ring buffer, but they still need their own identity.
+    /// The job id makes it stable for a repeated bootstrap and distinct from every other record
+    /// the same daemon synthesizes.
+    fn snapshot_event_id(&self, job_id: &str) -> String {
+        format!("{:x}-snapshot-{job_id}", self.started_unix_nanos)
     }
 
     /// Subscribe before taking the replay snapshot. There is no await between the two,
@@ -572,6 +596,17 @@ enum HubCursor {
 
 fn hub_cursor(sequence: u64) -> String {
     format!("hub:{sequence}")
+}
+
+fn daemon_start_nanos() -> u128 {
+    u128::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos()).unwrap_or_default()
+}
+
+/// SEP-3415 separates the two roles: `cursor` is an opaque, client-owned resume position while
+/// `eventId` identifies the occurrence so a client can deduplicate it. The start stamp keeps a
+/// restarted daemon from reusing an id even though its sequence starts again.
+fn hub_event_id(started_unix_nanos: u128, sequence: u64) -> String {
+    format!("{started_unix_nanos:x}-{sequence}")
 }
 
 fn snapshot_cursor(delivered: usize, start: u64) -> String {
@@ -1123,7 +1158,7 @@ fn hub_event_value(event: &HubEvent, filter: &HubFilter<'_>, stamp: Stamp<'_>) -
         }
     }
     let value = json!({
-        "eventId": event_cursor,
+        "eventId": event.event_id,
         "name": filter.stream,
         "timestamp": event.timestamp,
         "data": data,
@@ -1831,6 +1866,7 @@ where
             // Synthetic bootstrap records start before every durable occurrence, so they can
             // neither advance the durable feed cursor nor be mistaken for replayed history.
             sequence: 0,
+            event_id: feed.snapshot_event_id(&job_id),
             name: HUB_JOB,
             timestamp: now_rfc3339(),
             data: job_snapshot_data(&view, run.as_ref(), terminal),
@@ -2208,6 +2244,7 @@ where
     }
     feed.publish(HubEvent {
         sequence: 0,
+        event_id: String::new(),
         name: HUB_JOB,
         timestamp: now_rfc3339(),
         data,
@@ -2372,6 +2409,7 @@ fn publish_pool(feed: &HubFeed, record: &Value) {
     });
     feed.publish(HubEvent {
         sequence: 0,
+        event_id: String::new(),
         name: HUB_POOL,
         timestamp: at,
         data,
@@ -2617,6 +2655,7 @@ impl HubFeed {
         }
         self.publish(HubEvent {
             sequence: 0,
+            event_id: String::new(),
             name: HUB_RUN_DETAIL,
             timestamp: at,
             data: event,
@@ -2771,6 +2810,7 @@ impl HubFeed {
         }
         self.publish(HubEvent {
             sequence: 0,
+            event_id: String::new(),
             name: HUB_WARNING,
             timestamp: now_rfc3339(),
             data: Value::Object(data),
@@ -2994,6 +3034,9 @@ fn occurrence(event: &Value) -> Result<Option<Value>, McpFailure> {
     if let Some(map) = data.as_object_mut() {
         map.insert("summary".to_owned(), summary);
     }
+    // The run id and its durable per-run `v2:` cursor are both monotonic for that run, so this
+    // identity is already stable across reconnects and daemon restarts. It is deliberately not
+    // the hub-wide cursor, whose sequence a restart renumbers.
     Ok(Some(json!({
         "eventId": format!("{run_id}:{cursor}"),
         "name": EVENT_NAME,
@@ -3255,8 +3298,8 @@ fn payload_schema(name: &str) -> Value {
         "properties": {
             "eventId": {
                 "type": "string",
-                "pattern": HUB_CURSOR_PATTERN,
-                "description": "The record's resume cursor: durable hub:<sequence>, or hub:snapshot:<delivered>:<start> for a bootstrap snapshot record."
+                "pattern": HUB_EVENT_ID_PATTERN,
+                "description": "Stable identity for this occurrence: the daemon start stamp and the feed sequence that minted it. Deduplicate on it; resume from data.cursor instead."
             },
             "name": {
                 "const": name,
@@ -3713,6 +3756,7 @@ mod warning_tests {
     fn job_event(state: &str, snapshot: bool) -> HubEvent {
         HubEvent {
             sequence: 0,
+            event_id: String::new(),
             name: HUB_JOB,
             timestamp: "2024-01-01T00:00:00Z".to_owned(),
             data: json!({"jobId": "hj_1", "state": state}),
@@ -3766,5 +3810,83 @@ mod warning_tests {
         assert_eq!(human_duration(3 * 60_000), "3m");
         assert_eq!(human_duration((6 * 60 + 12) * 60_000), "6h 12m");
         assert_eq!(human_duration((2 * 24 + 3) * 3_600_000), "2d 3h");
+    }
+
+    fn delivered(event: &Arc<HubEvent>) -> Value {
+        let filter = HubFilter {
+            selector: &Selector::Hub,
+            target: &None,
+            kinds: &None,
+            detail: false,
+            stream: "hub",
+        };
+        hub_event_value(
+            event,
+            &filter,
+            Stamp {
+                sequence: 1,
+                id: None,
+            },
+        )
+        .expect("the test event is deliverable")
+    }
+
+    #[test]
+    fn a_hub_event_id_is_not_its_cursor() {
+        let feed = HubFeed::new();
+        feed.publish(job_event("queued", false));
+        let events = feed.test_deliver(None, json!({}));
+        assert_eq!(events.len(), 1, "{events:?}");
+        let cursor = events[0]["data"]["cursor"].as_str().expect("hub cursor");
+        let event_id = events[0]["eventId"].as_str().expect("event id");
+        assert!(cursor.starts_with("hub:"), "{events:?}");
+        assert_ne!(event_id, cursor);
+        assert!(!event_id.starts_with("hub:"), "{events:?}");
+    }
+
+    #[test]
+    fn consecutive_hub_events_get_distinct_ids() {
+        let feed = HubFeed::new();
+        feed.publish(job_event("queued", false));
+        feed.publish(job_event("running", false));
+        let events = feed.test_deliver(None, json!({}));
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_ne!(events[0]["eventId"], events[1]["eventId"]);
+        assert_ne!(events[0]["data"]["cursor"], events[1]["data"]["cursor"]);
+    }
+
+    #[test]
+    fn a_restarted_daemon_cannot_reuse_an_event_id() {
+        let first = HubFeed::with_start_nanos(0x5eed);
+        let second = HubFeed::with_start_nanos(0x5eee);
+        first.publish(job_event("queued", false));
+        second.publish(job_event("queued", false));
+        let first_events = first.test_deliver(None, json!({}));
+        let second_events = second.test_deliver(None, json!({}));
+        // The same sequence is reissued after a restart, so the cursor alone cannot dedupe.
+        assert_eq!(first_events[0]["data"]["cursor"], json!("hub:1"));
+        assert_eq!(
+            first_events[0]["data"]["cursor"],
+            second_events[0]["data"]["cursor"]
+        );
+        assert_ne!(first_events[0]["eventId"], second_events[0]["eventId"]);
+    }
+
+    #[test]
+    fn a_resumed_hub_stream_keeps_the_event_id_for_deduplication() {
+        let feed = HubFeed::new();
+        feed.publish(job_event("queued", false));
+        feed.publish(job_event("running", false));
+        let seen = feed.test_deliver(None, json!({}));
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        let cursor = seen[0]["data"]["cursor"].as_str().expect("hub cursor");
+        let sequence = cursor_sequence(cursor).expect("durable hub cursor");
+        // A cursor-based resume replays the second event; it must keep the id the first
+        // delivery handed out, which is what lets the client drop the duplicate.
+        let (replay, _) = feed.after(sequence);
+        assert_eq!(replay.len(), 1);
+        let resumed = delivered(&replay[0]);
+        assert_eq!(resumed["eventId"], seen[1]["eventId"]);
+        assert_eq!(resumed["data"]["cursor"], seen[1]["data"]["cursor"]);
     }
 }
