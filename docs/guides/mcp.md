@@ -172,17 +172,19 @@ events/subscribe {}
 ```
 
 ```json
-{"eventId": "hub:42", "name": "hub", "timestamp": "RFC3339", "data": {"kind": "hub.run"}, "_meta": {}}
+{"eventId": "17f3a1b2c3d4e5f6-42", "name": "hub", "timestamp": "RFC3339", "data": {"kind": "hub.run"}, "_meta": {}}
 ```
 
 `summary`, the carried kind in `data.kind`, and the hub cursor live inside `data`. Occurrences
 carry only the SEP-3415 envelope (`eventId`, `name`, `timestamp`, `data`, `_meta`); provenance is
 not a field, because a client that supplied a cursor already knows it is being served from one, and
 what is new to it is decided by `eventId`.
-`data.cursor` is the same `hub:<sequence>` value as `eventId`. The sequence is monotonic across
+`data.cursor` is the `hub:<sequence>` resume position. The sequence is monotonic across
 jobs, runs, pools, and warnings, so a client can keep one cursor and resume the whole feed. A
-`hub.run` or `hub.run.detail` record keeps its original durable `v2:<sequence>` watch cursor as
-`data.runCursor`.
+restarted daemon starts that sequence again, so an `eventId` is minted instead: the daemon's start
+stamp plus the sequence. Deduplicate on `eventId`; a replayed event keeps the id it was first
+delivered with, while a cursor is never an identity. A `hub.run` or `hub.run.detail` record keeps
+its original durable `v2:<sequence>` watch cursor as `data.runCursor`.
 
 `hub.run` is collapsed to the moments that matter: the run's node changes or its phase leaves
 `running`. Cursor advances inside one node emit nothing. Every collapsed event carries the
@@ -234,10 +236,11 @@ Subscription arguments are all optional filters:
 - `snapshot: true` opts into the bootstrap state. Only then does a null cursor return the
   synthesized `hub.job` records for every recent known job (queued, placing, running, or already
   attempted, bounded to the newest 512 job views) in `submittedAt` order with `data.snapshot: true`
-  and the current state. Each record has a distinct `eventId`/`data.cursor` of
-  `hub:snapshot:<delivered>:<start>`, where `<delivered>` counts the synthesized records already
-  sent and `<start>` is the durable boundary the batch began from. It is never reported by a later
-  poll. After that, the feed carries each genuine occurrence once; bootstrap records replace
+  and the current state. Each record's `data.cursor` is a distinct `hub:snapshot:<delivered>:<start>`,
+  where `<delivered>` counts the synthesized records already sent and `<start>` is the durable
+  boundary the batch began from, and its `eventId` is minted from the daemon start stamp and the
+  job identity. It is never reported by a later poll. After that, the feed carries each genuine
+  occurrence once; bootstrap records replace
   remembered job replay so stale job state cannot be repeated. A bootstrap for an already-terminal
   job is that job's one durable terminal occurrence, so its publication moves the response cursor
   past itself and a resume cannot replay it. The batch also replays the remembered latest state of

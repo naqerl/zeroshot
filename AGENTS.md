@@ -806,7 +806,10 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   `node`, `previousNode`, `phase`, `runCursor`, `lastCursorAt`, `cursorsSinceLastEvent`,
   `elapsedMsInNode`, `nodeChangedAt`, `terminal`, and `reason`, so one event plus the clock answers
   whether the run is moving. Occurrences keep the flattened five-field envelope (`eventId`, `name`,
-  `timestamp`, `data`, `_meta`). The envelope `name` is always the name the client subscribed with
+  `timestamp`, `data`, `_meta`). `eventId` is minted from the daemon start stamp and the feed
+  sequence when the event enters the ring buffer, so it deduplicates an event across a restart;
+  `data.cursor` stays the opaque resume position the daemon renumbers after a restart. The envelope
+  `name` is always the name the client subscribed with
   (`hub` when omitted), because MCP events clients route and validate occurrences by it; the
   carried kind is `data.kind` (`hub.pool` records keep their lease-or-pool discriminator as
   `data.scope`). `summary` and the hub `cursor` live inside `data`, while run records retain their

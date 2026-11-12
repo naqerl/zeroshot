@@ -329,7 +329,7 @@ An example notification for a lease that just became ready:
 
 ```json
 {
-  "eventId": "hub:57",
+  "eventId": "17f3a1b2c3d4e5f6-57",
   "name": "hub",
   "timestamp": "2026-02-11T09:41:12.481Z",
   "data": {
