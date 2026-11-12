@@ -892,7 +892,14 @@ impl HubService {
                         };
                         // Only a status read that watched this exact run reach success proves
                         // provider progress; reading an already-terminal success again does not.
-                        let just_succeeded = observing && job.state == JobState::Succeeded;
+                        // The run's terminal result decides this, because a delivery-empty
+                        // correction may have changed the job's verdict to failed.
+                        let just_succeeded = observing
+                            && status
+                                .as_ref()
+                                .and_then(|status| status.pointer("/status/terminalResult/status"))
+                                .and_then(Value::as_str)
+                                == Some("succeeded");
                         let result = (job.clone(), status, just_succeeded);
                         self.quota.record_jobs(&state.jobs);
                         Ok(result)
@@ -1407,7 +1414,7 @@ impl HubService {
             .await?;
         if finished
             .iter()
-            .any(|record| record.get("state").and_then(Value::as_str) == Some("succeeded"))
+            .any(|record| record.get("runSucceeded").and_then(Value::as_bool) == Some(true))
         {
             self.quota.clear();
             let state = self.snapshot().await;

@@ -1934,6 +1934,7 @@ fn job_snapshot_data(view: &Value, run: Option<&Value>, terminal: bool) -> Value
             .or_else(|| view.get("error"))
             .cloned()
             .unwrap_or(Value::Null),
+        "output": view.get("output").cloned().unwrap_or(Value::Null),
         "at": view
             .get("finishedAt")
             .or_else(|| view.get("dispatchedAt"))
@@ -2187,6 +2188,7 @@ where
         "failureReason": view.get("failureReason").cloned().unwrap_or(Value::Null),
         "errorKind": view.get("errorKind").cloned().unwrap_or(Value::Null),
         "reason": reason,
+        "output": view.get("output").cloned().unwrap_or(Value::Null),
         "at": at,
     });
     if terminal {
@@ -3170,6 +3172,10 @@ fn payload_schema(name: &str) -> Value {
             "errorKind": {"type": ["string", "null"]},
             "headBranch": {"type": ["string", "null"]},
             "headRevision": {"type": ["string", "null"]},
+            "output": {
+                "type": ["object", "string", "null"],
+                "description": "Terminal job output: the normalized delivery outcome with mode, headRevision, pinnedRevision and emptyDiff, or an eval judge's verdict."
+            },
             "status": {"type": ["object", "null"]},
             "state": {
                 "type": "string",

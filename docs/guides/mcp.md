@@ -155,7 +155,7 @@ carry in `data.kind`:
 
 | Kind             | Data                                                                                             |
 | ---------------- | ------------------------------------------------------------------------------------------------ |
-| `hub.job`        | `kind`, `jobId`, `title`, `state`, `target`, `project`, `runId`, `attempts`, `pinnedRevision`, `labels`, `submittedAt`, `finishedAt`, `failureReason`, `failureClassification`, `errorKind`, `headBranch`, `headRevision`, `status`, `terminal`, `snapshot`, `reason`, `at`, `cursor`, `summary`, `sequence` |
+| `hub.job`        | `kind`, `jobId`, `title`, `state`, `target`, `project`, `runId`, `attempts`, `pinnedRevision`, `labels`, `submittedAt`, `finishedAt`, `failureReason`, `failureClassification`, `errorKind`, `headBranch`, `headRevision`, `output`, `status`, `terminal`, `snapshot`, `reason`, `at`, `cursor`, `summary`, `sequence` |
 | `hub.run`        | `kind`, `runId`, `cursor`, `runCursor`, `node`, `previousNode`, `phase`, `lastCursorAt`, `cursorsSinceLastEvent`, `elapsedMsInNode`, `nodeChangedAt`, `terminal`, `reason`, `status`, `summary` |
 | `hub.run.detail` | `kind` and one raw per-cursor run watch record: `runId`, `cursor`, `runCursor`, `status`, `summary` |
 | `hub.pool`       | `kind`, `scope`, `pool`, `leaseId`, `serverId`, `memberId`, `machine`, `phase`, `previousPhase`, `reason`, `at`, `cursor`, `summary` |
@@ -271,7 +271,9 @@ to resume. A real replay or backpressure shortfall that permanently lost events 
 A terminal run or job is an ordinary event. Every job produces exactly one terminal `hub.job`
 occurrence, including `succeeded`, `failed`, `stopped`, `force_stopped`, `dequeued`,
 `target_lost`, and jobs found terminal after a daemon restart. It carries `data.terminal: true`, `finishedAt`,
-`failureReason`, `errorKind`, and `headBranch`/`headRevision` when Git delivery landed. A snapshot
+`failureReason`, `errorKind`, `headBranch`/`headRevision` when Git delivery landed, and `output`
+with the normalized delivery outcome (`headRevision`, `pinnedRevision`, `emptyDiff`) for a
+delivery job. A snapshot
 for a job that was already terminal is that terminal occurrence. The stream never completes on a
 terminal event: it stays open for later jobs, later runs, pool changes, warnings, and idle
 heartbeats. Only `events/unsubscribe`, MCP session shutdown, or request cancellation stops it.
