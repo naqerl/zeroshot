@@ -635,13 +635,23 @@ fn truncated_range(from: u64, to: u64) -> Value {
     json!({"from": hub_cursor(from), "to": hub_cursor(to)})
 }
 
-/// A resume cursor from before a daemon restart can sit beyond the new feed head. Clamp it to
-/// the head so live work is still delivered, and report the vanished range as truncation.
-fn clamp_resume(feed: &HubFeed, after: Option<u64>) -> (Option<u64>, Value) {
+/// A resume cursor from before a daemon restart can sit beyond the new feed head. A supplied
+/// cursor is never rewritten: honour it and report the range this feed cannot cover as
+/// truncation, so the caller decides whether to start over from the head.
+fn resume_truncation(feed: &HubFeed, after: Option<u64>) -> Value {
     let head = feed.head();
     match after {
-        Some(after) if after > head => (Some(head), truncated_range(head.saturating_add(1), after)),
-        _ => (after, json!(false)),
+        Some(after) if after > head => truncated_range(head.saturating_add(1), after),
+        _ => json!(false),
+    }
+}
+
+/// Name the subscription's start mode and the resolved feed sequence. The hub has no logging
+/// backend, so this is the debug-level record an operator enables when diagnosing a replay
+/// storm; it is silent during normal operation.
+fn debug_start_mode(mode: &str, sequence: u64) {
+    if std::env::var_os("ZEROSHOT_DEBUG").is_some() {
+        eprintln!("zeroshot mcp events: debug: {mode} start at hub:{sequence}");
     }
 }
 
@@ -820,21 +830,22 @@ where
     H: McpHost + 'static,
 {
     feed.ensure_started(Rc::clone(host));
-    let (after, snapshot_skip, bootstrap) = match request.cursor.as_deref() {
+    let (after, snapshot_skip, bootstrap, start_mode) = match request.cursor.as_deref() {
         Some(cursor) => match parse_hub_cursor(cursor)? {
-            HubCursor::Durable(sequence) => (Some(sequence), 0, false),
-            HubCursor::Snapshot { delivered, start } => (Some(start), delivered, true),
+            HubCursor::Durable(sequence) => (Some(sequence), 0, false, "cursor"),
+            HubCursor::Snapshot { delivered, start } => (Some(start), delivered, true, "cursor"),
         },
         // The explicit opt-in keeps the bootstrap batch: remembered latest run and pool-lease
         // state plus one synthesized `hub.job` per known job, with `hub:snapshot:` progress
         // cursors. `feed.snapshot(None)` is what replays that remembered state.
-        None if request.snapshot => (None, 0, true),
+        None if request.snapshot => (None, 0, true, "snapshot"),
         // A null cursor otherwise starts from now: no events, a plain durable cursor at the feed
         // head. The subscriber then sees only what is produced after this subscription.
-        None => (Some(feed.head()), 0, false),
+        None => (Some(feed.head()), 0, false, "head"),
     };
-    let (after, stale) = clamp_resume(feed, after);
+    let stale = resume_truncation(feed, after);
     let start = after.unwrap_or_else(|| feed.head());
+    debug_start_mode(start_mode, start);
     let (receiver, mut replay, truncated, cursor) = feed.snapshot(after);
     let mut truncated = merge_truncated(truncated, stale);
     if bootstrap && let Some(snapshots) = snapshot_events(host.as_ref(), feed, request, start).await
@@ -1520,21 +1531,22 @@ where
 {
     feed.ensure_started(Rc::clone(host));
     tokio::task::yield_now().await;
-    let (after, snapshot_skip, bootstrap) = match request.cursor.as_deref() {
+    let (after, snapshot_skip, bootstrap, start_mode) = match request.cursor.as_deref() {
         Some(cursor) => match parse_hub_cursor(cursor)? {
-            HubCursor::Durable(sequence) => (Some(sequence), 0, false),
-            HubCursor::Snapshot { delivered, start } => (Some(start), delivered, true),
+            HubCursor::Durable(sequence) => (Some(sequence), 0, false, "cursor"),
+            HubCursor::Snapshot { delivered, start } => (Some(start), delivered, true, "cursor"),
         },
         // The explicit opt-in keeps the bootstrap batch: remembered latest run and pool-lease
         // state plus one synthesized `hub.job` per known job, with `hub:snapshot:` progress
         // cursors. `feed.snapshot(None)` is what replays that remembered state.
-        None if request.snapshot => (None, 0, true),
+        None if request.snapshot => (None, 0, true, "snapshot"),
         // A null cursor otherwise means "from now": no events and a plain durable cursor at the
         // head, so the next call continues from events produced after this request.
-        None => (Some(feed.head()), 0, false),
+        None => (Some(feed.head()), 0, false, "head"),
     };
-    let (after, stale) = clamp_resume(feed, after);
+    let stale = resume_truncation(feed, after);
     let start = after.unwrap_or_else(|| feed.head());
+    debug_start_mode(start_mode, start);
     let (receiver, mut replay, truncated, _) = feed.snapshot(after);
     drop(receiver);
     let mut truncated = merge_truncated(truncated, stale);

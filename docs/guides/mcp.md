@@ -252,6 +252,8 @@ Subscription arguments are all optional filters:
   delivers only events produced after it.
 - A cursor is exclusive. The response cursor advances to the last delivered event and never moves
   backwards.
+- A supplied cursor is never rewritten: when it predates retention, or belongs to a previous daemon
+  incarnation beyond the current head, the response reports `truncated` instead of moving the position.
 - `truncated` is `false` when nothing was lost. It is `{ "from": "hub:N", "to": "hub:M" }` only
   when replay shortfall or backpressure permanently lost events. Sparse `v2:` watch cursors are
   not evidence of loss, so a normal jump in a run's cursor never sets `truncated`.
