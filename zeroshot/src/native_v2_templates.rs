@@ -56,7 +56,14 @@ const ACCEPTED_LABEL: &str = "accepted";
 const REJECTED_LABEL: &str = "rejected";
 const DELIVERY_NODE: &str = "deliver";
 const REVIEW_OUTPUT_INVALID_REASON: &str = "review_output_invalid";
+const REVIEW_OUTPUT_TRUNCATED_REASON: &str = "review_output_truncated";
 const REVIEW_REFUSED_REASON: &str = "review_refused";
+const TRUNCATED_FIELD: &str = "truncated";
+const TRUE_LABEL: &str = "true";
+const FALSE_LABEL: &str = "false";
+const FINDINGS_FIELD: &str = "findings";
+const SUMMARY_FIELD: &str = "summary";
+const LOCATION_FIELD: &str = "location";
 const RADIUS_FIELD: &str = "radius";
 const CONFIDENCE_FIELD: &str = "confidence";
 const TOUCHES_FIELD: &str = "touches";
@@ -379,7 +386,7 @@ fn fast_review_route(state: PayloadType) -> Result<GraphNode, BuiltinTemplateErr
         name: node_name("review_result")?,
         state: state.clone(),
         branches: non_empty({
-            let mut branches = review_failure_branches(&["acceptance", "code"])?;
+            let mut branches = review_failure_branches_with_truncation(&["acceptance", "code"])?;
             branches.push(ChoiceBranch {
                 when: accepted_reviews_guard()?,
                 node: next_iteration("reviews_accepted", state.clone())?,
@@ -700,6 +707,14 @@ fn review_verifier(spec: ReviewVerifierSpec<'_>) -> Result<GraphNode, BuiltinTem
     let signals = review_signals()?;
     let mut write_bindings = spec.write_bindings;
     write_bindings.push(diagnostic_write(spec.name, spec.feedback_target)?);
+    let authored_instructions = format!(
+        "{} Keep all actionable feedback in the diagnostic message so the repair worker receives \
+         it. The optional findings array is a bounded structured index: at most eight findings, \
+         each with a summary of at most 400 characters and an optional file:line location; its \
+         summaries are also appended to the message. Do not quote diffs. Keep the verdict signal \
+         itself short.",
+        spec.authored_instructions
+    );
     Ok(GraphNode::Verifier(VerifierNode {
         name: node_name(spec.name)?,
         worker: worker_ref(spec.worker)?,
@@ -713,8 +728,8 @@ fn review_verifier(spec: ReviewVerifierSpec<'_>) -> Result<GraphNode, BuiltinTem
         timeout_ms: None,
         attempts: positive(MAX_AGENT_VERIFIER_ATTEMPTS)?,
         signals,
-        diagnostic: diagnostic_type()?,
-        instructions: Some(delivery_feedback_instructions(spec.authored_instructions)?),
+        diagnostic: review_diagnostic_type()?,
+        instructions: Some(delivery_feedback_instructions(&authored_instructions)?),
     }))
 }
 
@@ -726,7 +741,7 @@ fn review_route(
         name: node_name("review_result")?,
         state: state.clone(),
         branches: non_empty({
-            let mut branches = review_failure_branches(&["acceptance", "code"])?;
+            let mut branches = review_failure_branches_with_truncation(&["acceptance", "code"])?;
             branches.push(ChoiceBranch {
                 when: accepted_reviews_guard()?,
                 node: accepted_change(state.clone(), delivery)?,
@@ -1007,6 +1022,37 @@ pub(super) fn review_failure_branches(
     ])
 }
 
+/// Reviewers carrying the bounded verdict also expose a `truncated` signal, so a provider output
+/// limit is named separately from an unreadable verdict. Generic review steps keep the original
+/// three error branches.
+pub(super) fn review_failure_branches_with_truncation(
+    nodes: &[&str],
+) -> Result<Vec<ChoiceBranch>, BuiltinTemplateError> {
+    let mut branches = vec![ChoiceBranch {
+        when: any_signal_guard(nodes, TRUNCATED_FIELD, &[TRUE_LABEL])?,
+        node: fail(
+            REVIEW_OUTPUT_TRUNCATED_REASON,
+            REVIEW_OUTPUT_TRUNCATED_REASON,
+        )?,
+    }];
+    branches.extend(review_failure_branches(nodes)?);
+    Ok(branches)
+}
+
+fn any_signal_guard(
+    nodes: &[&str],
+    field: &str,
+    labels: &[&str],
+) -> Result<Guard, BuiltinTemplateError> {
+    let guards = nodes
+        .iter()
+        .map(|name| signal_guard(name, field, labels))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Guard::Any {
+        guards: non_empty(guards)?,
+    })
+}
+
 fn feedback_paths() -> Result<Vec<FieldPath>, BuiltinTemplateError> {
     let mut paths = review_feedback_paths()?;
     paths.push(field_path(DELIVERY_FEEDBACK_FIELD)?);
@@ -1033,10 +1079,13 @@ fn review_promoted_paths(
 }
 
 fn review_signals() -> Result<BTreeMap<FieldName, NonEmptyEnumSet>, BuiltinTemplateError> {
-    Ok(BTreeMap::from([(
-        field_name(VERDICT_FIELD)?,
-        verdict_labels()?,
-    )]))
+    Ok(BTreeMap::from([
+        (field_name(VERDICT_FIELD)?, verdict_labels()?),
+        (
+            field_name(TRUNCATED_FIELD)?,
+            enum_labels(&[TRUE_LABEL, FALSE_LABEL])?,
+        ),
+    ]))
 }
 
 fn verdict_labels() -> Result<NonEmptyEnumSet, BuiltinTemplateError> {

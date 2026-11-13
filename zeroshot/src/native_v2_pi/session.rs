@@ -17,8 +17,9 @@ use crate::native_v2_capsule::provider_process::{
 };
 use crate::native_v2_contract::{NodeInvocation, NodeRuntimeBinding, PiProvider};
 use crate::native_v2_runner::{
-    AgentResponse, AgentResponseState, DriverControl, DriverInvocation, NodeDriver,
-    NodeRunnerError, NodeSession, ProviderSchemaDialect, ResolvedEnvironment, SessionFactory,
+    AgentResponse, AgentResponseState, DriverControl, DriverInvocation, LiveOutput,
+    LiveOutputStream, NodeDriver, NodeRunnerError, NodeSession, ProviderSchemaDialect,
+    ResolvedEnvironment, SessionFactory,
 };
 
 use super::session_id::pi_session_id;
@@ -58,6 +59,7 @@ pub(super) struct PiRunState {
 pub(super) enum PiTurnAdvance {
     Response(AgentResponse),
     ProviderFailure { retryable: bool, diagnostic: String },
+    Truncated { diagnostic: String },
 }
 
 #[async_trait]
@@ -141,6 +143,17 @@ impl PiAdapter {
                     .retry_provider_failure(turn, retryable, &diagnostic)
                     .await?;
                 Ok(None)
+            }
+            PiTurnAdvance::Truncated { diagnostic } => {
+                let outcome = turn
+                    .invocation
+                    .response
+                    .truncated_outcome(&diagnostic)
+                    .unwrap_or_else(WorkerOutcome::malformed);
+                control
+                    .emit(LiveOutput::new(LiveOutputStream::Error, diagnostic)?)
+                    .await?;
+                Ok(Some(outcome))
             }
         }
     }

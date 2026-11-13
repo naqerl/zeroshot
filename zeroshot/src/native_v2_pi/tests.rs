@@ -875,6 +875,76 @@ fn coverage_contract_pi_gateway_writes_the_provider_document_before_launch() {
 }
 
 #[test]
+fn coverage_contract_pi_gateway_writes_the_bounded_review_output_limit() {
+    let directory = TestDirectory::new("pi-gateway-review-limit");
+    let files = files(&directory);
+    let agent_dir = files.home().to_path_buf();
+    let adapter = PiAdapter::new_local(adapter_configuration(
+        PiProvider::Gateway,
+        "pi",
+        BTreeMap::new(),
+    ))
+    .assert_value();
+    let fields = ["GATEWAY_BASE_URL", "GATEWAY_API_KEY", "GATEWAY_API"];
+    let binding = agent_binding(
+        "provider-owned-model",
+        None,
+        SessionScope::Execution,
+        &fields,
+    );
+    let mut invocation = invocation(
+        binding,
+        NodeRole::Verifier,
+        resolved(
+            &fields,
+            &[
+                ("GATEWAY_BASE_URL", "https://gateway.example/api/v1"),
+                ("GATEWAY_API_KEY", "declared"),
+                ("GATEWAY_API", "openai-responses"),
+            ],
+        ),
+    );
+    invocation.response = NodeResponseContract::Verifier {
+        output: PayloadType::Null,
+        signals: BTreeMap::new(),
+        diagnostic: serde_json::from_value(serde_json::json!({
+            "kind": "record",
+            "fields": {
+                "message": { "type": { "kind": "string" }, "required": true },
+                "findings": {
+                    "type": {
+                        "kind": "array",
+                        "items": {
+                            "kind": "record",
+                            "fields": {
+                                "summary": { "type": { "kind": "string" }, "required": true }
+                            }
+                        }
+                    },
+                    "required": false
+                }
+            }
+        }))
+        .assert_value(),
+    };
+    let expected = invocation
+        .response
+        .effective_max_output_tokens(None)
+        .assert_value();
+    adapter
+        .command_for_test(&invocation, &files, "zs-fixed")
+        .assert_value_with("gateway review limit launch");
+    let written: Value =
+        serde_json::from_str(&std::fs::read_to_string(agent_dir.join(MODELS_FILE)).assert_value())
+            .assert_value();
+    let model = &written["providers"]["zeroshot-gateway"]["models"][0];
+    assert_eq!(
+        model["maxTokens"].as_u64().assert_value(),
+        u64::from(expected)
+    );
+}
+
+#[test]
 fn coverage_contract_pi_gateway_writes_caller_declared_model_limits() {
     // The adapter must carry the caller's declared limits into the synthesized entry instead of
     // falling back to Pi's 128,000-token default.

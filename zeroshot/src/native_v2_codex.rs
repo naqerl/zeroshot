@@ -29,7 +29,7 @@ use crate::native_v2_contract::CodexProvider;
 use crate::native_v2_runner::{
     AgentResponse, AgentResponseState, DriverControl, DriverInvocation, LiveOutput,
     LiveOutputStream, NodeRunnerError, ProviderSchemaDialect, ResolvedEnvironment,
-    render_agent_prompt, resolve_agent_response_with_dialect,
+    render_agent_prompt_with_budget, resolve_agent_response_with_dialect,
 };
 
 use command::{
@@ -272,8 +272,13 @@ impl NativeV2CodexAdapter {
         };
         let redactions = provider_redactions(&invocation.environment, &self.local_environment);
         let prompt = invocation.agent_instructions().and_then(|instructions| {
-            render_agent_prompt(instructions, &invocation.node.input, &invocation.response)
-                .map_err(|error| with_driver_detail(error, "Codex prompt could not be serialized"))
+            render_agent_prompt_with_budget(
+                instructions,
+                &invocation.node.input,
+                &invocation.response,
+                invocation.declared_max_output_tokens(),
+            )
+            .map_err(|error| with_driver_detail(error, "Codex prompt could not be serialized"))
         })?;
         let mut state = CodexRunState::new(prompt, redactions);
         loop {

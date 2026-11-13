@@ -41,7 +41,8 @@ use output::{DurableEventSender, durable_event_channel, durable_output_event};
 pub use response::{render_agent_prompt, NodeResponseContract};
 pub(crate) use response::ProviderSchemaDialect;
 pub(crate) use response::{
-    AgentResponse, AgentResponseState, render_agent_prompt_with_schema, resolve_agent_response,
+    AgentPromptRequest, AgentResponse, AgentResponseState, render_agent_prompt_with_budget,
+    render_agent_prompt_with_schema_and_budget, resolve_agent_response,
     resolve_agent_response_with_dialect, resolve_agent_response_with_schema,
 };
 pub(crate) use remote::{RemoteActivity, RemoteNodeHandleBridge, remote_node_handle};
@@ -189,6 +190,15 @@ pub struct DriverInvocation {
 }
 
 impl DriverInvocation {
+    pub(crate) fn declared_max_output_tokens(&self) -> Option<u32> {
+        match &self.node.binding {
+            NodeRuntimeBinding::Agent { max_tokens, .. } => *max_tokens,
+            NodeRuntimeBinding::GitDelivery { .. } | NodeRuntimeBinding::CommentDelivery { .. } => {
+                None
+            }
+        }
+    }
+
     pub(crate) fn agent_instructions(&self) -> Result<&NodeInstructions, NodeRunnerError> {
         if !matches!(&self.node.binding, NodeRuntimeBinding::Agent { .. }) {
             return Err(NodeRunnerError::InvalidRole);

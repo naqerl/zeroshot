@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use openengine_cluster_protocol::WorkerOutcome;
+use openengine_cluster_protocol::{EnumLabel, FieldName, NonEmptyEnumSet, WorkerOutcome};
 use openengine_cluster_testkit::assertions::AssertValue;
 
 use super::*;
@@ -125,6 +125,72 @@ async fn a_scripted_turn_completes_from_its_final_assistant_message() {
     assert!(outcome.is_ok(), "{outcome:?}");
     assert!(
         seen.iter().any(|output| output.text.contains("working")),
+        "{seen:?}"
+    );
+}
+
+const TRUNCATED_TURN: &str = r#"{"type":"message_end","message":{"role":"assistant","stopReason":"length","content":[{"type":"text","text":"{\"response\":{\"verdict\":\"rej"}]}}"#;
+
+#[tokio::test]
+async fn a_length_stop_reason_settles_as_a_truncated_verifier_signal() {
+    let directory = TestDirectory::new("pi-scripted-truncated");
+    let adapter = scripted_adapter(&directory, &script(&[TRUNCATED_TURN]));
+    let mut turn = scripted_invocation();
+    turn.role = NodeRole::Verifier;
+    turn.response = NodeResponseContract::Verifier {
+        output: PayloadType::Null,
+        signals: BTreeMap::from([
+            (
+                FieldName::new("verdict").assert_value(),
+                NonEmptyEnumSet::new(vec![
+                    EnumLabel::new("accepted").assert_value(),
+                    EnumLabel::new("rejected").assert_value(),
+                ])
+                .assert_value(),
+            ),
+            (
+                FieldName::new("truncated").assert_value(),
+                NonEmptyEnumSet::new(vec![
+                    EnumLabel::new("true").assert_value(),
+                    EnumLabel::new("false").assert_value(),
+                ])
+                .assert_value(),
+            ),
+        ]),
+        diagnostic: serde_json::from_value(serde_json::json!({
+            "kind": "record",
+            "fields": {
+                "message": { "type": { "kind": "string" }, "required": true },
+                "findings": {
+                    "type": {
+                        "kind": "array",
+                        "items": {
+                            "kind": "record",
+                            "fields": {
+                                "summary": { "type": { "kind": "string" }, "required": true }
+                            }
+                        }
+                    },
+                    "required": false
+                }
+            }
+        }))
+        .assert_value(),
+    };
+    let (outcome, seen) = run_invocation(&adapter, turn, false).await;
+    let WorkerOutcome::Verifier { signals, .. } = outcome.assert_value() else {
+        panic!("a truncated review must settle as a verifier outcome");
+    };
+    assert_eq!(
+        signals
+            .get(&FieldName::new("truncated").assert_value())
+            .assert_value()
+            .as_str(),
+        "true"
+    );
+    assert!(
+        seen.iter()
+            .any(|output| output.text.contains("output limit") && output.text.contains("bytes")),
         "{seen:?}"
     );
 }

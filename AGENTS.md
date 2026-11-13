@@ -144,7 +144,9 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   incompatible harness/provider pairs. A caller may declare optional bounded `contextWindow` and
   `maxTokens` on an agent binding; they are declarations rather than catalog knowledge, are written
   only to the Pi gateway model entry when supplied, and stay absent so the provider keeps its own
-  defaults otherwise. Never infer either value from the model identifier.
+  defaults otherwise. A bounded review verdict adds a runtime-derived output limit sized from its
+  own shape; a caller-declared limit can only lower it, and no value is inferred from the model
+  identifier.
 - Full-v1 loops may declare `maxIterationsInput` as an integer path in the initial input.
   Reusable profiles verify the authored default `maxIterations`; native-v2 run admission binds a
   present positive safe integer from caller input and re-verifies the concrete graph. An absent
@@ -381,8 +383,11 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   name the wire protocol (`openai-responses`, `openai-completions`, or `anthropic-messages`) and
   reach any endpoint Pi implements without probing it. The registered model entry carries the
   caller's identifier, the chosen protocol, and a `reasoning` flag mirroring the binding's authored
-  effort. It carries `contextWindow` and `maxTokens` only when the caller declared them, so omitted
-  limits and cost stay Pi-owned defaults. The same file is Pi's only
+  effort. It carries `contextWindow` and `maxTokens` only when the caller declared them or the node
+  is a bounded review verifier whose runtime-derived limit applies, so other omitted limits and cost
+  stay Pi-owned defaults. A native-local lane reuses the user's model document instead of a
+  synthesized one, so its bounded-review limit is prompt guidance rather than a provider setting.
+  The same file is Pi's only
   caller-owned-endpoint mechanism, which is why it also backs a declared or ambient
   `ANTHROPIC_BASE_URL` on the `anthropic` lane and `OPENAI_BASE_URL`/`OPENAI_API_BASE` on the
   `openai` lane: those overrides retarget the endpoint and keep each built-in provider's own
@@ -658,8 +663,18 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   reviewers; exact runtime plans and explicit session scopes remain caller-owned. Saved graphs are
   unchanged. A rejected verdict still continues through repair; an unreadable reviewer output fails
   as `review_output_invalid` and a reviewer refusal as `review_refused`, keeping both distinct from a
-  crash and from a genuine rejection. The final rejected round fails without starting an
-  unreviewable extra repair, and the failed run retains its workspace for recovery.
+  crash and from a genuine rejection. Reviewer verdicts carry at most eight findings, each with a
+  400-character summary and an optional short `file:line`, plus a capped message that keeps all
+  actionable feedback; finding summaries are merged into that message so repair cannot lose them.
+  The runner adds those caps to the provider schema, states the effective output budget in the
+  prompt, and rejects an oversized field with a correction that names it. The `truncated` signal is
+  optional for ordinary verdicts. A bounded review verifier's provider `length` stop reason becomes
+  `truncated: true` and fails the run as `review_output_truncated`, logging the received bytes and
+  the limit actually applied instead of retrying the same request. Other Pi nodes keep their previous
+  partial-answer behavior. Only the Pi transcript currently exposes that typed
+  `length` stop reason; Claude and Codex truncation remains their ordinary provider failure until
+  those transcripts carry an equivalent finish reason. The final rejected round fails without
+  starting an unreviewable extra repair, and the failed run retains its workspace for recovery.
 - Delivery-enabled software-change templates make the acceptance verifier the sole author of the
   current change title and description after every review pass. Reviewer output stays small: the
   title is structural output and the prospective description plus actionable findings travel through

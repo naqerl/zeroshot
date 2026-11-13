@@ -16,9 +16,10 @@ use super::{
     static_value, BuiltinTemplateError, TemplateDelivery, ACCEPTANCE_FEEDBACK_FIELD,
     CHECKS_REPORTED_FIELD, CODE_FEEDBACK_FIELD, CONFIDENCE_FIELD, CONTINUE_ITEMS_FIELD,
     DELIVERY_FEEDBACK_FIELD, DESCRIPTION_FIELD, DIAGNOSTIC_MESSAGE_FIELD, FILES_FIELD,
-    HIGH_CONFIDENCE_LABEL, ISSUE_NUMBER_FIELD, LARGE_RADIUS_LABEL, LINES_FIELD,
-    LOW_CONFIDENCE_LABEL, PHASE_FIELD, RADIUS_FIELD, REASONS_FIELD, SMALL_RADIUS_LABEL, TASK_FIELD,
-    TITLE_FIELD, TOUCHES_FIELD, verdict_labels,
+    FINDINGS_FIELD, HIGH_CONFIDENCE_LABEL, ISSUE_NUMBER_FIELD, LARGE_RADIUS_LABEL, LINES_FIELD,
+    LOCATION_FIELD, LOW_CONFIDENCE_LABEL, PHASE_FIELD, RADIUS_FIELD, REASONS_FIELD,
+    SMALL_RADIUS_LABEL, SUMMARY_FIELD, TASK_FIELD, TITLE_FIELD, TOUCHES_FIELD, VERDICT_FIELD,
+    verdict_labels,
 };
 
 pub(super) fn graph(
@@ -87,6 +88,26 @@ pub(super) fn task_type() -> Result<PayloadType, BuiltinTemplateError> {
 
 pub(super) fn diagnostic_type() -> Result<PayloadType, BuiltinTemplateError> {
     record_type(vec![(DIAGNOSTIC_MESSAGE_FIELD, PayloadType::String, true)])
+}
+
+/// Review diagnostics keep the feedback message plus a bounded finding list. The runner enforces
+/// the caps and adds them to the provider schema; this type only declares the shape.
+pub(super) fn review_diagnostic_type() -> Result<PayloadType, BuiltinTemplateError> {
+    let finding = record_type(vec![
+        (SUMMARY_FIELD, PayloadType::String, true),
+        (LOCATION_FIELD, PayloadType::String, false),
+    ])?;
+    record_type(vec![
+        (DIAGNOSTIC_MESSAGE_FIELD, PayloadType::String, true),
+        (VERDICT_FIELD, PayloadType::String, false),
+        (
+            FINDINGS_FIELD,
+            PayloadType::Array {
+                items: Box::new(finding),
+            },
+            false,
+        ),
+    ])
 }
 
 pub(super) fn software_worker_input_type(
