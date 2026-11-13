@@ -814,8 +814,9 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   carried kind is `data.kind` (`hub.pool` records keep their lease-or-pool discriminator as
   `data.scope`). `summary` and the hub `cursor` live inside `data`, while run records retain their
   durable `v2:` cursor as `data.runCursor`. A null cursor means "from now": no events and a durable
-  head cursor, with bootstrap state only behind the explicit `snapshot: true` opt-in, and
-  occurrences carry no invented `replayed` field. Terminal events
+  head cursor, with bootstrap state only behind the explicit `snapshot: true` opt-in, and a supplied
+  cursor is never rewritten; an unavailable range is reported as truncated. Occurrences carry no
+  invented `replayed` field. Terminal events
   are ordinary events and heartbeats continue while idle; only unsubscribe, session end, or
   cancellation closes a stream. `events/poll` and `events/stream` both replay from the same hub
   log. `truncated` is false unless replay shortfall or backpressure permanently lost events, and

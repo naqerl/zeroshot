@@ -2023,31 +2023,19 @@ async fn hub_bootstrap_terminal_advances_the_cursor_and_carries_run_delivery_fac
 }
 
 #[tokio::test]
-async fn hub_resume_past_the_feed_head_is_clamped_and_keeps_delivering() {
-    let mut run_events = HashMap::new();
-    run_events.insert(
-        "run-clamp".to_owned(),
-        vec![
-            watch_event("run-clamp", "v2:1", running_status("worker")),
-            watch_event("run-clamp", "v2:2", finished_status()),
-        ],
-    );
+async fn hub_resume_past_the_feed_head_is_not_rewritten() {
     let host = HubLifecycleHost::new(
-        vec![vec![hub_lifecycle_job(
-            "hj_clamp",
-            "running",
-            Some("run-clamp"),
-        )]],
+        vec![Vec::new()],
         vec![hub_member("builder")],
-        run_events,
-    )
-    .with_watch_delay(Duration::from_millis(300));
+        HashMap::new(),
+    );
     let mut session = Session::spawn(host);
     initialize(&mut session).await;
 
     let fresh = session
         .request(2, "events/poll", json!({"name": "hub.event"}))
         .await;
+    assert_eq!(fresh["result"]["resultType"], json!("complete"));
     let stale = session
         .request(
             3,
@@ -2058,44 +2046,30 @@ async fn hub_resume_past_the_feed_head_is_clamped_and_keeps_delivering() {
             }),
         )
         .await;
-    assert_ne!(stale["result"]["cursor"], json!("hub:999999"));
-    assert_ne!(stale["result"]["truncated"], json!(false), "{stale}");
-    let mut cursor = stale["result"]["cursor"].clone();
-    assert_eq!(fresh["result"]["resultType"], json!("complete"));
-
-    let mut runs = Vec::new();
-    for id in 4..24 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let response = session
-            .request(
-                id,
-                "events/poll",
-                json!({
-                    "name": "hub.run",
-                    "arguments": {"runId": "run-clamp"},
-                    "cursor": cursor
-                }),
-            )
-            .await;
-        if let Some(events) = response["result"]["events"].as_array() {
-            runs.extend(
-                events
-                    .iter()
-                    .filter(|event| event["data"]["kind"] == json!("hub.run"))
-                    .cloned(),
-            );
-        }
-        cursor = response["result"]["cursor"].clone();
-        if runs.len() >= 2 {
-            break;
-        }
-    }
-    assert_eq!(runs.len(), 2, "{runs:?}");
+    // A cursor from a previous daemon incarnation is honoured, never moved behind the caller:
+    // moving it to the new head would replay the events this caller already consumed.
+    assert_eq!(stale["result"]["cursor"], json!("hub:999999"), "{stale}");
+    assert_eq!(stale["result"]["events"], json!([]), "{stale}");
+    let truncated = &stale["result"]["truncated"];
+    assert_eq!(truncated["to"], json!("hub:999999"), "{stale}");
     assert!(
-        runs.iter()
-            .any(|event| event["data"]["summary"]["phase"] == json!("finished")),
-        "{runs:?}"
+        truncated["from"]
+            .as_str()
+            .is_some_and(|cursor| cursor.starts_with("hub:")),
+        "{stale}"
     );
+
+    let repeat = session
+        .request(
+            4,
+            "events/poll",
+            json!({
+                "name": "hub.event",
+                "cursor": "hub:999999"
+            }),
+        )
+        .await;
+    assert_eq!(repeat["result"]["cursor"], json!("hub:999999"), "{repeat}");
 }
 
 #[tokio::test]
