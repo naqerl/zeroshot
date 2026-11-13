@@ -114,6 +114,55 @@ fn the_last_assistant_message_is_the_response_not_the_pre_tool_text() {
 }
 
 #[test]
+fn a_length_stop_reason_is_reported_as_truncation_with_bytes_and_limit() {
+    let partial = r#"{"response":{"output":null,"signals":{"verdict":"rejected""#;
+    let mut transcript = PiTranscript::new(Vec::new())
+        .with_max_output_tokens(Some(2_048))
+        .with_truncation_signal(true);
+    transcript.push(
+        json!({"type": "message_end", "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": partial}],
+            "stopReason": "length"
+        }})
+        .to_string()
+        .as_bytes(),
+    );
+    let super::PiAttempt::Failed(failure) = transcript.finish(None).unwrap() else {
+        panic!("a length stop reason must not settle as an answer");
+    };
+    assert!(failure.truncated);
+    assert!(!failure.retryable);
+    assert!(failure.diagnostic.contains("output limit"));
+    assert!(
+        failure
+            .diagnostic
+            .contains(&format!("{} bytes", partial.len())),
+        "{}",
+        failure.diagnostic
+    );
+    assert!(failure.diagnostic.contains("2048 tokens"));
+}
+
+#[test]
+fn a_length_stop_outside_a_bounded_review_keeps_the_partial_answer() {
+    let mut transcript = PiTranscript::new(Vec::new());
+    transcript.push(
+        json!({"type": "message_end", "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "partial worker answer"}],
+            "stopReason": "length"
+        }})
+        .to_string()
+        .as_bytes(),
+    );
+    let super::PiAttempt::Complete(result) = transcript.finish(None).unwrap() else {
+        panic!("a worker keeps the previous partial-answer behavior");
+    };
+    assert_eq!(result.message, "partial worker answer");
+}
+
+#[test]
 fn a_recovered_retry_settles_as_success() {
     // Pi auto-retries a failed model turn. A later successful message must clear the earlier
     // error, since the recovered answer is the authoritative result.

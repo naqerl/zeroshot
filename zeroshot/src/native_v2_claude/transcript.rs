@@ -176,6 +176,7 @@ impl ClaudeTranscript {
             return Ok(ClaudeAttempt::Failed(ClaudeFailure {
                 session_id: self.session_id,
                 retryable: self.retryable_failure_seen,
+                truncated: false,
                 diagnostic: combine_failure_detail(session_failure, process_failure),
             }));
         }
@@ -183,6 +184,7 @@ impl ClaudeTranscript {
             return Ok(ClaudeAttempt::Failed(ClaudeFailure {
                 session_id: self.session_id,
                 retryable: self.retryable_failure_seen,
+                truncated: false,
                 diagnostic: process_failure.trim().to_owned(),
             }));
         }
@@ -206,6 +208,7 @@ impl ClaudeTranscript {
         ClaudeAttempt::Failed(ClaudeFailure {
             session_id: self.session_id,
             retryable: self.retryable_failure_seen,
+            truncated: false,
             diagnostic: combine_failure_detail(&diagnostic, process_failure),
         })
     }

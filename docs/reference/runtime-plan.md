@@ -71,9 +71,10 @@ need a connection.
 wire protocol as `openai-responses`, `openai-completions`, or `anthropic-messages`, so one lane
 reaches any endpoint Pi implements and the model identifier stays opaque and caller-owned. Zeroshot
 never infers the protocol from the identifier, and an unrecognized value fails before launch. The
-synthesized model entry carries a node's `contextWindow` and `maxTokens` only when the caller
-declared them; omitted limits keep Pi's own defaults. The built-in-provider endpoint overrides keep
-Pi's catalog and receive no synthesized model entry.
+synthesized model entry carries a node's `contextWindow` and `maxTokens` when the caller declared
+them. A bounded review verifier also receives a runtime-derived `maxTokens` sized from its verdict
+shape; a caller-declared value can only lower it. Other omitted limits keep Pi's own defaults. The
+built-in-provider endpoint overrides keep Pi's catalog and receive no synthesized model entry.
 
 To send the `anthropic` lane to a caller-owned Messages-compatible endpoint, declare
 `ANTHROPIC_BASE_URL` with any one of the lane's credentials (`ANTHROPIC_API_KEY`,
@@ -108,9 +109,13 @@ kind are rejected.
 
 Zeroshot passes `model` and `effort` to the harness unchanged. It keeps no model catalog and does not
 check whether a model supports the chosen effort. `contextWindow` and `maxTokens` are caller
-declarations, never inferences: they are validated at admission, emitted only into the
-`pi/gateway` model entry, and otherwise left unset for the provider to default. An absent value
-retains the provider's own limit; a present value must be a positive integer in the stated range.
+declarations, never inferences from the model identifier: they are validated at admission, emitted
+only into the `pi/gateway` model entry, and otherwise left unset for the provider to default. A
+bounded review verifier adds its own runtime-derived `maxTokens` to that entry, or lowers a caller
+declared value, because the verdict shape has a known size. A native-local `pi` lane reuses the
+user's model document instead of a synthesized one, so the derived limit is stated in its prompt but
+not written to the provider. An absent caller value retains the provider's own limit; a present
+value must be a positive integer in the stated range.
 
 `sessionScope` controls provider conversation state. It does not change graph state or bindings.
 
@@ -322,7 +327,7 @@ the fields of several providers.
 
 `contextWindow` and `maxTokens` are available in both an exact `agent` binding and a uniform
 runtime configuration. They are caller declarations and are never inferred from the model
-identifier.
+identifier; a bounded review verifier separately derives the output limit for its own verdict shape.
 
 Every executable node gets an `agent` binding with these values, except nodes that use a delivery
 worker. Those get a `git_delivery` binding as described below.

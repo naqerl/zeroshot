@@ -224,6 +224,37 @@ pub(super) fn settled_review(
     )
 }
 
+pub(super) fn settled_truncated_review(
+    execution: u64,
+    node: &str,
+    output: serde_json::Value,
+) -> DurableExecution {
+    settled_execution(
+        SettledExecutionSpec {
+            execution,
+            node_instance: execution,
+            node,
+            settled_at: execution,
+            input: json!({"task":"repair checkout","deliveryFeedback":""}),
+        },
+        WorkerOutcome::Verifier {
+            output,
+            signals: BTreeMap::from([
+                (
+                    FieldName::new(VERDICT_FIELD).assert_value(),
+                    EnumLabel::new(REJECTED_LABEL).assert_value(),
+                ),
+                (
+                    FieldName::new(TRUNCATED_FIELD).assert_value(),
+                    EnumLabel::new(TRUE_LABEL).assert_value(),
+                ),
+            ]),
+            diagnostic: json!({DIAGNOSTIC_MESSAGE_FIELD:"provider output truncated"}),
+            artifacts: Vec::new(),
+        },
+    )
+}
+
 pub(super) fn settled_review_execution(
     spec: SettledExecutionSpec<'_>,
     verdict: &str,

@@ -40,6 +40,8 @@ pub(crate) struct ProviderResult {
 pub(crate) struct ProviderTurnFailure {
     pub(crate) session_id: Option<String>,
     pub(crate) retryable: bool,
+    /// The provider stopped at its output limit before a complete answer was produced.
+    pub(crate) truncated: bool,
     pub(crate) diagnostic: String,
 }
 
@@ -53,6 +55,7 @@ impl ProviderAttempt {
         Self::Failed(ProviderTurnFailure {
             session_id: None,
             retryable: false,
+            truncated: false,
             diagnostic: diagnostic.into(),
         })
     }

@@ -743,6 +743,26 @@ async fn malformed_reviewer_output_names_the_envelope_instead_of_review_failed()
 }
 
 #[tokio::test]
+async fn truncated_reviewer_output_keeps_its_branch_and_names_truncation() {
+    let (verified, initial_input) = verified_software_template(TemplateDelivery::PullRequest).await;
+    let history = [
+        settled_worker(),
+        settled_truncated_review(2, "acceptance", json!({"title":"fix: truncated"})),
+        settled_review(3, "code", ACCEPTED_LABEL, "implementation sound"),
+    ];
+
+    let projection = reduce(&verified, &initial_input, &history);
+    assert_eq!(
+        projection.terminal,
+        Some(TerminalProjection::Failed {
+            context: None,
+            reason: "review_output_truncated".parse().assert_value()
+        })
+    );
+    assert_no_dispatch_node(&projection, "deliver");
+}
+
+#[tokio::test]
 async fn refused_reviewer_output_keeps_its_own_failure_reason() {
     let (verified, initial_input) = verified_software_template(TemplateDelivery::None).await;
     let history = [

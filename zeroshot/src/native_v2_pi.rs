@@ -32,8 +32,8 @@ use crate::native_v2_capsule::provider_process::{
 use crate::native_v2_contract::{NodeRuntimeBinding, PiProvider};
 use crate::native_v2_runner::{
     AgentResponse, DriverControl, DriverInvocation, LiveOutput, LiveOutputStream, NodeRunnerError,
-    ProviderSchemaDialect, ResolvedEnvironment, render_agent_prompt_with_schema,
-    resolve_agent_response_with_schema,
+    AgentPromptRequest, ProviderSchemaDialect, ResolvedEnvironment,
+    render_agent_prompt_with_schema_and_budget, resolve_agent_response_with_schema,
 };
 use command::{PiCommandRequest, command};
 use provider_document::{
@@ -75,12 +75,13 @@ fn prompt(
     dialect: ProviderSchemaDialect,
     invocation: &DriverInvocation,
 ) -> Result<String, NodeRunnerError> {
-    render_agent_prompt_with_schema(
-        invocation.agent_instructions()?,
-        &invocation.node.input,
-        &invocation.response,
+    render_agent_prompt_with_schema_and_budget(AgentPromptRequest {
+        instructions: invocation.agent_instructions()?,
+        input: &invocation.node.input,
+        response: &invocation.response,
         dialect,
-    )
+        max_output_tokens: binding_max_tokens(invocation)?,
+    })
     .map_err(|error| with_driver_detail(error, "Pi prompt could not be serialized"))
 }
 
@@ -278,7 +279,7 @@ impl PiAdapter {
                 model.as_str(),
                 effort.is_some(),
                 *context_window,
-                *max_tokens,
+                invocation.response.effective_max_output_tokens(*max_tokens),
             ),
             _ => {
                 return Err(NodeRunnerError::DriverDetail(
@@ -377,6 +378,34 @@ impl PiAdapter {
     }
 }
 
+/// The output limit this lane actually writes into Pi's provider document. A native-local lane
+/// and the lanes without a synthesized model entry keep an unknown limit instead of reporting a
+/// bound the provider never received.
+fn applied_max_output_tokens(
+    provider: PiProvider,
+    invocation: &DriverInvocation,
+) -> Result<Option<u32>, NodeRunnerError> {
+    let limit = invocation
+        .response
+        .effective_max_output_tokens(binding_max_tokens(invocation)?);
+    Ok(match provider {
+        PiProvider::Gateway => limit,
+        PiProvider::Anthropic
+        | PiProvider::OpenAi
+        | PiProvider::OpenRouter
+        | PiProvider::Bedrock => None,
+    })
+}
+
+fn binding_max_tokens(invocation: &DriverInvocation) -> Result<Option<u32>, NodeRunnerError> {
+    match &invocation.node.binding {
+        NodeRuntimeBinding::Agent { max_tokens, .. } => Ok(*max_tokens),
+        _ => Err(NodeRunnerError::DriverDetail(
+            "Pi command requires an agent runtime binding".to_owned(),
+        )),
+    }
+}
+
 fn is_pi_credential(name: &str) -> bool {
     matches!(
         name,
@@ -423,6 +452,11 @@ impl PiAdapter {
             PiAttempt::Failed(failure) => {
                 observe_session(failure.session_id.as_deref(), &expected)
                     .map_err(|detail| NodeRunnerError::DriverDetail(detail.to_owned()))?;
+                if failure.truncated {
+                    return Ok(PiTurnAdvance::Truncated {
+                        diagnostic: failure.diagnostic,
+                    });
+                }
                 Ok(PiTurnAdvance::ProviderFailure {
                     retryable: failure.retryable,
                     diagnostic: failure.diagnostic,
@@ -458,7 +492,9 @@ impl PiAdapter {
                 .entry(name)
                 .or_insert_with(|| value.clone());
         }
-        let transcript = PiTranscript::new(self.redactions(&turn.invocation.environment));
+        let transcript = PiTranscript::new(self.redactions(&turn.invocation.environment))
+            .with_max_output_tokens(applied_max_output_tokens(self.provider, turn.invocation)?)
+            .with_truncation_signal(turn.invocation.response.is_bounded_review());
         let mut process = match turn_process::open(files, command, turn.control).await? {
             PiProcessStart::Ready(process) => process,
             PiProcessStart::Failed(attempt) => return Ok(attempt),

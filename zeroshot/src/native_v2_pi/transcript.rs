@@ -29,6 +29,7 @@ pub(super) use crate::native_v2_capsule::provider_process::{
 enum Terminal {
     Complete(String),
     Failed(String),
+    Truncated { bytes: usize, limit: Option<u32> },
 }
 
 pub(crate) struct PiTranscript {
@@ -46,6 +47,10 @@ pub(crate) struct PiTranscript {
     usage_invalid: bool,
     output: ProviderText,
     tool_activity: ActivityTracker,
+    /// Output limit applied to this turn, when the caller or the review bound supplied one.
+    max_output_tokens: Option<u32>,
+    /// True only for bounded review verifiers, whose `length` stop reason has its own graph signal.
+    truncation_signal: bool,
 }
 
 impl PiTranscript {
@@ -59,7 +64,19 @@ impl PiTranscript {
             usage_invalid: false,
             output: ProviderText::new(&redactions),
             tool_activity: ActivityTracker::default(),
+            max_output_tokens: None,
+            truncation_signal: false,
         }
+    }
+
+    pub(super) fn with_max_output_tokens(mut self, limit: Option<u32>) -> Self {
+        self.max_output_tokens = limit;
+        self
+    }
+
+    pub(super) fn with_truncation_signal(mut self, enabled: bool) -> Self {
+        self.truncation_signal = enabled;
+        self
     }
 }
 
@@ -140,6 +157,22 @@ impl ProviderTranscript for PiTranscript {
                     retryable: !process_failure.is_some_and(|failure| {
                         failure.kind == ProviderProcessFailureKind::IncompleteInput
                     }),
+                    truncated: false,
+                    diagnostic: self.safe(&detail),
+                }))
+            }
+            Some(Terminal::Truncated { bytes, limit }) => {
+                let limit = limit.map_or_else(
+                    || "an unknown output limit".to_owned(),
+                    |limit| format!("{limit} tokens"),
+                );
+                let detail = format!(
+                    "Pi stopped at its output limit after receiving {bytes} bytes ({limit})"
+                );
+                Ok(PiAttempt::Failed(PiFailure {
+                    session_id,
+                    retryable: false,
+                    truncated: true,
                     diagnostic: self.safe(&detail),
                 }))
             }
@@ -149,6 +182,7 @@ impl ProviderTranscript for PiTranscript {
                     return Ok(PiAttempt::Failed(PiFailure {
                         session_id,
                         retryable: false,
+                        truncated: false,
                         diagnostic: self.safe(&detail.detail),
                     }));
                 }
@@ -160,6 +194,7 @@ impl ProviderTranscript for PiTranscript {
             None => Ok(PiAttempt::Failed(PiFailure {
                 session_id,
                 retryable: false,
+                truncated: false,
                 diagnostic: self.safe(
                     process_failure.map_or("Pi ended without a settled answer", |failure| {
                         failure.detail.as_str()
@@ -290,6 +325,15 @@ impl PiTranscript {
             // A tool-use step is narration, never the node's answer: Pi emits one assistant
             // message per tool call, so the answer is whatever follows the last tool result.
             Some("toolUse") => {}
+            // A bounded review verdict cannot be repaired from partial JSON. Other nodes keep the
+            // previous behavior: the partial text is the answer and the contract decides whether
+            // it needs a correction turn.
+            Some("length") if self.truncation_signal => {
+                self.terminal = Some(Terminal::Truncated {
+                    bytes: text.as_ref().map_or(0, String::len),
+                    limit: self.max_output_tokens,
+                });
+            }
             // The last assistant message is authoritative, including when it carries no text. An
             // empty answer is reported as such for the contract to reject, never replaced by an
             // earlier message's text.

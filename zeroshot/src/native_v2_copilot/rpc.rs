@@ -15,7 +15,7 @@ use crate::native_v2_capsule::provider_process::{
 };
 use crate::native_v2_runner::{
     AgentResponseState, DriverControl, DriverInvocation, NodeRunnerError, ProviderSchemaDialect,
-    render_agent_prompt, resolve_agent_response_with_dialect,
+    render_agent_prompt_with_budget, resolve_agent_response_with_dialect,
 };
 use super::{auth, command, events, framing::Frames, provider, session::CopilotSession};
 
@@ -231,10 +231,11 @@ impl<'a> CopilotRpc<'a> {
     }
 
     async fn run_response(&mut self) -> Result<WorkerOutcome, NodeRunnerError> {
-        let prompt = render_agent_prompt(
+        let prompt = render_agent_prompt_with_budget(
             self.invocation.agent_instructions()?,
             &self.invocation.node.input,
             &self.invocation.response,
+            self.invocation.declared_max_output_tokens(),
         )?;
         let mut response = AgentResponseState::new(prompt);
         loop {
