@@ -1365,17 +1365,24 @@ impl HubService {
             self.recover_active_leases().await?;
         }
         let result = match self.pass_phases().await {
-            Ok((report, mut view)) => match self.pool_pass().await {
-                Ok(mut pools) => {
-                    pools.absorb(restored);
-                    self.metrics.record_pool_pass(&pools);
-                    if pools != PoolReport::default() {
-                        view["pools"] = pools.view();
-                    }
-                    Ok((report, view))
+            Ok((report, mut view)) => {
+                // A terminal trial's bundle must exist before pool cleanup can discard its
+                // workspace, so settle evals-v2 work before the pool pass archives/deletes.
+                match self.evals_reconcile().await {
+                    Ok(()) => match self.pool_pass().await {
+                        Ok(mut pools) => {
+                            pools.absorb(restored);
+                            self.metrics.record_pool_pass(&pools);
+                            if pools != PoolReport::default() {
+                                view["pools"] = pools.view();
+                            }
+                            Ok((report, view))
+                        }
+                        Err(error) => Err(error),
+                    },
+                    Err(error) => Err(error),
                 }
-                Err(error) => Err(error),
-            },
+            }
             Err(error) => Err(error),
         };
         self.metrics

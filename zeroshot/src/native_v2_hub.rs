@@ -31,6 +31,7 @@ mod delivery;
 mod driver;
 mod error;
 mod eval;
+pub(crate) mod evals;
 mod health;
 mod hetzner;
 mod install;

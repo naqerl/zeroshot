@@ -33,6 +33,8 @@ mod driver;
 mod eval;
 #[path = "tests/eval_flows.rs"]
 mod eval_flows;
+#[path = "tests/evals.rs"]
+mod evals;
 #[path = "tests/flows.rs"]
 mod flows;
 #[path = "tests/mcp.rs"]

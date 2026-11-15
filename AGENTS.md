@@ -1098,6 +1098,20 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   instead of failing the candidate. Reports are pure (`eval/report.rs`); `--fail-on-regression`
   exits 6 on a regression and 3 while incomplete. Judge and report schemas are documented in
   `docs/guides/hub-operations.md`; keep them in sync.
+- Evals-v2 (`native_v2_hub/evals/`) is a separate subsystem stored in `HubState.evals_v2`; it
+  never imports the old `eval` module except through the shared judge host-command boundary.
+  Tasks (`ev-`), arms (`ea-`), runs (`er-`), and trials (`et-`) are deterministic hashes over
+  their canonical requests. A trial is an ordinary queued hub job, so placement, quota, stalls,
+  and cleanup stay owned by the existing dispatcher. Before pool cleanup can discard a terminal
+  trial's workspace, `HubService::pass` reconciles evals-v2 and writes
+  `hub/evals/<run>/<task>/<arm>/<trial>/bundle.json` with the diff, acceptance checks, usage,
+  timing, and retained log paths; a terminal trial without its bundle is reported `failed` /
+  `bundle_missing`, and a written bundle is never recreated by a read or after deletion. A
+  successful job with no capturable diff is `failed` / `diff_unavailable`. `harnessPatch` is
+  materialized as a runtime plan when it is a uniform runtime or full node plan, `modelIds` set
+  its models, and `nodeBudgets` set authored graph node deadlines when `graphRef` names graph
+  JSON; otherwise those arm fields remain trial input and job attribution for a later slice.
+  The old `hub eval` state and routes are unchanged.
 - Read-only safe commands include `zeroshot list`, `zeroshot status`, `zeroshot report`,
   `zeroshot logs`, `zeroshot hub list`, `zeroshot hub ps`, `zeroshot hub stats`,
   `zeroshot hub daemon status`, `zeroshot hub eval report|status|list`, and

@@ -8,6 +8,7 @@ use zeroshot_engine::native_v2_cli::hub::{HubMemberState, HubStrategy};
 use super::capacity::Machine;
 use super::clock::rfc3339;
 use super::eval::EvalState;
+use super::evals::EvalsState;
 use super::health::DataHealth;
 use super::pool::{Lease, POOL_EVENT_LIMIT, Pool, PoolEventRecord};
 use super::profile::Spec;
@@ -16,8 +17,9 @@ use super::usage::JobUsage;
 /// Reserved member name for the local controller.
 pub(crate) const LOCAL_MEMBER: &str = "local";
 /// Version of `state.json` this hub writes. Version 2 added pools, leases and job archives;
-/// [`super::store`] upgrades version 1 files on load and refuses newer ones.
-pub(crate) const STATE_VERSION: u32 = 2;
+/// version 3 added evals-v2 tasks, arms, runs and trials. [`super::store`] upgrades older files
+/// on load and refuses newer ones.
+pub(crate) const STATE_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -31,6 +33,9 @@ pub(crate) struct HubState {
     pub schedules: Vec<Schedule>,
     #[serde(default, skip_serializing_if = "EvalState::is_empty")]
     pub evals: EvalState,
+    /// Tasks, arms, runs, and trials of the evals-v2 subsystem; separate from `evals`.
+    #[serde(default, skip_serializing_if = "EvalsState::is_empty")]
+    pub evals_v2: EvalsState,
     /// Random ID labelling every cloud resource this hub creates; set with the first pool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hub_id: Option<String>,
@@ -58,6 +63,7 @@ impl Default for HubState {
             jobs: Vec::new(),
             schedules: Vec::new(),
             evals: EvalState::default(),
+            evals_v2: EvalsState::default(),
             hub_id: None,
             pools: Vec::new(),
             leases: Vec::new(),
