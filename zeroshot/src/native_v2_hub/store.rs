@@ -127,9 +127,9 @@ pub(crate) enum Migration {
 /// Parse `state.json` of any supported version and upgrade it to [`STATE_VERSION`]. Version 1
 /// lacks pools, leases and job archives, which all default to empty, so its upgrade only bumps
 /// the version; strict field checking still applies to the result. Version 2 lacks the evals-v2
-/// state, whose field defaults to empty. Earlier version 2 files may carry removed pool data
-/// settings, lease TTL/expiry values, and lease Volume IDs, which are dropped here so they load
-/// and disappear on the next save.
+/// state, whose field defaults to empty. Version 3 lacks evals-v2 regrades, which also default to
+/// empty. Earlier version 2 files may carry removed pool data settings, lease TTL/expiry values,
+/// and lease Volume IDs, which are dropped here so they load and disappear on the next save.
 pub(crate) fn migrate(bytes: &[u8]) -> Result<HubState, Migration> {
     let mut document: serde_json::Value =
         serde_json::from_slice(bytes).map_err(Migration::Malformed)?;

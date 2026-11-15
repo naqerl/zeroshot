@@ -11,7 +11,7 @@ use super::super::evals::Trial;
 use super::super::evals::bundle::{self, Bundle};
 use super::super::evals::report::{EvalsReportRequest, LossParams};
 use super::super::evals::task::{BaselineMetrics, Cost};
-use super::super::evals::{CreateArm, CreateEvalRun, CreateTask};
+use super::super::evals::{CreateArm, CreateEvalRun, CreateRegrade, CreateTask};
 use super::super::evals::{canonical, sha256_hex, short_hash, trial_id, trial_job_id};
 use super::super::service::HubService;
 use super::super::store::{HubStore, migrate};
@@ -1060,4 +1060,235 @@ async fn a_loss_parameter_outside_zero_to_two_is_a_usage_error_naming_the_field(
             "{field} must be named: {error}"
         );
     }
+}
+
+// --- slice 3: append-only human regrades ---
+
+fn regrade(quality: f64, reviewer: &str) -> CreateRegrade {
+    CreateRegrade {
+        quality,
+        reviewer: reviewer.to_owned(),
+        note: None,
+    }
+}
+
+#[tokio::test]
+async fn a_regrade_is_appended_without_rewriting_the_bundle_and_is_readable_newest_last() {
+    let fixture = fixture(
+        2,
+        &[
+            ("baseline", "graph-baseline.json"),
+            ("candidate", "graph-candidate.json"),
+        ],
+    )
+    .await;
+    fixture.measure("baseline", Measured::graded(0.5, 0.25, 1_000));
+    fixture.measure("candidate", Measured::graded(0.2, 0.25, 1_000));
+    let trial = fixture.trials[0].clone();
+    let path = bundle::path(&fixture.hub, &trial);
+    let before = std::fs::read(&path).expect("bundle before");
+
+    let first = fixture
+        .service
+        .evals_trial_regrade(&trial.trial_id, regrade(0.4, "reviewer-a"))
+        .await
+        .expect("first regrade");
+    let second = fixture
+        .service
+        .evals_trial_regrade(
+            &trial.trial_id,
+            CreateRegrade {
+                quality: 0.9,
+                reviewer: "reviewer-b".to_owned(),
+                note: Some("read the actual diff".to_owned()),
+            },
+        )
+        .await
+        .expect("second regrade");
+    assert_ne!(first["regradeId"], second["regradeId"]);
+    assert_eq!(
+        std::fs::read(&path).expect("bundle after"),
+        before,
+        "regrading must not rewrite the measured bundle"
+    );
+
+    let document = fixture
+        .service
+        .evals_trial(&trial.trial_id)
+        .await
+        .expect("trial");
+    assert_eq!(document["trial"]["trialId"], json!(trial.trial_id));
+    assert_eq!(document["bundle"]["trialId"], json!(trial.trial_id));
+    let regrades = document["regrades"].as_array().expect("regrades");
+    assert_eq!(regrades.len(), 2);
+    assert_eq!(regrades[0]["regradeId"], first["regradeId"]);
+    assert_eq!(regrades[1]["regradeId"], second["regradeId"]);
+    assert_eq!(regrades[1]["quality"], json!(0.9));
+    assert_eq!(regrades[1]["reviewer"], json!("reviewer-b"));
+    assert_eq!(regrades[1]["note"], json!("read the actual diff"));
+    assert_eq!(
+        fixture.service.snapshot().await.evals_v2.regrades.len(),
+        2,
+        "history is a list, not an overwritten value"
+    );
+}
+
+#[tokio::test]
+async fn a_regrade_cannot_fabricate_a_trial_or_accept_an_invalid_quality_or_reviewer() {
+    let fixture = fixture(1, &[("baseline", "graph-baseline.json")]).await;
+    let trial = fixture.trials[0].clone();
+
+    let missing = fixture
+        .service
+        .evals_trial_regrade("et-ffffffffffff", regrade(0.5, "reviewer"))
+        .await
+        .expect_err("unknown trial");
+    assert!(matches!(missing, HubError::EvalNotFound(_)), "{missing:?}");
+    assert_eq!(missing.http_status(), 404);
+
+    for request in [regrade(1.1, "reviewer"), regrade(-0.1, "reviewer")] {
+        let error = fixture
+            .service
+            .evals_trial_regrade(&trial.trial_id, request)
+            .await
+            .expect_err("invalid quality");
+        assert!(matches!(error, HubError::Usage(_)), "{error:?}");
+        assert_eq!(error.http_status(), 400);
+    }
+    for reviewer in ["", "   "] {
+        let error = fixture
+            .service
+            .evals_trial_regrade(&trial.trial_id, regrade(0.5, reviewer))
+            .await
+            .expect_err("empty reviewer");
+        assert!(matches!(error, HubError::Usage(_)), "{error:?}");
+        assert_eq!(error.http_status(), 400);
+    }
+    assert!(
+        fixture
+            .service
+            .snapshot()
+            .await
+            .evals_v2
+            .regrades
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn the_latest_regrade_wins_in_reports_and_every_trial_entry_names_its_source() {
+    let fixture = fixture(
+        2,
+        &[
+            ("baseline", "graph-baseline.json"),
+            ("candidate", "graph-candidate.json"),
+        ],
+    )
+    .await;
+    fixture.measure("baseline", Measured::graded(0.5, 0.25, 1_000));
+    fixture.measure("candidate", Measured::graded(0.2, 0.25, 1_000));
+    let candidate = fixture.arm_id("candidate");
+    let candidate_trials = fixture
+        .trials
+        .iter()
+        .filter(|trial| trial.arm_id == candidate)
+        .cloned()
+        .collect::<Vec<_>>();
+    // The first regrade of the first trial loses to the second one.
+    fixture
+        .service
+        .evals_trial_regrade(&candidate_trials[0].trial_id, regrade(0.1, "first"))
+        .await
+        .expect("old regrade");
+    fixture
+        .service
+        .evals_trial_regrade(&candidate_trials[0].trial_id, regrade(1.0, "second"))
+        .await
+        .expect("latest regrade");
+    fixture
+        .service
+        .evals_trial_regrade(&candidate_trials[1].trial_id, regrade(0.8, "third"))
+        .await
+        .expect("other regrade");
+
+    let report = fixture.report(0.5, 0.5).await;
+    let arm = fixture.arm(&report, &candidate);
+    assert_eq!(
+        arm["quality"],
+        json!(0.9),
+        "the latest regrades set quality"
+    );
+    assert_eq!(report["summary"]["regradedTrials"], json!(2));
+
+    let entries = report["tasks"][0]["trials"].as_array().expect("trials");
+    for trial in &fixture.trials {
+        let entry = entries
+            .iter()
+            .find(|entry| entry["trialId"] == json!(trial.trial_id))
+            .expect("per-trial entry");
+        let expected = if trial.arm_id == candidate {
+            "human"
+        } else {
+            "auto"
+        };
+        assert_eq!(entry["qualitySource"], json!(expected));
+    }
+    let regraded = entries
+        .iter()
+        .find(|entry| entry["trialId"] == json!(candidate_trials[0].trial_id))
+        .expect("regraded entry");
+    assert_eq!(regraded["quality"], json!(1.0));
+    assert!(regraded["regradeId"].is_string());
+}
+
+#[tokio::test]
+async fn a_human_regrade_reports_a_missing_bundle_as_human_quality() {
+    let fixture = fixture(
+        2,
+        &[
+            ("baseline", "graph-baseline.json"),
+            ("candidate", "graph-candidate.json"),
+        ],
+    )
+    .await;
+    fixture.measure("baseline", Measured::graded(0.5, 0.25, 1_000));
+    fixture.measure("candidate", Measured::graded(0.2, 0.25, 1_000));
+    let candidate = fixture.arm_id("candidate");
+    let trial = fixture
+        .trials
+        .iter()
+        .find(|trial| trial.arm_id == candidate)
+        .cloned()
+        .expect("candidate trial");
+    std::fs::remove_file(bundle::path(&fixture.hub, &trial)).expect("remove bundle");
+    fixture
+        .service
+        .evals_trial_regrade(&trial.trial_id, regrade(0.7, "human"))
+        .await
+        .expect("regrade");
+
+    let report = fixture.report(0.5, 0.5).await;
+    let excluded = report["excluded"]
+        .as_array()
+        .expect("excluded")
+        .iter()
+        .find(|entry| entry["trialId"] == json!(trial.trial_id))
+        .expect("excluded trial");
+    assert_eq!(excluded["reason"], json!("missing_bundle"));
+    assert_eq!(excluded["qualitySource"], json!("human"));
+    assert_eq!(excluded["quality"], json!(0.7));
+    assert_eq!(report["summary"]["regradedTrials"], json!(1));
+}
+
+#[test]
+fn a_version_three_state_without_regrades_still_loads_and_empty_regrades_are_not_written() {
+    let state = migrate(
+        br#"{"version":3,"members":[],"jobs":[],"evalsV2":{"tasks":[],"arms":[],"runs":[],"trials":[]}}"#,
+    )
+    .expect("v3 loads");
+    assert_eq!(state.version, super::super::model::STATE_VERSION);
+    assert_eq!(state.version, 4);
+    assert!(state.evals_v2.regrades.is_empty());
+    let encoded = serde_json::to_value(&state).expect("encode");
+    assert!(encoded.get("evalsV2").is_none() || encoded["evalsV2"].get("regrades").is_none());
 }

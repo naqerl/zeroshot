@@ -14,6 +14,7 @@ use super::super::usage::JobUsage;
 use super::super::wire::JobFile;
 use super::arm::{Arm, CreateArm};
 use super::bundle::{self, Bundle};
+use super::regrade::{CreateRegrade, Regrade};
 use super::task::{CreateTask, EvalTask};
 use super::trial::{CreateEvalRun, EvalV2Run, Trial, TrialState};
 use super::{canonical, sha256_hex, short_hash, trial_id, trial_job_id};
@@ -673,6 +674,95 @@ impl HubService {
             .map(|trial| trial_view(trial, &state, self.store().directory()))
             .collect::<Vec<_>>();
         Ok(run_document(&run, trials))
+    }
+
+    /// One trial with its untouched bundle and every human regrade, newest last.
+    pub(crate) async fn evals_trial(&self, trial_id: &str) -> Result<Value, HubError> {
+        let state = self.snapshot().await;
+        let trial = state.evals_v2.trial(trial_id).cloned().ok_or_else(|| {
+            HubError::EvalNotFound(format!("evals trial {trial_id} does not exist"))
+        })?;
+        let bundle_path = trial
+            .bundle_path
+            .clone()
+            .unwrap_or_else(|| bundle::path(self.store().directory(), &trial));
+        let bundle = if bundle_path.is_file() {
+            let bytes = std::fs::read(&bundle_path).map_err(|error| {
+                HubError::storage(
+                    &format!("{} could not be read", bundle_path.display()),
+                    error,
+                )
+            })?;
+            serde_json::from_slice::<Value>(&bytes).map_err(|error| {
+                HubError::InvalidState(format!(
+                    "{} is not a trial bundle: {error}",
+                    bundle_path.display()
+                ))
+            })?
+        } else {
+            Value::Null
+        };
+        let regrades = state
+            .evals_v2
+            .regrades_for(trial_id)
+            .into_iter()
+            .map(Regrade::view)
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "schema": "zeroshot.hub.evals.trial/v1",
+            "trial": trial_view(&trial, &state, self.store().directory()),
+            "bundle": bundle,
+            "regrades": regrades,
+        }))
+    }
+
+    /// Append a human quality for one trial. The bundle stays exactly as measured.
+    pub(crate) async fn evals_trial_regrade(
+        &self,
+        trial_id: &str,
+        request: CreateRegrade,
+    ) -> Result<Value, HubError> {
+        if !request.quality.is_finite() || !(0.0..=1.0).contains(&request.quality) {
+            return Err(HubError::Usage(
+                "quality must be a number in 0.0..=1.0".to_owned(),
+            ));
+        }
+        if request.reviewer.trim().is_empty() {
+            return Err(HubError::Usage("reviewer must not be empty".to_owned()));
+        }
+        let created_at_ms = now_ms();
+        self.mutate(|state| {
+            if state.evals_v2.trial(trial_id).is_none() {
+                return Err(HubError::EvalNotFound(format!(
+                    "evals trial {trial_id} does not exist"
+                )));
+            }
+            let mut sequence = state.evals_v2.regrades.len() as u64 + 1;
+            let regrade_id = loop {
+                let candidate = format!("rg-{sequence:012x}");
+                if state
+                    .evals_v2
+                    .regrades
+                    .iter()
+                    .all(|regrade| regrade.regrade_id != candidate)
+                {
+                    break candidate;
+                }
+                sequence = sequence.saturating_add(1);
+            };
+            let regrade = Regrade {
+                regrade_id,
+                trial_id: trial_id.to_owned(),
+                quality: request.quality,
+                reviewer: request.reviewer.clone(),
+                note: request.note.clone(),
+                created_at_ms,
+            };
+            let id = regrade.regrade_id.clone();
+            state.evals_v2.regrades.push(regrade);
+            Ok(json!({ "regradeId": id }))
+        })
+        .await
     }
 
     /// Measure a run at the caller's `(a,b)`. This is a pure read: it writes neither state nor

@@ -30,6 +30,7 @@ use super::super::error::HubError;
 use super::super::model::HubState;
 use super::arm::Arm;
 use super::bundle::{self, Bundle};
+use super::regrade::Regrade;
 use super::sha256_hex;
 use super::task::EvalTask;
 use super::trial::{EvalV2Run, Trial};
@@ -142,7 +143,55 @@ struct Exclusion {
     trial_id: String,
     arm_id: String,
     seed: u32,
+    quality: Option<f64>,
+    quality_source: &'static str,
+    regrade_id: Option<String>,
     reason: &'static str,
+}
+
+/// A per-trial report entry. Unlike an arm aggregate, this names the trial whose quality was
+/// read and says whether that quality was human, automated, or absent.
+#[derive(Clone, Debug)]
+struct TrialEntry {
+    trial_id: String,
+    arm_id: String,
+    seed: u32,
+    quality: Option<f64>,
+    quality_source: &'static str,
+    regrade_id: Option<String>,
+    cost_ratio: Option<f64>,
+    time_ratio: Option<f64>,
+    loss: Option<f64>,
+    reason: Option<&'static str>,
+    measurement: Option<Measurement>,
+}
+
+impl TrialEntry {
+    fn view(&self) -> Value {
+        json!({
+            "trialId": self.trial_id,
+            "armId": self.arm_id,
+            "seed": self.seed,
+            "quality": self.quality.map(round),
+            "qualitySource": self.quality_source,
+            "regradeId": self.regrade_id,
+            "costRatio": self.cost_ratio.and_then(finite),
+            "timeRatio": self.time_ratio.and_then(finite),
+            "loss": self.loss,
+            "reason": self.reason,
+        })
+    }
+}
+
+fn latest_regrade<'a>(regrades: &'a [Regrade], trial_id: &str) -> Option<&'a Regrade> {
+    regrades
+        .iter()
+        .filter(|regrade| regrade.trial_id == trial_id)
+        .max_by(|left, right| {
+            left.created_at_ms
+                .cmp(&right.created_at_ms)
+                .then_with(|| left.regrade_id.cmp(&right.regrade_id))
+        })
 }
 
 /// The object maps of a bundle's `checks`, whether it is one object or a list of checks.
@@ -220,46 +269,124 @@ fn loss(quality: f64, cost_ratio: f64, time_ratio: f64, params: &LossParams) -> 
     finite(quality / denominator)
 }
 
-/// Read one trial's bundle and turn it into a measurement or an exclusion reason.
-fn measure(
-    task: &EvalTask,
-    trial: &Trial,
-    hub_directory: &Path,
-    params: &LossParams,
-) -> Result<Measurement, &'static str> {
+/// Inputs of one trial's report entry.
+struct TrialEntryInput<'a> {
+    task: &'a EvalTask,
+    trial: &'a Trial,
+    hub_directory: &'a Path,
+    params: &'a LossParams,
+    regrades: &'a [Regrade],
+}
+
+/// Read one trial's bundle and turn it into a report entry and, when measurable, a measurement.
+/// A human regrade replaces only the quality; it never rewrites the bundle evidence.
+fn trial_entry(input: TrialEntryInput<'_>) -> TrialEntry {
+    let TrialEntryInput {
+        task,
+        trial,
+        hub_directory,
+        params,
+        regrades,
+    } = input;
+    let regrade = latest_regrade(regrades, &trial.trial_id);
+    let mut effective_quality = regrade.map(|regrade| regrade.quality);
+    let mut quality_source = if regrade.is_some() {
+        "human"
+    } else {
+        "missing"
+    };
+    let mut reason = None;
+    let mut cost_ratio = None;
+    let mut time_ratio = None;
+    let mut loss_value = None;
     let path = trial
         .bundle_path
         .clone()
         .unwrap_or_else(|| bundle::path(hub_directory, trial));
-    let bytes = std::fs::read(&path).map_err(|_| "missing_bundle")?;
-    let document: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid_bundle")?;
-    let bundle: Bundle = serde_json::from_value(document.clone()).map_err(|_| "invalid_bundle")?;
-    let objects = check_objects(&bundle.checks);
-    let quality = quality(&objects)?;
-    let (baseline_cost, baseline_duration) = baseline(task)?;
-    let cost = cost_usd(&objects)
-        .or_else(|| document.get("costUsd").and_then(Value::as_f64))
-        .filter(|value| value.is_finite())
-        .ok_or("no_cost")?;
-    if cost <= 0.0 {
-        return Err("no_cost");
+    match std::fs::read(&path) {
+        Err(_) => reason = Some("missing_bundle"),
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Err(_) => reason = Some("invalid_bundle"),
+            Ok(document) => match serde_json::from_value::<Bundle>(document.clone()) {
+                Err(_) => reason = Some("invalid_bundle"),
+                Ok(bundle) => {
+                    let objects = check_objects(&bundle.checks);
+                    if effective_quality.is_none() {
+                        match quality(&objects) {
+                            Ok(auto) => {
+                                effective_quality = Some(auto);
+                                quality_source = "auto";
+                            }
+                            Err(why) => reason = Some(why),
+                        }
+                    }
+                    if reason.is_none()
+                        && let Some(quality_value) = effective_quality
+                    {
+                        let measured =
+                            baseline(task).and_then(|(baseline_cost, baseline_duration)| {
+                                let cost = cost_usd(&objects)
+                                    .or_else(|| document.get("costUsd").and_then(Value::as_f64))
+                                    .filter(|value| value.is_finite())
+                                    .ok_or("no_cost")?;
+                                if cost <= 0.0 {
+                                    return Err("no_cost");
+                                }
+                                let duration = trial
+                                    .duration_ms
+                                    .or(bundle.duration_ms)
+                                    .map(|duration| duration as f64)
+                                    .filter(|duration| *duration > 0.0)
+                                    .ok_or("no_duration")?;
+                                Ok((cost / baseline_cost, duration / baseline_duration))
+                            });
+                        match measured {
+                            Err(why) => reason = Some(why),
+                            Ok((cost, time)) => match loss(quality_value, cost, time, params) {
+                                Some(value) => {
+                                    cost_ratio = Some(cost);
+                                    time_ratio = Some(time);
+                                    loss_value = Some(value);
+                                }
+                                None => reason = Some("undefined_loss"),
+                            },
+                        }
+                    }
+                }
+            },
+        },
     }
-    let duration = trial
-        .duration_ms
-        .or(bundle.duration_ms)
-        .map(|duration| duration as f64)
-        .filter(|duration| *duration > 0.0)
-        .ok_or("no_duration")?;
-    let cost_ratio = cost / baseline_cost;
-    let time_ratio = duration / baseline_duration;
-    let loss = loss(quality, cost_ratio, time_ratio, params).ok_or("undefined_loss")?;
-    Ok(Measurement {
-        seed: trial.seed,
-        quality,
+    let measurement = match (
+        reason,
+        effective_quality,
         cost_ratio,
         time_ratio,
-        loss,
-    })
+        loss_value,
+    ) {
+        (None, Some(quality), Some(cost_ratio), Some(time_ratio), Some(loss)) => {
+            Some(Measurement {
+                seed: trial.seed,
+                quality,
+                cost_ratio,
+                time_ratio,
+                loss,
+            })
+        }
+        _ => None,
+    };
+    TrialEntry {
+        trial_id: trial.trial_id.clone(),
+        arm_id: trial.arm_id.clone(),
+        seed: trial.seed,
+        quality: effective_quality,
+        quality_source,
+        regrade_id: regrade.map(|regrade| regrade.regrade_id.clone()),
+        cost_ratio,
+        time_ratio,
+        loss: loss_value,
+        reason,
+        measurement,
+    }
 }
 
 fn mean(values: &[f64]) -> Option<f64> {
@@ -447,7 +574,9 @@ struct TaskReport {
     task_hash: String,
     verdict: &'static str,
     arms: Vec<ArmReport>,
+    trials: Vec<TrialEntry>,
     excluded: Vec<Exclusion>,
+    regraded_trials: usize,
     delta: Option<f64>,
 }
 
@@ -456,6 +585,7 @@ struct TaskInput<'a> {
     task: &'a EvalTask,
     arms: &'a [Arm],
     trials: &'a [&'a Trial],
+    regrades: &'a [Regrade],
     hub_directory: &'a Path,
     params: &'a LossParams,
 }
@@ -466,6 +596,7 @@ fn task_report(input: TaskInput<'_>) -> TaskReport {
         task,
         arms,
         trials,
+        regrades,
         hub_directory,
         params,
     } = input;
@@ -473,20 +604,33 @@ fn task_report(input: TaskInput<'_>) -> TaskReport {
         .iter()
         .find(|arm| arm.name.eq_ignore_ascii_case("baseline"));
     let mut arm_measurements = Vec::new();
+    let mut entries = Vec::new();
     let mut excluded = Vec::new();
     for arm in arms {
         let mut measurements = Vec::new();
         let mut arm_excluded = Vec::new();
         for trial in trials.iter().filter(|trial| trial.arm_hash == arm.arm_hash) {
-            match measure(task, trial, hub_directory, params) {
-                Ok(measurement) => measurements.push(measurement),
-                Err(reason) => arm_excluded.push(Exclusion {
+            let entry = trial_entry(TrialEntryInput {
+                task,
+                trial,
+                hub_directory,
+                params,
+                regrades,
+            });
+            if let Some(measurement) = entry.measurement {
+                measurements.push(measurement);
+            } else {
+                arm_excluded.push(Exclusion {
                     trial_id: trial.trial_id.clone(),
                     arm_id: arm.arm_id.clone(),
                     seed: trial.seed,
-                    reason,
-                }),
+                    quality: entry.quality,
+                    quality_source: entry.quality_source,
+                    regrade_id: entry.regrade_id.clone(),
+                    reason: entry.reason.unwrap_or("missing_quality"),
+                });
             }
+            entries.push(entry);
         }
         arm_measurements.push(ArmMeasurement {
             arm_id: arm.arm_id.clone(),
@@ -538,6 +682,11 @@ fn task_report(input: TaskInput<'_>) -> TaskReport {
         task_hash: task.task_hash.clone(),
         verdict,
         arms: reports,
+        regraded_trials: entries
+            .iter()
+            .filter(|entry| entry.quality_source == "human")
+            .count(),
+        trials: entries,
         excluded,
         delta,
     }
@@ -550,6 +699,9 @@ impl Exclusion {
             "trialId": self.trial_id,
             "armId": self.arm_id,
             "seed": self.seed,
+            "quality": self.quality.map(round),
+            "qualitySource": self.quality_source,
+            "regradeId": self.regrade_id,
             "reason": self.reason,
         })
     }
@@ -562,7 +714,9 @@ impl TaskReport {
             "taskHash": self.task_hash,
             "verdict": self.verdict,
             "delta": self.delta,
+            "regradedTrials": self.regraded_trials,
             "arms": self.arms.iter().map(ArmReport::view).collect::<Vec<_>>(),
+            "trials": self.trials.iter().map(TrialEntry::view).collect::<Vec<_>>(),
             "excluded": self
                 .excluded
                 .iter()
@@ -640,6 +794,7 @@ struct SummaryInput<'a> {
     deltas: &'a [f64],
     any_baseline: bool,
     insufficient: bool,
+    regraded_trials: usize,
     resamples: usize,
     run_id: &'a str,
 }
@@ -650,6 +805,7 @@ fn summary_view(input: SummaryInput<'_>) -> Value {
         deltas,
         any_baseline,
         insufficient,
+        regraded_trials,
         resamples,
         run_id,
     } = input;
@@ -687,6 +843,7 @@ fn summary_view(input: SummaryInput<'_>) -> Value {
         "wins": wins,
         "losses": losses,
         "ties": ties,
+        "regradedTrials": regraded_trials,
         "pareto": pareto,
     })
 }
@@ -732,6 +889,7 @@ pub(crate) fn report(input: ReportInput<'_>) -> Result<Value, HubError> {
             task,
             arms: &arms,
             trials: &trials,
+            regrades: &state.evals_v2.regrades,
             hub_directory,
             params,
         });
@@ -740,16 +898,19 @@ pub(crate) fn report(input: ReportInput<'_>) -> Result<Value, HubError> {
         task_deltas.extend(task_report.delta);
         tasks.push(task_report);
     }
+    let regraded_trials = tasks.iter().map(|task| task.regraded_trials).sum();
     let summary = summary_view(SummaryInput {
         tasks: &tasks,
         deltas: &task_deltas,
         any_baseline,
         insufficient,
+        regraded_trials,
         resamples,
         run_id: &run.run_id,
     });
     // The same per-task exclusions are also listed at the report root, so a caller does not have
-    // to descend into every task to know what was unmeasurable.
+    // to descend into every task to know what was unmeasurable. Every trial entry is likewise
+    // visible at the root, naming its task, so a quality source is never hidden behind an arm.
     let excluded = tasks
         .iter()
         .flat_map(|task| {
@@ -758,12 +919,24 @@ pub(crate) fn report(input: ReportInput<'_>) -> Result<Value, HubError> {
                 .map(|exclusion| exclusion.view(&task.task_id))
         })
         .collect::<Vec<_>>();
+    let trials = tasks
+        .iter()
+        .flat_map(|task| {
+            task.trials.iter().map(|entry| {
+                let mut view = entry.view();
+                view["taskId"] = json!(task.task_id);
+                view
+            })
+        })
+        .collect::<Vec<_>>();
     Ok(json!({
         "schema": "zeroshot.hub.evals.report/v1",
         "runId": run.run_id,
         "loss": { "a": params.a, "b": params.b },
         "tasks": tasks.iter().map(TaskReport::view).collect::<Vec<_>>(),
+        "trials": trials,
         "excluded": excluded,
+        "regradedTrials": regraded_trials,
         "summary": summary,
     }))
 }

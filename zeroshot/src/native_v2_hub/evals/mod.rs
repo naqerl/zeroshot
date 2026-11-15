@@ -1,8 +1,8 @@
-//! `zeroshot hub evals` slice 1: tasks, arms, trials, and bundles.
+//! `zeroshot hub evals`: tasks, arms, trials, bundles, report-time measurement, and human regrades.
 //!
 //! This is deliberately a separate subsystem from [`super::eval`]. The older eval module keeps
-//! owning suites, cases, runs, and reports; this module only adds the pieces slice 1 needs and
-//! reuses the old judge/check host-command implementation when a bundle needs grading evidence.
+//! owning suites, cases, runs, and reports; this module adds the evals-v2 pieces and reuses the old
+//! judge/check host-command implementation when a bundle needs grading evidence.
 
 use std::collections::BTreeMap;
 
@@ -12,12 +12,14 @@ use sha2::{Digest, Sha256};
 
 pub(crate) mod arm;
 pub(crate) mod bundle;
+pub(crate) mod regrade;
 pub(crate) mod report;
 pub(crate) mod service;
 pub(crate) mod task;
 pub(crate) mod trial;
 
 pub(crate) use arm::{Arm, CreateArm};
+pub(crate) use regrade::{CreateRegrade, Regrade};
 pub(crate) use report::EvalsReportRequest;
 pub(crate) use task::{CreateTask, EvalTask};
 pub(crate) use trial::{CreateEvalRun, EvalV2Run, Trial};
@@ -35,6 +37,9 @@ pub(crate) struct EvalsState {
     pub runs: Vec<EvalV2Run>,
     #[serde(default)]
     pub trials: Vec<Trial>,
+    /// Human regrades, append-only and never written into a bundle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub regrades: Vec<Regrade>,
 }
 
 impl EvalsState {
@@ -43,6 +48,7 @@ impl EvalsState {
             && self.arms.is_empty()
             && self.runs.is_empty()
             && self.trials.is_empty()
+            && self.regrades.is_empty()
     }
 
     pub(crate) fn task(&self, id_or_hash: &str) -> Option<&EvalTask> {
@@ -63,6 +69,22 @@ impl EvalsState {
 
     pub(crate) fn trial(&self, trial_id: &str) -> Option<&Trial> {
         self.trials.iter().find(|trial| trial.trial_id == trial_id)
+    }
+
+    /// Every regrade of one trial, oldest first and newest last. The latest regrade is therefore
+    /// the greatest `(createdAtMs, regradeId)` and the last element of this list.
+    pub(crate) fn regrades_for(&self, trial_id: &str) -> Vec<&Regrade> {
+        let mut regrades = self
+            .regrades
+            .iter()
+            .filter(|regrade| regrade.trial_id == trial_id)
+            .collect::<Vec<_>>();
+        regrades.sort_by(|left, right| {
+            left.created_at_ms
+                .cmp(&right.created_at_ms)
+                .then_with(|| left.regrade_id.cmp(&right.regrade_id))
+        });
+        regrades
     }
 }
 

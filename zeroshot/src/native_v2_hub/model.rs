@@ -17,9 +17,9 @@ use super::usage::JobUsage;
 /// Reserved member name for the local controller.
 pub(crate) const LOCAL_MEMBER: &str = "local";
 /// Version of `state.json` this hub writes. Version 2 added pools, leases and job archives;
-/// version 3 added evals-v2 tasks, arms, runs and trials. [`super::store`] upgrades older files
-/// on load and refuses newer ones.
-pub(crate) const STATE_VERSION: u32 = 3;
+/// version 3 added evals-v2 tasks, arms, runs and trials; version 4 added append-only human
+/// regrades. [`super::store`] upgrades older files on load and refuses newer ones.
+pub(crate) const STATE_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
