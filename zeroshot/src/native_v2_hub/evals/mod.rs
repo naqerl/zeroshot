@@ -12,11 +12,13 @@ use sha2::{Digest, Sha256};
 
 pub(crate) mod arm;
 pub(crate) mod bundle;
+pub(crate) mod report;
 pub(crate) mod service;
 pub(crate) mod task;
 pub(crate) mod trial;
 
 pub(crate) use arm::{Arm, CreateArm};
+pub(crate) use report::EvalsReportRequest;
 pub(crate) use task::{CreateTask, EvalTask};
 pub(crate) use trial::{CreateEvalRun, EvalV2Run, Trial};
 

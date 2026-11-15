@@ -1111,6 +1111,18 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   materialized as a runtime plan when it is a uniform runtime or full node plan, `modelIds` set
   its models, and `nodeBudgets` set authored graph node deadlines when `graphRef` names graph
   JSON; otherwise those arm fields remain trial input and job attribution for a later slice.
+  `POST /v1/hub/evals/runs/{id}/report` measures a run without storing anything: `{loss:{a,b}}`
+  (each `0.0..=2.0`) selects `quality / (costRatio^a * timeRatio^b)` over task-relative ratios,
+  reading blind `checks.quality` and `checks.costUsd` from each bundle, and never writes a loss
+  to state or bundles. Trials with no quality, no positive cost/duration, or no positive task
+  baseline are listed under the task's `excluded[]` with a reason. The report is paired by
+  task and seed against the case-insensitive `baseline` arm; fewer than two graded, measurable
+  trials per (task, arm) yields `insufficient_data` rather than a verdict, a task without a
+  baseline arm is `no_baseline` and contributes nothing to the summary (not even a frontier
+  point), and the summary reports a median delta, a bootstrap 95% CI
+  seeded from `sha256(runId)` (default 2000 resamples), wins/losses/ties, and a Pareto frontier
+  of arm points, never a pooled average loss across tasks. Reports are pure reads, so identical
+  requests over unchanged data are byte-identical.
   The old `hub eval` state and routes are unchanged.
 - Read-only safe commands include `zeroshot list`, `zeroshot status`, `zeroshot report`,
   `zeroshot logs`, `zeroshot hub list`, `zeroshot hub ps`, `zeroshot hub stats`,

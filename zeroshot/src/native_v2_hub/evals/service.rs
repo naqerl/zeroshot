@@ -675,6 +675,28 @@ impl HubService {
         Ok(run_document(&run, trials))
     }
 
+    /// Measure a run at the caller's `(a,b)`. This is a pure read: it writes neither state nor
+    /// bundles, so the same request over unchanged data answers with the same document.
+    pub(crate) async fn evals_report(
+        &self,
+        run_id: &str,
+        request: super::report::EvalsReportRequest,
+    ) -> Result<Value, HubError> {
+        let resamples = request.validate()?;
+        let state = self.snapshot().await;
+        let run =
+            state.evals_v2.run(run_id).cloned().ok_or_else(|| {
+                HubError::EvalNotFound(format!("evals run {run_id} does not exist"))
+            })?;
+        super::report::report(super::report::ReportInput {
+            run: &run,
+            state: &state,
+            hub_directory: self.store().directory(),
+            params: &request.loss,
+            resamples,
+        })
+    }
+
     /// Move every trial whose job changed forward and write bundles for terminal trials. This
     /// runs beside dispatching, before a pool lease can discard the trial's workspace.
     pub(crate) async fn evals_reconcile(&self) -> Result<(), HubError> {

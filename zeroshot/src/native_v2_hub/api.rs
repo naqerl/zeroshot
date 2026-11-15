@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use super::driver::hub_executable;
 use super::error::HubError;
 use super::eval::{AddCase, AddSuite, CaseQuery, CreateRun, ReportRequest, RunQuery};
-use super::evals::{CreateArm, CreateEvalRun, CreateTask};
+use super::evals::{CreateArm, CreateEvalRun, CreateTask, EvalsReportRequest};
 use super::service::HubService;
 use super::wire::{
     AddMember, AddPool, CreateSchedule, EnqueueJob, JobQuery, MemberQuery, StatsRequest,
@@ -100,6 +100,7 @@ pub(crate) fn router_with_mcp(state: Arc<ApiState>, mcp: Option<Router>) -> Rout
         .route("/v1/hub/evals/arms", post(evals_arm_create))
         .route("/v1/hub/evals/runs", post(evals_run_create))
         .route("/v1/hub/evals/runs/{id}", get(evals_run))
+        .route("/v1/hub/evals/runs/{id}/report", post(evals_report))
         .route("/metrics", get(metrics))
         .merge(mcp)
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
@@ -488,6 +489,21 @@ async fn evals_run_create(State(state): State<Arc<ApiState>>, bytes: Bytes) -> R
 
 async fn evals_run(State(state): State<Arc<ApiState>>, Path(id): Path<String>) -> Response {
     reply(state.service.evals_run(&id).await)
+}
+
+async fn evals_report(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    bytes: Bytes,
+) -> Response {
+    let result = async {
+        state
+            .service
+            .evals_report(&id, body::<EvalsReportRequest>(&bytes)?)
+            .await
+    }
+    .await;
+    reply(result)
 }
 
 async fn stream(
