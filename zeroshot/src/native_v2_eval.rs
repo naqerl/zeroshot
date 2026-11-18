@@ -6,6 +6,7 @@
 //! judge; this module owns the manifest/store/report/scoring core plus the synthetic runner.
 
 mod capacity;
+mod capture;
 mod cli;
 mod error;
 mod fake;
@@ -13,6 +14,7 @@ mod judge;
 mod manifest;
 mod model;
 mod report;
+mod resume;
 mod runner;
 mod scorer;
 mod store;
@@ -54,3 +56,28 @@ pub async fn run_fixture(
 #[cfg(test)]
 #[path = "native_v2_eval/tests.rs"]
 mod tests;
+
+/// Current wall-clock time in milliseconds since the Unix epoch.
+pub(crate) fn now_ms() -> u64 {
+    model::now_ms()
+}
+
+/// Write JSON through a temporary file in the same directory so a crash never leaves a half file.
+fn write_json_atomic(path: &std::path::Path, value: &impl serde::Serialize) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
+    write_bytes_atomic(path, &bytes)
+}
+
+fn write_bytes_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(bytes)?;
+    if !bytes.ends_with(b"\n") {
+        temporary.write_all(b"\n")?;
+    }
+    temporary.as_file_mut().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
