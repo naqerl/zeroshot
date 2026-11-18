@@ -27,6 +27,8 @@ pub enum EvalError {
     DuplicateScorer(String),
     #[error("eval sample runner failed: {0}")]
     Runner(String),
+    #[error("eval judge response is invalid: {0}")]
+    Judge(String),
     #[error("eval report is unavailable for {0}")]
     ReportUnavailable(String),
     #[error("could not encode eval data: {0}")]

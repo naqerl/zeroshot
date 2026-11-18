@@ -6,6 +6,8 @@ runsPerArm = 3
 scorer = "quality-vs-cost"
 runner = "fake"
 seed = 7
+judgeModel = "synthetic-judge"
+judgeTemplate = "eval-judge"
 
 [options.fake]
 queueWaitMs = 5

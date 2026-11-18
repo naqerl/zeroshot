@@ -20,7 +20,9 @@ use crate::native_v2_cli::{
     RunRuntime, RunSelection, RunSelector, RunResumeCommand, RunCheckpointsCommand,
     RunWatchCommand, TargetAdd, TargetServe, TemplateDelivery,
 };
-use crate::native_v2_eval::{EvalAction, EvalCommand, EvalId, EvalRunCommand};
+use crate::native_v2_eval::{
+    EvalAction, EvalCommand, EvalId, EvalJudgeCapturesCommand, EvalJudgeCommand, EvalRunCommand,
+};
 
 #[path = "convert/profile_commands.rs"]
 mod profile_commands;
@@ -77,7 +79,12 @@ impl CliCommand {
             Self::Profile { command } => command.into_command(),
             Self::Template { command } => command.into_command(),
             Self::Plan { command } => command.into_command(),
-            Self::Eval { directory, command } => command.into_command(directory),
+            Self::Eval {
+                directory,
+                judge_template,
+                judge_model,
+                command,
+            } => command.into_command(directory, judge_template, judge_model),
             Self::Run(args) => args.into_command(),
             Self::Utility(command) => command.into_command(),
             _ => Err(usage("expected an execution or management command")),
@@ -183,13 +190,20 @@ fn connection_route(
 }
 
 impl EvalCliCommand {
-    fn into_command(self, directory: PathBuf) -> Result<NativeV2CliCommand, NativeV2CliError> {
+    fn into_command(
+        self,
+        directory: PathBuf,
+        judge_template: Option<String>,
+        judge_model: Option<String>,
+    ) -> Result<NativeV2CliCommand, NativeV2CliError> {
         let action = match self {
             Self::Run(args) => EvalAction::Run(EvalRunCommand {
                 manifest: args.manifest,
                 directory: directory.clone(),
                 id: args.id.map(validate_eval_id).transpose()?,
                 scorer: args.scorer,
+                judge_template,
+                judge_model,
             }),
             Self::List => EvalAction::List,
             Self::Show(args) => EvalAction::Show {
@@ -202,6 +216,20 @@ impl EvalCliCommand {
                 id: validate_eval_id(args.id)?,
                 scorer: args.scorer,
             },
+            Self::Judge(args) => EvalAction::Judge(EvalJudgeCommand {
+                id: validate_eval_id(args.id)?,
+                judge_model,
+                judge_template,
+                scorer: args.scorer,
+            }),
+            Self::JudgeCaptures(args) => EvalAction::JudgeCaptures(EvalJudgeCapturesCommand {
+                manifest: args.manifest,
+                captures: args.captures,
+                id: args.id.map(validate_eval_id).transpose()?,
+                judge_model,
+                judge_template,
+                scorer: args.scorer,
+            }),
             Self::Clean(args) => EvalAction::Clean {
                 id: args.id.map(validate_eval_id).transpose()?,
                 all: args.all,

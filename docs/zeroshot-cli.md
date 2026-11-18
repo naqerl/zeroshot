@@ -1057,19 +1057,27 @@ Evals are stored under `.zeroshot/eval/<id>/`. The manifest is strict TOML; see 
 Usage: zeroshot eval [OPTIONS] <COMMAND>
 
 Commands:
-  run     Validate a manifest, run it through the synthetic runner, and write its report
-  list    List stored evals as JSON
-  show    Show one stored eval, including its manifest, samples, and report, as JSON
-  report  Print one eval report as JSON and refresh its Markdown rendering
-  score   Recompute a stored eval with a registered scorer
-  clean   Delete one stored eval, or every stored eval
-  help    Print this message or the help of the given subcommand(s)
+  run             Validate a manifest, run it through the synthetic runner, and write its report
+  list            List stored evals as JSON
+  show            Show one stored eval, including its manifest, samples, and report, as JSON
+  report          Print one eval report as JSON and refresh its Markdown rendering
+  score           Recompute a stored eval with a registered scorer
+  judge           Judge every captured sample and rebuild the report
+  judge-captures  Judge slice-2 capture directories laid out as `<captures>/<arm-id>/<sample>/`
+  clean           Delete one stored eval, or every stored eval
+  help            Print this message or the help of the given subcommand(s)
 
 Options:
       --directory <DIR>
           Workspace whose `.zeroshot/eval` store is used
 
           [default: .]
+
+      --judge-template <NAME|PATH>
+          Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions
+
+      --judge-model <MODEL>
+          Judge model identifier, overriding per-arm and manifest defaults
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1095,8 +1103,14 @@ Options:
       --id <ID>
           Use this eval id instead of generating one
 
+      --judge-template <NAME|PATH>
+          Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions
+
       --scorer <NAME>
           Override the manifest's scorer for this run
+
+      --judge-model <MODEL>
+          Judge model identifier, overriding per-arm and manifest defaults
 
   -h, --help
           Print help
@@ -1114,6 +1128,12 @@ Options:
           Workspace whose `.zeroshot/eval` store is used
 
           [default: .]
+
+      --judge-template <NAME|PATH>
+          Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions
+
+      --judge-model <MODEL>
+          Judge model identifier, overriding per-arm and manifest defaults
 
   -h, --help
           Print help
@@ -1136,6 +1156,12 @@ Options:
 
           [default: .]
 
+      --judge-template <NAME|PATH>
+          Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions
+
+      --judge-model <MODEL>
+          Judge model identifier, overriding per-arm and manifest defaults
+
   -h, --help
           Print help
 ```
@@ -1156,6 +1182,12 @@ Options:
           Workspace whose `.zeroshot/eval` store is used
 
           [default: .]
+
+      --judge-template <NAME|PATH>
+          Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions
+
+      --judge-model <MODEL>
+          Judge model identifier, overriding per-arm and manifest defaults
 
   -h, --help
           Print help
@@ -1181,6 +1213,78 @@ Options:
       --scorer <NAME>
           Registered scorer name
 
+      --judge-template <NAME|PATH>
+          Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions
+
+      --judge-model <MODEL>
+          Judge model identifier, overriding per-arm and manifest defaults
+
+  -h, --help
+          Print help
+```
+
+#### `zeroshot eval judge`
+
+```text
+Judge every captured sample and rebuild the report
+
+Usage: zeroshot eval judge [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          Stored eval id
+
+Options:
+      --directory <DIR>
+          Workspace whose `.zeroshot/eval` store is used
+
+          [default: .]
+
+      --scorer <NAME>
+          Override the manifest's scorer while rebuilding the judged report
+
+      --judge-template <NAME|PATH>
+          Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions
+
+      --judge-model <MODEL>
+          Judge model identifier, overriding per-arm and manifest defaults
+
+  -h, --help
+          Print help
+```
+
+#### `zeroshot eval judge-captures`
+
+```text
+Judge slice-2 capture directories laid out as `<captures>/<arm-id>/<sample>/`
+
+Usage: zeroshot eval judge-captures [OPTIONS] --captures <DIR> <MANIFEST>
+
+Arguments:
+  <MANIFEST>
+          Strict TOML eval manifest supplying criteria and arms
+
+Options:
+      --captures <DIR>
+          Directory containing one subdirectory per arm, each with sample capture directories
+
+      --directory <DIR>
+          Workspace whose `.zeroshot/eval` store is used
+
+          [default: .]
+
+      --id <ID>
+          Use this eval id instead of generating one
+
+      --judge-template <NAME|PATH>
+          Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions
+
+      --judge-model <MODEL>
+          Judge model identifier, overriding per-arm and manifest defaults
+
+      --scorer <NAME>
+          Override the manifest's scorer while rebuilding the judged report
+
   -h, --help
           Print help
 ```
@@ -1205,6 +1309,12 @@ Options:
 
           [default: .]
 
+      --judge-template <NAME|PATH>
+          Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions
+
+      --judge-model <MODEL>
+          Judge model identifier, overriding per-arm and manifest defaults
+
   -h, --help
           Print help
 ```
@@ -1217,13 +1327,15 @@ Print this message or the help of the given subcommand(s)
 Usage: zeroshot eval help [COMMAND]
 
 Commands:
-  run     Validate a manifest, run it through the synthetic runner, and write its report
-  list    List stored evals as JSON
-  show    Show one stored eval, including its manifest, samples, and report, as JSON
-  report  Print one eval report as JSON and refresh its Markdown rendering
-  score   Recompute a stored eval with a registered scorer
-  clean   Delete one stored eval, or every stored eval
-  help    Print this message or the help of the given subcommand(s)
+  run             Validate a manifest, run it through the synthetic runner, and write its report
+  list            List stored evals as JSON
+  show            Show one stored eval, including its manifest, samples, and report, as JSON
+  report          Print one eval report as JSON and refresh its Markdown rendering
+  score           Recompute a stored eval with a registered scorer
+  judge           Judge every captured sample and rebuild the report
+  judge-captures  Judge slice-2 capture directories laid out as `<captures>/<arm-id>/<sample>/`
+  clean           Delete one stored eval, or every stored eval
+  help            Print this message or the help of the given subcommand(s)
 ```
 
 ### `zeroshot run`

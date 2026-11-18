@@ -1,0 +1,403 @@
+{
+  "profile": "openengine.graph.full/v1",
+  "initialInput": {
+    "kind": "record",
+    "fields": {
+      "criterion": {
+        "type": {
+          "kind": "string"
+        },
+        "required": true
+      },
+      "criterionDescription": {
+        "type": {
+          "kind": "string"
+        },
+        "required": true
+      },
+      "patch": {
+        "type": {
+          "kind": "string"
+        },
+        "required": true
+      },
+      "sample": {
+        "type": {
+          "kind": "string"
+        },
+        "required": true
+      },
+      "model": {
+        "type": {
+          "kind": "string"
+        },
+        "required": true
+      },
+      "score": {
+        "type": {
+          "kind": "number"
+        },
+        "required": true
+      },
+      "checkout": {
+        "type": {
+          "kind": "string"
+        },
+        "required": true
+      }
+    }
+  },
+  "policy": {
+    "policy": "policy.native-v2@1",
+    "default": "deny"
+  },
+  "root": {
+    "kind": "seq",
+    "name": "run",
+    "state": {
+      "kind": "record",
+      "fields": {
+        "criterion": {
+          "type": {
+            "kind": "string"
+          },
+          "required": true
+        },
+        "criterionDescription": {
+          "type": {
+            "kind": "string"
+          },
+          "required": true
+        },
+        "patch": {
+          "type": {
+            "kind": "string"
+          },
+          "required": true
+        },
+        "sample": {
+          "type": {
+            "kind": "string"
+          },
+          "required": true
+        },
+        "model": {
+          "type": {
+            "kind": "string"
+          },
+          "required": true
+        },
+        "score": {
+          "type": {
+            "kind": "number"
+          },
+          "required": true
+        },
+        "reasoning": {
+          "type": {
+            "kind": "string"
+          },
+          "required": true
+        },
+        "errors": {
+          "type": {
+            "kind": "array",
+            "items": {
+              "kind": "string"
+            }
+          },
+          "required": true
+        },
+        "checkout": {
+          "type": {
+            "kind": "string"
+          },
+          "required": true
+        }
+      }
+    },
+    "children": [
+      {
+        "kind": "step",
+        "name": "judge",
+        "worker": "builtin.agent.worker@1",
+        "instructions": "You are an independent evaluator. Judge exactly one captured sample against exactly one criterion. Read the captured patch.diff and the sample.json metadata supplied in the input. Do not modify the workspace, do not run delivery, and do not repair the patch. Return one JSON object with one judgement: criterion is the supplied criterion id, score is a number from 1 to 5 inclusive (3 is the pass threshold), reasoning is one short paragraph that references concrete lines or files in the patch, and errors is an array of concrete defects. Use an empty errors array when the patch has no concrete defect for this criterion. Do not include markdown fences or any prose outside the JSON object.",
+        "input": {
+          "kind": "record",
+          "fields": {
+            "criterion": {
+              "type": {
+                "kind": "string"
+              },
+              "required": true
+            },
+            "criterionDescription": {
+              "type": {
+                "kind": "string"
+              },
+              "required": true
+            },
+            "patch": {
+              "type": {
+                "kind": "string"
+              },
+              "required": true
+            },
+            "sample": {
+              "type": {
+                "kind": "string"
+              },
+              "required": true
+            },
+            "model": {
+              "type": {
+                "kind": "string"
+              },
+              "required": true
+            },
+            "checkout": {
+              "type": {
+                "kind": "string"
+              },
+              "required": true
+            }
+          }
+        },
+        "output": {
+          "kind": "record",
+          "fields": {
+            "criterion": {
+              "type": {
+                "kind": "string"
+              },
+              "required": true
+            },
+            "score": {
+              "type": {
+                "kind": "number"
+              },
+              "required": true
+            },
+            "reasoning": {
+              "type": {
+                "kind": "string"
+              },
+              "required": true
+            },
+            "errors": {
+              "type": {
+                "kind": "array",
+                "items": {
+                  "kind": "string"
+                }
+              },
+              "required": true
+            }
+          }
+        },
+        "inputBindings": [
+          {
+            "target": [
+              "criterion"
+            ],
+            "value": {
+              "source": "state",
+              "path": [
+                "criterion"
+              ]
+            }
+          },
+          {
+            "target": [
+              "criterionDescription"
+            ],
+            "value": {
+              "source": "state",
+              "path": [
+                "criterionDescription"
+              ]
+            }
+          },
+          {
+            "target": [
+              "patch"
+            ],
+            "value": {
+              "source": "state",
+              "path": [
+                "patch"
+              ]
+            }
+          },
+          {
+            "target": [
+              "sample"
+            ],
+            "value": {
+              "source": "state",
+              "path": [
+                "sample"
+              ]
+            }
+          },
+          {
+            "target": [
+              "model"
+            ],
+            "value": {
+              "source": "state",
+              "path": [
+                "model"
+              ]
+            }
+          },
+          {
+            "target": [
+              "checkout"
+            ],
+            "value": {
+              "source": "state",
+              "path": [
+                "checkout"
+              ]
+            }
+          }
+        ],
+        "writeBindings": [
+          {
+            "value": {
+              "node": "judge",
+              "channel": "out",
+              "path": [
+                "criterion"
+              ]
+            },
+            "target": [
+              "criterion"
+            ]
+          },
+          {
+            "value": {
+              "node": "judge",
+              "channel": "out",
+              "path": [
+                "score"
+              ]
+            },
+            "target": [
+              "score"
+            ]
+          },
+          {
+            "value": {
+              "node": "judge",
+              "channel": "out",
+              "path": [
+                "reasoning"
+              ]
+            },
+            "target": [
+              "reasoning"
+            ]
+          },
+          {
+            "value": {
+              "node": "judge",
+              "channel": "out",
+              "path": [
+                "errors"
+              ]
+            },
+            "target": [
+              "errors"
+            ]
+          }
+        ],
+        "attempts": 1
+      },
+      {
+        "kind": "succeed",
+        "name": "done",
+        "output": {
+          "kind": "record",
+          "fields": {
+            "criterion": {
+              "type": {
+                "kind": "string"
+              },
+              "required": true
+            },
+            "score": {
+              "type": {
+                "kind": "number"
+              },
+              "required": true
+            },
+            "reasoning": {
+              "type": {
+                "kind": "string"
+              },
+              "required": true
+            },
+            "errors": {
+              "type": {
+                "kind": "array",
+                "items": {
+                  "kind": "string"
+                }
+              },
+              "required": true
+            }
+          }
+        },
+        "bindings": [
+          {
+            "target": [
+              "criterion"
+            ],
+            "value": {
+              "source": "state",
+              "path": [
+                "criterion"
+              ]
+            }
+          },
+          {
+            "target": [
+              "score"
+            ],
+            "value": {
+              "source": "state",
+              "path": [
+                "score"
+              ]
+            }
+          },
+          {
+            "target": [
+              "reasoning"
+            ],
+            "value": {
+              "source": "state",
+              "path": [
+                "reasoning"
+              ]
+            }
+          },
+          {
+            "target": [
+              "errors"
+            ],
+            "value": {
+              "source": "state",
+              "path": [
+                "errors"
+              ]
+            }
+          }
+        ]
+      }
+    ],
+    "promotedStatePaths": []
+  }
+}

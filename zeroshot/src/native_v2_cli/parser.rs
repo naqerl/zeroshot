@@ -92,6 +92,14 @@ enum CliCommand {
         #[arg(long, global = true, value_name = "DIR", default_value = ".")]
         directory: PathBuf,
 
+        /// Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions.
+        #[arg(long, global = true, value_name = "NAME|PATH")]
+        judge_template: Option<String>,
+
+        /// Judge model identifier, overriding per-arm and manifest defaults.
+        #[arg(long, global = true, value_name = "MODEL")]
+        judge_model: Option<String>,
+
         #[command(subcommand)]
         command: EvalCommand,
     },
@@ -219,6 +227,12 @@ enum EvalCommand {
     /// Recompute a stored eval with a registered scorer.
     Score(EvalScoreArgs),
 
+    /// Judge every captured sample and rebuild the report.
+    Judge(EvalJudgeArgs),
+
+    /// Judge slice-2 capture directories laid out as `<captures>/<arm-id>/<sample>/`.
+    JudgeCaptures(EvalJudgeCapturesArgs),
+
     /// Delete one stored eval, or every stored eval.
     Clean(EvalCleanArgs),
 }
@@ -241,6 +255,34 @@ struct EvalRunArgs {
 struct EvalShowArgs {
     /// Stored eval id.
     id: String,
+}
+
+#[derive(Debug, Args)]
+struct EvalJudgeCapturesArgs {
+    /// Strict TOML eval manifest supplying criteria and arms.
+    manifest: PathBuf,
+
+    /// Directory containing one subdirectory per arm, each with sample capture directories.
+    #[arg(long, value_name = "DIR")]
+    captures: PathBuf,
+
+    /// Use this eval id instead of generating one.
+    #[arg(long, value_name = "ID")]
+    id: Option<String>,
+
+    /// Override the manifest's scorer while rebuilding the judged report.
+    #[arg(long, value_name = "NAME")]
+    scorer: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct EvalJudgeArgs {
+    /// Stored eval id.
+    id: String,
+
+    /// Override the manifest's scorer while rebuilding the judged report.
+    #[arg(long, value_name = "NAME")]
+    scorer: Option<String>,
 }
 
 #[derive(Debug, Args)]

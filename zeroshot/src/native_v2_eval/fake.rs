@@ -200,7 +200,9 @@ impl FakeRunner {
                     criterion.id.clone(),
                     CriterionResult {
                         passed,
+                        score: Some(if passed { 5.0 } else { 1.0 }),
                         reasoning: Some(explanation),
+                        errors: Vec::new(),
                     },
                 );
             }

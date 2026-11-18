@@ -150,6 +150,7 @@ struct ScriptState {
     last: Option<CliRunStatusResult>,
     forced: Vec<RunId>,
     resumed: Vec<RunResumeParams>,
+    requests: Vec<PreparedRunRequest>,
     submits: usize,
     fail_next_submit: bool,
     fail_next_status: bool,
@@ -183,6 +184,10 @@ impl ScriptedBackend {
 
     fn submits(&self) -> usize {
         self.state.lock().unwrap().submits
+    }
+
+    fn last_request(&self) -> Option<PreparedRunRequest> {
+        self.state.lock().unwrap().requests.last().cloned()
     }
 
     fn fail_next_submit(&self) {
@@ -237,10 +242,11 @@ impl NativeV2CliBackend for ScriptedBackend {
     async fn run_submit(
         &self,
         _target: Option<&str>,
-        _request: PreparedRunRequest,
+        request: PreparedRunRequest,
     ) -> Result<RunSubmitResult, crate::native_v2_cli::NativeV2CliError> {
         let mut state = self.state.lock().unwrap();
         state.submits += 1;
+        state.requests.push(request);
         if state.fail_next_submit {
             state.fail_next_submit = false;
             return Err(crate::native_v2_cli::NativeV2CliError::Protocol(
@@ -375,6 +381,28 @@ fn delivery_receipt_is_found_in_a_wrapped_terminal_output() {
         DeliveryReceipt::from_terminal_output(&json!({"message": "not a delivery"})),
         None
     );
+}
+
+fn finished_with_judge_output() -> CliRunStatusResult {
+    status(json!({
+        "phase": "finished",
+        "terminalResult": {
+            "status": "succeeded",
+            "output": {
+                "criterion": "correctness",
+                "score": 4.0,
+                "reasoning": "The captured patch adds the guard.",
+                "errors": []
+            }
+        },
+        "metadata": {
+            "tokenUsage": {
+                "inputTokens": 12,
+                "outputTokens": 4,
+                "complete": true
+            }
+        }
+    }))
 }
 
 #[tokio::test]
@@ -1005,7 +1033,9 @@ async fn sample_artifact_round_trips_a_partial_eval_sample() {
 async fn cli_backend_path_runs_the_selected_platform_runner() {
     let temporary = tempfile::tempdir().unwrap();
     let source = include_str!("../../fixtures/eval/synthetic.toml")
-        .replace("runner = \"fake\"", "runner = \"platform\"");
+        .replace("runner = \"fake\"", "runner = \"platform\"")
+        .replace("judgeModel = \"synthetic-judge\"\n", "")
+        .replace("judgeTemplate = \"eval-judge\"\n", "");
     let manifest_path = temporary.path().join("platform.toml");
     std::fs::write(&manifest_path, &source).unwrap();
     let manifest = EvalManifest::parse(&source).unwrap();
@@ -1021,6 +1051,8 @@ async fn cli_backend_path_runs_the_selected_platform_runner() {
             directory: temporary.path().to_path_buf(),
             id: Some("fixture-platform".to_owned()),
             scorer: None,
+            judge_template: None,
+            judge_model: None,
         },
         backend,
         target: Some("platform".to_owned()),
@@ -1047,4 +1079,130 @@ async fn cli_backend_path_runs_the_selected_platform_runner() {
     let capacity = report.capacity.expect("report records capacity provenance");
     assert_eq!(capacity.concurrency, 2);
     assert_eq!(capacity.capacity_source.label(), "concurrency");
+}
+
+#[tokio::test]
+async fn local_judge_graph_executor_applies_the_model_and_parses_terminal_output() {
+    use crate::native_v2_contract::{DeclaredConnections, ModelId, NodeRuntimeBinding, RuntimePlan};
+    use crate::native_v2_eval::{
+        EvalCriterion, EvalSample, Judge, JudgeRequest, LocalJudgeGraphExecutor, SampleStatus,
+        SampleTiming, TemplateJudge, TokenUsage, resolve_judge_template,
+    };
+    use openengine_cluster_protocol::{NodeName, RunSize, SessionScope};
+    use std::collections::BTreeMap;
+
+    let backend = Arc::new(ScriptedBackend::new(
+        vec![queued(), finished_with_judge_output()],
+        Duration::from_millis(1),
+    ));
+    let node = NodeName::new("judge").expect("node");
+    let mut nodes = BTreeMap::new();
+    nodes.insert(
+        node.clone(),
+        NodeRuntimeBinding::Agent {
+            lane: None,
+            model: ModelId::new("authored-model").expect("model"),
+            effort: None,
+            session_scope: SessionScope::Execution,
+            connections: DeclaredConnections::empty(),
+        },
+    );
+    let runtime = crate::native_v2_candidate::test_support::codex_runtime(RunSize::Small, nodes);
+    let live_workspace = tempfile::tempdir().expect("live workspace");
+    let executor =
+        LocalJudgeGraphExecutor::new(Arc::clone(&backend), runtime, live_workspace.path());
+    let template = resolve_judge_template("eval-judge").expect("template");
+    let judge = TemplateJudge::new(executor, template);
+    let sample = EvalSample {
+        id: "baseline-0000".to_owned(),
+        run_id: "run".to_owned(),
+        arm_id: "baseline".to_owned(),
+        run_index: 0,
+        status: SampleStatus::Succeeded,
+        timing: SampleTiming::default(),
+        tokens: TokenUsage::default(),
+        delivered_revision: None,
+        failure_reason: None,
+        patch: None,
+        criteria: Default::default(),
+        reasoning: Default::default(),
+        judge_model: None,
+        judge_template: None,
+        judge_checkout: None,
+        judge_executor: None,
+    };
+    let request = JudgeRequest::new(
+        sample,
+        vec![EvalCriterion {
+            id: "correctness".to_owned(),
+            description: "correct".to_owned(),
+            weight: 1.0,
+        }],
+        "patch",
+        "per-arm-model",
+    );
+    let result = judge.judge(request).await.expect("judge executes");
+    assert_eq!(result.judgements["correctness"].score, 4.0);
+    let submitted = backend.last_request().expect("request submitted");
+    let nodes = match submitted.intent.runtime {
+        RuntimePlan::Codex { nodes, .. } => nodes,
+        _ => panic!("codex runtime"),
+    };
+    match nodes.get(&node).expect("judge binding") {
+        NodeRuntimeBinding::Agent { model, .. } => assert_eq!(model.as_str(), "per-arm-model"),
+        _ => panic!("agent binding"),
+    }
+    assert!(
+        submitted
+            .cwd
+            .expect("scratch cwd")
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("zeroshot-judge-"))
+    );
+}
+
+#[tokio::test]
+async fn local_judge_graph_executor_rejects_connection_requirements_before_submission() {
+    use crate::native_v2_contract::{
+        DeclaredConnections, DeclaredEnvironment, ModelId, NodeRuntimeBinding,
+    };
+    use crate::native_v2_eval::{JudgeGraphExecutor, LocalJudgeGraphExecutor, resolve_judge_template};
+    use openengine_cluster_protocol::{EnvironmentVariableName, NodeName, RunSize, SessionScope};
+    use std::collections::BTreeMap;
+
+    let backend = Arc::new(ScriptedBackend::new(Vec::new(), Duration::ZERO));
+    let node = NodeName::new("judge").expect("node");
+    let mut nodes = BTreeMap::new();
+    nodes.insert(
+        node,
+        NodeRuntimeBinding::Agent {
+            lane: None,
+            model: ModelId::new("authored-model").expect("model"),
+            effort: None,
+            session_scope: SessionScope::Execution,
+            connections: DeclaredConnections::single(
+                "gateway",
+                DeclaredEnvironment::new(
+                    [EnvironmentVariableName::new("GATEWAY_API_KEY").unwrap()],
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        },
+    );
+    let runtime = crate::native_v2_candidate::test_support::codex_runtime(RunSize::Small, nodes);
+    let live_workspace = tempfile::tempdir().expect("live workspace");
+    let executor =
+        LocalJudgeGraphExecutor::new(Arc::clone(&backend), runtime, live_workspace.path());
+    let template = resolve_judge_template("eval-judge").expect("template");
+    let error = executor
+        .execute(
+            &template,
+            "per-arm-model",
+            json!({"criterion":"correctness"}),
+        )
+        .await
+        .expect_err("connection requirements fail closed");
+    assert!(error.to_string().contains("connection requirements"));
+    assert_eq!(backend.submits(), 0);
 }

@@ -70,3 +70,21 @@ Every sample is persisted immediately after it settles. A later process can ther
 `zeroshot eval show <id>`, `report`, or `score` using only the files above; no run state is
 carried in memory. `report` additionally rebuilds `report.json` and `report.md` if the stored
 report is absent.
+
+
+## Judging
+
+A run first records samples and patches. The judge reads those captured artifacts; it never
+re-runs an arm. Configure the model per run, per arm, or in `[options]`:
+
+```toml
+[options]
+judgeModel = "provider/default-judge"
+judgeTemplate = "eval-judge"
+```
+
+The `eval-judge` graph lives at `zeroshot/src/native_v2_templates/eval_judge.json`. A custom graph
+is any JSON path with the same input/output shape. Judgements use the inclusive 1..=5 scale, with
+3 as the pass threshold, and must provide short reasoning plus an `errors` array. The checked-in
+fixture declares both defaults, so a plain `zeroshot eval run` judges its captured samples. See
+`docs/guides/eval.md` for the contract and the X/Y report section.

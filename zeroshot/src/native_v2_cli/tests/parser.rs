@@ -977,6 +977,8 @@ fn parser_wires_eval_run_report_score_and_clean_actions() {
                     directory: run_directory,
                     id,
                     scorer: None,
+                    judge_template: None,
+                    judge_model: None,
                 }),
         }) => {
             assert_eq!(directory, PathBuf::from("workspace"));
@@ -1003,6 +1005,68 @@ fn parser_wires_eval_run_report_score_and_clean_actions() {
             action: crate::native_v2_eval::EvalAction::Score { id, scorer },
             ..
         }) if id == "fixture" && scorer == "none"
+    ));
+
+    let command = parse_native_v2_args(args(&[
+        "eval",
+        "judge",
+        "fixture",
+        "--judge-model",
+        "provider/judge",
+        "--judge-template",
+        "eval-judge",
+        "--scorer",
+        "none",
+    ]))
+    .assert_value();
+    assert!(matches!(
+        command,
+        NativeV2CliCommand::Eval(crate::native_v2_eval::EvalCommand {
+            action: crate::native_v2_eval::EvalAction::Judge(
+                crate::native_v2_eval::EvalJudgeCommand {
+                    id,
+                    judge_model: Some(model),
+                    judge_template: Some(template),
+                    scorer: Some(scorer),
+                }
+            ),
+            ..
+        }) if id == "fixture"
+            && model == "provider/judge"
+            && template == "eval-judge"
+            && scorer == "none"
+    ));
+
+    let command = parse_native_v2_args(args(&[
+        "eval",
+        "judge-captures",
+        "manifest.toml",
+        "--captures",
+        "captures",
+        "--id",
+        "captured",
+        "--judge-model",
+        "provider/judge",
+    ]))
+    .assert_value();
+    assert!(matches!(
+        command,
+        NativeV2CliCommand::Eval(crate::native_v2_eval::EvalCommand {
+            action: crate::native_v2_eval::EvalAction::JudgeCaptures(
+                crate::native_v2_eval::EvalJudgeCapturesCommand {
+                    manifest,
+                    captures,
+                    id: Some(id),
+                    judge_model: Some(model),
+                    judge_template: None,
+                    scorer: None,
+                }
+            ),
+            ..
+        }) if manifest.as_path() == std::path::Path::new("manifest.toml")
+            && captures.as_path() == std::path::Path::new("captures")
+            && id == "captured"
+            && model == "provider/judge"
     ));
 
     let command = parse_native_v2_args(args(&["eval", "clean", "--all"])).assert_value();

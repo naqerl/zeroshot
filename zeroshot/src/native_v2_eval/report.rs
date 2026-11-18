@@ -23,6 +23,9 @@ pub struct EvalReport {
     pub quality: f64,
     pub matrix: TraitMatrix,
     pub cost_time: CostTimeComparison,
+    /// Paired X vs Y comparison for the first two arms, when judge scores exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<XyComparison>,
     pub unmatched_reasoning: Vec<UnmatchedReasoning>,
     #[serde(default)]
     pub notes: Vec<String>,
@@ -52,6 +55,10 @@ pub struct TraitMatrixRow {
     pub arm_id: String,
     pub run_index: u32,
     pub status: SampleStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_executor: Option<String>,
     pub cells: BTreeMap<String, TraitCell>,
 }
 
@@ -61,7 +68,11 @@ pub struct TraitCell {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -74,6 +85,11 @@ pub struct TraitSummary {
     pub attempted: u64,
     pub skipped: u64,
     pub rate: f64,
+    /// Judge score mean on the 1..=5 scale. Old boolean-only results omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_score: Option<f64>,
+    #[serde(default)]
+    pub scored: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -94,6 +110,52 @@ pub struct UnmatchedReasoning {
     pub arm_id: String,
     pub key: String,
     pub reasoning: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct XyComparison {
+    pub arm_x: String,
+    pub arm_y: String,
+    pub traits: Vec<XyTrait>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct XyTrait {
+    pub id: String,
+    pub description: String,
+    pub weight: f64,
+    pub scored_pairs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_mean: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y_mean: Option<f64>,
+    /// Mean of Y - X over paired samples.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paired_difference: Option<f64>,
+    pub outliers: Vec<XyOutlier>,
+}
+
+/// The pairs with the largest absolute Y - X difference, including both judges' reasoning.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct XyOutlier {
+    pub x_sample_id: String,
+    pub y_sample_id: String,
+    pub run_index: u32,
+    pub x_score: f64,
+    pub y_score: f64,
+    /// Y - X on the 1..=5 scale.
+    pub difference: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y_reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_judge_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y_judge_model: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -130,6 +192,7 @@ pub struct QualityCostFit {
 pub(crate) struct Analysis {
     pub matrix: TraitMatrix,
     pub cost_time: CostTimeComparison,
+    pub comparison: Option<XyComparison>,
     pub unmatched_reasoning: Vec<UnmatchedReasoning>,
     pub quality: f64,
 }
@@ -181,6 +244,7 @@ pub(crate) fn analyze(data: &EvalData) -> Analysis {
         .collect::<Vec<_>>();
     let quality = weighted_quality(&traits);
     let cost_time = cost_time(data, &arms);
+    let comparison = comparison(data, &columns, &ordered);
     let unmatched_reasoning = unmatched_reasoning(data, &criterion_ids);
     Analysis {
         matrix: TraitMatrix {
@@ -190,6 +254,7 @@ pub(crate) fn analyze(data: &EvalData) -> Analysis {
             arms,
         },
         cost_time,
+        comparison,
         unmatched_reasoning,
         quality,
     }
@@ -220,6 +285,7 @@ impl EvalReport {
             quality: output.quality,
             matrix: analysis.matrix,
             cost_time,
+            comparison: analysis.comparison,
             unmatched_reasoning: analysis.unmatched_reasoning,
             notes: output.notes,
         }
@@ -249,12 +315,12 @@ pub fn render_markdown(report: &EvalReport) -> String {
 
     let _ = writeln!(out, "## Trait matrix");
     let _ = writeln!(out);
-    out.push_str("| Sample | Arm | Run | Status |");
+    out.push_str("| Sample | Arm | Run | Status | Judge |");
     for column in &report.matrix.columns {
         let _ = write!(out, " {} |", escape(&column.id));
     }
     out.push('\n');
-    out.push_str("| --- | --- | ---: | --- |");
+    out.push_str("| --- | --- | ---: | --- | --- |");
     for _ in &report.matrix.columns {
         out.push_str(" --- |");
     }
@@ -262,11 +328,12 @@ pub fn render_markdown(report: &EvalReport) -> String {
     for row in &report.matrix.rows {
         let _ = write!(
             out,
-            "| `{}` | `{}` | {} | {} |",
+            "| `{}` | `{}` | {} | {} | {} |",
             escape(&row.sample_id),
             escape(&row.arm_id),
             row.run_index,
-            status_label(row.status)
+            status_label(row.status),
+            judge_label(row.judge_model.as_deref(), row.judge_executor.as_deref())
         );
         for column in &report.matrix.columns {
             let cell = row.cells.get(&column.id);
@@ -282,20 +349,51 @@ pub fn render_markdown(report: &EvalReport) -> String {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "| Trait | Weight | Passed | Attempted | Skipped | Rate |"
+        "| Trait | Weight | Passed | Attempted | Skipped | Rate | Mean score | Scored |"
     );
-    let _ = writeln!(out, "| --- | ---: | ---: | ---: | ---: | ---: |");
+    let _ = writeln!(
+        out,
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+    );
     for summary in &report.matrix.traits {
         let _ = writeln!(
             out,
-            "| {} | {:.2} | {} | {} | {} | {:.4} |",
+            "| {} | {:.2} | {} | {} | {} | {:.4} | {} | {} |",
             escape(&summary.id),
             summary.weight,
             summary.passed,
             summary.attempted,
             summary.skipped,
-            summary.rate
+            summary.rate,
+            mean_label(summary.mean_score),
+            summary.scored
         );
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## Judge errors");
+    let _ = writeln!(out);
+    let mut any_errors = false;
+    for row in &report.matrix.rows {
+        for column in &report.matrix.columns {
+            let Some(cell) = row.cells.get(&column.id) else {
+                continue;
+            };
+            for error in &cell.errors {
+                any_errors = true;
+                let _ = writeln!(
+                    out,
+                    "- `{}` / `{}` / {}: {}",
+                    escape(&row.sample_id),
+                    escape(&row.arm_id),
+                    escape(&column.id),
+                    escape(error)
+                );
+            }
+        }
+    }
+    if !any_errors {
+        let _ = writeln!(out, "None.");
     }
     let _ = writeln!(out);
 
@@ -332,6 +430,74 @@ pub fn render_markdown(report: &EvalReport) -> String {
         }
         None => {
             let _ = writeln!(out, "No quality-vs-cost fit is available.");
+        }
+    }
+    let _ = writeln!(out);
+
+    if let Some(comparison) = &report.comparison {
+        let _ = writeln!(out, "## X vs Y");
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "X is `{}`, Y is `{}`. Difference is Y - X on the judge's 1..=5 scale; positive values favor Y.",
+            escape(&comparison.arm_x),
+            escape(&comparison.arm_y)
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "| Trait | X mean | Y mean | Paired difference | Pairs |"
+        );
+        let _ = writeln!(out, "| --- | ---: | ---: | ---: | ---: |");
+        for trait_summary in &comparison.traits {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} |",
+                escape(&trait_summary.id),
+                mean_label(trait_summary.x_mean),
+                mean_label(trait_summary.y_mean),
+                mean_label(trait_summary.paired_difference),
+                trait_summary.scored_pairs
+            );
+        }
+        let _ = writeln!(out);
+        let _ = writeln!(out, "### Outlier reasoning");
+        let _ = writeln!(out);
+        let mut any = false;
+        for trait_summary in &comparison.traits {
+            for outlier in &trait_summary.outliers {
+                any = true;
+                let _ = writeln!(
+                    out,
+                    "- {} / run {} / `{}` -> `{}`: X {:.2}, Y {:.2}, difference {:+.2}",
+                    escape(&trait_summary.id),
+                    outlier.run_index,
+                    escape(&outlier.x_sample_id),
+                    escape(&outlier.y_sample_id),
+                    outlier.x_score,
+                    outlier.y_score,
+                    outlier.difference
+                );
+                if let Some(reasoning) = &outlier.x_reasoning {
+                    let _ = writeln!(
+                        out,
+                        "  - X{}: {}",
+                        model_suffix(outlier.x_judge_model.as_deref()),
+                        escape(reasoning)
+                    );
+                }
+                if let Some(reasoning) = &outlier.y_reasoning {
+                    let _ = writeln!(
+                        out,
+                        "  - Y{}: {}",
+                        model_suffix(outlier.y_judge_model.as_deref()),
+                        escape(reasoning)
+                    );
+                }
+            }
+        }
+        if !any {
+            let _ = writeln!(out, "No unequal paired judge scores were recorded.");
         }
     }
     let _ = writeln!(out);
@@ -407,17 +573,29 @@ fn matrix_row(sample: &EvalSample, columns: &[TraitColumn]) -> TraitMatrixRow {
             let cell = match sample.status {
                 SampleStatus::Skipped => TraitCell {
                     passed: None,
+                    score: result.and_then(|result| result.score),
                     reasoning: result.and_then(|result| result.reasoning.clone()),
+                    errors: result
+                        .map(|result| result.errors.clone())
+                        .unwrap_or_default(),
                 },
                 SampleStatus::Failed => TraitCell {
                     passed: Some(result.is_some_and(|result| result.passed)),
+                    score: result.and_then(|result| result.score),
                     reasoning: result
                         .and_then(|result| result.reasoning.clone())
                         .or_else(|| sample.failure_reason.clone()),
+                    errors: result
+                        .map(|result| result.errors.clone())
+                        .unwrap_or_default(),
                 },
                 SampleStatus::Succeeded => TraitCell {
                     passed: result.map(|result| result.passed),
+                    score: result.and_then(|result| result.score),
                     reasoning: result.and_then(|result| result.reasoning.clone()),
+                    errors: result
+                        .map(|result| result.errors.clone())
+                        .unwrap_or_default(),
                 },
             };
             (column.id.clone(), cell)
@@ -428,6 +606,8 @@ fn matrix_row(sample: &EvalSample, columns: &[TraitColumn]) -> TraitMatrixRow {
         arm_id: sample.arm_id.clone(),
         run_index: sample.run_index,
         status: sample.status,
+        judge_model: sample.judge_model.clone(),
+        judge_executor: sample.judge_executor.clone(),
         cells,
     }
 }
@@ -439,8 +619,10 @@ fn summaries(columns: &[TraitColumn], rows: &[TraitMatrixRow]) -> Vec<TraitSumma
             let mut passed = 0_u64;
             let mut attempted = 0_u64;
             let mut skipped = 0_u64;
+            let mut scores = Vec::new();
             for row in rows {
-                match row.cells.get(&column.id).and_then(|cell| cell.passed) {
+                let cell = row.cells.get(&column.id);
+                match cell.and_then(|cell| cell.passed) {
                     Some(true) => {
                         passed += 1;
                         attempted += 1;
@@ -448,7 +630,11 @@ fn summaries(columns: &[TraitColumn], rows: &[TraitMatrixRow]) -> Vec<TraitSumma
                     Some(false) => attempted += 1,
                     None => skipped += 1,
                 }
+                if let Some(score) = cell.and_then(|cell| cell.score) {
+                    scores.push(score);
+                }
             }
+            let scored = u64::try_from(scores.len()).unwrap_or(u64::MAX);
             TraitSummary {
                 id: column.id.clone(),
                 description: column.description.clone(),
@@ -457,6 +643,8 @@ fn summaries(columns: &[TraitColumn], rows: &[TraitMatrixRow]) -> Vec<TraitSumma
                 attempted,
                 skipped,
                 rate: ratio(passed, attempted).unwrap_or(0.0),
+                mean_score: mean(&scores),
+                scored,
             }
         })
         .collect()
@@ -540,6 +728,129 @@ fn cost_time(data: &EvalData, arms: &[ArmTraitSummary]) -> CostTimeComparison {
     }
 }
 
+fn comparison(
+    data: &EvalData,
+    columns: &[TraitColumn],
+    samples: &[&EvalSample],
+) -> Option<XyComparison> {
+    let x_arm = data.manifest.arms.first()?;
+    let y_arm = data.manifest.arms.get(1)?;
+    let x_samples = samples
+        .iter()
+        .copied()
+        .filter(|sample| sample.arm_id == x_arm.id)
+        .collect::<Vec<_>>();
+    let y_samples = samples
+        .iter()
+        .copied()
+        .filter(|sample| sample.arm_id == y_arm.id)
+        .collect::<Vec<_>>();
+    let traits = columns
+        .iter()
+        .map(|column| {
+            let x_scores = scores_for(&x_samples, &column.id);
+            let y_scores = scores_for(&y_samples, &column.id);
+            let mut pairs = Vec::new();
+            for y_sample in &y_samples {
+                let Some(y) = sample_score(y_sample, &column.id) else {
+                    continue;
+                };
+                let Some(x_sample) = x_samples
+                    .iter()
+                    .find(|sample| sample.run_index == y_sample.run_index)
+                else {
+                    continue;
+                };
+                let Some(x) = sample_score(x_sample, &column.id) else {
+                    continue;
+                };
+                pairs.push((*x_sample, *y_sample, x, y));
+            }
+            let differences = pairs
+                .iter()
+                .map(|(_, _, x, y)| y.values.0 - x.values.0)
+                .collect::<Vec<_>>();
+            let paired_difference = mean(&differences);
+            let mut ordered = pairs;
+            ordered.sort_by(
+                |(x_left, y_left, x_score_left, y_score_left),
+                 (x_right, y_right, x_score_right, y_score_right)| {
+                    let left = (y_score_left.values.0 - x_score_left.values.0).abs();
+                    let right = (y_score_right.values.0 - x_score_right.values.0).abs();
+                    right
+                        .total_cmp(&left)
+                        .then_with(|| x_left.id.cmp(&x_right.id))
+                        .then_with(|| y_left.id.cmp(&y_right.id))
+                },
+            );
+            let outliers = ordered
+                .into_iter()
+                .take(3)
+                .map(|(x_sample, y_sample, x, y)| XyOutlier {
+                    x_sample_id: x_sample.id.clone(),
+                    y_sample_id: y_sample.id.clone(),
+                    run_index: x_sample.run_index,
+                    x_score: x.values.0,
+                    y_score: y.values.0,
+                    difference: y.values.0 - x.values.0,
+                    x_reasoning: x.values.1,
+                    y_reasoning: y.values.1,
+                    x_judge_model: x_sample.judge_model.clone(),
+                    y_judge_model: y_sample.judge_model.clone(),
+                })
+                .collect::<Vec<_>>();
+            XyTrait {
+                id: column.id.clone(),
+                description: column.description.clone(),
+                weight: column.weight,
+                scored_pairs: u64::try_from(differences.len()).unwrap_or(u64::MAX),
+                x_mean: mean(&x_scores),
+                y_mean: mean(&y_scores),
+                paired_difference,
+                outliers,
+            }
+        })
+        .collect::<Vec<_>>();
+    if traits
+        .iter()
+        .all(|trait_summary| trait_summary.scored_pairs == 0)
+    {
+        return None;
+    }
+    Some(XyComparison {
+        arm_x: x_arm.id.clone(),
+        arm_y: y_arm.id.clone(),
+        traits,
+    })
+}
+
+struct CellScore {
+    values: (f64, Option<String>),
+}
+
+fn scores_for(samples: &[&EvalSample], criterion: &str) -> Vec<f64> {
+    samples
+        .iter()
+        .filter_map(|sample| sample_score(sample, criterion).map(|score| score.values.0))
+        .collect()
+}
+
+fn sample_score(sample: &EvalSample, criterion: &str) -> Option<CellScore> {
+    let result = sample.criteria.get(criterion)?;
+    let score = result.score?;
+    Some(CellScore {
+        values: (score, result.reasoning.clone()),
+    })
+}
+
+fn mean(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let sum = values.iter().sum::<f64>();
+    sum.is_finite().then_some(sum / values.len() as f64)
+}
+
 fn unmatched_reasoning(data: &EvalData, criterion_ids: &BTreeSet<&str>) -> Vec<UnmatchedReasoning> {
     let mut unmatched = Vec::new();
     for sample in &data.samples {
@@ -597,6 +908,25 @@ fn cell_label(cell: Option<&TraitCell>) -> String {
 
 fn ratio_label(value: Option<f64>) -> String {
     value.map_or_else(|| "-".to_owned(), |value| format!("{value:.4}"))
+}
+
+fn mean_label(value: Option<f64>) -> String {
+    value.map_or_else(|| "-".to_owned(), |value| format!("{value:.2}"))
+}
+
+fn model_suffix(model: Option<&str>) -> String {
+    model.map_or_else(String::new, |model| format!(" (`{}`)", escape(model)))
+}
+
+fn judge_label(model: Option<&str>, executor: Option<&str>) -> String {
+    match (model, executor) {
+        (Some(model), Some(executor)) => {
+            format!("`{}` ({})", escape(model), escape(executor))
+        }
+        (Some(model), None) => format!("`{}`", escape(model)),
+        (None, Some(executor)) => format!("- ({})", escape(executor)),
+        (None, None) => "-".to_owned(),
+    }
 }
 
 fn escape(value: &str) -> String {

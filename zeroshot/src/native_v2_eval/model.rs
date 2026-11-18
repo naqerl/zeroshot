@@ -124,6 +124,18 @@ pub struct EvalSample {
     pub criteria: BTreeMap<String, CriterionResult>,
     #[serde(default)]
     pub reasoning: BTreeMap<String, String>,
+    /// Provider-owned model identifier that judged this sample, when it was judged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_model: Option<String>,
+    /// Judge graph template used for this sample, when it was judged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_template: Option<String>,
+    /// Read-only delivered tree captured by slice 2, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_checkout: Option<String>,
+    /// Executor that produced the judgement: `fixture`, `graph`, or a caller-defined label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_executor: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -166,12 +178,18 @@ impl TokenUsage {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CriterionResult {
     pub passed: bool,
+    /// Judge score on the documented 1..=5 scale. Older boolean results omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Concrete defects reported by the judge. Never provider or serialization noise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

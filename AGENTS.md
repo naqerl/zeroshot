@@ -123,6 +123,19 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   Capsule allocation reuses the resolved
   `ProductionHostingConfig`; instantiated diagnostic storage remains separate from configuration.
 
+- Eval judges read captured `patch.diff`/`sample.json` artifacts and never re-run an arm. The
+  judgement contract is strict: one score per criterion on an inclusive 1..=5 scale (3 passes),
+  short patch-referencing reasoning, and an `errors` array; malformed responses name the field.
+  Reports record the judging model and executor per sample and include the first-two-arm X/Y means,
+  paired difference, and outlier reasoning. `eval-judge` is a JSON graph template in
+  `zeroshot/src/native_v2_templates/`; custom graph JSON paths receive only the standard input
+  fields their own `initialInput` declares. Provider-backed CLI execution uses an authored
+  `options.judgeRuntimeConfig` plan through the native-v2 local runner and applies the effective
+  model to every agent binding; runtime plans with connection requirements fail closed. Without a
+  runtime plan the synthetic executor reuses recorded fake evidence and fails closed when a capture
+  has none; a succeeded sample with no captured patch is an error. Captured patch/checkout paths
+  stay inside the capture directory, graph judges run in private scratch, and slice-2 capture
+  directories are importable through `zeroshot eval judge-captures`.
 - Protocol Rust types are the source of truth. Generated files under
   `protocol/openengine-cluster/v1/` must be regenerated through the Rust testkit, not hand-edited.
 - Initial input remains caller-owned and is validated unchanged. A root group may add required
@@ -834,6 +847,8 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 | CLI self-update               | `zeroshot/src/native_v2_cli/update.rs`                                                                                                                                                            |
 | Built-in templates            | `zeroshot/src/native_v2_templates.rs`, `zeroshot/src/native_v2_templates/`                                                                                                                        |
 | Local run composition         | `zeroshot/src/native_v2_local.rs`                                                                                                                                                                 |
+| Eval core, judge, report      | `zeroshot/src/native_v2_eval.rs`, `zeroshot/src/native_v2_eval/` (judge contract, strict parser, X/Y report, `eval-judge` template)                                                               |
+| Eval runner/capture           | `zeroshot/src/native_v2_eval/` (unified runner, capacity, capture, resume, judge backend)                                                                                                           |
 | Hosted/platform composition   | `zeroshot/src/native_v2_platform.rs`, `zeroshot/src/native_v2_hosting.rs`                                                                                                                         |
 | Hosted merge plans            | `crates/openengine-cluster-protocol/src/native_v2_hosted/merge_plan.rs`, `zeroshot/src/native_v2_cli/execution/merge_plans.rs`, `zeroshot/src/native_v2_target/controller_authority/hosted_runs/` |
 | Portable controller           | `zeroshot/src/native_v2_portable_controller.rs`, `zeroshot/src/native_v2_portable_controller/`                                                                                                    |

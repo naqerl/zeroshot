@@ -57,6 +57,9 @@ pub struct EvalArm {
     pub input: Value,
     #[serde(default)]
     pub knobs: serde_json::Map<String, Value>,
+    /// Default judge model for this arm. A run-level `--judge-model` overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_model: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -78,6 +81,16 @@ pub struct EvalOptions {
     pub seed: u64,
     #[serde(default)]
     pub fake: FakeOptions,
+    /// Default judge model for every arm without its own `judgeModel`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_model: Option<String>,
+    /// Default judge graph template. `eval-judge` is the built-in template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_template: Option<String>,
+    /// Authored runtime plan for provider-backed judge graph execution. Relative paths resolve
+    /// against the eval directory; without it the CLI uses the synthetic graph executor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_runtime_config: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -108,6 +121,9 @@ impl Default for EvalOptions {
             runner: default_runner(),
             seed: 0,
             fake: FakeOptions::default(),
+            judge_model: None,
+            judge_template: None,
+            judge_runtime_config: None,
         }
     }
 }
@@ -191,7 +207,17 @@ impl EvalManifest {
                 )));
             }
         }
-        self.options.validate()
+        self.options.validate()?;
+        if let Some(model) = &self.options.judge_model {
+            validate_label("options.judgeModel", model, 256)?;
+        }
+        if let Some(template) = &self.options.judge_template {
+            validate_label("options.judgeTemplate", template, 512)?;
+        }
+        if let Some(runtime) = &self.options.judge_runtime_config {
+            validate_label("options.judgeRuntimeConfig", runtime, 4_096)?;
+        }
+        Ok(())
     }
 
     pub fn criterion_ids(&self) -> impl Iterator<Item = &str> {
@@ -239,6 +265,9 @@ impl EvalArm {
                 "arm {:?} requires a prompt or input payload",
                 self.id
             )));
+        }
+        if let Some(model) = &self.judge_model {
+            validate_label("arm judgeModel", model, 256)?;
         }
         Ok(())
     }
@@ -319,7 +348,7 @@ pub(crate) fn validate_scorer_name(value: &str) -> Result<(), EvalError> {
     validate_identifier("scorer name", value)
 }
 
-fn validate_identifier(kind: &str, value: &str) -> Result<(), EvalError> {
+pub(crate) fn validate_identifier(kind: &str, value: &str) -> Result<(), EvalError> {
     if value.is_empty() || value.len() > 128 {
         return Err(invalid(format!("{kind} must contain 1 to 128 characters")));
     }

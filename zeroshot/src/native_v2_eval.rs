@@ -12,6 +12,9 @@ mod cli;
 mod error;
 mod fake;
 mod judge;
+mod judge_backend;
+mod judge_runner;
+mod judge_template;
 mod manifest;
 mod model;
 mod report;
@@ -28,12 +31,25 @@ pub use capture::{
     JudgeCheckout, capture_patch, checkout_patch,
 };
 pub use cli::{
-    BackendRunRequest, EvalAction, EvalCommand, EvalRunCommand, ManifestRunRequest,
-    RunnerSelection, execute, run_manifest_with_backend, run_manifest_with_runner, select_runner,
+    BackendRunRequest, EvalAction, EvalCommand, EvalJudgeCapturesCommand, EvalJudgeCommand,
+    EvalRunCommand, ManifestRunRequest, RunnerSelection, execute, run_manifest_with_backend,
+    run_manifest_with_runner, select_runner,
 };
 pub use error::EvalError;
 pub use fake::{FakeFixtureRequest, FakeRunner, FakeSampleRequest};
-pub use judge::{Judge, JudgeRequest, JudgeResult};
+pub use judge::{
+    JUDGE_PASS_SCORE, JUDGE_SCORE_MAX, JUDGE_SCORE_MIN, JUDGE_TEMPLATE_NAME, Judge,
+    JudgeParseError, JudgeRequest, JudgeResult, Judgement, parse_judgement,
+};
+pub use judge_backend::{LocalJudgeGraphExecutor, load_judge_runtime, runtime_with_model};
+pub use judge_runner::{
+    CapturedSampleInput, JudgeOptions, JudgeRunReport, JudgedSample, JudgedSampleSummary,
+    captured_sample_from_directory, judge_captured_samples, judge_eval, judge_model_for,
+};
+pub use judge_template::{
+    FixtureJudgeGraphExecutor, JUDGE_TEMPLATE_JSON, JudgeGraphExecutor, JudgeTemplate,
+    TemplateJudge, judge_input, judge_input_for_template, resolve_judge_template,
+};
 pub use manifest::{EvalArm, EvalCriterion, EvalManifest, EvalOptions, FakeOptions, MANIFEST_SCHEMA};
 pub use model::{
     CriterionResult, EvalData, EvalId, EvalSample, PatchArtifact, SampleCounts, SampleStatus,
@@ -41,8 +57,8 @@ pub use model::{
 };
 pub use report::{
     ArmCostTime, ArmTraitSummary, CostTimeComparison, EvalReport, QualityCostFit, TraitCell,
-    TraitColumn, TraitMatrix, TraitMatrixRow, TraitSummary, UnmatchedReasoning, REPORT_SCHEMA,
-    render_markdown,
+    TraitColumn, TraitMatrix, TraitMatrixRow, TraitSummary, UnmatchedReasoning, XyComparison,
+    XyOutlier, XyTrait, REPORT_SCHEMA, render_markdown,
 };
 pub use resume::{
     CapacityWarning, RESUME_FILE, ResumeAction, ResumeError, ResumeJournal, ResumeSample,
@@ -68,6 +84,8 @@ pub async fn run_fixture(
         directory: workspace.into(),
         id,
         scorer: None,
+        judge_template: None,
+        judge_model: None,
     })
     .await
 }

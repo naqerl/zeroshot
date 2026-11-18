@@ -192,6 +192,26 @@ impl EvalStore {
         Ok(relative)
     }
 
+    /// Read a captured patch by its stored relative path. Absolute and escaping paths are refused
+    /// so a rewritten sample record cannot make the judge read outside the eval directory.
+    pub fn read_patch(&self, id: &EvalId, relative: &str) -> Result<String, EvalError> {
+        let path = std::path::Path::new(relative);
+        if path.is_absolute()
+            || path.components().any(|component| {
+                !matches!(
+                    component,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err(EvalError::Command(format!(
+                "stored patch path {relative:?} must stay inside the eval directory"
+            )));
+        }
+        let path = self.root.join(id.as_str()).join(path);
+        std::fs::read_to_string(&path).map_err(|error| EvalError::io(&path, error))
+    }
+
     /// Persist `report.json` first. Markdown is rendered only from this stored report.
     pub fn write_report(&self, id: &EvalId, report: &EvalReport) -> Result<(), EvalError> {
         let directory = self.root.join(id.as_str());
