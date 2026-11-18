@@ -261,13 +261,13 @@ async fn run_sample_writes_sample_json_patch_and_judge_checkout_together() {
         receipt.clone(),
     )
     .with_git_program("git");
-    let runner = crate::native_v2_eval_platform::FakeRunner::new();
-    let artifact = crate::native_v2_eval_platform::run_sample(
+    let runner = crate::native_v2_eval::FakeRunner::new();
+    let artifact = crate::native_v2_eval::run_sample(
         &runner,
-        crate::native_v2_eval_platform::FakeSampleRequest {
+        crate::native_v2_eval::FakeSampleRequest {
             run_id: Some(openengine_cluster_protocol::RunId::new("run-capture")),
             delivery: Some(receipt),
-            ..crate::native_v2_eval_platform::FakeSampleRequest::succeeded("sample-capture")
+            ..crate::native_v2_eval::FakeSampleRequest::succeeded("sample-capture")
         },
         &sample,
         |_, _| Some(capture),

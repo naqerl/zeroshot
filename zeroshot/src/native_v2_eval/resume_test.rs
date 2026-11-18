@@ -4,7 +4,7 @@ use super::{
     Capacity, CapacitySourceKind, RESUME_FILE, ResumeAction, ResumeJournal, SampleResumeState,
     SampleStatus,
 };
-use crate::native_v2_eval_platform::runner::{SampleArtifact, SampleOutcome, SampleRun, SampleTimings};
+use crate::native_v2_eval::runner::{SampleArtifact, SampleOutcome, SampleRun, SampleTimings};
 
 fn sample_run(run_id: &str) -> SampleRun {
     SampleRun {
@@ -34,6 +34,9 @@ fn outcome(status: SampleStatus) -> SampleOutcome {
         delivery: None,
         failure_reason: None,
         output: None,
+        criteria: Default::default(),
+        reasoning: Default::default(),
+        patch: None,
     }
 }
 

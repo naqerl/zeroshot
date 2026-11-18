@@ -51,6 +51,9 @@ fn sample_outcome_for_test(status: SampleStatus) -> SampleOutcome {
         delivery: None,
         failure_reason: Some("worker_failed".to_owned()),
         output: None,
+        criteria: Default::default(),
+        reasoning: Default::default(),
+        patch: None,
     }
 }
 
@@ -597,7 +600,7 @@ async fn terminal_failed_reattach_uses_workspace_recovery() {
         })
         .await
         .unwrap();
-    let mut journal = crate::native_v2_eval_platform::ResumeJournal::default();
+    let mut journal = crate::native_v2_eval::ResumeJournal::default();
     journal.claim("sample-failed-resume", run);
     journal.save(directory.path()).unwrap();
     let report = run_eval(EvalRunRequest {
@@ -656,10 +659,10 @@ async fn transient_wait_failure_keeps_the_run_resumable_without_duplicate_submis
     assert_eq!(first.failures.len(), 1);
     assert_eq!(backend.submits(), 1);
     assert!(matches!(
-        crate::native_v2_eval_platform::ResumeJournal::load(directory.path())
+        crate::native_v2_eval::ResumeJournal::load(directory.path())
             .unwrap()
             .action("sample-retry"),
-        crate::native_v2_eval_platform::ResumeAction::Resume(_)
+        crate::native_v2_eval::ResumeAction::Resume(_)
     ));
 
     let second = run_eval(EvalRunRequest {
@@ -734,7 +737,7 @@ async fn driver_resumes_an_interrupted_sample_without_a_fresh_request() {
         .await
         .unwrap();
     let directory = tempfile::tempdir().unwrap();
-    let mut journal = crate::native_v2_eval_platform::ResumeJournal::default();
+    let mut journal = crate::native_v2_eval::ResumeJournal::default();
     journal.claim("sample-resume", old);
     journal.save(directory.path()).unwrap();
     let report = run_eval(EvalRunRequest {
@@ -835,7 +838,7 @@ async fn failed_sample_retry_does_not_reuse_an_old_artifact_after_interruption()
     SampleArtifact::new("sample-stale", old_outcome)
         .write(&sample_directory)
         .unwrap();
-    let mut journal = crate::native_v2_eval_platform::ResumeJournal::default();
+    let mut journal = crate::native_v2_eval::ResumeJournal::default();
     journal.claim("sample-stale", new_run);
     let journal = tokio::sync::Mutex::new(journal);
     let artifact = super::run_eval_sample(
@@ -863,7 +866,7 @@ async fn failed_sample_retry_does_not_reuse_an_old_artifact_after_interruption()
 async fn capture_failure_keeps_the_measured_sample_artifact() {
     let runner = FakeRunner::new();
     let directory = tempfile::tempdir().unwrap();
-    let capture = crate::native_v2_eval_platform::CaptureRequest::new(
+    let capture = crate::native_v2_eval::CaptureRequest::new(
         directory.path(),
         "https://example.invalid/acme/project.git",
         "a".repeat(40),

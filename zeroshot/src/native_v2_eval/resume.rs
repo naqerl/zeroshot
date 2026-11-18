@@ -217,7 +217,7 @@ impl ResumeJournal {
 
     pub fn record_outcome(&mut self, sample_id: &str, outcome: SampleOutcome) {
         let state = match outcome.status {
-            SampleStatus::Succeeded => SampleResumeState::Completed,
+            SampleStatus::Succeeded | SampleStatus::Skipped => SampleResumeState::Completed,
             SampleStatus::Failed => SampleResumeState::Failed,
         };
         let run_id = outcome.run_id.clone();
@@ -244,7 +244,7 @@ impl ResumeJournal {
             {
                 SampleResumeState::CapturePending
             }
-            SampleStatus::Succeeded => SampleResumeState::Completed,
+            SampleStatus::Succeeded | SampleStatus::Skipped => SampleResumeState::Completed,
             SampleStatus::Failed => SampleResumeState::Failed,
         };
         self.update_sample(&artifact.sample_id, |sample| {

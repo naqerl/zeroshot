@@ -1,12 +1,14 @@
 use std::path::PathBuf;
 
+use openengine_cluster_protocol::TokenUsage as ProtocolTokenUsage;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{
-    EvalData, EvalError, EvalId, EvalManifest, EvalReport, EvalSample, EvalStore, FakeRunner,
-    PatchArtifact, SampleHandle, SampleOutcome, SampleRequest, SampleRunner, SampleStatus,
-    SampleTiming, ScorerInput, ScorerRegistry, TokenUsage, model::now_ms, report, store::timestamp,
+    EvalData, EvalError, EvalId, EvalManifest, EvalReport, EvalSample, EvalStore,
+    FakeFixtureRequest, FakeRunner, FakeSampleRequest, PatchArtifact, SampleOutcome, SampleRun,
+    SampleRunner, SampleStatus, SampleTiming, ScorerInput, ScorerRegistry, TokenUsage,
+    model::now_ms, report, store::timestamp,
 };
 
 /// CLI command family wired as `zeroshot eval ...`.
@@ -34,11 +36,36 @@ pub struct EvalRunCommand {
     pub scorer: Option<String>,
 }
 
+/// The executable selected for an eval manifest.
+///
+/// The manifest's `options.runner` is the explicit switch: fixtures use [`FakeRunner`], while
+/// `platform` and `local` select the corresponding native-v2 backend runner. A caller that owns a
+/// backend constructs [`super::PlatformRunner`] or [`super::LocalRunner`] with this selection; the
+/// standalone CLI command only has the fixture runner available.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunnerSelection {
+    Fake,
+    Platform,
+    Local,
+}
+
+/// Select the runner for a manifest. Unknown values fail closed instead of silently using a fake.
+pub fn select_runner(manifest: &EvalManifest) -> Result<RunnerSelection, EvalError> {
+    match manifest.options.runner.as_str() {
+        "fake" => Ok(RunnerSelection::Fake),
+        "platform" => Ok(RunnerSelection::Platform),
+        "local" => Ok(RunnerSelection::Local),
+        other => Err(EvalError::Manifest(format!(
+            "runner {other:?} is not available; expected \"fake\", \"platform\", or \"local\""
+        ))),
+    }
+}
+
 pub async fn execute(command: &EvalCommand) -> Result<Value, EvalError> {
     let store = EvalStore::for_workspace(&command.directory);
     match &command.action {
         EvalAction::Run(run) => {
-            let data = run_manifest_through_fake(run.clone()).await?;
+            let data = run_manifest(run.clone()).await?;
             let report = data
                 .report
                 .ok_or_else(|| EvalError::ReportUnavailable(data.id.to_string()))?;
@@ -70,7 +97,18 @@ pub async fn execute(command: &EvalCommand) -> Result<Value, EvalError> {
 pub(crate) async fn run_manifest_through_fake(
     command: EvalRunCommand,
 ) -> Result<EvalData, EvalError> {
+    run_manifest(command).await
+}
+
+async fn run_manifest(command: EvalRunCommand) -> Result<EvalData, EvalError> {
     let (manifest, source) = EvalManifest::from_file(&command.manifest)?;
+    let selection = select_runner(&manifest)?;
+    if selection != RunnerSelection::Fake {
+        return Err(EvalError::Command(format!(
+            "runner {:?} requires a native-v2 backend; the standalone eval command can only run fixtures",
+            manifest.options.runner
+        )));
+    }
     let store = EvalStore::for_workspace(&command.directory);
     let id = match command.id {
         Some(id) => EvalId::new(id)?,
@@ -83,7 +121,7 @@ pub(crate) async fn run_manifest_through_fake(
         .as_deref()
         .unwrap_or(&manifest.options.scorer)
         .to_owned();
-    let runner = FakeRunner::new(manifest.options.fake.clone(), manifest.options.seed);
+    let runner = FakeRunner::from_fixture(manifest.options.fake.clone(), manifest.options.seed);
     let mut data = EvalData {
         id,
         created_at_ms,
@@ -95,10 +133,10 @@ pub(crate) async fn run_manifest_through_fake(
     Ok(data)
 }
 
-async fn execute_with_runner<S: SampleRunner>(
+async fn execute_with_runner(
     store: &EvalStore,
     data: &mut EvalData,
-    runner: &S,
+    runner: &FakeRunner,
     scorer_name: &str,
 ) -> Result<EvalReport, EvalError> {
     let arms = data.manifest.arms.clone();
@@ -106,18 +144,17 @@ async fn execute_with_runner<S: SampleRunner>(
     let runs_per_arm = data.manifest.runs_per_arm;
     for arm in arms {
         for run_index in 0..runs_per_arm {
-            let request = SampleRequest {
-                eval_id: data.id.clone(),
-                arm: arm.clone(),
+            let request = FakeSampleRequest::fixture(
+                data.id.clone(),
+                arm.clone(),
                 run_index,
-                criteria: criteria.clone(),
-            };
-            let submitted = runner.submit(request.clone()).await;
-            let sample = match submitted {
-                Ok(handle) => settle_sample(store, &request, runner, handle).await?,
+                criteria.clone(),
+            );
+            let sample = match runner.submit(request.clone()).await {
+                Ok(run) => settle_sample(store, &request, runner, run).await?,
                 Err(error) => failed_sample(
                     &request,
-                    format!("fake-{}-{}-{:04}", data.id, request.arm.id, run_index),
+                    synthetic_run_id(&data.id, &request),
                     error.to_string(),
                 ),
             };
@@ -132,28 +169,42 @@ async fn execute_with_runner<S: SampleRunner>(
     Ok(report)
 }
 
-async fn settle_sample<S: SampleRunner>(
+async fn settle_sample(
     store: &EvalStore,
-    request: &SampleRequest,
-    runner: &S,
-    handle: SampleHandle,
+    request: &FakeSampleRequest,
+    runner: &FakeRunner,
+    run: SampleRun,
 ) -> Result<EvalSample, EvalError> {
-    match runner.wait(handle.clone()).await {
-        Ok(outcome) => sample_from_outcome(store, request, &handle.run_id, outcome),
-        Err(error) => Ok(failed_sample(request, handle.run_id, error.to_string())),
+    match runner.wait(&run).await {
+        Ok(outcome) => sample_from_outcome(store, request, outcome),
+        Err(error) => Ok(failed_sample(
+            request,
+            run.run_id.as_str().to_owned(),
+            error.to_string(),
+        )),
     }
 }
 
 fn sample_from_outcome(
     store: &EvalStore,
-    request: &SampleRequest,
-    run_id: &str,
+    request: &FakeSampleRequest,
     outcome: SampleOutcome,
 ) -> Result<EvalSample, EvalError> {
-    let id = sample_id(&request.arm.id, request.run_index);
+    let Some(FakeFixtureRequest {
+        eval_id,
+        arm,
+        run_index,
+        ..
+    }) = &request.fixture
+    else {
+        return Err(EvalError::Runner(
+            "fixture request lost its manifest identity".to_owned(),
+        ));
+    };
+    let id = request.sample_id.clone();
     let patch = match outcome.patch {
         Some(patch) => {
-            let path = store.write_patch(&request.eval_id, &id, &patch.content)?;
+            let path = store.write_patch(eval_id, &id, &patch.content)?;
             Some(PatchArtifact {
                 path,
                 sha256: hex_digest(patch.content.as_bytes()),
@@ -164,12 +215,19 @@ fn sample_from_outcome(
     };
     Ok(EvalSample {
         id,
-        run_id: run_id.to_owned(),
-        arm_id: request.arm.id.clone(),
-        run_index: request.run_index,
+        run_id: outcome.run_id.as_str().to_owned(),
+        arm_id: arm.id.clone(),
+        run_index: *run_index,
         status: outcome.status,
-        timing: outcome.timing,
-        tokens: outcome.tokens,
+        timing: SampleTiming {
+            started_at_ms: outcome
+                .timings
+                .started_at_ms
+                .unwrap_or(outcome.timings.submitted_at_ms),
+            wall_clock_ms: outcome.timings.wall_clock_ms,
+            queue_wait_ms: outcome.timings.queue_wait_ms,
+        },
+        tokens: eval_tokens(outcome.token_usage),
         delivered_revision: outcome.delivered_revision,
         failure_reason: outcome.failure_reason,
         patch,
@@ -178,12 +236,32 @@ fn sample_from_outcome(
     })
 }
 
-fn failed_sample(request: &SampleRequest, run_id: String, reason: String) -> EvalSample {
+fn failed_sample(request: &FakeSampleRequest, run_id: String, reason: String) -> EvalSample {
+    let Some(fixture) = &request.fixture else {
+        return EvalSample {
+            id: request.sample_id.clone(),
+            run_id,
+            arm_id: String::new(),
+            run_index: 0,
+            status: SampleStatus::Failed,
+            timing: SampleTiming {
+                started_at_ms: now_ms(),
+                wall_clock_ms: 0,
+                queue_wait_ms: 0,
+            },
+            tokens: TokenUsage::default(),
+            delivered_revision: None,
+            failure_reason: Some(reason),
+            patch: None,
+            criteria: Default::default(),
+            reasoning: Default::default(),
+        };
+    };
     EvalSample {
-        id: sample_id(&request.arm.id, request.run_index),
+        id: request.sample_id.clone(),
         run_id,
-        arm_id: request.arm.id.clone(),
-        run_index: request.run_index,
+        arm_id: fixture.arm.id.clone(),
+        run_index: fixture.run_index,
         status: SampleStatus::Failed,
         timing: SampleTiming {
             started_at_ms: now_ms(),
@@ -199,8 +277,26 @@ fn failed_sample(request: &SampleRequest, run_id: String, reason: String) -> Eva
     }
 }
 
-fn sample_id(arm_id: &str, run_index: u32) -> String {
-    format!("{arm_id}-{run_index:04}")
+fn eval_tokens(usage: Option<ProtocolTokenUsage>) -> TokenUsage {
+    usage.map_or_else(TokenUsage::default, |usage| TokenUsage {
+        input: usage.input_tokens.get(),
+        output: usage.output_tokens.get(),
+        cache: usage
+            .cache_read_input_tokens
+            .map_or(0, |tokens| tokens.get())
+            .saturating_add(
+                usage
+                    .cache_creation_input_tokens
+                    .map_or(0, |tokens| tokens.get()),
+            ),
+    })
+}
+
+fn synthetic_run_id(eval_id: &EvalId, request: &FakeSampleRequest) -> String {
+    match &request.fixture {
+        Some(fixture) => format!("fake-{eval_id}-{}-{:04}", fixture.arm.id, fixture.run_index),
+        None => format!("fake-{eval_id}-{}", request.sample_id),
+    }
 }
 
 fn ensure_report(store: &EvalStore, data: &EvalData) -> Result<EvalReport, EvalError> {

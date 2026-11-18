@@ -2,34 +2,166 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use openengine_cluster_protocol::{
+    MAX_SAFE_GENERATION, RunId, TokenCount, TokenUsage as ProtocolTokenUsage,
+};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use super::{
-    CriterionResult, EvalError, FakeOptions, SampleHandle, SampleOutcome, SamplePatch,
-    SampleRequest, SampleRunner, SampleStatus, SampleTiming, TokenUsage, model::now_ms,
+use super::EvalError;
+use super::capture::DeliveryReceipt;
+use super::manifest::{EvalArm, EvalCriterion};
+use super::model::{CriterionResult, EvalId};
+use super::runner::{
+    ResumeCredentials, SampleOutcome, SamplePatch, SampleRequest, SampleRun, SampleRunner,
+    SampleRunnerError, SampleStatus, SampleTimings,
 };
+use super::{FakeOptions, model::now_ms};
+
+/// Inputs the manifest fixture passes to the synthetic runner.
+#[derive(Clone, Debug)]
+pub struct FakeFixtureRequest {
+    pub eval_id: EvalId,
+    pub arm: EvalArm,
+    pub run_index: u32,
+    pub criteria: Vec<EvalCriterion>,
+}
+
+/// One request for [`FakeRunner`].
+///
+/// A `fixture` request derives its result from `[options.fake]` and per-arm knobs. A request
+/// without one is a scripted result, which keeps the platform runner tests independent of the
+/// manifest fixture vocabulary.
+#[derive(Clone, Debug)]
+pub struct FakeSampleRequest {
+    pub sample_id: String,
+    pub run_id: Option<RunId>,
+    pub concurrency: usize,
+    pub queue_wait_ms: u64,
+    pub wall_clock_ms: u64,
+    pub status: SampleStatus,
+    pub token_usage: Option<ProtocolTokenUsage>,
+    pub delivery: Option<DeliveryReceipt>,
+    pub failure_reason: Option<String>,
+    pub fixture: Option<FakeFixtureRequest>,
+}
+
+impl FakeSampleRequest {
+    #[must_use]
+    pub fn succeeded(sample_id: impl Into<String>) -> Self {
+        Self {
+            sample_id: sample_id.into(),
+            run_id: None,
+            concurrency: 1,
+            queue_wait_ms: 0,
+            wall_clock_ms: 1,
+            status: SampleStatus::Succeeded,
+            token_usage: None,
+            delivery: None,
+            failure_reason: None,
+            fixture: None,
+        }
+    }
+
+    #[must_use]
+    pub fn failed(sample_id: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            status: SampleStatus::Failed,
+            failure_reason: Some(reason.into()),
+            ..Self::succeeded(sample_id)
+        }
+    }
+
+    #[must_use]
+    pub fn fixture(
+        eval_id: EvalId,
+        arm: EvalArm,
+        run_index: u32,
+        criteria: Vec<EvalCriterion>,
+    ) -> Self {
+        Self {
+            sample_id: format!("{}-{run_index:04}", arm.id),
+            fixture: Some(FakeFixtureRequest {
+                eval_id,
+                arm,
+                run_index,
+                criteria,
+            }),
+            ..Self::succeeded(String::new())
+        }
+    }
+}
+
+impl SampleRequest for FakeSampleRequest {
+    fn with_concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = concurrency;
+        self
+    }
+}
+
+#[derive(Default)]
+struct FakeState {
+    submissions: BTreeMap<RunId, FakeSampleRequest>,
+    order: Vec<SampleRun>,
+    stopped: Vec<RunId>,
+}
 
 /// Deterministic in-process runner used by fixtures and tests. It never touches the network.
 pub struct FakeRunner {
     options: FakeOptions,
     seed: u64,
-    pending: Mutex<BTreeMap<String, SampleOutcome>>,
+    state: Mutex<FakeState>,
 }
 
 impl FakeRunner {
     #[must_use]
-    pub fn new(options: FakeOptions, seed: u64) -> Self {
+    pub fn new() -> Self {
+        Self::from_fixture(FakeOptions::default(), 0)
+    }
+
+    /// Build a runner seeded by the manifest's `[options.fake]` block.
+    #[must_use]
+    pub fn from_fixture(options: FakeOptions, seed: u64) -> Self {
         Self {
             options,
             seed,
-            pending: Mutex::new(BTreeMap::new()),
+            state: Mutex::new(FakeState::default()),
         }
     }
 
-    fn outcome(&self, request: &SampleRequest) -> Result<SampleOutcome, EvalError> {
-        let settings = FakeArmSettings::from_request(&self.options, request)?;
-        let ordinal = request.run_index.saturating_add(1);
+    pub async fn submitted(&self) -> Vec<SampleRun> {
+        self.state
+            .lock()
+            .map(|state| state.order.clone())
+            .unwrap_or_default()
+    }
+
+    pub async fn stopped(&self) -> Vec<RunId> {
+        self.state
+            .lock()
+            .map(|state| state.stopped.clone())
+            .unwrap_or_default()
+    }
+
+    fn outcome(
+        &self,
+        request: &FakeSampleRequest,
+        run: &SampleRun,
+    ) -> Result<SampleOutcome, SampleRunnerError> {
+        match &request.fixture {
+            Some(fixture) => self.fixture_outcome(run, fixture),
+            None => Ok(scripted_outcome(request, run)),
+        }
+    }
+
+    fn fixture_outcome(
+        &self,
+        run: &SampleRun,
+        fixture: &FakeFixtureRequest,
+    ) -> Result<SampleOutcome, SampleRunnerError> {
+        let settings = FakeArmSettings::from_request(&self.options, fixture)
+            .map_err(|error| SampleRunnerError::InvalidRequest(error.to_string()))?;
+        let ordinal = fixture.run_index.saturating_add(1);
         let skip = settings.skip
             || self
                 .options
@@ -44,21 +176,21 @@ impl FakeRunner {
         let mut criteria = BTreeMap::new();
         let mut reasoning = BTreeMap::new();
         if !skip && !fail {
-            for criterion in &request.criteria {
+            for criterion in &fixture.criteria {
                 let passed = settings
                     .criteria
                     .get(&criterion.id)
                     .copied()
                     .unwrap_or_else(|| {
-                        unit_hash(self.seed, &request.arm.id, &criterion.id, request.run_index)
+                        unit_hash(self.seed, &fixture.arm.id, &criterion.id, fixture.run_index)
                             < settings.pass_rate
                     });
                 let explanation = format!(
                     "fake judgement: {}{} for arm {} run {}",
                     criterion.id,
                     if passed { " passed" } else { " failed" },
-                    request.arm.id,
-                    request.run_index
+                    fixture.arm.id,
+                    fixture.run_index
                 );
                 reasoning.insert(criterion.id.clone(), explanation.clone());
                 criteria.insert(
@@ -80,84 +212,183 @@ impl FakeRunner {
         let failure_reason = match status {
             SampleStatus::Failed => Some(format!(
                 "fake runner failed arm {} run {}",
-                request.arm.id, request.run_index
+                fixture.arm.id, fixture.run_index
             )),
             SampleStatus::Skipped => Some(format!(
                 "fake runner skipped arm {} run {}",
-                request.arm.id, request.run_index
+                fixture.arm.id, fixture.run_index
             )),
             SampleStatus::Succeeded => None,
         };
+        let started_at_ms = run.submitted_at_ms.saturating_add(settings.queue_wait_ms);
+        let finished_at_ms = started_at_ms.saturating_add(settings.wall_clock_ms);
         Ok(SampleOutcome {
+            run_id: run.run_id.clone(),
             status,
-            timing: SampleTiming {
-                started_at_ms: now_ms(),
-                wall_clock_ms: settings.wall_clock_ms,
+            timings: SampleTimings {
+                submitted_at_ms: run.submitted_at_ms,
+                started_at_ms: Some(started_at_ms),
+                finished_at_ms,
                 queue_wait_ms: settings.queue_wait_ms,
+                wall_clock_ms: settings.wall_clock_ms,
+                concurrency: run.concurrency,
             },
-            tokens: settings.tokens,
+            token_usage: Some(protocol_tokens(settings.tokens)),
             delivered_revision: (status == SampleStatus::Succeeded)
-                .then(|| revision(self.seed, &request.arm.id, request.run_index)),
+                .then(|| revision(self.seed, &fixture.arm.id, fixture.run_index)),
+            delivered_branch: None,
+            delivery: None,
             failure_reason,
+            output: None,
+            criteria,
+            reasoning,
             patch: (status == SampleStatus::Succeeded).then(|| SamplePatch {
                 content: format!(
                     "fake patch for eval {} arm {} run {}\n",
-                    request.eval_id, request.arm.id, request.run_index
+                    fixture.eval_id, fixture.arm.id, fixture.run_index
                 ),
             }),
-            criteria,
-            reasoning,
         })
     }
 }
 
+impl Default for FakeRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn scripted_outcome(request: &FakeSampleRequest, run: &SampleRun) -> SampleOutcome {
+    let started_at_ms = run.submitted_at_ms.saturating_add(request.queue_wait_ms);
+    let finished_at_ms = started_at_ms.saturating_add(request.wall_clock_ms);
+    let delivery = request.delivery.clone();
+    SampleOutcome {
+        run_id: run.run_id.clone(),
+        status: request.status,
+        timings: SampleTimings {
+            submitted_at_ms: run.submitted_at_ms,
+            started_at_ms: Some(started_at_ms),
+            finished_at_ms,
+            queue_wait_ms: request.queue_wait_ms,
+            wall_clock_ms: request.wall_clock_ms,
+            concurrency: run.concurrency,
+        },
+        token_usage: request.token_usage.clone(),
+        delivered_revision: delivery
+            .as_ref()
+            .and_then(DeliveryReceipt::delivered_revision),
+        delivered_branch: delivery
+            .as_ref()
+            .and_then(|value| value.head_branch.clone()),
+        delivery,
+        failure_reason: request.failure_reason.clone(),
+        output: None,
+        criteria: BTreeMap::new(),
+        reasoning: BTreeMap::new(),
+        patch: None,
+    }
+}
+
+fn protocol_tokens(tokens: super::model::TokenUsage) -> ProtocolTokenUsage {
+    ProtocolTokenUsage {
+        input_tokens: token_count(tokens.input),
+        output_tokens: token_count(tokens.output),
+        cache_read_input_tokens: (tokens.cache > 0).then(|| token_count(tokens.cache)),
+        cache_creation_input_tokens: None,
+        complete: true,
+    }
+}
+
+fn token_count(value: u64) -> TokenCount {
+    TokenCount::new(value.min(MAX_SAFE_GENERATION)).unwrap_or_default()
+}
+
 #[async_trait]
 impl SampleRunner for FakeRunner {
-    async fn submit(&self, request: SampleRequest) -> Result<SampleHandle, EvalError> {
-        let run_id = format!(
-            "fake-{}-{}-{:04}",
-            request.eval_id, request.arm.id, request.run_index
-        );
-        let outcome = self.outcome(&request)?;
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| EvalError::Runner("fake runner state is poisoned".to_owned()))?;
-        pending.insert(run_id.clone(), outcome);
-        Ok(SampleHandle {
-            run_id,
-            arm_id: request.arm.id,
-            run_index: request.run_index,
-        })
+    type Request = FakeSampleRequest;
+
+    async fn submit(&self, request: Self::Request) -> Result<SampleRun, SampleRunnerError> {
+        if request.sample_id.trim().is_empty() {
+            return Err(SampleRunnerError::InvalidRequest(
+                "sample id is required".to_owned(),
+            ));
+        }
+        let run_id = request
+            .run_id
+            .clone()
+            .unwrap_or_else(|| RunId::new(uuid::Uuid::now_v7().to_string()));
+        let run = SampleRun {
+            sample_id: request.sample_id.clone(),
+            run_id: run_id.clone(),
+            target: None,
+            submitted_at_ms: now_ms(),
+            concurrency: request.concurrency.max(1),
+        };
+        // Validate fixture knobs before the sample enters the journal.
+        self.outcome(&request, &run)?;
+        let mut state = self.state.lock().map_err(|_| {
+            SampleRunnerError::InvalidRequest("fake runner state is poisoned".to_owned())
+        })?;
+        state.order.push(run.clone());
+        state.submissions.insert(run_id, request);
+        Ok(run)
     }
 
-    async fn wait(&self, handle: SampleHandle) -> Result<SampleOutcome, EvalError> {
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| EvalError::Runner("fake runner state is poisoned".to_owned()))?;
-        pending.remove(&handle.run_id).ok_or_else(|| {
-            EvalError::Runner(format!(
-                "fake runner has no pending sample {}",
-                handle.run_id
-            ))
-        })
+    async fn wait(&self, run: &SampleRun) -> Result<SampleOutcome, SampleRunnerError> {
+        let (request, stopped) = {
+            let state = self.state.lock().map_err(|_| {
+                SampleRunnerError::InvalidRequest("fake runner state is poisoned".to_owned())
+            })?;
+            let request = state.submissions.get(&run.run_id).cloned().ok_or_else(|| {
+                SampleRunnerError::InvalidRequest("run was not submitted".to_owned())
+            })?;
+            (request, state.stopped.contains(&run.run_id))
+        };
+        if stopped {
+            return Err(SampleRunnerError::Stopped);
+        }
+        self.outcome(&request, run)
     }
 
-    async fn stop(&self, handle: SampleHandle) -> Result<(), EvalError> {
-        let mut pending = self
-            .pending
+    async fn stop(&self, run: &SampleRun) -> Result<(), SampleRunnerError> {
+        self.state
             .lock()
-            .map_err(|_| EvalError::Runner("fake runner state is poisoned".to_owned()))?;
-        pending.remove(&handle.run_id);
+            .map_err(|_| {
+                SampleRunnerError::InvalidRequest("fake runner state is poisoned".to_owned())
+            })?
+            .stopped
+            .push(run.run_id.clone());
         Ok(())
+    }
+
+    async fn resume(
+        &self,
+        run: SampleRun,
+        _credentials: ResumeCredentials,
+    ) -> Result<SampleRun, SampleRunnerError> {
+        let mut state = self.state.lock().map_err(|_| {
+            SampleRunnerError::InvalidRequest("fake runner state is poisoned".to_owned())
+        })?;
+        let submission =
+            state.submissions.get(&run.run_id).cloned().ok_or_else(|| {
+                SampleRunnerError::InvalidRequest("run was not submitted".to_owned())
+            })?;
+        let successor = RunId::new(uuid::Uuid::now_v7().to_string());
+        let resumed = SampleRun {
+            run_id: successor.clone(),
+            submitted_at_ms: now_ms(),
+            ..run
+        };
+        state.order.push(resumed.clone());
+        state.submissions.insert(successor, submission);
+        Ok(resumed)
     }
 }
 
 struct FakeArmSettings {
     queue_wait_ms: u64,
     wall_clock_ms: u64,
-    tokens: TokenUsage,
+    tokens: super::model::TokenUsage,
     pass_rate: f64,
     fail: bool,
     skip: bool,
@@ -165,13 +396,16 @@ struct FakeArmSettings {
 }
 
 impl FakeArmSettings {
-    fn from_request(options: &FakeOptions, request: &SampleRequest) -> Result<Self, EvalError> {
+    fn from_request(
+        options: &FakeOptions,
+        request: &FakeFixtureRequest,
+    ) -> Result<Self, EvalError> {
         let knobs = &request.arm.knobs;
         let criteria = criteria_overrides(knobs, &request.arm.id)?;
         Ok(Self {
             queue_wait_ms: u64_knob(knobs, "queueWaitMs", options.queue_wait_ms, &request.arm.id)?,
             wall_clock_ms: u64_knob(knobs, "wallClockMs", options.wall_clock_ms, &request.arm.id)?,
-            tokens: TokenUsage {
+            tokens: super::model::TokenUsage {
                 input: u64_knob(knobs, "inputTokens", options.input_tokens, &request.arm.id)?,
                 output: u64_knob(
                     knobs,

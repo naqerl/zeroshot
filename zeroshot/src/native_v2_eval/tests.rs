@@ -19,6 +19,32 @@ async fn run_fixture_in(directory: &std::path::Path, id: &str, source: &str) -> 
 }
 
 #[test]
+fn cli_selects_the_unified_runner_from_the_manifest() {
+    let fixture = EvalManifest::parse(fixture_source()).expect("fixture manifest parses");
+    assert_eq!(
+        select_runner(&fixture).expect("fixture runner is selected"),
+        RunnerSelection::Fake
+    );
+
+    let local =
+        EvalManifest::parse(&fixture_source().replace("runner = \"fake\"", "runner = \"local\""))
+            .expect("local manifest parses");
+    assert_eq!(
+        select_runner(&local).expect("local runner is selected"),
+        RunnerSelection::Local
+    );
+
+    let platform = EvalManifest::parse(
+        &fixture_source().replace("runner = \"fake\"", "runner = \"platform\""),
+    )
+    .expect("platform manifest parses");
+    assert_eq!(
+        select_runner(&platform).expect("platform runner is selected"),
+        RunnerSelection::Platform
+    );
+}
+
+#[test]
 fn manifest_validation_failure_is_named_and_never_panics() {
     let invalid_runs = fixture_source().replace("runsPerArm = 3", "runsPerArm = 0");
     let error = EvalManifest::parse(&invalid_runs).expect_err("zero runs must be rejected");

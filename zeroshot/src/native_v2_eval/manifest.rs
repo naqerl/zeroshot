@@ -282,9 +282,9 @@ impl EvalCriterion {
 impl EvalOptions {
     fn validate(&self) -> Result<(), EvalError> {
         validate_scorer_name(&self.scorer)?;
-        if self.runner != "fake" {
+        if !matches!(self.runner.as_str(), "fake" | "platform" | "local") {
             return Err(invalid(format!(
-                "runner {:?} is not available in this build; expected \"fake\"",
+                "runner {:?} is not available; expected \"fake\", \"platform\", or \"local\"",
                 self.runner
             )));
         }

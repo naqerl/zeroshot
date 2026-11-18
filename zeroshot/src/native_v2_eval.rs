@@ -2,8 +2,9 @@
 //!
 //! An eval is described by one strict manifest. The runner persists every sample record and then
 //! derives the report from those records, so `show`, `report`, and `score` never depend on state
-//! carried by the process that executed the eval. Slices 2 and 3 fill in real sample runners and a
-//! judge; this module owns the manifest/store/report/scoring core plus the synthetic runner.
+//! carried by the process that executed the eval. This module owns the manifest/store/report/scoring
+//! core, the capacity/capture/resume support, and one `Submit`/`Wait`/`Stop` runner seam implemented
+//! by the platform, local, and synthetic runners.
 
 mod capacity;
 mod capture;
@@ -19,22 +20,37 @@ mod runner;
 mod scorer;
 mod store;
 
-pub use capacity::CapacitySource;
-pub use cli::{execute, EvalAction, EvalCommand, EvalRunCommand};
+pub use capacity::{
+    Capacity, CapacityError, CapacitySource, CapacitySourceKind, StaticCapacity, resolve_capacity,
+};
+pub use capture::{
+    CaptureCredentials, CaptureError, CaptureRequest, CapturedSample, DeliveryReceipt,
+    JudgeCheckout, capture_patch, checkout_patch,
+};
+pub use cli::{EvalAction, EvalCommand, EvalRunCommand, RunnerSelection, execute, select_runner};
 pub use error::EvalError;
-pub use fake::FakeRunner;
+pub use fake::{FakeFixtureRequest, FakeRunner, FakeSampleRequest};
 pub use judge::{Judge, JudgeRequest, JudgeResult};
 pub use manifest::{EvalArm, EvalCriterion, EvalManifest, EvalOptions, FakeOptions, MANIFEST_SCHEMA};
 pub use model::{
-    CriterionResult, EvalData, EvalId, EvalSample, PatchArtifact, SampleCounts, SampleStatus,
-    SampleTiming, TokenUsage,
+    CriterionResult, EvalData, EvalId, EvalSample, PatchArtifact, SampleCounts, SampleTiming,
+    TokenUsage,
 };
 pub use report::{
     ArmCostTime, ArmTraitSummary, CostTimeComparison, EvalReport, QualityCostFit, TraitCell,
     TraitColumn, TraitMatrix, TraitMatrixRow, TraitSummary, UnmatchedReasoning, REPORT_SCHEMA,
     render_markdown,
 };
-pub use runner::{SampleHandle, SampleOutcome, SamplePatch, SampleRequest, SampleRunner};
+pub use resume::{
+    CapacityWarning, RESUME_FILE, ResumeAction, ResumeError, ResumeJournal, ResumeSample,
+    SampleResumeState,
+};
+pub use runner::{
+    BackendSampleRequest, EvalRunError, EvalRunReport, EvalRunRequest, EvalSamplePlan, LocalRunner,
+    PlatformRunner, ResumeCredentials, SAMPLE_FILE, SampleArtifact, SampleExecution,
+    SampleExecutionError, SampleFailure, SampleOutcome, SamplePatch, SampleRequest, SampleRun,
+    SampleRunner, SampleRunnerError, SampleStatus, SampleTimings, run_eval, run_sample,
+};
 pub use scorer::{NoneScorer, QualityVsCostScorer, Scorer, ScorerInput, ScorerOutput, ScorerRegistry};
 pub use store::{EvalStore, EvalSummary};
 

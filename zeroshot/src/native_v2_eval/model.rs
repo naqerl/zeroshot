@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use super::runner::SampleStatus;
 use super::{EvalError, EvalManifest, EvalReport};
 
 /// Stable directory identity for one eval.
@@ -124,21 +125,6 @@ pub struct EvalSample {
     pub criteria: BTreeMap<String, CriterionResult>,
     #[serde(default)]
     pub reasoning: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SampleStatus {
-    Succeeded,
-    Failed,
-    Skipped,
-}
-
-impl SampleStatus {
-    #[must_use]
-    pub const fn is_attempted(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
