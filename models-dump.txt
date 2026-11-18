@@ -1,0 +1,36 @@
+=== PI_CODING_AGENT_DIR ===
+/var/lib/zeroshot/native-v2/runs/97c634708153c3f545cee131a2da14c75ae1b29c8556a1efb1a76e4c53ad8743/runtime/writer-node-instance-1
+=== ls -la "$PI_CODING_AGENT_DIR" ===
+total 20
+drwx------ 1 20000 10002  202 Nov 18 14:34 .
+drwx--x--x 1 root  root    78 Nov 18 14:34 ..
+-rw------- 1 20000 10002  105 Nov 18 14:34 active-memory-capability.json
+-rw------- 1 20000 10002 2341 Nov 18 14:34 active-memory-extension.mjs
+-rw------- 1 20000 10002    2 Nov 18 14:34 auth.json
+-rw------- 1 20000 10002    2 Nov 18 14:34 models-store.json
+-rw------- 1 20000 10002  447 Nov 18 14:34 models.json
+drwxr-xr-x 1 20000 10002  196 Nov 18 14:34 sessions
+=== cat "$PI_CODING_AGENT_DIR/models.json" ===
+{
+  "providers": {
+    "zeroshot-gateway": {
+      "api": "openai-completions",
+      "apiKey": "$GATEWAY_API_KEY",
+      "baseUrl": "https://magpie-lab.tail6dedc8.ts.net/v1",
+      "models": [
+        {
+          "api": "openai-completions",
+          "contextWindow": 1000000,
+          "id": "deepseek-v4.1-flash",
+          "maxTokens": 32000,
+          "name": "deepseek-v4.1-flash",
+          "reasoning": false
+        }
+      ]
+    }
+  }
+}
+=== echo "$ZEROSHOT_TOOLS" ===
+/var/lib/zeroshot/native-v2/runs/97c634708153c3f545cee131a2da14c75ae1b29c8556a1efb1a76e4c53ad8743/tools
+=== zeroshot --version || true ===
+zeroshot 0.1.0
