@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use super::capacity::{Capacity, CapacitySourceKind};
 use super::capture::CapturedSample;
-use super::runner::{SampleOutcome, SampleStatus};
+use super::runner::{SampleArtifact, SampleOutcome, SampleRun, SampleStatus};
 use super::now_ms;
 
 pub const RESUME_FILE: &str = "resume.json";
@@ -34,12 +34,17 @@ pub struct ResumeSample {
     pub state: SampleResumeState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<RunId>,
+    /// Full submitted identity, including timings and target, so resume can reattach accurately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<SampleRun>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<SampleOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub captured: Option<CapturedSample>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_error: Option<String>,
     pub updated_at_ms: u64,
 }
 
@@ -59,7 +64,7 @@ pub enum ResumeAction {
     /// The sample completed; its stored outcome is authoritative.
     Skip,
     /// The previous controller lost this run before completion. Resume its retained workspace.
-    Resume(RunId),
+    Resume(SampleRun),
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -129,8 +134,8 @@ impl ResumeJournal {
     pub fn action(&self, sample_id: &str) -> ResumeAction {
         match self.samples.get(sample_id) {
             Some(sample) if sample.state == SampleResumeState::Completed => ResumeAction::Skip,
-            Some(sample) if sample.state == SampleResumeState::Running => match &sample.run_id {
-                Some(run_id) => ResumeAction::Resume(run_id.clone()),
+            Some(sample) if sample.state == SampleResumeState::Running => match &sample.run {
+                Some(run) => ResumeAction::Resume(run.clone()),
                 None => ResumeAction::Start,
             },
             _ => ResumeAction::Start,
@@ -162,7 +167,7 @@ impl ResumeJournal {
             .collect()
     }
 
-    pub fn claim(&mut self, sample_id: &str, run_id: RunId) {
+    pub fn claim(&mut self, sample_id: &str, run: SampleRun) {
         let now = now_ms();
         self.updated_at_ms = now;
         let sample = self
@@ -172,14 +177,18 @@ impl ResumeJournal {
                 sample_id: sample_id.to_owned(),
                 state: SampleResumeState::Pending,
                 run_id: None,
+                run: None,
                 outcome: None,
                 captured: None,
                 error: None,
+                capture_error: None,
                 updated_at_ms: now,
             });
-        sample.run_id = Some(run_id);
+        sample.run_id = Some(run.run_id.clone());
+        sample.run = Some(run);
         sample.state = SampleResumeState::Running;
         sample.error = None;
+        sample.capture_error = None;
         sample.updated_at_ms = now;
     }
 
@@ -200,6 +209,23 @@ impl ResumeJournal {
     pub fn record_capture(&mut self, sample_id: &str, captured: CapturedSample) {
         self.update_sample(sample_id, |sample| {
             sample.captured = Some(captured);
+            sample.capture_error = None;
+        });
+    }
+
+    /// Record the durable artifact, including a capture failure that must not erase its outcome.
+    pub fn record_artifact(&mut self, artifact: &SampleArtifact) {
+        let state = match artifact.outcome.status {
+            SampleStatus::Succeeded => SampleResumeState::Completed,
+            SampleStatus::Failed => SampleResumeState::Failed,
+        };
+        self.update_sample(&artifact.sample_id, |sample| {
+            sample.state = state;
+            sample.run_id = Some(artifact.outcome.run_id.clone());
+            sample.error = artifact.outcome.failure_reason.clone();
+            sample.outcome = Some(artifact.outcome.clone());
+            sample.captured = artifact.captured.clone();
+            sample.capture_error = artifact.capture_error.clone();
         });
     }
 
@@ -236,9 +262,11 @@ impl ResumeJournal {
                 sample_id: sample_id.to_owned(),
                 state: SampleResumeState::Pending,
                 run_id: None,
+                run: None,
                 outcome: None,
                 captured: None,
                 error: None,
+                capture_error: None,
                 updated_at_ms: now,
             });
         update(sample);

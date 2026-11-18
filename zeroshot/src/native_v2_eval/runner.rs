@@ -1,4 +1,4 @@
-//! Sample submission, waiting, and cancellation behind one trait.
+//! Sample submission, waiting, cancellation, capture, and resume behind one trait.
 //!
 //! `PlatformRunner` and `LocalRunner` adapt the existing native-v2 CLI backend; `FakeRunner` is
 //! the deterministic test double. All timings are captured at this boundary so an eval can compare
@@ -11,18 +11,24 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use openengine_cluster_protocol::{
-    RunForceParams, RunId, RunStatus, RunStatusParams, TerminalResult, TokenUsage,
+    RunForceParams, RunId, RunResumeParams, RunStatus, RunStatusParams, TerminalResult, TokenUsage,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 use crate::native_v2_cli::{CliRunStatus, NativeV2CliBackend, PreparedRunRequest};
 
-use super::capture::{CaptureError, CaptureRequest, CapturedSample, DeliveryReceipt, capture_patch};
+use super::capacity::{Capacity, CapacityError, CapacitySource, resolve_capacity, run_bounded};
+use super::capture::{
+    CaptureError, CaptureRequest, CapturedSample, DeliveryReceipt, capture_patch, checkout_patch,
+};
 use super::now_ms;
+use super::resume::{CapacityWarning, ResumeAction, ResumeError, ResumeJournal};
 
 pub const SAMPLE_FILE: &str = "sample.json";
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_STORED_OUTPUT_BYTES: usize = 1_024 * 1_024;
 
 /// One sample's request. The eval manifest supplies `sample_id`; the CLI has already prepared the
 /// immutable native-v2 submission.
@@ -82,7 +88,8 @@ pub struct SampleOutcome {
     pub delivery: Option<DeliveryReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
-    /// Final graph output. It is stored so a later scorer can recompute from the sample artifact.
+    /// Bounded final graph output. Delivery fields are also projected above so truncation cannot
+    /// hide the captured revision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<serde_json::Value>,
 }
@@ -96,6 +103,10 @@ pub struct SampleArtifact {
     pub outcome: SampleOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub captured: Option<CapturedSample>,
+    /// A successful run whose fetch or patch application failed. The outcome remains renderable;
+    /// resume can retry capture without pretending the run did not happen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_error: Option<String>,
 }
 
 impl SampleArtifact {
@@ -105,6 +116,7 @@ impl SampleArtifact {
             sample_id: sample_id.into(),
             outcome,
             captured: None,
+            capture_error: None,
         }
     }
 
@@ -134,6 +146,10 @@ pub enum SampleRunnerError {
     InvalidRequest(String),
     #[error("sample runner was stopped before completion")]
     Stopped,
+    #[error("sample exceeded its configured deadline")]
+    Deadline,
+    #[error("sample runner cannot resume retained runs")]
+    ResumeUnsupported,
 }
 
 #[async_trait]
@@ -145,6 +161,12 @@ pub trait SampleRunner: Send + Sync {
     async fn wait(&self, run: &SampleRun) -> Result<SampleOutcome, SampleRunnerError>;
 
     async fn stop(&self, run: &SampleRun) -> Result<(), SampleRunnerError>;
+
+    /// Resume a run that was already submitted but never reached a terminal outcome.
+    async fn resume(&self, run: SampleRun) -> Result<SampleRun, SampleRunnerError> {
+        let _ = run;
+        Err(SampleRunnerError::ResumeUnsupported)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -160,7 +182,8 @@ pub enum SampleExecutionError {
 /// Run one sample end to end and persist its `sample.json`.
 ///
 /// The optional capture callback receives the submitted run and final outcome, so the caller can
-/// derive the exact source remote and revision without duplicating timing bookkeeping.
+/// derive the exact source remote and revision without duplicating timing bookkeeping. A capture
+/// failure is recorded on the artifact after the run outcome has already been persisted.
 pub async fn run_sample<R, F>(
     runner: &R,
     request: R::Request,
@@ -171,22 +194,43 @@ where
     R: SampleRunner,
     F: FnOnce(&SampleRun, &SampleOutcome) -> Option<CaptureRequest>,
 {
-    std::fs::create_dir_all(directory)?;
     let run = runner.submit(request).await?;
     let outcome = runner.wait(&run).await?;
-    let captured = match outcome.status {
-        SampleStatus::Succeeded => match capture(&run, &outcome) {
-            Some(request) => Some(capture_patch(&request).await?),
-            None => None,
-        },
-        SampleStatus::Failed => None,
+    let capture = if outcome.status == SampleStatus::Succeeded {
+        capture(&run, &outcome)
+    } else {
+        None
     };
-    let artifact = SampleArtifact {
-        sample_id: run.sample_id,
-        outcome,
-        captured,
-    };
+    finish_sample(run, outcome, directory, capture).await
+}
+
+async fn finish_sample(
+    run: SampleRun,
+    outcome: SampleOutcome,
+    directory: &Path,
+    capture: Option<CaptureRequest>,
+) -> Result<SampleArtifact, SampleExecutionError> {
+    std::fs::create_dir_all(directory)?;
+    let mut artifact = SampleArtifact::new(run.sample_id, outcome);
+    // Persist the measured run before any network capture so a failed fetch never erases it.
     artifact.write(directory)?;
+    if artifact.outcome.status == SampleStatus::Succeeded {
+        if let Some(mut request) = capture {
+            request.directory = directory.to_owned();
+            request.receipt = artifact.outcome.delivery.clone().unwrap_or_default();
+            match capture_patch(&request).await {
+                Ok(mut captured) => {
+                    match checkout_patch(&request, &directory.join("judge")).await {
+                        Ok(judge) => captured.judge = Some(judge),
+                        Err(error) => artifact.capture_error = Some(error.to_string()),
+                    }
+                    artifact.captured = Some(captured);
+                }
+                Err(error) => artifact.capture_error = Some(error.to_string()),
+            }
+            artifact.write(directory)?;
+        }
+    }
     Ok(artifact)
 }
 
@@ -195,6 +239,7 @@ pub struct PlatformRunner<B> {
     backend: Arc<B>,
     target: String,
     poll_interval: Duration,
+    deadline: Option<Duration>,
 }
 
 impl<B> PlatformRunner<B> {
@@ -204,6 +249,7 @@ impl<B> PlatformRunner<B> {
             backend,
             target: target.into(),
             poll_interval: DEFAULT_POLL_INTERVAL,
+            deadline: None,
         }
     }
 
@@ -212,12 +258,19 @@ impl<B> PlatformRunner<B> {
         self.poll_interval = poll_interval.max(Duration::from_millis(1));
         self
     }
+
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = Some(deadline.max(Duration::from_millis(1)));
+        self
+    }
 }
 
 /// A runner backed by the local native-v2 controller.
 pub struct LocalRunner<B> {
     backend: Arc<B>,
     poll_interval: Duration,
+    deadline: Option<Duration>,
 }
 
 impl<B> LocalRunner<B> {
@@ -226,12 +279,19 @@ impl<B> LocalRunner<B> {
         Self {
             backend,
             poll_interval: DEFAULT_POLL_INTERVAL,
+            deadline: None,
         }
     }
 
     #[must_use]
     pub fn with_poll_interval(mut self, poll_interval: Duration) -> Self {
         self.poll_interval = poll_interval.max(Duration::from_millis(1));
+        self
+    }
+
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = Some(deadline.max(Duration::from_millis(1)));
         self
     }
 }
@@ -249,13 +309,20 @@ impl<B: NativeV2CliBackend> SampleRunner for PlatformRunner<B> {
             self.backend.as_ref(),
             Some(self.target.as_str()),
             run,
-            self.poll_interval,
+            WaitPolicy {
+                poll_interval: self.poll_interval,
+                deadline: self.deadline,
+            },
         )
         .await
     }
 
     async fn stop(&self, run: &SampleRun) -> Result<(), SampleRunnerError> {
         stop(self.backend.as_ref(), Some(self.target.as_str()), run).await
+    }
+
+    async fn resume(&self, run: SampleRun) -> Result<SampleRun, SampleRunnerError> {
+        resume(self.backend.as_ref(), Some(self.target.as_str()), run).await
     }
 }
 
@@ -268,11 +335,24 @@ impl<B: NativeV2CliBackend> SampleRunner for LocalRunner<B> {
     }
 
     async fn wait(&self, run: &SampleRun) -> Result<SampleOutcome, SampleRunnerError> {
-        wait_for_run(self.backend.as_ref(), None, run, self.poll_interval).await
+        wait_for_run(
+            self.backend.as_ref(),
+            None,
+            run,
+            WaitPolicy {
+                poll_interval: self.poll_interval,
+                deadline: self.deadline,
+            },
+        )
+        .await
     }
 
     async fn stop(&self, run: &SampleRun) -> Result<(), SampleRunnerError> {
         stop(self.backend.as_ref(), None, run).await
+    }
+
+    async fn resume(&self, run: SampleRun) -> Result<SampleRun, SampleRunnerError> {
+        resume(self.backend.as_ref(), None, run).await
     }
 }
 
@@ -300,6 +380,34 @@ async fn submit<B: NativeV2CliBackend>(
     })
 }
 
+async fn resume<B: NativeV2CliBackend>(
+    backend: &B,
+    target: Option<&str>,
+    run: SampleRun,
+) -> Result<SampleRun, SampleRunnerError> {
+    let successor = RunId::new(uuid::Uuid::now_v7().to_string());
+    let result = backend
+        .run_resume(
+            target,
+            RunResumeParams {
+                run_id: run.run_id.clone(),
+                successor_run_id: successor,
+                from: None,
+                connections: BTreeMap::new(),
+                connection_resolver: None,
+                github_token: None,
+                git_credentials: None,
+            },
+        )
+        .await
+        .map_err(|error| SampleRunnerError::Backend(error.to_string()))?;
+    Ok(SampleRun {
+        run_id: result.run_id,
+        submitted_at_ms: now_ms(),
+        ..run
+    })
+}
+
 async fn stop<B: NativeV2CliBackend>(
     backend: &B,
     target: Option<&str>,
@@ -317,23 +425,42 @@ async fn stop<B: NativeV2CliBackend>(
         .map_err(|error| SampleRunnerError::Backend(error.to_string()))
 }
 
+struct WaitPolicy {
+    poll_interval: Duration,
+    deadline: Option<Duration>,
+}
+
 async fn wait_for_run<B: NativeV2CliBackend>(
     backend: &B,
     target: Option<&str>,
     run: &SampleRun,
-    poll_interval: Duration,
+    policy: WaitPolicy,
 ) -> Result<SampleOutcome, SampleRunnerError> {
     let mut started_at_ms = None;
+    let deadline_at = policy.deadline.map(|deadline| Instant::now() + deadline);
     loop {
-        let status = backend
-            .run_status(
-                target,
-                RunStatusParams {
-                    run_id: run.run_id.clone(),
-                },
+        let status = backend.run_status(
+            target,
+            RunStatusParams {
+                run_id: run.run_id.clone(),
+            },
+        );
+        let status = match deadline_at {
+            Some(deadline_at) => match tokio::time::timeout(
+                deadline_at.saturating_duration_since(Instant::now()),
+                status,
             )
             .await
-            .map_err(|error| SampleRunnerError::Backend(error.to_string()))?;
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    let _ = stop(backend, target, run).await;
+                    return Err(SampleRunnerError::Deadline);
+                }
+            },
+            None => status.await,
+        }
+        .map_err(|error| SampleRunnerError::Backend(error.to_string()))?;
         let observed_at_ms = now_ms();
         match &status.status {
             CliRunStatus::Queued(_) => {}
@@ -356,7 +483,19 @@ async fn wait_for_run<B: NativeV2CliBackend>(
                 ));
             }
         }
-        tokio::time::sleep(poll_interval).await;
+        let wait = if let Some(deadline_at) = deadline_at {
+            let now = Instant::now();
+            if now >= deadline_at {
+                let _ = stop(backend, target, run).await;
+                return Err(SampleRunnerError::Deadline);
+            }
+            policy
+                .poll_interval
+                .min(deadline_at.saturating_duration_since(now))
+        } else {
+            policy.poll_interval
+        };
+        tokio::time::sleep(wait).await;
     }
 }
 
@@ -402,7 +541,7 @@ fn outcome_from_terminal(
                     .and_then(|value| value.head_branch.clone()),
                 delivery,
                 failure_reason: None,
-                output: Some(output.clone()),
+                output: bounded_output(output),
             }
         }
         TerminalResult::Failed { reason, .. } => SampleOutcome {
@@ -419,11 +558,23 @@ fn outcome_from_terminal(
     }
 }
 
+fn bounded_output(output: &serde_json::Value) -> Option<serde_json::Value> {
+    let bytes = serde_json::to_vec(output).ok()?;
+    if bytes.len() <= MAX_STORED_OUTPUT_BYTES {
+        return Some(output.clone());
+    }
+    Some(serde_json::json!({
+        "truncated": true,
+        "originalBytes": bytes.len(),
+    }))
+}
+
 /// A deterministic in-memory runner used by focused eval tests.
 #[derive(Clone, Debug)]
 pub struct FakeSampleRequest {
     pub sample_id: String,
     pub run_id: Option<RunId>,
+    pub concurrency: usize,
     pub queue_wait_ms: u64,
     pub wall_clock_ms: u64,
     pub status: SampleStatus,
@@ -438,6 +589,7 @@ impl FakeSampleRequest {
         Self {
             sample_id: sample_id.into(),
             run_id: None,
+            concurrency: 1,
             queue_wait_ms: 0,
             wall_clock_ms: 1,
             status: SampleStatus::Succeeded,
@@ -508,7 +660,7 @@ impl SampleRunner for FakeRunner {
             run_id: run_id.clone(),
             target: None,
             submitted_at_ms: now_ms(),
-            concurrency: 1,
+            concurrency: request.concurrency.max(1),
         };
         let mut state = self.state.lock().await;
         state.order.push(run.clone());
@@ -557,6 +709,216 @@ impl SampleRunner for FakeRunner {
         self.state.lock().await.stopped.push(run.run_id.clone());
         Ok(())
     }
+
+    async fn resume(&self, run: SampleRun) -> Result<SampleRun, SampleRunnerError> {
+        let mut state = self.state.lock().await;
+        let submission =
+            state.submissions.get(&run.run_id).cloned().ok_or_else(|| {
+                SampleRunnerError::InvalidRequest("run was not submitted".to_owned())
+            })?;
+        let successor = RunId::new(uuid::Uuid::now_v7().to_string());
+        let resumed = SampleRun {
+            run_id: successor.clone(),
+            submitted_at_ms: now_ms(),
+            ..run
+        };
+        state.order.push(resumed.clone());
+        state.submissions.insert(successor, submission);
+        Ok(resumed)
+    }
+}
+
+/// One sample in an eval driver invocation. `request` is required for a fresh start; a completed
+/// sample can be skipped from its persisted artifact without one.
+pub struct EvalSamplePlan<R: SampleRunner> {
+    pub sample_id: String,
+    pub directory: PathBuf,
+    pub request: Option<R::Request>,
+    pub capture: Option<CaptureRequest>,
+}
+
+impl<R: SampleRunner> EvalSamplePlan<R> {
+    #[must_use]
+    pub fn new(
+        sample_id: impl Into<String>,
+        directory: impl Into<PathBuf>,
+        request: R::Request,
+    ) -> Self {
+        Self {
+            sample_id: sample_id.into(),
+            directory: directory.into(),
+            request: Some(request),
+            capture: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_capture(mut self, capture: CaptureRequest) -> Self {
+        self.capture = Some(capture);
+        self
+    }
+}
+
+/// A complete eval attempt: resolve capacity once, journal the attempt, and run each sample.
+pub struct EvalRunRequest<'a, R: SampleRunner> {
+    pub runner: &'a R,
+    pub capacity_source: Option<&'a dyn CapacitySource>,
+    pub concurrency: Option<usize>,
+    pub journal_directory: PathBuf,
+    pub samples: Vec<EvalSamplePlan<R>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SampleFailure {
+    pub sample_id: String,
+    pub error: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvalRunReport {
+    pub capacity: Capacity,
+    pub capacity_warning: Option<CapacityWarning>,
+    pub artifacts: Vec<SampleArtifact>,
+    pub failures: Vec<SampleFailure>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum EvalRunError {
+    #[error(transparent)]
+    Capacity(#[from] CapacityError),
+    #[error(transparent)]
+    Journal(#[from] ResumeError),
+    #[error("eval run filesystem operation failed: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Resolve `platform`, then `--concurrency`, then one; journal the capacity and each sample; run
+/// samples through the bounded scheduler; return every artifact plus per-sample failures.
+pub async fn run_eval<R>(request: EvalRunRequest<'_, R>) -> Result<EvalRunReport, EvalRunError>
+where
+    R: SampleRunner,
+{
+    let capacity = resolve_capacity(request.capacity_source, request.concurrency)?;
+    std::fs::create_dir_all(&request.journal_directory)?;
+    let mut journal = ResumeJournal::load_or_default(&request.journal_directory)?;
+    let capacity_warning = journal.observe_capacity(capacity);
+    journal.save(&request.journal_directory)?;
+    let journal = Arc::new(Mutex::new(journal));
+    let journal_directory = request.journal_directory;
+    let runner = request.runner;
+    let completed = run_bounded(request.samples, capacity.concurrency, |_index, sample| {
+        let journal = Arc::clone(&journal);
+        let journal_directory = journal_directory.clone();
+        async move {
+            (
+                sample.sample_id.clone(),
+                run_eval_sample(runner, sample, &journal, &journal_directory).await,
+            )
+        }
+    })
+    .await?;
+    let mut artifacts = Vec::new();
+    let mut failures = Vec::new();
+    for (_, (sample_id, result)) in completed {
+        match result {
+            Ok(artifact) => artifacts.push(artifact),
+            Err(error) => failures.push(SampleFailure { sample_id, error }),
+        }
+    }
+    Ok(EvalRunReport {
+        capacity,
+        capacity_warning,
+        artifacts,
+        failures,
+    })
+}
+
+async fn run_eval_sample<R: SampleRunner>(
+    runner: &R,
+    mut sample: EvalSamplePlan<R>,
+    journal: &Mutex<ResumeJournal>,
+    journal_directory: &Path,
+) -> Result<SampleArtifact, String> {
+    let sample_id = sample.sample_id.clone();
+    let mut action = journal.lock().await.action(&sample_id);
+    if matches!(action, ResumeAction::Skip) {
+        match SampleArtifact::read(&sample.directory) {
+            Ok(artifact) => return Ok(artifact),
+            Err(_) => action = ResumeAction::Start,
+        }
+    }
+    let run = match action {
+        ResumeAction::Skip => unreachable!("completed sample without artifact was restarted"),
+        ResumeAction::Resume(run) => match runner.resume(run).await {
+            Ok(run) => run,
+            Err(error) => match sample.request.take() {
+                Some(request) => runner
+                    .submit(request)
+                    .await
+                    .map_err(|error| error.to_string())?,
+                None => return Err(format!("resume failed: {error}")),
+            },
+        },
+        ResumeAction::Start => {
+            let request = sample
+                .request
+                .take()
+                .ok_or_else(|| "sample has no request to start".to_owned())?;
+            runner
+                .submit(request)
+                .await
+                .map_err(|error| error.to_string())?
+        }
+    };
+    journal_update(journal, journal_directory, |journal| {
+        journal.claim(&sample_id, run.clone());
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    let outcome = match runner.wait(&run).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ = journal_update(journal, journal_directory, |journal| {
+                journal.record_error(&sample_id, error.to_string());
+            })
+            .await;
+            return Err(error.to_string());
+        }
+    };
+    let capture = sample.capture.map(|mut request| {
+        request.directory = sample.directory.clone();
+        request.receipt = outcome.delivery.clone().unwrap_or_default();
+        request
+    });
+    let artifact = match finish_sample(run, outcome, &sample.directory, capture).await {
+        Ok(artifact) => artifact,
+        Err(error) => {
+            let message = error.to_string();
+            let _ = journal_update(journal, journal_directory, |journal| {
+                journal.record_error(&sample_id, &message);
+            })
+            .await;
+            return Err(message);
+        }
+    };
+    journal_update(journal, journal_directory, |journal| {
+        journal.record_artifact(&artifact);
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(artifact)
+}
+
+async fn journal_update<T>(
+    journal: &Mutex<ResumeJournal>,
+    directory: &Path,
+    update: impl FnOnce(&mut ResumeJournal) -> T,
+) -> Result<T, ResumeError> {
+    let mut journal = journal.lock().await;
+    let value = update(&mut journal);
+    journal.save(directory)?;
+    Ok(value)
 }
 
 #[cfg(test)]

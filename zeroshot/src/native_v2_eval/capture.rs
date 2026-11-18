@@ -184,19 +184,26 @@ pub struct CapturedSample {
     pub delivered_revision: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_branch: Option<String>,
+    /// Path relative to the sample directory.
     pub patch: PathBuf,
     pub patch_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge: Option<JudgeCheckout>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct JudgeCheckout {
+    /// Path relative to the sample directory.
     pub directory: PathBuf,
+    /// Revision whose tree the judge sees, which is the delivered revision.
     pub revision: String,
+    pub base_revision: String,
+    /// Path relative to the sample directory.
     pub patch: PathBuf,
 }
 
@@ -204,8 +211,6 @@ pub struct JudgeCheckout {
 pub enum CaptureError {
     #[error("delivery receipt has no delivered revision")]
     MissingRevision,
-    #[error("delivered branch is required to fetch the delivered revision")]
-    MissingBranch,
     #[error("revision {0:?} is not a valid Git revision")]
     InvalidRevision(String),
     #[error("checkout destination is not empty: {0}")]
@@ -222,11 +227,7 @@ pub async fn capture_patch(request: &CaptureRequest) -> Result<CapturedSample, C
         .receipt
         .delivered_revision()
         .ok_or(CaptureError::MissingRevision)?;
-    let delivered_branch = request
-        .receipt
-        .delivered_branch()
-        .ok_or(CaptureError::MissingBranch)?
-        .to_owned();
+    let delivered_branch = request.receipt.delivered_branch().map(str::to_owned);
     validate_revisions(&request.base_revision, &delivered_revision)?;
     std::fs::create_dir_all(&request.directory)?;
     let workspace = tempfile::Builder::new()
@@ -240,7 +241,7 @@ pub async fn capture_patch(request: &CaptureRequest) -> Result<CapturedSample, C
         request,
         RevisionLookup {
             revision: &delivered_revision,
-            branch: Some(&delivered_branch),
+            branch: delivered_branch.as_deref(),
         },
         credential,
     )
@@ -270,14 +271,16 @@ pub async fn capture_patch(request: &CaptureRequest) -> Result<CapturedSample, C
         .await?;
     let patch_path = request.directory.join("patch.diff");
     super::write_bytes_atomic(&patch_path, patch.stdout().as_bytes())?;
+    let patch_bytes = std::fs::metadata(&patch_path)?.len();
     Ok(CapturedSample {
         base_revision: request.base_revision.clone(),
         delivered_revision,
-        delivered_branch: Some(delivered_branch),
-        patch: patch_path,
-        patch_bytes: u64::try_from(patch.stdout().len()).unwrap_or(u64::MAX),
+        delivered_branch,
+        patch: PathBuf::from("patch.diff"),
+        patch_bytes,
         mode: request.receipt.mode.clone(),
         outcome: request.receipt.outcome.clone(),
+        judge: None,
     })
 }
 
@@ -341,9 +344,15 @@ pub async fn checkout_patch(
             .await?;
     }
     Ok(JudgeCheckout {
-        directory: destination.to_owned(),
-        revision: request.base_revision.clone(),
-        patch,
+        directory: destination
+            .file_name()
+            .map_or_else(|| destination.to_owned(), PathBuf::from),
+        revision: request
+            .receipt
+            .delivered_revision()
+            .unwrap_or_else(|| request.base_revision.clone()),
+        base_revision: request.base_revision.clone(),
+        patch: PathBuf::from("patch.diff"),
     })
 }
 

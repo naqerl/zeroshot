@@ -4,7 +4,17 @@ use super::{
     Capacity, CapacitySourceKind, RESUME_FILE, ResumeAction, ResumeJournal, SampleResumeState,
     SampleStatus,
 };
-use crate::native_v2_eval::runner::{SampleOutcome, SampleTimings};
+use crate::native_v2_eval::runner::{SampleOutcome, SampleRun, SampleTimings};
+
+fn sample_run(run_id: &str) -> SampleRun {
+    SampleRun {
+        sample_id: "sample".to_owned(),
+        run_id: RunId::new(run_id),
+        target: None,
+        submitted_at_ms: 1,
+        concurrency: 2,
+    }
+}
 
 fn outcome(status: SampleStatus) -> SampleOutcome {
     SampleOutcome {
@@ -37,10 +47,10 @@ fn journal_skips_completed_resumes_interrupted_and_restarts_failed_samples() {
     assert_eq!(journal.samples["done"].state, SampleResumeState::Completed);
     assert!(journal.incomplete().is_empty());
 
-    journal.claim("interrupted", RunId::new("run-2"));
+    journal.claim("interrupted", sample_run("run-2"));
     assert_eq!(
         journal.action("interrupted"),
-        ResumeAction::Resume(RunId::new("run-2"))
+        ResumeAction::Resume(sample_run("run-2"))
     );
     assert_eq!(journal.incomplete(), vec!["interrupted"]);
 
@@ -61,7 +71,7 @@ fn journal_round_trips_and_warns_when_attempt_concurrency_changes() {
             .observe_capacity(Capacity::new(2, CapacitySourceKind::Concurrency))
             .is_none()
     );
-    journal.claim("sample", RunId::new("run-1"));
+    journal.claim("sample", sample_run("run-1"));
     journal.record_outcome("sample", outcome(SampleStatus::Succeeded));
     journal.save(directory.path()).unwrap();
     assert!(directory.path().join(RESUME_FILE).is_file());

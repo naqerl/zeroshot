@@ -29,9 +29,10 @@ pub use resume::{
     SampleResumeState,
 };
 pub use runner::{
-    BackendSampleRequest, FakeRunner, FakeSampleRequest, LocalRunner, PlatformRunner,
-    SampleArtifact, SampleExecutionError, SampleOutcome, SampleRun, SampleRunner,
-    SampleRunnerError, SampleStatus, SampleTimings, run_sample,
+    BackendSampleRequest, EvalRunError, EvalRunReport, EvalRunRequest, EvalSamplePlan, FakeRunner,
+    FakeSampleRequest, LocalRunner, PlatformRunner, SampleArtifact, SampleExecutionError,
+    SampleFailure, SampleOutcome, SampleRun, SampleRunner, SampleRunnerError, SampleStatus,
+    SampleTimings, run_eval, run_sample,
 };
 
 /// A registered scorer, implemented by slice 1.
