@@ -23,6 +23,7 @@ Commands:
   profile            Manage reusable graph/runtime profiles
   template           Inspect built-in graph templates
   plan               Validate, submit, and observe hosted merge plans
+  eval               Create, inspect, report on, score, and clean local graph evals
   run                Submit a graph run locally or to a named target
   update             Update this executable and managed agent skills to the newest canonical release
   list               List runs as JSON
@@ -1046,6 +1047,185 @@ Commands:
   help        Print this message or the help of the given subcommand(s)
 ```
 
+### `zeroshot eval`
+
+```text
+Create, inspect, report on, score, and clean local graph evals.
+
+Evals are stored under `.zeroshot/eval/<id>/`. The manifest is strict TOML; see `zeroshot eval run --help` and the checked-in synthetic fixture.
+
+Usage: zeroshot eval [OPTIONS] <COMMAND>
+
+Commands:
+  run     Validate a manifest, run it through the synthetic runner, and write its report
+  list    List stored evals as JSON
+  show    Show one stored eval, including its manifest, samples, and report, as JSON
+  report  Print one eval report as JSON and refresh its Markdown rendering
+  score   Recompute a stored eval with a registered scorer
+  clean   Delete one stored eval, or every stored eval
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --directory <DIR>
+          Workspace whose `.zeroshot/eval` store is used
+
+          [default: .]
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+#### `zeroshot eval run`
+
+```text
+Validate a manifest, run it through the synthetic runner, and write its report
+
+Usage: zeroshot eval run [OPTIONS] <MANIFEST>
+
+Arguments:
+  <MANIFEST>
+          Strict TOML eval manifest
+
+Options:
+      --directory <DIR>
+          Workspace whose `.zeroshot/eval` store is used
+
+          [default: .]
+
+      --id <ID>
+          Use this eval id instead of generating one
+
+      --scorer <NAME>
+          Override the manifest's scorer for this run
+
+  -h, --help
+          Print help
+```
+
+#### `zeroshot eval list`
+
+```text
+List stored evals as JSON
+
+Usage: zeroshot eval list [OPTIONS]
+
+Options:
+      --directory <DIR>
+          Workspace whose `.zeroshot/eval` store is used
+
+          [default: .]
+
+  -h, --help
+          Print help
+```
+
+#### `zeroshot eval show`
+
+```text
+Show one stored eval, including its manifest, samples, and report, as JSON
+
+Usage: zeroshot eval show [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          Stored eval id
+
+Options:
+      --directory <DIR>
+          Workspace whose `.zeroshot/eval` store is used
+
+          [default: .]
+
+  -h, --help
+          Print help
+```
+
+#### `zeroshot eval report`
+
+```text
+Print one eval report as JSON and refresh its Markdown rendering
+
+Usage: zeroshot eval report [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          Stored eval id
+
+Options:
+      --directory <DIR>
+          Workspace whose `.zeroshot/eval` store is used
+
+          [default: .]
+
+  -h, --help
+          Print help
+```
+
+#### `zeroshot eval score`
+
+```text
+Recompute a stored eval with a registered scorer
+
+Usage: zeroshot eval score [OPTIONS] --scorer <NAME> <ID>
+
+Arguments:
+  <ID>
+          Stored eval id
+
+Options:
+      --directory <DIR>
+          Workspace whose `.zeroshot/eval` store is used
+
+          [default: .]
+
+      --scorer <NAME>
+          Registered scorer name
+
+  -h, --help
+          Print help
+```
+
+#### `zeroshot eval clean`
+
+```text
+Delete one stored eval, or every stored eval
+
+Usage: zeroshot eval clean [OPTIONS] <ID|--all>
+
+Arguments:
+  [ID]
+          Stored eval id
+
+Options:
+      --all
+          Delete every stored eval
+
+      --directory <DIR>
+          Workspace whose `.zeroshot/eval` store is used
+
+          [default: .]
+
+  -h, --help
+          Print help
+```
+
+#### `zeroshot eval help`
+
+```text
+Print this message or the help of the given subcommand(s)
+
+Usage: zeroshot eval help [COMMAND]
+
+Commands:
+  run     Validate a manifest, run it through the synthetic runner, and write its report
+  list    List stored evals as JSON
+  show    Show one stored eval, including its manifest, samples, and report, as JSON
+  report  Print one eval report as JSON and refresh its Markdown rendering
+  score   Recompute a stored eval with a registered scorer
+  clean   Delete one stored eval, or every stored eval
+  help    Print this message or the help of the given subcommand(s)
+```
+
 ### `zeroshot run`
 
 ```text
@@ -1470,6 +1650,7 @@ Commands:
   profile            Manage reusable graph/runtime profiles
   template           Inspect built-in graph templates
   plan               Validate, submit, and observe hosted merge plans
+  eval               Create, inspect, report on, score, and clean local graph evals
   run                Submit a graph run locally or to a named target
   update             Update this executable and managed agent skills to the newest canonical release
   list               List runs as JSON

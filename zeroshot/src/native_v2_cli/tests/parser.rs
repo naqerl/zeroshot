@@ -955,3 +955,66 @@ fn repository_overrides_use_transport_bounds_and_reject_credential_bearing_locat
     }
     assert!(parse(&format!("{prefix}{}", "r".repeat(2049 - prefix.len()))).is_err());
 }
+
+#[test]
+fn parser_wires_eval_run_report_score_and_clean_actions() {
+    let command = parse_native_v2_args(args(&[
+        "eval",
+        "run",
+        "manifest.toml",
+        "--id",
+        "fixture",
+        "--directory",
+        "workspace",
+    ]))
+    .assert_value();
+    match command {
+        NativeV2CliCommand::Eval(crate::native_v2_eval::EvalCommand {
+            directory,
+            action:
+                crate::native_v2_eval::EvalAction::Run(crate::native_v2_eval::EvalRunCommand {
+                    manifest,
+                    directory: run_directory,
+                    id,
+                    scorer: None,
+                }),
+        }) => {
+            assert_eq!(directory, PathBuf::from("workspace"));
+            assert_eq!(run_directory, PathBuf::from("workspace"));
+            assert_eq!(manifest, PathBuf::from("manifest.toml"));
+            assert_eq!(id.as_deref(), Some("fixture"));
+        }
+        command => panic!("unexpected eval command: {command:?}"),
+    }
+
+    let command = parse_native_v2_args(args(&[
+        "eval",
+        "score",
+        "fixture",
+        "--scorer",
+        "none",
+        "--directory",
+        "workspace",
+    ]))
+    .assert_value();
+    assert!(matches!(
+        command,
+        NativeV2CliCommand::Eval(crate::native_v2_eval::EvalCommand {
+            action: crate::native_v2_eval::EvalAction::Score { id, scorer },
+            ..
+        }) if id == "fixture" && scorer == "none"
+    ));
+
+    let command = parse_native_v2_args(args(&["eval", "clean", "--all"])).assert_value();
+    assert!(matches!(
+        command,
+        NativeV2CliCommand::Eval(crate::native_v2_eval::EvalCommand {
+            action: crate::native_v2_eval::EvalAction::Clean {
+                id: None,
+                all: true
+            },
+            ..
+        })
+    ));
+    assert!(parse_native_v2_args(args(&["eval", "clean"])).is_err());
+}

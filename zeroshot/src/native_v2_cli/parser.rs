@@ -83,6 +83,19 @@ enum CliCommand {
         command: PlanCommand,
     },
 
+    /// Create, inspect, report on, score, and clean local graph evals.
+    ///
+    /// Evals are stored under `.zeroshot/eval/<id>/`. The manifest is strict TOML; see
+    /// `zeroshot eval run --help` and the checked-in synthetic fixture.
+    Eval {
+        /// Workspace whose `.zeroshot/eval` store is used.
+        #[arg(long, global = true, value_name = "DIR", default_value = ".")]
+        directory: PathBuf,
+
+        #[command(subcommand)]
+        command: EvalCommand,
+    },
+
     /// Submit a graph run locally or to a named target.
     ///
     /// Local runs use --cwd or the invoking folder; Git worktrees use their root. Local Git delivery
@@ -187,6 +200,68 @@ enum UtilityCommand {
 
     /// Print the Zeroshot version.
     Version,
+}
+
+#[derive(Debug, Subcommand)]
+enum EvalCommand {
+    /// Validate a manifest, run it through the synthetic runner, and write its report.
+    Run(EvalRunArgs),
+
+    /// List stored evals as JSON.
+    List,
+
+    /// Show one stored eval, including its manifest, samples, and report, as JSON.
+    Show(EvalShowArgs),
+
+    /// Print one eval report as JSON and refresh its Markdown rendering.
+    Report(EvalShowArgs),
+
+    /// Recompute a stored eval with a registered scorer.
+    Score(EvalScoreArgs),
+
+    /// Delete one stored eval, or every stored eval.
+    Clean(EvalCleanArgs),
+}
+
+#[derive(Debug, Args)]
+struct EvalRunArgs {
+    /// Strict TOML eval manifest.
+    manifest: PathBuf,
+
+    /// Use this eval id instead of generating one.
+    #[arg(long, value_name = "ID")]
+    id: Option<String>,
+
+    /// Override the manifest's scorer for this run.
+    #[arg(long, value_name = "NAME")]
+    scorer: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct EvalShowArgs {
+    /// Stored eval id.
+    id: String,
+}
+
+#[derive(Debug, Args)]
+struct EvalScoreArgs {
+    /// Stored eval id.
+    id: String,
+
+    /// Registered scorer name.
+    #[arg(long, value_name = "NAME")]
+    scorer: String,
+}
+
+#[derive(Debug, Args)]
+#[command(group(ArgGroup::new("selection").args(["id", "all"]).required(true).multiple(false)))]
+struct EvalCleanArgs {
+    /// Stored eval id.
+    id: Option<String>,
+
+    /// Delete every stored eval.
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Debug, Subcommand)]

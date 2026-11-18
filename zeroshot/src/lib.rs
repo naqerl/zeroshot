@@ -12,6 +12,7 @@ pub mod native_v2_comment_delivery;
 pub mod native_v2_contract;
 pub mod native_v2_copilot;
 pub mod native_v2_delivery;
+pub mod native_v2_eval;
 pub mod native_v2_hosting;
 pub mod native_v2_local;
 pub mod native_v2_observability;

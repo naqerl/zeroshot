@@ -42,6 +42,7 @@ tokio-rustls = { version = "=0.26.4", default-features = false, features = ["rin
 webpki-roots = "=0.26.8"
 rcgen = "=0.13.2"
 time = "0.3.41"
+toml = "1.2.1"
 futures-util = "0.3"
 jsonschema = { version = "0.29.1", default-features = false }
 keyring = { version = "3.6.3", default-features = false }

@@ -358,6 +358,7 @@ pub enum NativeV2CliCommand {
     PlanStatus(MergePlanSelector),
     PlanWatch(MergePlanSelector),
     PlanForceStop(MergePlanSelector),
+    Eval(crate::native_v2_eval::EvalCommand),
     Run(Box<RunCommand>),
     List {
         target: Option<String>,
@@ -499,6 +500,8 @@ pub enum NativeV2CliError {
     RunFailed(Box<RunFailure>),
     #[error("merge plan finished unsuccessfully")]
     MergePlanFailed,
+    #[error("eval failed: {0}")]
+    Eval(#[from] crate::native_v2_eval::EvalError),
     #[error("could not write CLI output: {0}")]
     Output(#[from] std::io::Error),
     #[error("could not encode CLI output: {0}")]

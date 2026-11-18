@@ -8,9 +8,10 @@ use openengine_cluster_protocol::{
 };
 
 use super::{
-    AcpArgs, AttachArgs, Cli, CliCommand, ConnectionCommand, ConnectionScopeArg, PlanCommand,
-    PlanSelectorArgs, PlanSubmitArgs, RunArgs, RunCheckpointsArgs, RunResumeArgs, RunLogsArgs,
-    RunSelectorArgs, RunWatchArgs, TargetCommand, TemplateCommand, TemplateName, UtilityCommand,
+    AcpArgs, AttachArgs, Cli, CliCommand, ConnectionCommand, ConnectionScopeArg,
+    EvalCommand as EvalCliCommand, PlanCommand, PlanSelectorArgs, PlanSubmitArgs, RunArgs,
+    RunCheckpointsArgs, RunResumeArgs, RunLogsArgs, RunSelectorArgs, RunWatchArgs, TargetCommand,
+    TemplateCommand, TemplateName, UtilityCommand,
 };
 use crate::native_v2_cli::{
     BuiltinGraphTemplate, ConnectionInput, ConnectionRoute, ConnectionSetCommand,
@@ -19,6 +20,7 @@ use crate::native_v2_cli::{
     RunRuntime, RunSelection, RunSelector, RunResumeCommand, RunCheckpointsCommand,
     RunWatchCommand, TargetAdd, TargetServe, TemplateDelivery,
 };
+use crate::native_v2_eval::{EvalAction, EvalCommand, EvalId, EvalRunCommand};
 
 #[path = "convert/profile_commands.rs"]
 mod profile_commands;
@@ -75,6 +77,7 @@ impl CliCommand {
             Self::Profile { command } => command.into_command(),
             Self::Template { command } => command.into_command(),
             Self::Plan { command } => command.into_command(),
+            Self::Eval { directory, command } => command.into_command(directory),
             Self::Run(args) => args.into_command(),
             Self::Utility(command) => command.into_command(),
             _ => Err(usage("expected an execution or management command")),
@@ -177,6 +180,41 @@ fn connection_route(
             ConnectionScopeArg::Org => ConnectionScope::Org,
         }),
     })
+}
+
+impl EvalCliCommand {
+    fn into_command(self, directory: PathBuf) -> Result<NativeV2CliCommand, NativeV2CliError> {
+        let action = match self {
+            Self::Run(args) => EvalAction::Run(EvalRunCommand {
+                manifest: args.manifest,
+                directory: directory.clone(),
+                id: args.id.map(validate_eval_id).transpose()?,
+                scorer: args.scorer,
+            }),
+            Self::List => EvalAction::List,
+            Self::Show(args) => EvalAction::Show {
+                id: validate_eval_id(args.id)?,
+            },
+            Self::Report(args) => EvalAction::Report {
+                id: validate_eval_id(args.id)?,
+            },
+            Self::Score(args) => EvalAction::Score {
+                id: validate_eval_id(args.id)?,
+                scorer: args.scorer,
+            },
+            Self::Clean(args) => EvalAction::Clean {
+                id: args.id.map(validate_eval_id).transpose()?,
+                all: args.all,
+            },
+        };
+        Ok(NativeV2CliCommand::Eval(EvalCommand { directory, action }))
+    }
+}
+
+fn validate_eval_id(value: String) -> Result<String, NativeV2CliError> {
+    EvalId::new(value)
+        .map(|id| id.to_string())
+        .map_err(|error| usage(error.to_string()))
 }
 
 impl UtilityCommand {

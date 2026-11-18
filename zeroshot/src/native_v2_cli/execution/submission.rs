@@ -74,6 +74,11 @@ where
         write_json(output, &result)?;
         return Ok(Some(CliOutcome::Completed));
     }
+    if let NativeV2CliCommand::Eval(command) = command {
+        let result = crate::native_v2_eval::execute(command).await?;
+        write_json(output, &result)?;
+        return Ok(Some(CliOutcome::Completed));
+    }
     let NativeV2CliCommand::Run(run) = command else {
         return Ok(None);
     };

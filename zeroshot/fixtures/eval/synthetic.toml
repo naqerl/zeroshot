@@ -1,0 +1,53 @@
+schema = "zeroshot.eval/v1"
+name = "synthetic"
+runsPerArm = 3
+
+[options]
+scorer = "quality-vs-cost"
+runner = "fake"
+seed = 7
+
+[options.fake]
+queueWaitMs = 5
+wallClockMs = 100
+inputTokens = 1000
+outputTokens = 200
+cacheTokens = 0
+passRate = 1.0
+failEvery = 2
+
+[[arms]]
+id = "baseline"
+template = "single-worker"
+prompt = "Implement the synthetic task."
+input = { task = "Implement the synthetic task." }
+
+[arms.knobs]
+wallClockMs = 90
+inputTokens = 900
+outputTokens = 180
+
+[arms.knobs.criteria]
+efficiency = false
+
+[[arms]]
+id = "candidate"
+template = "single-worker"
+prompt = "Implement the synthetic task with the candidate graph."
+input = { task = "Implement the synthetic task with the candidate graph." }
+
+[arms.knobs]
+wallClockMs = 140
+inputTokens = 1800
+outputTokens = 260
+cacheTokens = 120
+
+[[criteria]]
+id = "correctness"
+description = "The change satisfies the requested behavior."
+weight = 2.0
+
+[[criteria]]
+id = "efficiency"
+description = "The change avoids unnecessary work."
+weight = 1.0
