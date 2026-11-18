@@ -244,6 +244,8 @@ async fn run_sample_writes_sample_json_patch_and_judge_checkout_together() {
     git(&work, &home, &["push", "origin", "main"]);
 
     let sample = root.path().join("sample");
+    std::fs::create_dir_all(sample.join("judge")).unwrap();
+    std::fs::write(sample.join("judge").join("stale"), "partial checkout").unwrap();
     let receipt = DeliveryReceipt {
         repository: "acme/project".to_owned(),
         mode: Some("push".to_owned()),
@@ -349,4 +351,26 @@ async fn sha256_delivered_revisions_use_a_matching_object_format() {
         std::fs::read_to_string(judge.join("file.txt")).unwrap(),
         "delivered\n"
     );
+}
+
+#[tokio::test]
+async fn failed_checkout_leaves_no_partial_destination_for_retry() {
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("judge");
+    let request = CaptureRequest::new(
+        root.path().join("sample"),
+        root.path().join("missing.git").to_str().unwrap(),
+        "a".repeat(40),
+        DeliveryReceipt {
+            repository: "acme/project".to_owned(),
+            mode: Some("push".to_owned()),
+            outcome: Some("pushed".to_owned()),
+            head_branch: Some("main".to_owned()),
+            head_revision: Some("b".repeat(40)),
+            ..DeliveryReceipt::default()
+        },
+    )
+    .with_git_program("git");
+    assert!(checkout_patch(&request, &destination).await.is_err());
+    assert!(!destination.exists());
 }

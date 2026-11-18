@@ -120,6 +120,10 @@ pub struct SampleArtifact {
     /// resume can retry capture without pretending the run did not happen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_error: Option<String>,
+    /// True while a successful run has not yet finished its patch and judge capture. This is
+    /// written before any capture so an interrupted process remains resumable.
+    #[serde(default)]
+    pub capture_pending: bool,
 }
 
 impl SampleArtifact {
@@ -130,6 +134,7 @@ impl SampleArtifact {
             outcome,
             captured: None,
             capture_error: None,
+            capture_pending: false,
         }
     }
 
@@ -163,6 +168,15 @@ pub enum SampleRunnerError {
     Deadline,
     #[error("sample runner cannot resume retained runs")]
     ResumeUnsupported,
+}
+
+impl SampleRunnerError {
+    /// A transport/backend failure may clear on a later attempt. The in-flight run must stay
+    /// recoverable rather than being replaced by a fresh submission.
+    #[must_use]
+    pub const fn is_transient(&self) -> bool {
+        matches!(self, Self::Backend(_))
+    }
 }
 
 #[async_trait]
@@ -222,6 +236,13 @@ where
     persist_sample(run.sample_id, outcome, directory, capture).await
 }
 
+fn remove_existing_judge(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        std::fs::remove_dir_all(path)?;
+    }
+    Ok(())
+}
+
 async fn persist_sample(
     sample_id: String,
     outcome: SampleOutcome,
@@ -230,24 +251,33 @@ async fn persist_sample(
 ) -> Result<SampleArtifact, SampleExecutionError> {
     std::fs::create_dir_all(directory)?;
     let mut artifact = SampleArtifact::new(sample_id, outcome);
-    // Persist the measured run before any network capture so a failed fetch never erases it.
+    let capture_requested = capture.is_some() && artifact.outcome.status == SampleStatus::Succeeded;
+    artifact.capture_pending = capture_requested;
+    // Persist the measured run before any network capture so a failed fetch never erases it, and
+    // mark capture as pending so a crash in the middle of capture is retried later.
     artifact.write(directory)?;
-    if artifact.outcome.status == SampleStatus::Succeeded {
-        if let Some(mut request) = capture {
-            request.directory = directory.to_owned();
-            request.receipt = artifact.outcome.delivery.clone().unwrap_or_default();
-            match capture_patch(&request).await {
-                Ok(mut captured) => {
-                    match checkout_patch(&request, &directory.join("judge")).await {
-                        Ok(judge) => captured.judge = Some(judge),
-                        Err(error) => artifact.capture_error = Some(error.to_string()),
-                    }
-                    artifact.captured = Some(captured);
+    if let Some(mut request) =
+        capture.filter(|_| artifact.outcome.status == SampleStatus::Succeeded)
+    {
+        request.directory = directory.to_owned();
+        request.receipt = artifact.outcome.delivery.clone().unwrap_or_default();
+        match capture_patch(&request).await {
+            Ok(mut captured) => {
+                let judge = directory.join("judge");
+                let checkout = match remove_existing_judge(&judge) {
+                    Ok(()) => checkout_patch(&request, &judge).await,
+                    Err(error) => Err(CaptureError::Io(error)),
+                };
+                match checkout {
+                    Ok(judge) => captured.judge = Some(judge),
+                    Err(error) => artifact.capture_error = Some(error.to_string()),
                 }
-                Err(error) => artifact.capture_error = Some(error.to_string()),
+                artifact.captured = Some(captured);
             }
-            artifact.write(directory)?;
+            Err(error) => artifact.capture_error = Some(error.to_string()),
         }
+        artifact.capture_pending = false;
+        artifact.write(directory)?;
     }
     Ok(artifact)
 }
@@ -926,6 +956,9 @@ async fn run_eval_sample<R: SampleRunner>(
         ResumeAction::Resume(run) => {
             match runner.resume(run, sample.resume_connections.clone()).await {
                 Ok(run) => run,
+                Err(error) if error.is_transient() => {
+                    return Err(format!("resume pending: {error}"));
+                }
                 Err(error) => match sample.request.take() {
                     Some(request) => runner
                         .submit(request)
@@ -959,7 +992,7 @@ async fn run_eval_sample<R: SampleRunner>(
         Ok(outcome) => outcome,
         Err(error) => {
             let _ = journal_update(journal, journal_directory, |journal| {
-                journal.record_error(&sample_id, error.to_string());
+                journal.record_interruption(&sample_id, error.to_string());
             })
             .await;
             return Err(error.to_string());
@@ -994,7 +1027,9 @@ async fn retry_capture(
     directory: &Path,
     capture: Option<CaptureRequest>,
 ) -> Result<SampleArtifact, SampleExecutionError> {
-    if existing.capture_error.is_none() || existing.outcome.status != SampleStatus::Succeeded {
+    if (!existing.capture_pending && existing.capture_error.is_none())
+        || existing.outcome.status != SampleStatus::Succeeded
+    {
         return Ok(existing);
     }
     let Some(mut request) = capture else {

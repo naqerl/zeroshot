@@ -223,7 +223,9 @@ impl ResumeJournal {
     /// Record the durable artifact, including a capture failure that must not erase its outcome.
     pub fn record_artifact(&mut self, artifact: &SampleArtifact) {
         let state = match artifact.outcome.status {
-            SampleStatus::Succeeded if artifact.capture_error.is_some() => {
+            SampleStatus::Succeeded
+                if artifact.capture_pending || artifact.capture_error.is_some() =>
+            {
                 SampleResumeState::CapturePending
             }
             SampleStatus::Succeeded => SampleResumeState::Completed,
@@ -242,6 +244,15 @@ impl ResumeJournal {
     pub fn record_error(&mut self, sample_id: &str, error: impl Into<String>) {
         self.update_sample(sample_id, |sample| {
             sample.state = SampleResumeState::Failed;
+            sample.error = Some(error.into());
+        });
+    }
+
+    /// Keep the submitted run resumable after a transient wait/poll failure. Treating this as a
+    /// terminal sample failure would cause the next attempt to submit a duplicate run.
+    pub fn record_interruption(&mut self, sample_id: &str, error: impl Into<String>) {
+        self.update_sample(sample_id, |sample| {
+            sample.state = SampleResumeState::Running;
             sample.error = Some(error.into());
         });
     }

@@ -121,6 +121,9 @@ struct ScriptState {
     last: Option<CliRunStatusResult>,
     forced: Vec<RunId>,
     resumed: Vec<RunResumeParams>,
+    submits: usize,
+    fail_next_status: bool,
+    fail_next_resume: bool,
 }
 
 struct ScriptedBackend {
@@ -145,6 +148,18 @@ impl ScriptedBackend {
 
     fn resumed(&self) -> Vec<RunResumeParams> {
         self.state.lock().unwrap().resumed.clone()
+    }
+
+    fn submits(&self) -> usize {
+        self.state.lock().unwrap().submits
+    }
+
+    fn fail_next_status(&self) {
+        self.state.lock().unwrap().fail_next_status = true;
+    }
+
+    fn fail_next_resume(&self) {
+        self.state.lock().unwrap().fail_next_resume = true;
     }
 }
 
@@ -185,6 +200,7 @@ impl NativeV2CliBackend for ScriptedBackend {
         _target: Option<&str>,
         _request: PreparedRunRequest,
     ) -> Result<RunSubmitResult, crate::native_v2_cli::NativeV2CliError> {
+        self.state.lock().unwrap().submits += 1;
         Ok(RunSubmitResult {
             run_id: RunId::new("run-scripted"),
         })
@@ -203,6 +219,17 @@ impl NativeV2CliBackend for ScriptedBackend {
         _target: Option<&str>,
         _params: RunStatusParams,
     ) -> Result<CliRunStatusResult, crate::native_v2_cli::NativeV2CliError> {
+        let fail = {
+            let mut state = self.state.lock().unwrap();
+            let fail = state.fail_next_status;
+            state.fail_next_status = false;
+            fail
+        };
+        if fail {
+            return Err(crate::native_v2_cli::NativeV2CliError::Protocol(
+                "transient status failure".to_owned(),
+            ));
+        }
         tokio::time::sleep(self.delay).await;
         let mut state = self.state.lock().unwrap();
         let status = state.statuses.pop_front().unwrap_or_else(|| {
@@ -258,6 +285,12 @@ impl NativeV2CliBackend for ScriptedBackend {
         params: RunResumeParams,
     ) -> Result<RunResumeResult, crate::native_v2_cli::NativeV2CliError> {
         let mut state = self.state.lock().unwrap();
+        if state.fail_next_resume {
+            state.fail_next_resume = false;
+            return Err(crate::native_v2_cli::NativeV2CliError::Protocol(
+                "transient resume failure".to_owned(),
+            ));
+        }
         let successor = RunId::new("run-successor");
         state.resumed.push(params);
         Ok(RunResumeResult {
@@ -483,6 +516,104 @@ async fn driver_schedules_samples_and_skips_completed_work() {
     assert_eq!(rerun.artifacts.len(), 2);
     assert_eq!(runner.submitted().await.len(), 2);
     assert_eq!(rerun.capacity_warning.unwrap().previous, 2);
+}
+
+#[tokio::test]
+async fn transient_wait_failure_keeps_the_run_resumable_without_duplicate_submission() {
+    let backend = Arc::new(ScriptedBackend::new(
+        vec![finished_succeeded()],
+        Duration::from_millis(1),
+    ));
+    let runner = PlatformRunner::new(Arc::clone(&backend), "platform")
+        .with_poll_interval(Duration::from_millis(1));
+    let directory = tempfile::tempdir().unwrap();
+    let plan = || {
+        EvalSamplePlan::<PlatformRunner<ScriptedBackend>>::new(
+            "sample-retry",
+            directory.path().join("sample"),
+            BackendSampleRequest {
+                sample_id: "sample-retry".to_owned(),
+                concurrency: 1,
+                request: prepared_request(),
+            },
+        )
+    };
+    backend.fail_next_status();
+    let first = run_eval(EvalRunRequest {
+        runner: &runner,
+        capacity_source: None,
+        concurrency: Some(1),
+        journal_directory: directory.path().to_owned(),
+        samples: vec![plan()],
+    })
+    .await
+    .unwrap();
+    assert_eq!(first.failures.len(), 1);
+    assert_eq!(backend.submits(), 1);
+    assert!(matches!(
+        crate::native_v2_eval::ResumeJournal::load(directory.path())
+            .unwrap()
+            .action("sample-retry"),
+        crate::native_v2_eval::ResumeAction::Resume(_)
+    ));
+
+    let second = run_eval(EvalRunRequest {
+        runner: &runner,
+        capacity_source: None,
+        concurrency: Some(1),
+        journal_directory: directory.path().to_owned(),
+        samples: vec![plan()],
+    })
+    .await
+    .unwrap();
+    assert!(second.failures.is_empty());
+    assert_eq!(second.artifacts.len(), 1);
+    assert_eq!(backend.submits(), 1);
+    assert_eq!(backend.resumed().len(), 1);
+}
+
+#[tokio::test]
+async fn transient_resume_failure_does_not_fall_back_to_a_new_submission() {
+    let backend = Arc::new(ScriptedBackend::new(
+        vec![finished_succeeded()],
+        Duration::from_millis(1),
+    ));
+    let runner = PlatformRunner::new(Arc::clone(&backend), "platform")
+        .with_poll_interval(Duration::from_millis(1));
+    let directory = tempfile::tempdir().unwrap();
+    let plan = || {
+        EvalSamplePlan::<PlatformRunner<ScriptedBackend>>::new(
+            "sample-resume-error",
+            directory.path().join("sample"),
+            BackendSampleRequest {
+                sample_id: "sample-resume-error".to_owned(),
+                concurrency: 1,
+                request: prepared_request(),
+            },
+        )
+    };
+    backend.fail_next_status();
+    let _ = run_eval(EvalRunRequest {
+        runner: &runner,
+        capacity_source: None,
+        concurrency: Some(1),
+        journal_directory: directory.path().to_owned(),
+        samples: vec![plan()],
+    })
+    .await
+    .unwrap();
+    backend.fail_next_resume();
+    let failed = run_eval(EvalRunRequest {
+        runner: &runner,
+        capacity_source: None,
+        concurrency: Some(1),
+        journal_directory: directory.path().to_owned(),
+        samples: vec![plan()],
+    })
+    .await
+    .unwrap();
+    assert_eq!(failed.failures.len(), 1);
+    assert_eq!(backend.submits(), 1);
 }
 
 #[tokio::test]

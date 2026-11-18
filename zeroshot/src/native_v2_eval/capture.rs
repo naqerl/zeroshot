@@ -307,19 +307,26 @@ pub async fn checkout_patch(
     if destination.exists() && std::fs::read_dir(destination)?.next().is_some() {
         return Err(CaptureError::DestinationNotEmpty(destination.to_owned()));
     }
-    std::fs::create_dir_all(destination)?;
-    let private = tempfile::Builder::new().prefix(".checkout-").tempdir_in(
-        destination
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new(".")),
-    )?;
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    // Build the complete tree in a sibling staging directory. A failed fetch or patch leaves no
+    // partial destination, so a later capture retry can start cleanly.
+    let staging = tempfile::Builder::new()
+        .prefix(".checkout-stage-")
+        .tempdir_in(parent)?;
+    let workspace = staging.path().to_owned();
+    let private = tempfile::Builder::new()
+        .prefix(".checkout-private-")
+        .tempdir_in(parent)?;
     std::fs::create_dir_all(private.path().join("home"))?;
     std::fs::create_dir_all(private.path().join("private"))?;
     let transport = GitTransport::new(
         GitTransportConfig {
             git_program: request.git_program.clone(),
-            workspace: destination.to_owned(),
+            workspace: workspace.clone(),
             home_directory: private.path().join("home"),
             private_directory: private.path().join("private"),
             identity: None,
@@ -356,6 +363,10 @@ pub async fn checkout_patch(
             )
             .await?;
     }
+    if destination.exists() {
+        std::fs::remove_dir(destination)?;
+    }
+    std::fs::rename(&workspace, destination)?;
     Ok(JudgeCheckout {
         directory: destination
             .file_name()

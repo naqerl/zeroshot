@@ -87,7 +87,10 @@ pub fn resolve_capacity(
     platform: Option<&dyn CapacitySource>,
     concurrency: Option<usize>,
 ) -> Result<Capacity, CapacityError> {
-    if let Some(value) = platform.and_then(CapacitySource::capacity) {
+    if let Some(value) = platform
+        .and_then(CapacitySource::capacity)
+        .filter(|value| (1..=MAX_CONCURRENCY).contains(value))
+    {
         return Ok(Capacity::new(value, CapacitySourceKind::Platform));
     }
     match concurrency {

@@ -103,6 +103,10 @@ fn capture_incompleteness_stays_resumable_until_patch_and_judge_exist() {
     assert_eq!(journal.incomplete(), vec!["capture"]);
 
     artifact.capture_error = None;
+    artifact.capture_pending = true;
+    journal.record_artifact(&artifact);
+    assert_eq!(journal.action("capture"), ResumeAction::Capture);
+    artifact.capture_pending = false;
     journal.record_artifact(&artifact);
     assert_eq!(journal.action("capture"), ResumeAction::Skip);
     assert_eq!(

@@ -36,6 +36,30 @@ fn missing_capacity_falls_back_to_one_and_rejects_zero() {
     assert_eq!(StaticCapacity(0).capacity(), None);
 }
 
+struct RawCapacity(usize);
+
+impl CapacitySource for RawCapacity {
+    fn capacity(&self) -> Option<usize> {
+        Some(self.0)
+    }
+}
+
+#[test]
+fn invalid_platform_capacity_falls_back_instead_of_being_trusted() {
+    assert_eq!(
+        resolve_capacity(Some(&RawCapacity(0)), Some(3)).unwrap(),
+        Capacity::new(3, CapacitySourceKind::Concurrency)
+    );
+    assert_eq!(
+        resolve_capacity(Some(&RawCapacity(4_097)), None).unwrap(),
+        Capacity::new(1, CapacitySourceKind::Fallback)
+    );
+    assert_eq!(
+        resolve_capacity(Some(&RawCapacity(usize::MAX)), Some(5)).unwrap(),
+        Capacity::new(5, CapacitySourceKind::Concurrency)
+    );
+}
+
 #[tokio::test]
 async fn bounded_scheduler_preserves_input_order_and_observes_the_limit() {
     let active = Arc::new(AtomicUsize::new(0));
