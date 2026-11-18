@@ -323,9 +323,10 @@ pub async fn checkout_patch(
         .tempdir_in(parent)?;
     std::fs::create_dir_all(private.path().join("home"))?;
     std::fs::create_dir_all(private.path().join("private"))?;
+    let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let transport = GitTransport::new(
         GitTransportConfig {
-            git_program: request.git_program.clone(),
+            git_program: resolve_git_program(&request.git_program, &directory),
             workspace: workspace.clone(),
             home_directory: private.path().join("home"),
             private_directory: private.path().join("private"),
@@ -402,12 +403,16 @@ async fn write_diff(
             .unwrap_or_else(|| Path::new(".")),
     )?;
     let stdout = temporary.as_file().try_clone()?;
-    let mut command = tokio::process::Command::new(&config.git_program);
+    let git_program = resolve_git_program(&config.git_program, &config.workspace);
+    let mut command = tokio::process::Command::new(git_program);
     command
         .current_dir(&config.workspace)
         .env_clear()
         .env("HOME", &config.home_directory)
-        .env("PATH", "/usr/bin:/bin")
+        .env(
+            "PATH",
+            std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+        )
         .env("GIT_TERMINAL_PROMPT", "0")
         .args([
             "diff",
@@ -441,10 +446,22 @@ async fn write_diff(
 }
 
 fn default_git_program() -> PathBuf {
-    let environment = std::env::vars().collect::<BTreeMap<_, _>>();
     let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    crate::execution::platform::find_executable("git", &environment, &directory)
-        .unwrap_or_else(|| PathBuf::from("git"))
+    resolve_git_program(Path::new("git"), &directory)
+}
+
+fn resolve_git_program(program: &Path, directory: &Path) -> PathBuf {
+    if program.is_absolute() {
+        return program.to_owned();
+    }
+    let Some(name) = program.to_str() else {
+        return program.to_owned();
+    };
+    let environment = std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect::<BTreeMap<_, _>>();
+    crate::execution::platform::find_executable(name, &environment, directory)
+        .unwrap_or_else(|| program.to_owned())
 }
 
 fn open_transport(
@@ -455,9 +472,10 @@ fn open_transport(
     let private = workspace.join(".private");
     std::fs::create_dir_all(&home)?;
     std::fs::create_dir_all(&private)?;
+    let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     Ok(GitTransport::new(
         GitTransportConfig {
-            git_program: request.git_program.clone(),
+            git_program: resolve_git_program(&request.git_program, &directory),
             workspace: workspace.to_owned(),
             home_directory: home,
             private_directory: private,

@@ -67,8 +67,11 @@ pub enum ResumeAction {
     Skip,
     /// The run succeeded but capture did not. Retry capture without running the sample again.
     Capture,
-    /// The previous controller lost this run before completion. Resume its retained workspace.
+    /// The previous controller lost this run before completion. Reattach, then recover it if needed.
     Resume(SampleRun),
+    /// The run reached a terminal failure. Reattach to its outcome, then use retained-workspace
+    /// recovery before falling back to a fresh submission.
+    Recover(SampleRun),
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -150,6 +153,10 @@ impl ResumeJournal {
             }
             Some(sample) if sample.state == SampleResumeState::Running => match &sample.run {
                 Some(run) => ResumeAction::Resume(run.clone()),
+                None => ResumeAction::Start,
+            },
+            Some(sample) if sample.state == SampleResumeState::Failed => match &sample.run {
+                Some(run) => ResumeAction::Recover(run.clone()),
                 None => ResumeAction::Start,
             },
             _ => ResumeAction::Start,

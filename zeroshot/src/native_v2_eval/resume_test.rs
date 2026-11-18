@@ -54,8 +54,12 @@ fn journal_skips_completed_resumes_interrupted_and_restarts_failed_samples() {
     );
     assert_eq!(journal.incomplete(), vec!["interrupted"]);
 
+    journal.claim("failed", sample_run("run-resume"));
     journal.record_outcome("failed", outcome(SampleStatus::Failed));
-    assert_eq!(journal.action("failed"), ResumeAction::Start);
+    assert_eq!(
+        journal.action("failed"),
+        ResumeAction::Recover(sample_run("run-resume"))
+    );
     assert_eq!(
         journal.resumable_run("failed"),
         Some(&RunId::new("run-resume"))

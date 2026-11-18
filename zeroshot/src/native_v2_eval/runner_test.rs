@@ -144,6 +144,7 @@ struct ScriptState {
     forced: Vec<RunId>,
     resumed: Vec<RunResumeParams>,
     submits: usize,
+    fail_next_submit: bool,
     fail_next_status: bool,
     fail_next_status_lost: bool,
     fail_next_resume: bool,
@@ -175,6 +176,10 @@ impl ScriptedBackend {
 
     fn submits(&self) -> usize {
         self.state.lock().unwrap().submits
+    }
+
+    fn fail_next_submit(&self) {
+        self.state.lock().unwrap().fail_next_submit = true;
     }
 
     fn fail_next_status(&self) {
@@ -227,7 +232,14 @@ impl NativeV2CliBackend for ScriptedBackend {
         _target: Option<&str>,
         _request: PreparedRunRequest,
     ) -> Result<RunSubmitResult, crate::native_v2_cli::NativeV2CliError> {
-        self.state.lock().unwrap().submits += 1;
+        let mut state = self.state.lock().unwrap();
+        state.submits += 1;
+        if state.fail_next_submit {
+            state.fail_next_submit = false;
+            return Err(crate::native_v2_cli::NativeV2CliError::Protocol(
+                "transient submit failure".to_owned(),
+            ));
+        }
         Ok(RunSubmitResult {
             run_id: RunId::new("run-scripted"),
         })
@@ -747,6 +759,55 @@ async fn driver_resumes_an_interrupted_sample_without_a_fresh_request() {
     assert_eq!(
         report.artifacts[0].outcome.run_id.as_str(),
         "run-interrupted"
+    );
+}
+
+#[tokio::test]
+async fn failed_submission_keeps_the_previous_sample_artifacts() {
+    let backend = Arc::new(ScriptedBackend::new(
+        vec![finished_succeeded()],
+        Duration::from_millis(1),
+    ));
+    backend.fail_next_submit();
+    let runner =
+        PlatformRunner::new(backend, "platform").with_poll_interval(Duration::from_millis(1));
+    let directory = tempfile::tempdir().unwrap();
+    let sample = directory.path().join("sample");
+    std::fs::create_dir_all(sample.join("judge")).unwrap();
+    std::fs::write(sample.join("patch.diff"), "previous patch").unwrap();
+    std::fs::write(sample.join("judge").join("previous.txt"), "previous judge").unwrap();
+    SampleArtifact::new(
+        "sample-submit-failed",
+        super::tests::sample_outcome_for_test(SampleStatus::Failed),
+    )
+    .write(&sample)
+    .unwrap();
+    let report = run_eval(EvalRunRequest {
+        runner: &runner,
+        capacity_source: None,
+        concurrency: Some(1),
+        journal_directory: directory.path().to_owned(),
+        samples: vec![EvalSamplePlan::<PlatformRunner<ScriptedBackend>>::new(
+            "sample-submit-failed",
+            &sample,
+            BackendSampleRequest {
+                sample_id: "sample-submit-failed".to_owned(),
+                concurrency: 1,
+                request: prepared_request(),
+            },
+        )],
+    })
+    .await
+    .unwrap();
+    assert_eq!(report.failures.len(), 1);
+    assert!(sample.join("sample.json").is_file());
+    assert_eq!(
+        std::fs::read_to_string(sample.join("patch.diff")).unwrap(),
+        "previous patch"
+    );
+    assert_eq!(
+        std::fs::read_to_string(sample.join("judge").join("previous.txt")).unwrap(),
+        "previous judge"
     );
 }
 

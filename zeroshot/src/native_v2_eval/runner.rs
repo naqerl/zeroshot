@@ -1010,9 +1010,11 @@ async fn run_eval_sample<R: SampleRunner>(
             journal.current_run_id(&sample_id).cloned(),
         )
     };
+    let recovering_failed = matches!(action, ResumeAction::Recover(_));
+    let mut existing_artifact = None;
     if action != ResumeAction::Start {
         if let Ok(existing) = SampleArtifact::read(&sample.directory) {
-            if current_run_id.as_ref() == Some(&existing.outcome.run_id) {
+            if !recovering_failed && current_run_id.as_ref() == Some(&existing.outcome.run_id) {
                 let artifact = retry_capture(existing, &sample.directory, sample.capture.take())
                     .await
                     .map_err(|error| error.to_string())?;
@@ -1023,20 +1025,22 @@ async fn run_eval_sample<R: SampleRunner>(
                 .map_err(|error| error.to_string())?;
                 return Ok(artifact);
             }
-            remove_sample_artifact(&sample.directory).map_err(|error| error.to_string())?;
+            existing_artifact = Some(existing);
         }
     }
-    let action = match action {
-        ResumeAction::Resume(run) => ResumeAction::Resume(run),
-        ResumeAction::Skip | ResumeAction::Capture | ResumeAction::Start => ResumeAction::Start,
+    let resume_run = match action {
+        ResumeAction::Resume(run) | ResumeAction::Recover(run) => Some(run),
+        ResumeAction::Skip | ResumeAction::Capture | ResumeAction::Start => None,
     };
-    let mut run = match action {
-        ResumeAction::Resume(run) => {
-            // A running journal entry normally means the previous controller was interrupted, not
-            // that the target already lost the run. Reattach and wait for its real outcome first.
+    let mut run = match resume_run {
+        Some(run) => {
+            // A running or failed journal entry normally means the previous controller was
+            // interrupted, not that the target already lost the run. Reattach first.
             let mut terminal_failure = None;
             match runner.wait(&run).await {
                 Ok(outcome) if outcome.status == SampleStatus::Succeeded => {
+                    // The existing run is already successful; replace any stale attempt output.
+                    remove_sample_artifact(&sample.directory).map_err(|error| error.to_string())?;
                     return complete_sample(&sample, run.sample_id, outcome, &context).await;
                 }
                 Ok(outcome) => terminal_failure = Some(outcome),
@@ -1068,28 +1072,32 @@ async fn run_eval_sample<R: SampleRunner>(
                         .submit(request)
                         .await
                         .map_err(|error| error.to_string())?,
-                    None => match terminal_failure {
-                        Some(outcome) => {
+                    None => {
+                        if let Some(existing) = existing_artifact {
+                            if current_run_id.as_ref() == Some(&existing.outcome.run_id) {
+                                // No replacement run was created; retain the measured failure.
+                                return Ok(existing);
+                            }
+                        }
+                        if let Some(outcome) = terminal_failure {
+                            remove_sample_artifact(&sample.directory)
+                                .map_err(|error| error.to_string())?;
                             return complete_sample(&sample, run.sample_id, outcome, &context)
                                 .await;
                         }
-                        None => {
-                            let message = format!("resume failed: {error}");
-                            let _ = journal_update(journal, journal_directory, |journal| {
-                                journal.record_error(&sample_id, &message);
-                            })
-                            .await;
-                            return Err(message);
-                        }
-                    },
+                        let message = format!("resume failed: {error}");
+                        let _ = journal_update(journal, journal_directory, |journal| {
+                            journal.record_error(&sample_id, &message);
+                        })
+                        .await;
+                        return Err(message);
+                    }
                 },
             }
         }
-        ResumeAction::Skip | ResumeAction::Capture => {
-            unreachable!("completed or capture-pending sample had no stored artifact")
-        }
-        ResumeAction::Start => {
-            remove_sample_artifact(&sample.directory).map_err(|error| error.to_string())?;
+        None => {
+            // Take the request and submit before touching previous artifacts. A transient
+            // submission failure must leave the last measured sample intact.
             let request = sample
                 .request
                 .take()
@@ -1106,6 +1114,8 @@ async fn run_eval_sample<R: SampleRunner>(
     })
     .await
     .map_err(|error| error.to_string())?;
+    // The replacement run is now claimed. Discard prior sample-local evidence before waiting.
+    remove_sample_artifact(&sample.directory).map_err(|error| error.to_string())?;
     let outcome = match runner.wait(&run).await {
         Ok(outcome) => outcome,
         Err(error) => {
