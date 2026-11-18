@@ -25,6 +25,8 @@ pub enum SampleResumeState {
     Running,
     Completed,
     Failed,
+    /// The run succeeded but its patch or judge checkout is still missing.
+    CapturePending,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -63,6 +65,8 @@ pub enum ResumeAction {
     Start,
     /// The sample completed; its stored outcome is authoritative.
     Skip,
+    /// The run succeeded but capture did not. Retry capture without running the sample again.
+    Capture,
     /// The previous controller lost this run before completion. Resume its retained workspace.
     Resume(SampleRun),
 }
@@ -134,6 +138,9 @@ impl ResumeJournal {
     pub fn action(&self, sample_id: &str) -> ResumeAction {
         match self.samples.get(sample_id) {
             Some(sample) if sample.state == SampleResumeState::Completed => ResumeAction::Skip,
+            Some(sample) if sample.state == SampleResumeState::CapturePending => {
+                ResumeAction::Capture
+            }
             Some(sample) if sample.state == SampleResumeState::Running => match &sample.run {
                 Some(run) => ResumeAction::Resume(run.clone()),
                 None => ResumeAction::Start,
@@ -216,6 +223,9 @@ impl ResumeJournal {
     /// Record the durable artifact, including a capture failure that must not erase its outcome.
     pub fn record_artifact(&mut self, artifact: &SampleArtifact) {
         let state = match artifact.outcome.status {
+            SampleStatus::Succeeded if artifact.capture_error.is_some() => {
+                SampleResumeState::CapturePending
+            }
             SampleStatus::Succeeded => SampleResumeState::Completed,
             SampleStatus::Failed => SampleResumeState::Failed,
         };

@@ -6,12 +6,15 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 use openengine_cluster_protocol::GitTransportCredentials;
 use serde::{Deserialize, Serialize};
 
-use crate::native_v2_delivery::transport::{GitTransport, GitTransportConfig, source_credential};
+use crate::native_v2_delivery::transport::{
+    GitTransport, GitTransportConfig, object_format, source_credential,
+};
 use crate::source_code_provider::{SourceDeliveryError, valid_git_revision};
 
 const DEFAULT_CAPTURE_DEADLINE: Duration = Duration::from_secs(15 * 60);
@@ -59,16 +62,22 @@ impl DeliveryReceipt {
     /// Find a delivery receipt in a terminal graph output.
     ///
     /// Graphs commonly wrap the delivery worker result as `{"delivery": {...}}`; a root result is
-    /// also accepted. The search is bounded and only accepts objects that actually carry a
-    /// revision, so unrelated worker outputs are never mistaken for delivery.
+    /// also accepted. Only the delivery receipt shape is accepted, so an unrelated object such as
+    /// a review scope that also carries `headRevision` is never mistaken for delivery.
     #[must_use]
     pub fn from_terminal_output(output: &serde_json::Value) -> Option<Self> {
+        fn receipt_like(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+            ["headRevision", "repository", "mode", "outcome"]
+                .into_iter()
+                .all(|key| object.get(key).is_some_and(serde_json::Value::is_string))
+        }
+
         fn find(value: &serde_json::Value, depth: usize) -> Option<DeliveryReceipt> {
             if depth > 8 {
                 return None;
             }
             let object = value.as_object()?;
-            if object.contains_key("headRevision") || object.contains_key("mergeRevision") {
+            if receipt_like(object) {
                 return serde_json::from_value(value.clone()).ok();
             }
             for key in ["delivery", "result", "output"] {
@@ -81,16 +90,14 @@ impl DeliveryReceipt {
         find(output, 0)
     }
 
+    /// The candidate revision for this sample. `mergeRevision` is target-branch metadata and is
+    /// never used as the sample patch revision.
     #[must_use]
     pub fn delivered_revision(&self) -> Option<String> {
-        [
-            self.merge_revision.as_deref(),
-            self.head_revision.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .find(|revision| valid_git_revision(revision))
-        .map(str::to_owned)
+        self.head_revision
+            .as_deref()
+            .filter(|revision| valid_git_revision(revision))
+            .map(str::to_owned)
     }
 
     #[must_use]
@@ -215,6 +222,10 @@ pub enum CaptureError {
     InvalidRevision(String),
     #[error("checkout destination is not empty: {0}")]
     DestinationNotEmpty(PathBuf),
+    #[error("base and delivered revisions use different Git object formats")]
+    ObjectFormatMismatch,
+    #[error("Git capture failed: {0}")]
+    Git(String),
     #[error("capture filesystem operation failed: {0}")]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -235,7 +246,13 @@ pub async fn capture_patch(request: &CaptureRequest) -> Result<CapturedSample, C
         .tempdir_in(&request.directory)?;
     let transport = open_transport(request, workspace.path())?;
     let credential = credential(request);
-    initialize(&transport, request, credential).await?;
+    initialize(
+        &transport,
+        request,
+        credential,
+        object_format(&delivered_revision),
+    )
+    .await?;
     ensure_revision(
         &transport,
         request,
@@ -256,22 +273,14 @@ pub async fn capture_patch(request: &CaptureRequest) -> Result<CapturedSample, C
         credential,
     )
     .await?;
-    let patch = transport
-        .success(
-            &[
-                "diff",
-                "--binary",
-                "--no-ext-diff",
-                "--full-index",
-                &request.base_revision,
-                &delivered_revision,
-            ],
-            credential,
-        )
-        .await?;
     let patch_path = request.directory.join("patch.diff");
-    super::write_bytes_atomic(&patch_path, patch.stdout().as_bytes())?;
-    let patch_bytes = std::fs::metadata(&patch_path)?.len();
+    let patch_bytes = write_diff(
+        &transport,
+        &request.base_revision,
+        &delivered_revision,
+        &patch_path,
+    )
+    .await?;
     Ok(CapturedSample {
         base_revision: request.base_revision.clone(),
         delivered_revision,
@@ -290,13 +299,11 @@ pub async fn checkout_patch(
     request: &CaptureRequest,
     destination: &Path,
 ) -> Result<JudgeCheckout, CaptureError> {
-    validate_revisions(
-        &request.base_revision,
-        &request
-            .receipt
-            .delivered_revision()
-            .ok_or(CaptureError::MissingRevision)?,
-    )?;
+    let delivered_revision = request
+        .receipt
+        .delivered_revision()
+        .ok_or(CaptureError::MissingRevision)?;
+    validate_revisions(&request.base_revision, &delivered_revision)?;
     if destination.exists() && std::fs::read_dir(destination)?.next().is_some() {
         return Err(CaptureError::DestinationNotEmpty(destination.to_owned()));
     }
@@ -322,7 +329,13 @@ pub async fn checkout_patch(
         request.remote.clone(),
     );
     let credential = credential(request);
-    initialize(&transport, request, credential).await?;
+    initialize(
+        &transport,
+        request,
+        credential,
+        object_format(&delivered_revision),
+    )
+    .await?;
     advertise_base(&transport, request, credential).await?;
     transport
         .success(
@@ -347,10 +360,7 @@ pub async fn checkout_patch(
         directory: destination
             .file_name()
             .map_or_else(|| destination.to_owned(), PathBuf::from),
-        revision: request
-            .receipt
-            .delivered_revision()
-            .unwrap_or_else(|| request.base_revision.clone()),
+        revision: delivered_revision,
         base_revision: request.base_revision.clone(),
         patch: PathBuf::from("patch.diff"),
     })
@@ -362,7 +372,61 @@ fn validate_revisions(base: &str, delivered: &str) -> Result<(), CaptureError> {
             return Err(CaptureError::InvalidRevision(revision.to_owned()));
         }
     }
+    if base.len() != delivered.len() {
+        return Err(CaptureError::ObjectFormatMismatch);
+    }
     Ok(())
+}
+
+async fn write_diff(
+    transport: &GitTransport,
+    base_revision: &str,
+    delivered_revision: &str,
+    path: &Path,
+) -> Result<u64, CaptureError> {
+    let config = transport.config();
+    let mut temporary = tempfile::NamedTempFile::new_in(
+        path.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(".")),
+    )?;
+    let stdout = temporary.as_file().try_clone()?;
+    let mut command = tokio::process::Command::new(&config.git_program);
+    command
+        .current_dir(&config.workspace)
+        .env_clear()
+        .env("HOME", &config.home_directory)
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args([
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--full-index",
+            base_revision,
+            delivered_revision,
+        ])
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = command.spawn()?;
+    let output = tokio::time::timeout(config.deadline, child.wait_with_output())
+        .await
+        .map_err(|_| CaptureError::Git("git diff exceeded its deadline".to_owned()))??;
+    if !output.status.success() {
+        let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        stderr.truncate(4_096);
+        return Err(CaptureError::Git(format!(
+            "git diff failed with {}: {stderr}",
+            output.status
+        )));
+    }
+    temporary.as_file_mut().sync_all()?;
+    temporary
+        .persist(path)
+        .map_err(|error| CaptureError::Io(error.error))?;
+    Ok(std::fs::metadata(path)?.len())
 }
 
 fn default_git_program() -> PathBuf {
@@ -407,8 +471,11 @@ async fn initialize(
     transport: &GitTransport,
     request: &CaptureRequest,
     credential: crate::source_code_provider::SourceDeliveryCredential<'_>,
+    object_format: &str,
 ) -> Result<(), CaptureError> {
-    transport.success(&["init", "--quiet"], credential).await?;
+    transport
+        .success(&["init", "--quiet", object_format], credential)
+        .await?;
     transport
         .success(
             &["remote", "add", "origin", request.remote.as_str()],

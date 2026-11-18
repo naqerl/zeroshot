@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use openengine_cluster_protocol::{
-    RunForceParams, RunId, RunResumeParams, RunStatus, RunStatusParams, TerminalResult, TokenUsage,
+    RunConnectionValues, RunForceParams, RunId, RunResumeParams, RunStatus, RunStatusParams,
+    TerminalResult, TokenUsage,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -37,6 +38,18 @@ pub struct BackendSampleRequest {
     pub sample_id: String,
     pub concurrency: usize,
     pub request: PreparedRunRequest,
+}
+
+/// A request whose recorded scheduler width can be aligned with the eval's resolved capacity.
+pub trait SampleRequest: Send {
+    fn with_concurrency(self, concurrency: usize) -> Self;
+}
+
+impl SampleRequest for BackendSampleRequest {
+    fn with_concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = concurrency;
+        self
+    }
 }
 
 /// A submitted sample. `submitted_at_ms` is captured before any platform queueing.
@@ -154,7 +167,7 @@ pub enum SampleRunnerError {
 
 #[async_trait]
 pub trait SampleRunner: Send + Sync {
-    type Request: Send;
+    type Request: SampleRequest;
 
     async fn submit(&self, request: Self::Request) -> Result<SampleRun, SampleRunnerError>;
 
@@ -162,9 +175,14 @@ pub trait SampleRunner: Send + Sync {
 
     async fn stop(&self, run: &SampleRun) -> Result<(), SampleRunnerError>;
 
-    /// Resume a run that was already submitted but never reached a terminal outcome.
-    async fn resume(&self, run: SampleRun) -> Result<SampleRun, SampleRunnerError> {
-        let _ = run;
+    /// Resume a run that was already submitted but never reached a terminal outcome. Fresh
+    /// connection values stay out of the journal and are supplied for this attempt only.
+    async fn resume(
+        &self,
+        run: SampleRun,
+        connections: RunConnectionValues,
+    ) -> Result<SampleRun, SampleRunnerError> {
+        let _ = (run, connections);
         Err(SampleRunnerError::ResumeUnsupported)
     }
 }
@@ -201,17 +219,17 @@ where
     } else {
         None
     };
-    finish_sample(run, outcome, directory, capture).await
+    persist_sample(run.sample_id, outcome, directory, capture).await
 }
 
-async fn finish_sample(
-    run: SampleRun,
+async fn persist_sample(
+    sample_id: String,
     outcome: SampleOutcome,
     directory: &Path,
     capture: Option<CaptureRequest>,
 ) -> Result<SampleArtifact, SampleExecutionError> {
     std::fs::create_dir_all(directory)?;
-    let mut artifact = SampleArtifact::new(run.sample_id, outcome);
+    let mut artifact = SampleArtifact::new(sample_id, outcome);
     // Persist the measured run before any network capture so a failed fetch never erases it.
     artifact.write(directory)?;
     if artifact.outcome.status == SampleStatus::Succeeded {
@@ -321,8 +339,18 @@ impl<B: NativeV2CliBackend> SampleRunner for PlatformRunner<B> {
         stop(self.backend.as_ref(), Some(self.target.as_str()), run).await
     }
 
-    async fn resume(&self, run: SampleRun) -> Result<SampleRun, SampleRunnerError> {
-        resume(self.backend.as_ref(), Some(self.target.as_str()), run).await
+    async fn resume(
+        &self,
+        run: SampleRun,
+        connections: RunConnectionValues,
+    ) -> Result<SampleRun, SampleRunnerError> {
+        resume(
+            self.backend.as_ref(),
+            Some(self.target.as_str()),
+            run,
+            connections,
+        )
+        .await
     }
 }
 
@@ -351,8 +379,12 @@ impl<B: NativeV2CliBackend> SampleRunner for LocalRunner<B> {
         stop(self.backend.as_ref(), None, run).await
     }
 
-    async fn resume(&self, run: SampleRun) -> Result<SampleRun, SampleRunnerError> {
-        resume(self.backend.as_ref(), None, run).await
+    async fn resume(
+        &self,
+        run: SampleRun,
+        connections: RunConnectionValues,
+    ) -> Result<SampleRun, SampleRunnerError> {
+        resume(self.backend.as_ref(), None, run, connections).await
     }
 }
 
@@ -384,6 +416,7 @@ async fn resume<B: NativeV2CliBackend>(
     backend: &B,
     target: Option<&str>,
     run: SampleRun,
+    connections: RunConnectionValues,
 ) -> Result<SampleRun, SampleRunnerError> {
     let successor = RunId::new(uuid::Uuid::now_v7().to_string());
     let result = backend
@@ -393,7 +426,7 @@ async fn resume<B: NativeV2CliBackend>(
                 run_id: run.run_id.clone(),
                 successor_run_id: successor,
                 from: None,
-                connections: BTreeMap::new(),
+                connections,
                 connection_resolver: None,
                 github_token: None,
                 git_credentials: None,
@@ -609,6 +642,13 @@ impl FakeSampleRequest {
     }
 }
 
+impl SampleRequest for FakeSampleRequest {
+    fn with_concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = concurrency;
+        self
+    }
+}
+
 #[derive(Clone, Debug)]
 struct FakeSubmission {
     request: FakeSampleRequest,
@@ -710,7 +750,11 @@ impl SampleRunner for FakeRunner {
         Ok(())
     }
 
-    async fn resume(&self, run: SampleRun) -> Result<SampleRun, SampleRunnerError> {
+    async fn resume(
+        &self,
+        run: SampleRun,
+        _connections: RunConnectionValues,
+    ) -> Result<SampleRun, SampleRunnerError> {
         let mut state = self.state.lock().await;
         let submission =
             state.submissions.get(&run.run_id).cloned().ok_or_else(|| {
@@ -735,6 +779,9 @@ pub struct EvalSamplePlan<R: SampleRunner> {
     pub directory: PathBuf,
     pub request: Option<R::Request>,
     pub capture: Option<CaptureRequest>,
+    pub concurrency: usize,
+    /// Fresh connection values for resuming a retained run. Never persisted in the journal.
+    pub resume_connections: RunConnectionValues,
 }
 
 impl<R: SampleRunner> EvalSamplePlan<R> {
@@ -749,12 +796,20 @@ impl<R: SampleRunner> EvalSamplePlan<R> {
             directory: directory.into(),
             request: Some(request),
             capture: None,
+            concurrency: 1,
+            resume_connections: RunConnectionValues::default(),
         }
     }
 
     #[must_use]
     pub fn with_capture(mut self, capture: CaptureRequest) -> Self {
         self.capture = Some(capture);
+        self
+    }
+
+    #[must_use]
+    pub fn with_resume_connections(mut self, connections: RunConnectionValues) -> Self {
+        self.resume_connections = connections;
         self
     }
 }
@@ -807,7 +862,15 @@ where
     let journal = Arc::new(Mutex::new(journal));
     let journal_directory = request.journal_directory;
     let runner = request.runner;
-    let completed = run_bounded(request.samples, capacity.concurrency, |_index, sample| {
+    let mut samples = request.samples;
+    for sample in &mut samples {
+        sample.concurrency = capacity.concurrency;
+        sample.request = sample
+            .request
+            .take()
+            .map(|request| request.with_concurrency(capacity.concurrency));
+    }
+    let completed = run_bounded(samples, capacity.concurrency, |_index, sample| {
         let journal = Arc::clone(&journal);
         let journal_directory = journal_directory.clone();
         async move {
@@ -841,25 +904,40 @@ async fn run_eval_sample<R: SampleRunner>(
     journal_directory: &Path,
 ) -> Result<SampleArtifact, String> {
     let sample_id = sample.sample_id.clone();
-    let mut action = journal.lock().await.action(&sample_id);
-    if matches!(action, ResumeAction::Skip) {
-        match SampleArtifact::read(&sample.directory) {
-            Ok(artifact) => return Ok(artifact),
-            Err(_) => action = ResumeAction::Start,
+    let action = journal.lock().await.action(&sample_id);
+    if action != ResumeAction::Start {
+        if let Ok(existing) = SampleArtifact::read(&sample.directory) {
+            let artifact = retry_capture(existing, &sample.directory, sample.capture.take())
+                .await
+                .map_err(|error| error.to_string())?;
+            journal_update(journal, journal_directory, |journal| {
+                journal.record_artifact(&artifact);
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            return Ok(artifact);
         }
     }
-    let run = match action {
-        ResumeAction::Skip => unreachable!("completed sample without artifact was restarted"),
-        ResumeAction::Resume(run) => match runner.resume(run).await {
-            Ok(run) => run,
-            Err(error) => match sample.request.take() {
-                Some(request) => runner
-                    .submit(request)
-                    .await
-                    .map_err(|error| error.to_string())?,
-                None => return Err(format!("resume failed: {error}")),
-            },
-        },
+    let action = match action {
+        ResumeAction::Resume(run) => ResumeAction::Resume(run),
+        ResumeAction::Skip | ResumeAction::Capture | ResumeAction::Start => ResumeAction::Start,
+    };
+    let mut run = match action {
+        ResumeAction::Resume(run) => {
+            match runner.resume(run, sample.resume_connections.clone()).await {
+                Ok(run) => run,
+                Err(error) => match sample.request.take() {
+                    Some(request) => runner
+                        .submit(request)
+                        .await
+                        .map_err(|error| error.to_string())?,
+                    None => return Err(format!("resume failed: {error}")),
+                },
+            }
+        }
+        ResumeAction::Skip | ResumeAction::Capture => {
+            unreachable!("completed or capture-pending sample had no stored artifact")
+        }
         ResumeAction::Start => {
             let request = sample
                 .request
@@ -871,6 +949,7 @@ async fn run_eval_sample<R: SampleRunner>(
                 .map_err(|error| error.to_string())?
         }
     };
+    run.concurrency = sample.concurrency;
     journal_update(journal, journal_directory, |journal| {
         journal.claim(&sample_id, run.clone());
     })
@@ -891,7 +970,7 @@ async fn run_eval_sample<R: SampleRunner>(
         request.receipt = outcome.delivery.clone().unwrap_or_default();
         request
     });
-    let artifact = match finish_sample(run, outcome, &sample.directory, capture).await {
+    let artifact = match persist_sample(run.sample_id, outcome, &sample.directory, capture).await {
         Ok(artifact) => artifact,
         Err(error) => {
             let message = error.to_string();
@@ -908,6 +987,28 @@ async fn run_eval_sample<R: SampleRunner>(
     .await
     .map_err(|error| error.to_string())?;
     Ok(artifact)
+}
+
+async fn retry_capture(
+    existing: SampleArtifact,
+    directory: &Path,
+    capture: Option<CaptureRequest>,
+) -> Result<SampleArtifact, SampleExecutionError> {
+    if existing.capture_error.is_none() || existing.outcome.status != SampleStatus::Succeeded {
+        return Ok(existing);
+    }
+    let Some(mut request) = capture else {
+        return Ok(existing);
+    };
+    request.directory = directory.to_owned();
+    request.receipt = existing.outcome.delivery.clone().unwrap_or_default();
+    persist_sample(
+        existing.sample_id,
+        existing.outcome,
+        directory,
+        Some(request),
+    )
+    .await
 }
 
 async fn journal_update<T>(

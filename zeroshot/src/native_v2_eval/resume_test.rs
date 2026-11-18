@@ -4,7 +4,7 @@ use super::{
     Capacity, CapacitySourceKind, RESUME_FILE, ResumeAction, ResumeJournal, SampleResumeState,
     SampleStatus,
 };
-use crate::native_v2_eval::runner::{SampleOutcome, SampleRun, SampleTimings};
+use crate::native_v2_eval::runner::{SampleArtifact, SampleOutcome, SampleRun, SampleTimings};
 
 fn sample_run(run_id: &str) -> SampleRun {
     SampleRun {
@@ -86,5 +86,27 @@ fn journal_round_trips_and_warns_when_attempt_concurrency_changes() {
     assert_eq!(
         loaded.samples["sample"].run_id.as_ref().map(RunId::as_str),
         Some("run-resume")
+    );
+}
+
+#[test]
+fn capture_incompleteness_stays_resumable_until_patch_and_judge_exist() {
+    let mut journal = ResumeJournal::default();
+    let mut artifact = SampleArtifact::new("capture", outcome(SampleStatus::Succeeded));
+    artifact.capture_error = Some("fetch failed".to_owned());
+    journal.record_artifact(&artifact);
+    assert_eq!(journal.action("capture"), ResumeAction::Capture);
+    assert_eq!(
+        journal.samples["capture"].state,
+        SampleResumeState::CapturePending
+    );
+    assert_eq!(journal.incomplete(), vec!["capture"]);
+
+    artifact.capture_error = None;
+    journal.record_artifact(&artifact);
+    assert_eq!(journal.action("capture"), ResumeAction::Skip);
+    assert_eq!(
+        journal.samples["capture"].state,
+        SampleResumeState::Completed
     );
 }

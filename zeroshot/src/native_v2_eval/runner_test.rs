@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use openengine_cluster_protocol::{
-    IdempotencyKey, RunAttachParams, RunForceParams, RunId, RunListParams, RunLogsParams,
-    RunResumeParams, RunResumeResult, RunSize, RunStatusParams, RunSubmitResult, RunTitle,
-    RunWatchParams, TokenCount, TokenUsage,
+    ConnectionKey, EnvironmentVariableName, IdempotencyKey, RunAttachParams, RunForceParams, RunId,
+    RunListParams, RunLogsParams, RunResumeParams, RunResumeResult, RunSize, RunStatusParams,
+    RunSubmitResult, RunTitle, RunWatchParams, StaticConnectionValues, TokenCount, TokenUsage,
 };
 use serde_json::json;
 
@@ -141,6 +141,10 @@ impl ScriptedBackend {
 
     fn forced(&self) -> Vec<RunId> {
         self.state.lock().unwrap().forced.clone()
+    }
+
+    fn resumed(&self) -> Vec<RunResumeParams> {
+        self.state.lock().unwrap().resumed.clone()
     }
 }
 
@@ -310,7 +314,7 @@ async fn platform_runner_polls_queue_running_and_terminal_states() {
     assert!(outcome.timings.started_at_ms.unwrap() > run.submitted_at_ms);
     assert!(outcome.timings.queue_wait_ms < outcome.timings.wall_clock_ms);
     assert_eq!(outcome.token_usage.unwrap().input_tokens.get(), 12);
-    assert_eq!(outcome.delivered_revision, Some("c".repeat(40)));
+    assert_eq!(outcome.delivered_revision, Some("b".repeat(40)));
     assert_eq!(outcome.delivered_branch.as_deref(), Some("zeroshot/run"));
 }
 
@@ -355,6 +359,35 @@ async fn platform_runner_enforces_a_deadline_and_requests_stop() {
         .unwrap();
     assert!(runner.wait(&run).await.is_err());
     assert_eq!(backend.forced(), vec![RunId::new("run-scripted")]);
+}
+
+#[tokio::test]
+async fn platform_runner_resume_supplies_fresh_connection_values() {
+    let backend = Arc::new(ScriptedBackend::new(Vec::new(), Duration::ZERO));
+    let runner = PlatformRunner::new(Arc::clone(&backend), "platform");
+    let connections = BTreeMap::from([(
+        ConnectionKey::new("provider").unwrap(),
+        StaticConnectionValues::new(BTreeMap::from([(
+            EnvironmentVariableName::new("PROVIDER_TOKEN").unwrap(),
+            "fresh-secret".to_owned(),
+        )]))
+        .unwrap(),
+    )]);
+    let resumed = runner
+        .resume(
+            super::SampleRun {
+                sample_id: "sample-resume".to_owned(),
+                run_id: RunId::new("run-scripted"),
+                target: Some("platform".to_owned()),
+                submitted_at_ms: 1,
+                concurrency: 2,
+            },
+            connections.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resumed.run_id.as_str(), "run-successor");
+    assert_eq!(backend.resumed()[0].connections, connections);
 }
 
 #[tokio::test]
@@ -419,6 +452,12 @@ async fn driver_schedules_samples_and_skips_completed_work() {
     assert_eq!(report.capacity.capacity_source.label(), "concurrency");
     assert_eq!(report.artifacts.len(), 2);
     assert!(report.failures.is_empty());
+    assert!(
+        report
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.outcome.timings.concurrency == 2)
+    );
     assert_eq!(runner.submitted().await.len(), 2);
 
     let rerun = run_eval(EvalRunRequest {
@@ -471,6 +510,8 @@ async fn driver_resumes_an_interrupted_sample_without_a_fresh_request() {
             directory: directory.path().join("sample"),
             request: None,
             capture: None,
+            concurrency: 1,
+            resume_connections: Default::default(),
         }],
     })
     .await
