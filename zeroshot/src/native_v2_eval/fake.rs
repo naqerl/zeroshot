@@ -79,8 +79,11 @@ impl FakeSampleRequest {
         run_index: u32,
         criteria: Vec<EvalCriterion>,
     ) -> Self {
+        let sample_id = format!("{}-{run_index:04}", arm.id);
+        let run_id = RunId::new(format!("fake-{eval_id}-{sample_id}"));
         Self {
-            sample_id: format!("{}-{run_index:04}", arm.id),
+            sample_id,
+            run_id: Some(run_id),
             fixture: Some(FakeFixtureRequest {
                 eval_id,
                 arm,

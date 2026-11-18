@@ -79,6 +79,9 @@ async fn full_fake_run_writes_a_trait_matrix_and_nonzero_score() {
 
     let report = data.report.as_ref().expect("run writes a report");
     assert_eq!(report.schema, REPORT_SCHEMA);
+    let capacity = report.capacity.expect("fixture report records capacity");
+    assert_eq!(capacity.concurrency, 1);
+    assert_eq!(capacity.capacity_source.label(), "fallback");
     assert!(report.aggregate_score > 0.0);
     assert_eq!(report.matrix.rows.len(), 6);
     assert_eq!(
@@ -125,6 +128,12 @@ async fn full_fake_run_writes_a_trait_matrix_and_nonzero_score() {
     assert_eq!(markdown, render_markdown(report));
     assert!(markdown.contains("## Trait matrix"));
     assert!(markdown.contains("| correctness |"));
+
+    assert!(
+        data.samples
+            .iter()
+            .all(|sample| { sample.run_id.starts_with(&format!("fake-{}-", data.id)) })
+    );
 
     let failed = data
         .samples

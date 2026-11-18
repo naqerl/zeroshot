@@ -27,14 +27,17 @@ pub use capture::{
     CaptureCredentials, CaptureError, CaptureRequest, CapturedSample, DeliveryReceipt,
     JudgeCheckout, capture_patch, checkout_patch,
 };
-pub use cli::{EvalAction, EvalCommand, EvalRunCommand, RunnerSelection, execute, select_runner};
+pub use cli::{
+    BackendRunRequest, EvalAction, EvalCommand, EvalRunCommand, ManifestRunRequest,
+    RunnerSelection, execute, run_manifest_with_backend, run_manifest_with_runner, select_runner,
+};
 pub use error::EvalError;
 pub use fake::{FakeFixtureRequest, FakeRunner, FakeSampleRequest};
 pub use judge::{Judge, JudgeRequest, JudgeResult};
 pub use manifest::{EvalArm, EvalCriterion, EvalManifest, EvalOptions, FakeOptions, MANIFEST_SCHEMA};
 pub use model::{
-    CriterionResult, EvalData, EvalId, EvalSample, PatchArtifact, SampleCounts, SampleTiming,
-    TokenUsage,
+    CriterionResult, EvalData, EvalId, EvalSample, PatchArtifact, SampleCounts, SampleStatus,
+    SampleTiming, TokenUsage,
 };
 pub use report::{
     ArmCostTime, ArmTraitSummary, CostTimeComparison, EvalReport, QualityCostFit, TraitCell,
@@ -49,7 +52,7 @@ pub use runner::{
     BackendSampleRequest, EvalRunError, EvalRunReport, EvalRunRequest, EvalSamplePlan, LocalRunner,
     PlatformRunner, ResumeCredentials, SAMPLE_FILE, SampleArtifact, SampleExecution,
     SampleExecutionError, SampleFailure, SampleOutcome, SamplePatch, SampleRequest, SampleRun,
-    SampleRunner, SampleRunnerError, SampleStatus, SampleTimings, run_eval, run_sample,
+    SampleRunner, SampleRunnerError, SampleTimings, run_eval, run_sample,
 };
 pub use scorer::{NoneScorer, QualityVsCostScorer, Scorer, ScorerInput, ScorerOutput, ScorerRegistry};
 pub use store::{EvalStore, EvalSummary};

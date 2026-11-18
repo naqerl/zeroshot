@@ -1,14 +1,19 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use openengine_cluster_protocol::TokenUsage as ProtocolTokenUsage;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::native_v2_cli::NativeV2CliBackend;
+
 use super::{
-    EvalData, EvalError, EvalId, EvalManifest, EvalReport, EvalSample, EvalStore,
-    FakeFixtureRequest, FakeRunner, FakeSampleRequest, PatchArtifact, SampleOutcome, SampleRun,
-    SampleRunner, SampleStatus, SampleTiming, ScorerInput, ScorerRegistry, TokenUsage,
-    model::now_ms, report, store::timestamp,
+    BackendSampleRequest, Capacity, CapacitySource, EvalArm, EvalCriterion, EvalData, EvalError,
+    EvalId, EvalManifest, EvalReport, EvalRunError, EvalRunRequest, EvalSample, EvalSamplePlan,
+    EvalStore, FakeRunner, FakeSampleRequest, LocalRunner, PatchArtifact, PlatformRunner,
+    SampleArtifact, SampleOutcome, SampleRunner, SampleStatus, SampleTiming, ScorerInput,
+    ScorerRegistry, TokenUsage, model::now_ms, report, store::timestamp,
 };
 
 /// CLI command family wired as `zeroshot eval ...`.
@@ -36,12 +41,32 @@ pub struct EvalRunCommand {
     pub scorer: Option<String>,
 }
 
+/// A manifest run through an already-constructed runner.
+pub struct ManifestRunRequest<'a, R, F> {
+    pub command: EvalRunCommand,
+    pub runner: &'a R,
+    pub capacity_source: Option<&'a dyn CapacitySource>,
+    pub concurrency: Option<usize>,
+    pub journal_directory: PathBuf,
+    pub request: F,
+}
+
+/// A manifest run through the backend runner selected by `options.runner`.
+pub struct BackendRunRequest<'a, B, F> {
+    pub command: EvalRunCommand,
+    pub backend: Arc<B>,
+    pub target: Option<String>,
+    pub capacity_source: Option<&'a dyn CapacitySource>,
+    pub concurrency: Option<usize>,
+    pub journal_directory: PathBuf,
+    pub request: F,
+}
+
 /// The executable selected for an eval manifest.
 ///
 /// The manifest's `options.runner` is the explicit switch: fixtures use [`FakeRunner`], while
-/// `platform` and `local` select the corresponding native-v2 backend runner. A caller that owns a
-/// backend constructs [`super::PlatformRunner`] or [`super::LocalRunner`] with this selection; the
-/// standalone CLI command only has the fixture runner available.
+/// `platform` and `local` select the corresponding native-v2 backend runner. The standalone CLI
+/// command runs fixtures directly; backend-aware callers use [`run_manifest_with_backend`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunnerSelection {
     Fake,
@@ -85,7 +110,8 @@ pub async fn execute(command: &EvalCommand) -> Result<Value, EvalError> {
         EvalAction::Score { id, scorer } => {
             let id = EvalId::new(id.clone())?;
             let data = store.load(&id)?;
-            let report = recompute(&data, scorer)?;
+            let capacity = data.report.as_ref().and_then(|report| report.capacity);
+            let report = recompute(&data, scorer, capacity)?;
             store.write_report(&id, &report)?;
             store.write_report_markdown(&id, &report)?;
             Ok(serde_json::to_value(report)?)
@@ -101,14 +127,114 @@ pub(crate) async fn run_manifest_through_fake(
 }
 
 async fn run_manifest(command: EvalRunCommand) -> Result<EvalData, EvalError> {
-    let (manifest, source) = EvalManifest::from_file(&command.manifest)?;
-    let selection = select_runner(&manifest)?;
-    if selection != RunnerSelection::Fake {
-        return Err(EvalError::Command(format!(
-            "runner {:?} requires a native-v2 backend; the standalone eval command can only run fixtures",
-            manifest.options.runner
-        )));
+    let (manifest, _) = EvalManifest::from_file(&command.manifest)?;
+    match select_runner(&manifest)? {
+        RunnerSelection::Fake => {
+            let runner =
+                FakeRunner::from_fixture(manifest.options.fake.clone(), manifest.options.seed);
+            // Fixture runs are deterministic and need no durable resume journal.
+            let journal = tempfile::tempdir().map_err(|error| EvalError::io(".", error))?;
+            run_manifest_with_runner(ManifestRunRequest {
+                command,
+                runner: &runner,
+                capacity_source: None,
+                concurrency: None,
+                journal_directory: journal.path().to_path_buf(),
+                request: |eval_id: &EvalId,
+                          _: &str,
+                          arm: &EvalArm,
+                          run_index: u32,
+                          criteria: &[EvalCriterion]| {
+                    FakeSampleRequest::fixture(
+                        eval_id.clone(),
+                        arm.clone(),
+                        run_index,
+                        criteria.to_vec(),
+                    )
+                },
+            })
+            .await
+        }
+        selection => Err(EvalError::Command(format!(
+            "runner {selection:?} requires a native-v2 backend; use run_manifest_with_backend"
+        ))),
     }
+}
+
+/// Run a manifest through an explicitly selected backend runner.
+///
+/// `PlatformRunner` is selected for `runner = "platform"` and `LocalRunner` for `runner = "local"`.
+/// The caller supplies the backend and the per-sample request factory because a backend-owned run
+/// request is outside the manifest's data model.
+pub async fn run_manifest_with_backend<B, F>(
+    request: BackendRunRequest<'_, B, F>,
+) -> Result<EvalData, EvalError>
+where
+    B: NativeV2CliBackend,
+    F: FnMut(&EvalId, &str, &EvalArm, u32, &[EvalCriterion]) -> BackendSampleRequest,
+{
+    let BackendRunRequest {
+        command,
+        backend,
+        target,
+        capacity_source,
+        concurrency,
+        journal_directory,
+        request,
+    } = request;
+    let (manifest, _) = EvalManifest::from_file(&command.manifest)?;
+    match select_runner(&manifest)? {
+        RunnerSelection::Platform => {
+            let runner =
+                PlatformRunner::new(backend, target.unwrap_or_else(|| "platform".to_owned()));
+            run_manifest_with_runner(ManifestRunRequest {
+                command,
+                runner: &runner,
+                capacity_source,
+                concurrency,
+                journal_directory,
+                request,
+            })
+            .await
+        }
+        RunnerSelection::Local => {
+            let runner = LocalRunner::new(backend);
+            run_manifest_with_runner(ManifestRunRequest {
+                command,
+                runner: &runner,
+                capacity_source,
+                concurrency,
+                journal_directory,
+                request,
+            })
+            .await
+        }
+        RunnerSelection::Fake => Err(EvalError::Command(
+            "runner \"fake\" does not use a native-v2 backend".to_owned(),
+        )),
+    }
+}
+
+/// Run one manifest through the unified [`SampleRunner`] seam and persist its store data.
+///
+/// Capacity is resolved once by [`super::run_eval`], every sample is journaled through it, and the
+/// resulting artifacts are translated into the slice-1 stored sample records.
+pub async fn run_manifest_with_runner<R, F>(
+    request: ManifestRunRequest<'_, R, F>,
+) -> Result<EvalData, EvalError>
+where
+    R: SampleRunner,
+    F: FnMut(&EvalId, &str, &EvalArm, u32, &[EvalCriterion]) -> R::Request,
+{
+    let ManifestRunRequest {
+        command,
+        runner,
+        capacity_source,
+        concurrency,
+        journal_directory,
+        mut request,
+    } = request;
+    let (manifest, source) = EvalManifest::from_file(&command.manifest)?;
     let store = EvalStore::for_workspace(&command.directory);
     let id = match command.id {
         Some(id) => EvalId::new(id)?,
@@ -121,7 +247,40 @@ async fn run_manifest(command: EvalRunCommand) -> Result<EvalData, EvalError> {
         .as_deref()
         .unwrap_or(&manifest.options.scorer)
         .to_owned();
-    let runner = FakeRunner::from_fixture(manifest.options.fake.clone(), manifest.options.seed);
+    let mut planned = Vec::new();
+    let mut samples = Vec::new();
+    for arm in &manifest.arms {
+        for run_index in 0..manifest.runs_per_arm {
+            let sample_id = format!("{}-{run_index:04}", arm.id);
+            let sample_request = request(&id, &sample_id, arm, run_index, &manifest.criteria);
+            planned.push(SamplePlanMeta {
+                sample_id: sample_id.clone(),
+                arm_id: arm.id.clone(),
+                run_index,
+            });
+            samples.push(EvalSamplePlan::new(
+                sample_id.clone(),
+                journal_directory.join(&sample_id),
+                sample_request,
+            ));
+        }
+    }
+    let run_report = super::run_eval(EvalRunRequest {
+        runner,
+        capacity_source,
+        concurrency,
+        journal_directory,
+        samples,
+    })
+    .await
+    .map_err(run_error)?;
+    let mut results = BTreeMap::new();
+    for artifact in run_report.artifacts {
+        results.insert(artifact.sample_id.clone(), Ok(artifact));
+    }
+    for failure in run_report.failures {
+        results.insert(failure.sample_id, Err(failure.error));
+    }
     let mut data = EvalData {
         id,
         created_at_ms,
@@ -129,80 +288,53 @@ async fn run_manifest(command: EvalRunCommand) -> Result<EvalData, EvalError> {
         samples: Vec::new(),
         report: None,
     };
-    execute_with_runner(&store, &mut data, &runner, &scorer_name).await?;
+    for meta in planned {
+        let sample = match results.remove(&meta.sample_id) {
+            Some(Ok(artifact)) => sample_from_artifact(&store, &data.id, artifact, &meta)?,
+            Some(Err(error)) => failed_sample(&data.id, &meta, error),
+            None => failed_sample(&data.id, &meta, "sample did not settle".to_owned()),
+        };
+        store.write_sample(&data.id, &sample)?;
+        data.samples.push(sample);
+    }
+    let report = recompute(&data, &scorer_name, Some(run_report.capacity))?;
+    store.write_report(&data.id, &report)?;
+    store.write_report_markdown(&data.id, &report)?;
+    data.report = Some(report);
     Ok(data)
 }
 
-async fn execute_with_runner(
-    store: &EvalStore,
-    data: &mut EvalData,
-    runner: &FakeRunner,
-    scorer_name: &str,
-) -> Result<EvalReport, EvalError> {
-    let arms = data.manifest.arms.clone();
-    let criteria = data.manifest.criteria.clone();
-    let runs_per_arm = data.manifest.runs_per_arm;
-    for arm in arms {
-        for run_index in 0..runs_per_arm {
-            let request = FakeSampleRequest::fixture(
-                data.id.clone(),
-                arm.clone(),
-                run_index,
-                criteria.clone(),
-            );
-            let sample = match runner.submit(request.clone()).await {
-                Ok(run) => settle_sample(store, &request, runner, run).await?,
-                Err(error) => failed_sample(
-                    &request,
-                    synthetic_run_id(&data.id, &request),
-                    error.to_string(),
-                ),
-            };
-            store.write_sample(&data.id, &sample)?;
-            data.samples.push(sample);
-        }
-    }
-    let report = recompute(data, scorer_name)?;
-    store.write_report(&data.id, &report)?;
-    store.write_report_markdown(&data.id, &report)?;
-    data.report = Some(report.clone());
-    Ok(report)
+fn run_error(error: EvalRunError) -> EvalError {
+    EvalError::Command(error.to_string())
 }
 
-async fn settle_sample(
-    store: &EvalStore,
-    request: &FakeSampleRequest,
-    runner: &FakeRunner,
-    run: SampleRun,
-) -> Result<EvalSample, EvalError> {
-    match runner.wait(&run).await {
-        Ok(outcome) => sample_from_outcome(store, request, outcome),
-        Err(error) => Ok(failed_sample(
-            request,
-            run.run_id.as_str().to_owned(),
-            error.to_string(),
-        )),
-    }
+#[derive(Clone)]
+struct SamplePlanMeta {
+    sample_id: String,
+    arm_id: String,
+    run_index: u32,
 }
 
-fn sample_from_outcome(
+fn sample_from_artifact(
     store: &EvalStore,
-    request: &FakeSampleRequest,
-    outcome: SampleOutcome,
+    eval_id: &EvalId,
+    artifact: SampleArtifact,
+    meta: &SamplePlanMeta,
 ) -> Result<EvalSample, EvalError> {
-    let Some(FakeFixtureRequest {
-        eval_id,
-        arm,
-        run_index,
+    let id = artifact.sample_id.clone();
+    let SampleOutcome {
+        run_id,
+        status,
+        timings,
+        token_usage,
+        delivered_revision,
+        failure_reason,
+        patch,
+        criteria,
+        reasoning,
         ..
-    }) = &request.fixture
-    else {
-        return Err(EvalError::Runner(
-            "fixture request lost its manifest identity".to_owned(),
-        ));
-    };
-    let id = request.sample_id.clone();
-    let patch = match outcome.patch {
+    } = artifact.outcome;
+    let patch = match patch {
         Some(patch) => {
             let path = store.write_patch(eval_id, &id, &patch.content)?;
             Some(PatchArtifact {
@@ -215,53 +347,30 @@ fn sample_from_outcome(
     };
     Ok(EvalSample {
         id,
-        run_id: outcome.run_id.as_str().to_owned(),
-        arm_id: arm.id.clone(),
-        run_index: *run_index,
-        status: outcome.status,
+        run_id: run_id.as_str().to_owned(),
+        arm_id: meta.arm_id.clone(),
+        run_index: meta.run_index,
+        status,
         timing: SampleTiming {
-            started_at_ms: outcome
-                .timings
-                .started_at_ms
-                .unwrap_or(outcome.timings.submitted_at_ms),
-            wall_clock_ms: outcome.timings.wall_clock_ms,
-            queue_wait_ms: outcome.timings.queue_wait_ms,
+            started_at_ms: timings.started_at_ms.unwrap_or(timings.submitted_at_ms),
+            wall_clock_ms: timings.wall_clock_ms,
+            queue_wait_ms: timings.queue_wait_ms,
         },
-        tokens: eval_tokens(outcome.token_usage),
-        delivered_revision: outcome.delivered_revision,
-        failure_reason: outcome.failure_reason,
+        tokens: eval_tokens(token_usage),
+        delivered_revision,
+        failure_reason,
         patch,
-        criteria: outcome.criteria,
-        reasoning: outcome.reasoning,
+        criteria,
+        reasoning,
     })
 }
 
-fn failed_sample(request: &FakeSampleRequest, run_id: String, reason: String) -> EvalSample {
-    let Some(fixture) = &request.fixture else {
-        return EvalSample {
-            id: request.sample_id.clone(),
-            run_id,
-            arm_id: String::new(),
-            run_index: 0,
-            status: SampleStatus::Failed,
-            timing: SampleTiming {
-                started_at_ms: now_ms(),
-                wall_clock_ms: 0,
-                queue_wait_ms: 0,
-            },
-            tokens: TokenUsage::default(),
-            delivered_revision: None,
-            failure_reason: Some(reason),
-            patch: None,
-            criteria: Default::default(),
-            reasoning: Default::default(),
-        };
-    };
+fn failed_sample(eval_id: &EvalId, meta: &SamplePlanMeta, reason: String) -> EvalSample {
     EvalSample {
-        id: request.sample_id.clone(),
-        run_id,
-        arm_id: fixture.arm.id.clone(),
-        run_index: fixture.run_index,
+        id: meta.sample_id.clone(),
+        run_id: format!("fake-{eval_id}-{}", meta.sample_id),
+        arm_id: meta.arm_id.clone(),
+        run_index: meta.run_index,
         status: SampleStatus::Failed,
         timing: SampleTiming {
             started_at_ms: now_ms(),
@@ -292,25 +401,23 @@ fn eval_tokens(usage: Option<ProtocolTokenUsage>) -> TokenUsage {
     })
 }
 
-fn synthetic_run_id(eval_id: &EvalId, request: &FakeSampleRequest) -> String {
-    match &request.fixture {
-        Some(fixture) => format!("fake-{eval_id}-{}-{:04}", fixture.arm.id, fixture.run_index),
-        None => format!("fake-{eval_id}-{}", request.sample_id),
-    }
-}
-
 fn ensure_report(store: &EvalStore, data: &EvalData) -> Result<EvalReport, EvalError> {
     if let Some(report) = &data.report {
         store.write_report_markdown(&data.id, report)?;
         return Ok(report.clone());
     }
-    let report = recompute(data, &data.manifest.options.scorer)?;
+    let capacity = data.report.as_ref().and_then(|report| report.capacity);
+    let report = recompute(data, &data.manifest.options.scorer, capacity)?;
     store.write_report(&data.id, &report)?;
     store.write_report_markdown(&data.id, &report)?;
     Ok(report)
 }
 
-fn recompute(data: &EvalData, scorer_name: &str) -> Result<EvalReport, EvalError> {
+fn recompute(
+    data: &EvalData,
+    scorer_name: &str,
+    capacity: Option<Capacity>,
+) -> Result<EvalReport, EvalError> {
     let registry = ScorerRegistry::builtin();
     let scorer = registry.require(scorer_name)?;
     let analysis = report::analyze(data);
@@ -327,7 +434,10 @@ fn recompute(data: &EvalData, scorer_name: &str) -> Result<EvalReport, EvalError
         data,
         analysis,
         output,
-        timestamp(),
+        report::ReportStamp {
+            capacity,
+            generated_at_ms: timestamp(),
+        },
     ))
 }
 

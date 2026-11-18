@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 
-use super::{EvalData, EvalId, EvalSample, SampleStatus, TokenUsage, scorer::ScorerOutput};
+use super::{Capacity, EvalData, EvalId, EvalSample, SampleStatus, TokenUsage, scorer::ScorerOutput};
 
 pub const REPORT_SCHEMA: &str = "zeroshot.eval-report/v1";
 
@@ -15,6 +15,9 @@ pub struct EvalReport {
     pub eval_name: String,
     pub generated_at_ms: u64,
     pub scorer: String,
+    /// Effective scheduler width and its provenance for this attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<Capacity>,
     pub aggregate_score: f64,
     /// Weighted quality (Q) over every attempted sample.
     pub quality: f64,
@@ -192,12 +195,17 @@ pub(crate) fn analyze(data: &EvalData) -> Analysis {
     }
 }
 
+pub(crate) struct ReportStamp {
+    pub capacity: Option<Capacity>,
+    pub generated_at_ms: u64,
+}
+
 impl EvalReport {
     pub(crate) fn from_analysis(
         data: &EvalData,
         analysis: Analysis,
         output: ScorerOutput,
-        generated_at_ms: u64,
+        stamp: ReportStamp,
     ) -> Self {
         let mut cost_time = analysis.cost_time;
         cost_time.fit = output.fit;
@@ -205,8 +213,9 @@ impl EvalReport {
             schema: REPORT_SCHEMA.to_owned(),
             eval_id: data.id.clone(),
             eval_name: data.manifest.name.clone(),
-            generated_at_ms,
+            generated_at_ms: stamp.generated_at_ms,
             scorer: output.name,
+            capacity: stamp.capacity,
             aggregate_score: output.score,
             quality: output.quality,
             matrix: analysis.matrix,
@@ -226,6 +235,14 @@ pub fn render_markdown(report: &EvalReport) -> String {
     let _ = writeln!(out, "- ID: `{}`", report.eval_id);
     let _ = writeln!(out, "- Generated: {}", report.generated_at_ms);
     let _ = writeln!(out, "- Scorer: `{}`", report.scorer);
+    if let Some(capacity) = report.capacity {
+        let _ = writeln!(
+            out,
+            "- Capacity: {} ({})",
+            capacity.concurrency,
+            capacity.capacity_source.label()
+        );
+    }
     let _ = writeln!(out, "- Aggregate score: {:.4}", report.aggregate_score);
     let _ = writeln!(out, "- Quality (Q): {:.4}", report.quality);
     let _ = writeln!(out);

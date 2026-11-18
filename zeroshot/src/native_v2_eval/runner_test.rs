@@ -22,6 +22,10 @@ use crate::native_v2_cli::{
     NativeV2CliBackend, PreparedRunRequest, TargetAdd,
 };
 use crate::native_v2_contract::RunSubmissionIntent;
+use crate::native_v2_eval::{
+    BackendRunRequest, EvalManifest, EvalRunCommand, RunnerSelection, run_manifest_with_backend,
+    select_runner,
+};
 
 fn usage() -> TokenUsage {
     TokenUsage {
@@ -995,4 +999,52 @@ async fn sample_artifact_round_trips_a_partial_eval_sample() {
     assert_eq!(value["runId"], "run-4");
     assert_eq!(value["timings"]["wallClockMs"], 1);
     assert_eq!(value["tokenUsage"]["inputTokens"], 11);
+}
+
+#[tokio::test]
+async fn cli_backend_path_runs_the_selected_platform_runner() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = include_str!("../../fixtures/eval/synthetic.toml")
+        .replace("runner = \"fake\"", "runner = \"platform\"");
+    let manifest_path = temporary.path().join("platform.toml");
+    std::fs::write(&manifest_path, &source).unwrap();
+    let manifest = EvalManifest::parse(&source).unwrap();
+    assert_eq!(select_runner(&manifest).unwrap(), RunnerSelection::Platform);
+
+    let backend = Arc::new(ScriptedBackend::new(
+        vec![queued(), finished_succeeded()],
+        Duration::from_millis(1),
+    ));
+    let data = run_manifest_with_backend(BackendRunRequest {
+        command: EvalRunCommand {
+            manifest: manifest_path,
+            directory: temporary.path().to_path_buf(),
+            id: Some("fixture-platform".to_owned()),
+            scorer: None,
+        },
+        backend,
+        target: Some("platform".to_owned()),
+        capacity_source: None,
+        concurrency: Some(2),
+        journal_directory: temporary.path().join("run"),
+        request: |_: &crate::native_v2_eval::EvalId, sample_id: &str, _: &_, _: u32, _: &_| {
+            BackendSampleRequest {
+                sample_id: sample_id.to_owned(),
+                concurrency: 1,
+                request: prepared_request(),
+            }
+        },
+    })
+    .await
+    .unwrap();
+    assert_eq!(data.samples.len(), 6);
+    assert!(
+        data.samples
+            .iter()
+            .all(|sample| sample.status == SampleStatus::Succeeded)
+    );
+    let report = data.report.expect("platform run writes a report");
+    let capacity = report.capacity.expect("report records capacity provenance");
+    assert_eq!(capacity.concurrency, 2);
+    assert_eq!(capacity.capacity_source.label(), "concurrency");
 }

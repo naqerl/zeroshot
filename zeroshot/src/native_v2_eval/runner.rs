@@ -26,6 +26,7 @@ pub use super::fake::{FakeRunner, FakeSampleRequest};
 use super::capture::{
     CaptureError, CaptureRequest, CapturedSample, DeliveryReceipt, capture_patch, checkout_patch,
 };
+pub use super::model::SampleStatus;
 use super::model::CriterionResult;
 use super::now_ms;
 use super::resume::{CapacityWarning, ResumeAction, ResumeError, ResumeJournal};
@@ -91,21 +92,6 @@ pub struct SampleRun {
     pub target: Option<String>,
     pub submitted_at_ms: u64,
     pub concurrency: usize,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SampleStatus {
-    Succeeded,
-    Failed,
-    Skipped,
-}
-
-impl SampleStatus {
-    #[must_use]
-    pub const fn is_attempted(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed)
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
