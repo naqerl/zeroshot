@@ -374,3 +374,57 @@ async fn failed_checkout_leaves_no_partial_destination_for_retry() {
     assert!(checkout_patch(&request, &destination).await.is_err());
     assert!(!destination.exists());
 }
+
+#[tokio::test]
+async fn missing_delivered_branch_falls_back_to_the_exact_revision() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let remote = root.path().join("remote.git");
+    git(root.path(), &home, &["init", "--bare", "remote.git"]);
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    git(&work, &home, &["init", "-b", "main"]);
+    std::fs::write(work.join("file.txt"), "base\n").unwrap();
+    git(&work, &home, &["add", "file.txt"]);
+    git(&work, &home, &["commit", "-m", "base"]);
+    let base_revision = revision(&work, &home);
+    std::fs::write(work.join("file.txt"), "delivered\n").unwrap();
+    git(&work, &home, &["add", "--all"]);
+    git(&work, &home, &["commit", "-m", "delivered"]);
+    let delivered_revision = revision(&work, &home);
+    git(
+        &work,
+        &home,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(
+        &work,
+        &home,
+        &[
+            "push",
+            "origin",
+            "HEAD:refs/heads/main",
+            "HEAD:refs/heads/feature",
+        ],
+    );
+    git(&work, &home, &["push", "origin", "--delete", "feature"]);
+
+    let request = CaptureRequest::new(
+        root.path().join("sample"),
+        remote.to_str().unwrap(),
+        &base_revision,
+        DeliveryReceipt {
+            repository: "acme/project".to_owned(),
+            mode: Some("push".to_owned()),
+            outcome: Some("pushed".to_owned()),
+            target_branch: Some("main".to_owned()),
+            head_branch: Some("feature".to_owned()),
+            head_revision: Some(delivered_revision.clone()),
+            ..DeliveryReceipt::default()
+        },
+    )
+    .with_git_program("git");
+    let captured = capture_patch(&request).await.unwrap();
+    assert_eq!(captured.delivered_revision, delivered_revision);
+}

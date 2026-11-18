@@ -511,7 +511,9 @@ async fn ensure_revision(
         return Ok(());
     }
     if let Some(branch) = lookup.branch {
-        fetch_branch(transport, request, branch, credential).await?;
+        // A merged/deleted head branch is normal; the advertised revision may still be reachable
+        // through another ref, so fall through to the exact-revision fetch.
+        let _ = fetch_branch(transport, request, branch, credential).await;
     }
     if has_commit(transport, lookup.revision, credential).await? {
         return Ok(());

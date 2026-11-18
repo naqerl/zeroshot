@@ -1150,7 +1150,15 @@ async fn complete_sample<R: SampleRunner>(
 }
 
 fn remove_sample_artifact(directory: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(directory.join(SAMPLE_FILE)) {
+    for file in [SAMPLE_FILE, "patch.diff"] {
+        match std::fs::remove_file(directory.join(file)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let judge = directory.join("judge");
+    match std::fs::remove_dir_all(&judge) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),

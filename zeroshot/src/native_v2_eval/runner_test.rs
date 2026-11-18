@@ -761,10 +761,18 @@ async fn failed_sample_retry_does_not_reuse_an_old_artifact_after_interruption()
         .await
         .unwrap();
     let directory = tempfile::tempdir().unwrap();
+    let sample_directory = directory.path().join("sample");
+    std::fs::create_dir_all(sample_directory.join("judge")).unwrap();
+    std::fs::write(sample_directory.join("patch.diff"), "stale patch").unwrap();
+    std::fs::write(
+        sample_directory.join("judge").join("old.txt"),
+        "stale judge",
+    )
+    .unwrap();
     let mut old_outcome = super::tests::sample_outcome_for_test(SampleStatus::Failed);
     old_outcome.run_id = RunId::new("old-run");
     SampleArtifact::new("sample-stale", old_outcome)
-        .write(&directory.path().join("sample"))
+        .write(&sample_directory)
         .unwrap();
     let mut journal = crate::native_v2_eval::ResumeJournal::default();
     journal.claim("sample-stale", new_run);
@@ -773,7 +781,7 @@ async fn failed_sample_retry_does_not_reuse_an_old_artifact_after_interruption()
         &runner,
         EvalSamplePlan::<FakeRunner> {
             sample_id: "sample-stale".to_owned(),
-            directory: directory.path().join("sample"),
+            directory: sample_directory.clone(),
             request: None,
             capture: None,
             concurrency: 1,
@@ -786,6 +794,8 @@ async fn failed_sample_retry_does_not_reuse_an_old_artifact_after_interruption()
     .unwrap();
     assert_eq!(artifact.outcome.run_id.as_str(), "new-run");
     assert_eq!(artifact.outcome.status, SampleStatus::Succeeded);
+    assert!(!sample_directory.join("patch.diff").exists());
+    assert!(!sample_directory.join("judge").exists());
 }
 
 #[tokio::test]
