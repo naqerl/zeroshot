@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use openengine_cluster_protocol::{
-    RunConnectionValues, RunForceParams, RunId, RunResumeParams, RunStatus, RunStatusParams,
-    TerminalResult, TokenUsage,
+    GitTransportCredentials, RunConnectionValues, RunForceParams, RunId, RunResumeParams,
+    RunStatus, RunStatusParams, TerminalResult, TokenUsage,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -49,6 +49,28 @@ impl SampleRequest for BackendSampleRequest {
     fn with_concurrency(mut self, concurrency: usize) -> Self {
         self.concurrency = concurrency;
         self
+    }
+}
+
+/// Fresh resume authority for one attempt. It is never serialized or written to the journal.
+#[derive(Clone, Default)]
+pub struct ResumeCredentials {
+    pub connections: RunConnectionValues,
+    pub github_token: Option<String>,
+    pub git_credentials: Option<GitTransportCredentials>,
+}
+
+impl std::fmt::Debug for ResumeCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResumeCredentials")
+            .field("connections", &self.connections.keys().collect::<Vec<_>>())
+            .field(
+                "github_token",
+                &self.github_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("git_credentials", &self.git_credentials)
+            .finish()
     }
 }
 
@@ -168,6 +190,10 @@ pub enum SampleRunnerError {
     Deadline,
     #[error("sample runner cannot resume retained runs")]
     ResumeUnsupported,
+    #[error("the submitted run no longer exists")]
+    RunLost,
+    #[error("the submitted run cannot be recovered")]
+    ResumeUnavailable(String),
 }
 
 impl SampleRunnerError {
@@ -176,6 +202,11 @@ impl SampleRunnerError {
     #[must_use]
     pub const fn is_transient(&self) -> bool {
         matches!(self, Self::Backend(_))
+    }
+
+    #[must_use]
+    pub const fn is_run_lost(&self) -> bool {
+        matches!(self, Self::RunLost)
     }
 }
 
@@ -190,13 +221,13 @@ pub trait SampleRunner: Send + Sync {
     async fn stop(&self, run: &SampleRun) -> Result<(), SampleRunnerError>;
 
     /// Resume a run that was already submitted but never reached a terminal outcome. Fresh
-    /// connection values stay out of the journal and are supplied for this attempt only.
+    /// authority stays out of the journal and is supplied for this attempt only.
     async fn resume(
         &self,
         run: SampleRun,
-        connections: RunConnectionValues,
+        credentials: ResumeCredentials,
     ) -> Result<SampleRun, SampleRunnerError> {
-        let _ = (run, connections);
+        let _ = (run, credentials);
         Err(SampleRunnerError::ResumeUnsupported)
     }
 }
@@ -372,13 +403,13 @@ impl<B: NativeV2CliBackend> SampleRunner for PlatformRunner<B> {
     async fn resume(
         &self,
         run: SampleRun,
-        connections: RunConnectionValues,
+        credentials: ResumeCredentials,
     ) -> Result<SampleRun, SampleRunnerError> {
         resume(
             self.backend.as_ref(),
             Some(self.target.as_str()),
             run,
-            connections,
+            credentials,
         )
         .await
     }
@@ -412,9 +443,9 @@ impl<B: NativeV2CliBackend> SampleRunner for LocalRunner<B> {
     async fn resume(
         &self,
         run: SampleRun,
-        connections: RunConnectionValues,
+        credentials: ResumeCredentials,
     ) -> Result<SampleRun, SampleRunnerError> {
-        resume(self.backend.as_ref(), None, run, connections).await
+        resume(self.backend.as_ref(), None, run, credentials).await
     }
 }
 
@@ -446,7 +477,7 @@ async fn resume<B: NativeV2CliBackend>(
     backend: &B,
     target: Option<&str>,
     run: SampleRun,
-    connections: RunConnectionValues,
+    credentials: ResumeCredentials,
 ) -> Result<SampleRun, SampleRunnerError> {
     let successor = RunId::new(uuid::Uuid::now_v7().to_string());
     let result = backend
@@ -456,19 +487,31 @@ async fn resume<B: NativeV2CliBackend>(
                 run_id: run.run_id.clone(),
                 successor_run_id: successor,
                 from: None,
-                connections,
+                connections: credentials.connections,
                 connection_resolver: None,
-                github_token: None,
-                git_credentials: None,
+                github_token: credentials.github_token,
+                git_credentials: credentials.git_credentials,
             },
         )
         .await
-        .map_err(|error| SampleRunnerError::Backend(error.to_string()))?;
+        .map_err(resume_error)?;
     Ok(SampleRun {
         run_id: result.run_id,
         submitted_at_ms: now_ms(),
         ..run
     })
+}
+
+fn resume_error(error: crate::native_v2_cli::NativeV2CliError) -> SampleRunnerError {
+    use crate::native_v2_cli::NativeV2CliError;
+    match error {
+        NativeV2CliError::RunNotFound { .. } => SampleRunnerError::RunLost,
+        NativeV2CliError::TargetTransport { .. }
+        | NativeV2CliError::Disconnected
+        | NativeV2CliError::Remote { .. }
+        | NativeV2CliError::Protocol(_) => SampleRunnerError::Backend(error.to_string()),
+        other => SampleRunnerError::ResumeUnavailable(other.to_string()),
+    }
 }
 
 async fn stop<B: NativeV2CliBackend>(
@@ -523,7 +566,7 @@ async fn wait_for_run<B: NativeV2CliBackend>(
             },
             None => status.await,
         }
-        .map_err(|error| SampleRunnerError::Backend(error.to_string()))?;
+        .map_err(wait_error)?;
         let observed_at_ms = now_ms();
         match &status.status {
             CliRunStatus::Queued(_) => {}
@@ -559,6 +602,17 @@ async fn wait_for_run<B: NativeV2CliBackend>(
             policy.poll_interval
         };
         tokio::time::sleep(wait).await;
+    }
+}
+
+fn wait_error(error: crate::native_v2_cli::NativeV2CliError) -> SampleRunnerError {
+    if matches!(
+        error,
+        crate::native_v2_cli::NativeV2CliError::RunNotFound { .. }
+    ) {
+        SampleRunnerError::RunLost
+    } else {
+        SampleRunnerError::Backend(error.to_string())
     }
 }
 
@@ -783,7 +837,7 @@ impl SampleRunner for FakeRunner {
     async fn resume(
         &self,
         run: SampleRun,
-        _connections: RunConnectionValues,
+        _credentials: ResumeCredentials,
     ) -> Result<SampleRun, SampleRunnerError> {
         let mut state = self.state.lock().await;
         let submission =
@@ -810,8 +864,8 @@ pub struct EvalSamplePlan<R: SampleRunner> {
     pub request: Option<R::Request>,
     pub capture: Option<CaptureRequest>,
     pub concurrency: usize,
-    /// Fresh connection values for resuming a retained run. Never persisted in the journal.
-    pub resume_connections: RunConnectionValues,
+    /// Fresh authority for resuming a retained run. Never persisted in the journal.
+    pub resume_credentials: ResumeCredentials,
 }
 
 impl<R: SampleRunner> EvalSamplePlan<R> {
@@ -827,7 +881,7 @@ impl<R: SampleRunner> EvalSamplePlan<R> {
             request: Some(request),
             capture: None,
             concurrency: 1,
-            resume_connections: RunConnectionValues::default(),
+            resume_credentials: ResumeCredentials::default(),
         }
     }
 
@@ -839,7 +893,13 @@ impl<R: SampleRunner> EvalSamplePlan<R> {
 
     #[must_use]
     pub fn with_resume_connections(mut self, connections: RunConnectionValues) -> Self {
-        self.resume_connections = connections;
+        self.resume_credentials.connections = connections;
+        self
+    }
+
+    #[must_use]
+    pub fn with_resume_credentials(mut self, credentials: ResumeCredentials) -> Self {
+        self.resume_credentials = credentials;
         self
     }
 }
@@ -927,25 +987,43 @@ where
     })
 }
 
+struct CompletionContext<'a> {
+    journal: &'a Mutex<ResumeJournal>,
+    directory: &'a Path,
+}
+
 async fn run_eval_sample<R: SampleRunner>(
     runner: &R,
     mut sample: EvalSamplePlan<R>,
     journal: &Mutex<ResumeJournal>,
     journal_directory: &Path,
 ) -> Result<SampleArtifact, String> {
+    let context = CompletionContext {
+        journal,
+        directory: journal_directory,
+    };
     let sample_id = sample.sample_id.clone();
-    let action = journal.lock().await.action(&sample_id);
+    let (action, current_run_id) = {
+        let journal = journal.lock().await;
+        (
+            journal.action(&sample_id),
+            journal.current_run_id(&sample_id).cloned(),
+        )
+    };
     if action != ResumeAction::Start {
         if let Ok(existing) = SampleArtifact::read(&sample.directory) {
-            let artifact = retry_capture(existing, &sample.directory, sample.capture.take())
+            if current_run_id.as_ref() == Some(&existing.outcome.run_id) {
+                let artifact = retry_capture(existing, &sample.directory, sample.capture.take())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                journal_update(journal, journal_directory, |journal| {
+                    journal.record_artifact(&artifact);
+                })
                 .await
                 .map_err(|error| error.to_string())?;
-            journal_update(journal, journal_directory, |journal| {
-                journal.record_artifact(&artifact);
-            })
-            .await
-            .map_err(|error| error.to_string())?;
-            return Ok(artifact);
+                return Ok(artifact);
+            }
+            remove_sample_artifact(&sample.directory).map_err(|error| error.to_string())?;
         }
     }
     let action = match action {
@@ -954,9 +1032,35 @@ async fn run_eval_sample<R: SampleRunner>(
     };
     let mut run = match action {
         ResumeAction::Resume(run) => {
-            match runner.resume(run, sample.resume_connections.clone()).await {
+            // A running journal entry normally means the previous controller was interrupted, not
+            // that the target already lost the run. Reattach and wait for its real outcome first.
+            let mut terminal_failure = None;
+            match runner.wait(&run).await {
+                Ok(outcome) if outcome.status == SampleStatus::Succeeded => {
+                    return complete_sample(&sample, run.sample_id, outcome, &context).await;
+                }
+                Ok(outcome) => terminal_failure = Some(outcome),
+                Err(error) if error.is_run_lost() => {}
+                Err(error) => {
+                    let _ = journal_update(journal, journal_directory, |journal| {
+                        journal.record_interruption(&sample_id, error.to_string());
+                    })
+                    .await;
+                    return Err(format!("reattach interrupted: {error}"));
+                }
+            }
+            // Only a terminal failed run or a lost run reaches workspace recovery. A successful
+            // reattach above never asks the target to resume.
+            match runner
+                .resume(run.clone(), sample.resume_credentials.clone())
+                .await
+            {
                 Ok(run) => run,
                 Err(error) if error.is_transient() => {
+                    let _ = journal_update(journal, journal_directory, |journal| {
+                        journal.record_interruption(&sample_id, error.to_string());
+                    })
+                    .await;
                     return Err(format!("resume pending: {error}"));
                 }
                 Err(error) => match sample.request.take() {
@@ -964,7 +1068,20 @@ async fn run_eval_sample<R: SampleRunner>(
                         .submit(request)
                         .await
                         .map_err(|error| error.to_string())?,
-                    None => return Err(format!("resume failed: {error}")),
+                    None => match terminal_failure {
+                        Some(outcome) => {
+                            return complete_sample(&sample, run.sample_id, outcome, &context)
+                                .await;
+                        }
+                        None => {
+                            let message = format!("resume failed: {error}");
+                            let _ = journal_update(journal, journal_directory, |journal| {
+                                journal.record_error(&sample_id, &message);
+                            })
+                            .await;
+                            return Err(message);
+                        }
+                    },
                 },
             }
         }
@@ -972,6 +1089,7 @@ async fn run_eval_sample<R: SampleRunner>(
             unreachable!("completed or capture-pending sample had no stored artifact")
         }
         ResumeAction::Start => {
+            remove_sample_artifact(&sample.directory).map_err(|error| error.to_string())?;
             let request = sample
                 .request
                 .take()
@@ -998,28 +1116,45 @@ async fn run_eval_sample<R: SampleRunner>(
             return Err(error.to_string());
         }
     };
-    let capture = sample.capture.map(|mut request| {
+    complete_sample(&sample, run.sample_id, outcome, &context).await
+}
+
+async fn complete_sample<R: SampleRunner>(
+    sample: &EvalSamplePlan<R>,
+    sample_id: String,
+    outcome: SampleOutcome,
+    context: &CompletionContext<'_>,
+) -> Result<SampleArtifact, String> {
+    let capture = sample.capture.clone().map(|mut request| {
         request.directory = sample.directory.clone();
         request.receipt = outcome.delivery.clone().unwrap_or_default();
         request
     });
-    let artifact = match persist_sample(run.sample_id, outcome, &sample.directory, capture).await {
+    let artifact = match persist_sample(sample_id, outcome, &sample.directory, capture).await {
         Ok(artifact) => artifact,
         Err(error) => {
             let message = error.to_string();
-            let _ = journal_update(journal, journal_directory, |journal| {
-                journal.record_error(&sample_id, &message);
+            let _ = journal_update(context.journal, context.directory, |journal| {
+                journal.record_interruption(&sample.sample_id, &message);
             })
             .await;
             return Err(message);
         }
     };
-    journal_update(journal, journal_directory, |journal| {
+    journal_update(context.journal, context.directory, |journal| {
         journal.record_artifact(&artifact);
     })
     .await
     .map_err(|error| error.to_string())?;
     Ok(artifact)
+}
+
+fn remove_sample_artifact(directory: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(directory.join(SAMPLE_FILE)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 async fn retry_capture(

@@ -113,4 +113,15 @@ fn capture_incompleteness_stays_resumable_until_patch_and_judge_exist() {
         journal.samples["capture"].state,
         SampleResumeState::Completed
     );
+
+    journal.claim("capture", sample_run("replacement-run"));
+    let sample = &journal.samples["capture"];
+    assert_eq!(sample.state, SampleResumeState::Running);
+    assert_eq!(
+        sample.run_id.as_ref().map(RunId::as_str),
+        Some("replacement-run")
+    );
+    assert!(sample.outcome.is_none());
+    assert!(sample.captured.is_none());
+    assert!(sample.capture_error.is_none());
 }

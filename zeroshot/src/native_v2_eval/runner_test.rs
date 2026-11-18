@@ -5,16 +5,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use openengine_cluster_protocol::{
-    ConnectionKey, EnvironmentVariableName, IdempotencyKey, RunAttachParams, RunForceParams, RunId,
-    RunListParams, RunLogsParams, RunResumeParams, RunResumeResult, RunSize, RunStatusParams,
-    RunSubmitResult, RunTitle, RunWatchParams, StaticConnectionValues, TokenCount, TokenUsage,
+    ConnectionKey, EnvironmentVariableName, GitTransportCredentials, IdempotencyKey,
+    RunAttachParams, RunForceParams, RunId, RunListParams, RunLogsParams, RunResumeParams,
+    RunResumeResult, RunSize, RunStatusParams, RunSubmitResult, RunTitle, RunWatchParams,
+    StaticConnectionValues, TokenCount, TokenUsage,
 };
 use serde_json::json;
 
 use super::{
     BackendSampleRequest, DeliveryReceipt, EvalRunRequest, EvalSamplePlan, FakeRunner,
-    FakeSampleRequest, PlatformRunner, SAMPLE_FILE, SampleArtifact, SampleOutcome, SampleRunner,
-    SampleStatus, run_eval, run_sample,
+    FakeSampleRequest, PlatformRunner, ResumeCredentials, SAMPLE_FILE, SampleArtifact,
+    SampleOutcome, SampleRunner, SampleStatus, run_eval, run_sample,
 };
 use crate::native_v2_cli::{
     CliRunForceResult, CliRunListResult, CliRunStatusResult, CliSubscription, CliSubscriptionItem,
@@ -29,6 +30,27 @@ fn usage() -> TokenUsage {
         cache_read_input_tokens: None,
         cache_creation_input_tokens: None,
         complete: true,
+    }
+}
+
+fn sample_outcome_for_test(status: SampleStatus) -> SampleOutcome {
+    SampleOutcome {
+        run_id: RunId::new("old-run"),
+        status,
+        timings: super::SampleTimings {
+            submitted_at_ms: 1,
+            started_at_ms: Some(2),
+            finished_at_ms: 3,
+            queue_wait_ms: 1,
+            wall_clock_ms: 2,
+            concurrency: 1,
+        },
+        token_usage: None,
+        delivered_revision: None,
+        delivered_branch: None,
+        delivery: None,
+        failure_reason: Some("worker_failed".to_owned()),
+        output: None,
     }
 }
 
@@ -123,6 +145,7 @@ struct ScriptState {
     resumed: Vec<RunResumeParams>,
     submits: usize,
     fail_next_status: bool,
+    fail_next_status_lost: bool,
     fail_next_resume: bool,
 }
 
@@ -156,6 +179,10 @@ impl ScriptedBackend {
 
     fn fail_next_status(&self) {
         self.state.lock().unwrap().fail_next_status = true;
+    }
+
+    fn fail_next_status_lost(&self) {
+        self.state.lock().unwrap().fail_next_status_lost = true;
     }
 
     fn fail_next_resume(&self) {
@@ -219,12 +246,19 @@ impl NativeV2CliBackend for ScriptedBackend {
         _target: Option<&str>,
         _params: RunStatusParams,
     ) -> Result<CliRunStatusResult, crate::native_v2_cli::NativeV2CliError> {
-        let fail = {
+        let (fail, lost) = {
             let mut state = self.state.lock().unwrap();
             let fail = state.fail_next_status;
+            let lost = state.fail_next_status_lost;
             state.fail_next_status = false;
-            fail
+            state.fail_next_status_lost = false;
+            (fail, lost)
         };
+        if lost {
+            return Err(crate::native_v2_cli::NativeV2CliError::RunNotFound {
+                run_id: "run-scripted".to_owned(),
+            });
+        }
         if fail {
             return Err(crate::native_v2_cli::NativeV2CliError::Protocol(
                 "transient status failure".to_owned(),
@@ -415,12 +449,28 @@ async fn platform_runner_resume_supplies_fresh_connection_values() {
                 submitted_at_ms: 1,
                 concurrency: 2,
             },
-            connections.clone(),
+            ResumeCredentials {
+                connections: connections.clone(),
+                github_token: Some("fresh-github-token".to_owned()),
+                git_credentials: Some(GitTransportCredentials::Https {
+                    username: "fresh-user".to_owned(),
+                    password: "fresh-git-secret".to_owned(),
+                }),
+            },
         )
         .await
         .unwrap();
     assert_eq!(resumed.run_id.as_str(), "run-successor");
-    assert_eq!(backend.resumed()[0].connections, connections);
+    let recorded = &backend.resumed()[0];
+    assert_eq!(recorded.connections, connections);
+    assert_eq!(recorded.github_token.as_deref(), Some("fresh-github-token"));
+    assert_eq!(
+        recorded.git_credentials,
+        Some(GitTransportCredentials::Https {
+            username: "fresh-user".to_owned(),
+            password: "fresh-git-secret".to_owned(),
+        })
+    );
 }
 
 #[tokio::test]
@@ -519,9 +569,52 @@ async fn driver_schedules_samples_and_skips_completed_work() {
 }
 
 #[tokio::test]
+async fn terminal_failed_reattach_uses_workspace_recovery() {
+    let backend = Arc::new(ScriptedBackend::new(
+        vec![finished_failed(), finished_succeeded()],
+        Duration::from_millis(1),
+    ));
+    let runner = PlatformRunner::new(Arc::clone(&backend), "platform")
+        .with_poll_interval(Duration::from_millis(1));
+    let directory = tempfile::tempdir().unwrap();
+    let run = runner
+        .submit(BackendSampleRequest {
+            sample_id: "sample-failed-resume".to_owned(),
+            concurrency: 1,
+            request: prepared_request(),
+        })
+        .await
+        .unwrap();
+    let mut journal = crate::native_v2_eval::ResumeJournal::default();
+    journal.claim("sample-failed-resume", run);
+    journal.save(directory.path()).unwrap();
+    let report = run_eval(EvalRunRequest {
+        runner: &runner,
+        capacity_source: None,
+        concurrency: Some(1),
+        journal_directory: directory.path().to_owned(),
+        samples: vec![EvalSamplePlan::<PlatformRunner<ScriptedBackend>> {
+            sample_id: "sample-failed-resume".to_owned(),
+            directory: directory.path().join("sample"),
+            request: None,
+            capture: None,
+            concurrency: 1,
+            resume_credentials: Default::default(),
+        }],
+    })
+    .await
+    .unwrap();
+    assert!(report.failures.is_empty());
+    assert_eq!(report.artifacts.len(), 1);
+    assert_eq!(report.artifacts[0].outcome.status, SampleStatus::Succeeded);
+    assert_eq!(backend.submits(), 1);
+    assert_eq!(backend.resumed().len(), 1);
+}
+
+#[tokio::test]
 async fn transient_wait_failure_keeps_the_run_resumable_without_duplicate_submission() {
     let backend = Arc::new(ScriptedBackend::new(
-        vec![finished_succeeded()],
+        vec![queued(), running(), finished_succeeded()],
         Duration::from_millis(1),
     ));
     let runner = PlatformRunner::new(Arc::clone(&backend), "platform")
@@ -569,7 +662,7 @@ async fn transient_wait_failure_keeps_the_run_resumable_without_duplicate_submis
     assert!(second.failures.is_empty());
     assert_eq!(second.artifacts.len(), 1);
     assert_eq!(backend.submits(), 1);
-    assert_eq!(backend.resumed().len(), 1);
+    assert!(backend.resumed().is_empty());
 }
 
 #[tokio::test]
@@ -592,7 +685,7 @@ async fn transient_resume_failure_does_not_fall_back_to_a_new_submission() {
             },
         )
     };
-    backend.fail_next_status();
+    backend.fail_next_status_lost();
     let _ = run_eval(EvalRunRequest {
         runner: &runner,
         capacity_source: None,
@@ -602,6 +695,7 @@ async fn transient_resume_failure_does_not_fall_back_to_a_new_submission() {
     })
     .await
     .unwrap();
+    backend.fail_next_status_lost();
     backend.fail_next_resume();
     let failed = run_eval(EvalRunRequest {
         runner: &runner,
@@ -642,14 +736,56 @@ async fn driver_resumes_an_interrupted_sample_without_a_fresh_request() {
             request: None,
             capture: None,
             concurrency: 1,
-            resume_connections: Default::default(),
+            resume_credentials: Default::default(),
         }],
     })
     .await
     .unwrap();
     assert_eq!(report.artifacts.len(), 1);
     assert!(report.failures.is_empty());
-    assert_eq!(runner.submitted().await.len(), 2);
+    assert_eq!(runner.submitted().await.len(), 1);
+    assert_eq!(
+        report.artifacts[0].outcome.run_id.as_str(),
+        "run-interrupted"
+    );
+}
+
+#[tokio::test]
+async fn failed_sample_retry_does_not_reuse_an_old_artifact_after_interruption() {
+    let runner = FakeRunner::new();
+    let new_run = runner
+        .submit(FakeSampleRequest {
+            run_id: Some(RunId::new("new-run")),
+            ..FakeSampleRequest::succeeded("sample-stale")
+        })
+        .await
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let mut old_outcome = super::tests::sample_outcome_for_test(SampleStatus::Failed);
+    old_outcome.run_id = RunId::new("old-run");
+    SampleArtifact::new("sample-stale", old_outcome)
+        .write(&directory.path().join("sample"))
+        .unwrap();
+    let mut journal = crate::native_v2_eval::ResumeJournal::default();
+    journal.claim("sample-stale", new_run);
+    let journal = tokio::sync::Mutex::new(journal);
+    let artifact = super::run_eval_sample(
+        &runner,
+        EvalSamplePlan::<FakeRunner> {
+            sample_id: "sample-stale".to_owned(),
+            directory: directory.path().join("sample"),
+            request: None,
+            capture: None,
+            concurrency: 1,
+            resume_credentials: Default::default(),
+        },
+        &journal,
+        directory.path(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(artifact.outcome.run_id.as_str(), "new-run");
+    assert_eq!(artifact.outcome.status, SampleStatus::Succeeded);
 }
 
 #[tokio::test]

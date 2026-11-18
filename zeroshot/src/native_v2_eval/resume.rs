@@ -135,6 +135,13 @@ impl ResumeJournal {
     }
 
     #[must_use]
+    pub fn current_run_id(&self, sample_id: &str) -> Option<&RunId> {
+        self.samples
+            .get(sample_id)
+            .and_then(|sample| sample.run_id.as_ref())
+    }
+
+    #[must_use]
     pub fn action(&self, sample_id: &str) -> ResumeAction {
         match self.samples.get(sample_id) {
             Some(sample) if sample.state == SampleResumeState::Completed => ResumeAction::Skip,
@@ -194,6 +201,8 @@ impl ResumeJournal {
         sample.run_id = Some(run.run_id.clone());
         sample.run = Some(run);
         sample.state = SampleResumeState::Running;
+        sample.outcome = None;
+        sample.captured = None;
         sample.error = None;
         sample.capture_error = None;
         sample.updated_at_ms = now;
