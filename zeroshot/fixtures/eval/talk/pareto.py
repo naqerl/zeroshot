@@ -4,7 +4,7 @@
 Usage:
     python3 pareto.py .zeroshot/eval/<id> [--out DIR]
 
-Reads `score.json` (for the arm names, weights, and ratio) and `runs.csv` (one row per sample)
+Reads `score.json` (for the arm names, weights, and the mean and median ratios) and `runs.csv` (one row per sample)
 and writes `pareto-cost-time.png` and `pareto-cost-quality.png`. Each dot is one run, diamonds are
 the per-arm means, and the dashed step line is the Pareto front over all measured runs. Requires
 matplotlib (`pip install matplotlib`).
@@ -63,10 +63,14 @@ def plot(score, rows, y_key, y_label, maximize_y, path):
     if len(pareto) > 1:
         axes.step([p[0] for p in pareto], [p[1] for p in pareto], where="post",
                   linestyle="--", color="black", linewidth=0.8, label="Pareto front")
-    ratio = score.get("ratio")
+    mean_ratio = score.get("meanRatio")
+    median_ratio = score.get("medianRatio")
     title = f"{score['evalName']}: cost vs {y_label.split(' ')[0].lower()}"
-    if ratio is not None:
-        title += f"   S_cand / S_base = {ratio:.2f} (a={score['a']}, b={score['b']})"
+    if mean_ratio is not None:
+        title += f"   S_cand / S_base = {mean_ratio:.2f} mean"
+        if median_ratio is not None:
+            title += f", {median_ratio:.2f} median"
+        title += f" (a={score['a']}, b={score['b']})"
     axes.set_title(title, fontsize=10)
     axes.set_xlabel(f"Cost per run ({unit})")
     axes.set_ylabel(y_label)
