@@ -11,11 +11,12 @@ use crate::native_v2_cli::NativeV2CliBackend;
 use super::{
     BackendSampleRequest, Capacity, CapacitySource, EvalArm, EvalCriterion, EvalData, EvalError,
     EvalId, EvalManifest, EvalReport, EvalRunError, EvalRunRequest, EvalSample, EvalSamplePlan,
-    EvalStore, FakeRunner, FakeSampleRequest, JUDGE_TEMPLATE_NAME, JudgeGraphExecutor,
-    JudgeOptions, LocalJudgeGraphExecutor, LocalRunner, PatchArtifact, PlatformRunner,
-    SampleArtifact, SampleOutcome, SampleRunner, SampleStatus, SampleTiming, ScorerInput,
-    ScorerRegistry, TemplateJudge, TokenUsage, captured_sample_from_directory, judge_eval,
-    load_judge_runtime, model::now_ms, report, resolve_judge_template, store::timestamp,
+    EvalStore, FakeRunner, FakeSampleRequest, FixtureJudgeGraphExecutor, JUDGE_TEMPLATE_NAME,
+    JudgeGraphExecutor, JudgeOptions, JudgeRunConfig, LocalJudgeGraphExecutor, LocalRunner,
+    PatchArtifact, PlatformRunner, SampleArtifact, SampleOutcome, SampleRunner, SampleStatus,
+    SampleTiming, ScorerInput, ScorerRegistry, TemplateJudge, TokenUsage,
+    captured_sample_from_directory, judge_eval, model::now_ms, report, resolve_judge_template,
+    store::timestamp,
 };
 
 /// CLI command family wired as `zeroshot eval ...`.
@@ -29,19 +30,75 @@ pub struct EvalCommand {
 pub enum EvalAction {
     Run(EvalRunCommand),
     List,
-    Show { id: String },
-    Report { id: String },
-    Score { id: String, scorer: String },
+    Show {
+        id: String,
+    },
+    Report {
+        id: String,
+    },
+    Score {
+        id: String,
+        scorer: String,
+        weights: ScoreWeights,
+    },
+    /// Write `score.json`, `table.csv`, and `runs.csv` (to `output`, or the eval directory).
+    Export {
+        id: String,
+        output: Option<PathBuf>,
+        weights: ScoreWeights,
+    },
     Judge(EvalJudgeCommand),
     JudgeCaptures(EvalJudgeCapturesCommand),
-    Clean { id: Option<String>, all: bool },
+    Clean {
+        id: Option<String>,
+        all: bool,
+    },
+}
+
+/// Optional overrides of `options.score.a` (cost), `options.score.b` (time), and token prices.
+///
+/// Values are validated to be finite numbers in `0..=1`, so equality is total.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScoreWeights {
+    pub a: Option<f64>,
+    pub b: Option<f64>,
+    /// Per-field price overrides (USD per 1M tokens); each set field wins over the manifest's
+    /// `[options.pricing]` and every `[arms.pricing]`.
+    pub pricing: super::Pricing,
+}
+
+impl Eq for ScoreWeights {}
+
+impl ScoreWeights {
+    fn apply(self, data: &mut EvalData) {
+        if let Some(a) = self.a {
+            data.manifest.options.score.a = a;
+        }
+        if let Some(b) = self.b {
+            data.manifest.options.score.b = b;
+        }
+        if !self.pricing.is_empty() {
+            let options = &mut data.manifest.options;
+            options.pricing = Some(self.pricing.or(options.pricing.unwrap_or_default()));
+            for arm in &mut data.manifest.arms {
+                if let Some(pricing) = arm.pricing {
+                    arm.pricing = Some(self.pricing.or(pricing));
+                }
+            }
+        }
+    }
+
+    const fn is_empty(self) -> bool {
+        self.a.is_none() && self.b.is_none() && self.pricing.is_empty()
+    }
 }
 
 /// Judge an existing eval from its captured samples.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvalJudgeCommand {
     pub id: String,
-    pub judge_model: Option<String>,
+    /// Judge runner override: `synthetic` or `local`.
+    pub judge_runner: Option<String>,
     pub judge_template: Option<String>,
     pub scorer: Option<String>,
 }
@@ -52,7 +109,8 @@ pub struct EvalJudgeCapturesCommand {
     pub manifest: PathBuf,
     pub captures: PathBuf,
     pub id: Option<String>,
-    pub judge_model: Option<String>,
+    /// Judge runner override: `synthetic` or `local`.
+    pub judge_runner: Option<String>,
     pub judge_template: Option<String>,
     pub scorer: Option<String>,
 }
@@ -64,7 +122,12 @@ pub struct EvalRunCommand {
     pub id: Option<String>,
     pub scorer: Option<String>,
     pub judge_template: Option<String>,
-    pub judge_model: Option<String>,
+    /// Judge runner override: `synthetic` or `local`.
+    pub judge_runner: Option<String>,
+    /// Override `options.runner`, e.g. `fake` for a dry run of a `local` manifest.
+    pub runner: Option<String>,
+    /// Checkout the `local` runner runs in. Defaults to `directory` (the eval store workspace).
+    pub workspace: Option<PathBuf>,
 }
 
 /// A manifest run through an already-constructed runner.
@@ -113,20 +176,6 @@ pub fn select_runner(manifest: &EvalManifest) -> Result<RunnerSelection, EvalErr
 }
 
 pub async fn execute(command: &EvalCommand) -> Result<Value, EvalError> {
-    execute_impl(command, false).await
-}
-
-/// Explicit unit-test entrypoint for the synthetic fixture judge. Production CLI execution never
-/// reaches the fixture executor because [`execute`] passes `false`.
-#[cfg(test)]
-pub(super) async fn execute_fixture(command: &EvalCommand) -> Result<Value, EvalError> {
-    execute_impl(command, true).await
-}
-
-async fn execute_impl(
-    command: &EvalCommand,
-    allow_fixture_executor: bool,
-) -> Result<Value, EvalError> {
     let store = EvalStore::for_workspace(&command.directory);
     match &command.action {
         EvalAction::Run(run) => {
@@ -147,33 +196,57 @@ async fn execute_impl(
             let report = ensure_report(&store, &data)?;
             Ok(serde_json::to_value(report)?)
         }
-        EvalAction::Score { id, scorer } => {
+        EvalAction::Score {
+            id,
+            scorer,
+            weights,
+        } => {
             let id = EvalId::new(id.clone())?;
-            let data = store.load(&id)?;
+            let mut data = store.load(&id)?;
+            weights.apply(&mut data);
             let capacity = data.report.as_ref().and_then(|report| report.capacity);
             let report = recompute(&data, scorer, capacity)?;
             store.write_report(&id, &report)?;
             store.write_report_markdown(&id, &report)?;
             Ok(serde_json::to_value(report)?)
         }
+        EvalAction::Export {
+            id,
+            output,
+            weights,
+        } => {
+            let id = EvalId::new(id.clone())?;
+            let mut data = store.load(&id)?;
+            let report = if weights.is_empty() {
+                ensure_report(&store, &data)?
+            } else {
+                weights.apply(&mut data);
+                let scorer = data.report.as_ref().map_or_else(
+                    || data.manifest.options.scorer.clone(),
+                    |report| report.scorer.clone(),
+                );
+                let capacity = data.report.as_ref().and_then(|report| report.capacity);
+                recompute(&data, &scorer, capacity)?
+            };
+            export(&store, &id, &report, output.as_deref())
+        }
         EvalAction::Judge(command) => {
             let id = EvalId::new(command.id.clone())?;
             let mut data = store.load(&id)?;
             let options = JudgeOptions {
-                model: command.judge_model.clone(),
+                runner: command.judge_runner.clone(),
                 template: command.judge_template.clone(),
                 scorer: command.scorer.clone(),
                 executor: None,
             };
-            judge_with_template(&store, &mut data, options, allow_fixture_executor).await?;
+            judge_with_template(&store, &mut data, options).await?;
             let report = data
                 .report
                 .ok_or_else(|| EvalError::ReportUnavailable(data.id.to_string()))?;
             Ok(serde_json::to_value(report)?)
         }
         EvalAction::JudgeCaptures(command) => {
-            let report =
-                run_captures_through_judge(&store, command.clone(), allow_fixture_executor).await?;
+            let report = run_captures_through_judge(&store, command.clone()).await?;
             Ok(serde_json::to_value(report)?)
         }
         EvalAction::Clean { id, all } => clean(&store, id.as_deref(), *all),
@@ -183,7 +256,6 @@ async fn execute_impl(
 async fn run_captures_through_judge(
     store: &EvalStore,
     mut command: EvalJudgeCapturesCommand,
-    allow_fixture_executor: bool,
 ) -> Result<EvalReport, EvalError> {
     if !command.captures.is_dir() {
         return Err(EvalError::Command(format!(
@@ -249,7 +321,7 @@ async fn run_captures_through_judge(
         .clone()
         .unwrap_or_else(|| manifest.options.scorer.clone());
     let options = JudgeOptions {
-        model: command.judge_model,
+        runner: command.judge_runner,
         template: command.judge_template,
         scorer: Some(scorer_name),
         executor: None,
@@ -276,7 +348,7 @@ async fn run_captures_through_judge(
             samples,
             report: None,
         };
-        judge_with_template(store, &mut data, options, allow_fixture_executor).await?;
+        judge_with_template(store, &mut data, options).await?;
         data.report
             .ok_or_else(|| EvalError::ReportUnavailable(data.id.to_string()))
     }
@@ -312,11 +384,15 @@ fn resolve_judge_paths(
         std::path::absolute(base).map_err(|error| EvalError::io(base, error))?
     };
     let mut changed = false;
-    if let Some(runtime) = manifest.options.judge_runtime_config.clone() {
-        if !std::path::Path::new(&runtime).is_absolute() {
-            let resolved = base.join(runtime);
-            manifest.options.judge_runtime_config = Some(path_string(&resolved));
-            changed = true;
+    for runtime in [
+        &mut manifest.options.judge_runtime_config,
+        &mut manifest.options.judge_uniform_runtime_config,
+    ] {
+        if let Some(path) = runtime.clone() {
+            if !std::path::Path::new(&path).is_absolute() {
+                *runtime = Some(path_string(&base.join(path)));
+                changed = true;
+            }
         }
     }
     let effective = template_override
@@ -336,77 +412,6 @@ fn resolve_judge_paths(
     Ok(changed)
 }
 
-fn path_string(path: &std::path::Path) -> String {
-    path.to_string_lossy().into_owned()
-}
-
-fn judge_configured(
-    manifest: &EvalManifest,
-    run_model: Option<&str>,
-    run_template: Option<&str>,
-) -> bool {
-    run_model.is_some()
-        || run_template.is_some()
-        || manifest.options.judge_model.is_some()
-        || manifest.options.judge_template.is_some()
-        || manifest.arms.iter().any(|arm| arm.judge_model.is_some())
-}
-
-async fn judge_with_template(
-    store: &EvalStore,
-    data: &mut EvalData,
-    mut options: JudgeOptions,
-    allow_fixture_executor: bool,
-) -> Result<(), EvalError> {
-    let reference = options
-        .template
-        .as_deref()
-        .or(data.manifest.options.judge_template.as_deref())
-        .unwrap_or(JUDGE_TEMPLATE_NAME);
-    let template = resolve_judge_template(reference)?;
-    let (executor, executor_kind): (Box<dyn JudgeGraphExecutor>, &str) = match data
-        .manifest
-        .options
-        .judge_runtime_config
-        .as_deref()
-    {
-        Some(runtime_path) => {
-            let manifest_directory = store.root().join(data.id.as_str());
-            let workspace = store
-                .root()
-                .parent()
-                .and_then(std::path::Path::parent)
-                .unwrap_or_else(|| store.root())
-                .to_owned();
-            let runtime_path = resolve_manifest_path(&manifest_directory, runtime_path)?;
-            let runtime = load_judge_runtime(&runtime_path)?;
-            let backend =
-                crate::native_v2_cli::local::LocalCliBackend::production().map_err(|error| {
-                    EvalError::Command(format!("judge backend is unavailable: {error}"))
-                })?;
-            (
-                Box::new(LocalJudgeGraphExecutor::new(
-                    Arc::new(backend),
-                    runtime,
-                    workspace,
-                )),
-                "graph",
-            )
-        }
-        None if allow_fixture_executor => (Box::new(super::FixtureJudgeGraphExecutor), "fixture"),
-        None => {
-            return Err(EvalError::Judge(format!(
-                "eval judge requires a real judge runtime; set options.judgeRuntimeConfig in the manifest (the synthetic fixture executor is test-only and cannot judge model {})",
-                options.model.as_deref().unwrap_or("<unset>")
-            )));
-        }
-    };
-    options.executor = Some(executor_kind.to_owned());
-    let judge = TemplateJudge::new(executor, template);
-    judge_eval(store, data, &judge, options).await?;
-    Ok(())
-}
-
 pub(super) fn resolve_manifest_path(
     manifest_directory: &std::path::Path,
     value: &str,
@@ -424,6 +429,96 @@ pub(super) fn resolve_manifest_path(
     Ok(base.join(path))
 }
 
+fn path_string(path: &std::path::Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn judge_configured(
+    manifest: &EvalManifest,
+    run_runner: Option<&str>,
+    run_template: Option<&str>,
+) -> bool {
+    run_runner.is_some()
+        || run_template.is_some()
+        || manifest.options.judge_template.is_some()
+        || manifest.options.judge_runner.is_some()
+        || manifest.options.judge_runtime_config.is_some()
+        || manifest.options.judge_uniform_runtime_config.is_some()
+}
+
+async fn judge_with_template(
+    store: &EvalStore,
+    data: &mut EvalData,
+    mut options: JudgeOptions,
+) -> Result<(), EvalError> {
+    let reference = options
+        .template
+        .as_deref()
+        .or(data.manifest.options.judge_template.as_deref())
+        .unwrap_or(JUDGE_TEMPLATE_NAME);
+    let template = resolve_judge_template(reference)?;
+    let options_manifest = &data.manifest.options;
+    let selected_runner = data.manifest.judge_runner(options.runner.as_deref())?;
+    if selected_runner == "local"
+        && options_manifest.judge_runtime_config.is_none()
+        && options_manifest.judge_uniform_runtime_config.is_none()
+        && options_manifest.judge_run_args.is_empty()
+    {
+        return Err(EvalError::Judge(
+            "eval judge requires a real judge runtime; set options.judgeRuntimeConfig (or judgeUniformRuntimeConfig/judgeRunArgs) in the manifest before selecting the local judge runner"
+                .to_owned(),
+        ));
+    }
+    let (executor, executor_kind): (Box<dyn JudgeGraphExecutor>, &str) = match selected_runner {
+        "local" => {
+            let manifest_directory = store.root().join(data.id.as_str());
+            let workspace = store
+                .root()
+                .parent()
+                .and_then(std::path::Path::parent)
+                .unwrap_or_else(|| store.root())
+                .to_owned();
+            let run = JudgeRunConfig {
+                template: if template.name == JUDGE_TEMPLATE_NAME {
+                    JUDGE_TEMPLATE_NAME.to_owned()
+                } else {
+                    resolve_manifest_path(&manifest_directory, &template.name)?
+                        .to_string_lossy()
+                        .into_owned()
+                },
+                runtime_config: options_manifest
+                    .judge_runtime_config
+                    .as_deref()
+                    .map(|path| resolve_manifest_path(&manifest_directory, path))
+                    .transpose()?,
+                uniform_runtime_config: options_manifest
+                    .judge_uniform_runtime_config
+                    .as_deref()
+                    .map(|path| resolve_manifest_path(&manifest_directory, path))
+                    .transpose()?,
+                run_args: options_manifest.judge_run_args.clone(),
+            };
+            let backend =
+                crate::native_v2_cli::local::LocalCliBackend::production().map_err(|error| {
+                    EvalError::Command(format!("judge backend is unavailable: {error}"))
+                })?;
+            (
+                Box::new(LocalJudgeGraphExecutor::new(
+                    Arc::new(backend),
+                    run,
+                    workspace,
+                )),
+                "graph",
+            )
+        }
+        _ => (Box::new(FixtureJudgeGraphExecutor), "synthetic"),
+    };
+    options.executor = Some(executor_kind.to_owned());
+    let judge = TemplateJudge::new(executor, template);
+    judge_eval(store, data, &judge, options).await?;
+    Ok(())
+}
+
 pub(crate) async fn run_manifest_through_fake(
     command: EvalRunCommand,
 ) -> Result<EvalData, EvalError> {
@@ -431,7 +526,11 @@ pub(crate) async fn run_manifest_through_fake(
 }
 
 async fn run_manifest(command: EvalRunCommand) -> Result<EvalData, EvalError> {
-    let (manifest, _) = EvalManifest::from_file(&command.manifest)?;
+    let (mut manifest, _) = EvalManifest::from_file(&command.manifest)?;
+    if let Some(runner) = &command.runner {
+        manifest.options.runner.clone_from(runner);
+        manifest.validate()?;
+    }
     match select_runner(&manifest)? {
         RunnerSelection::Fake => {
             let runner =
@@ -459,9 +558,10 @@ async fn run_manifest(command: EvalRunCommand) -> Result<EvalData, EvalError> {
             })
             .await
         }
-        selection => Err(EvalError::Command(format!(
-            "runner {selection:?} requires a native-v2 backend; use run_manifest_with_backend"
-        ))),
+        RunnerSelection::Local => super::local::run_manifest_locally(command, manifest).await,
+        RunnerSelection::Platform => Err(EvalError::Command(
+            "runner \"platform\" requires an embedding backend; use run_manifest_with_backend, or run the arms elsewhere and import them with `zeroshot eval judge-captures`".to_owned(),
+        )),
     }
 }
 
@@ -530,6 +630,19 @@ where
     R: SampleRunner,
     F: FnMut(&EvalId, &str, &EvalArm, u32, &[EvalCriterion]) -> R::Request,
 {
+    run_manifest_with_capture(request, None).await
+}
+
+/// [`run_manifest_with_runner`] plus an optional capture template applied to every sample, so a
+/// delivered branch is turned into `patch.diff` before judging.
+pub(crate) async fn run_manifest_with_capture<R, F>(
+    request: ManifestRunRequest<'_, R, F>,
+    capture: Option<super::CaptureRequest>,
+) -> Result<EvalData, EvalError>
+where
+    R: SampleRunner,
+    F: FnMut(&EvalId, &str, &EvalArm, u32, &[EvalCriterion]) -> R::Request,
+{
     let ManifestRunRequest {
         mut command,
         runner,
@@ -539,11 +652,18 @@ where
         mut request,
     } = request;
     let (mut manifest, source) = EvalManifest::from_file(&command.manifest)?;
-    let changed = resolve_judge_paths(
+    let mut changed = resolve_judge_paths(
         &mut manifest,
         &command.manifest,
         &mut command.judge_template,
     )?;
+    if let Some(runner) = command.runner.clone() {
+        if runner != manifest.options.runner {
+            manifest.options.runner = runner;
+            manifest.validate()?;
+            changed = true;
+        }
+    }
     let store = EvalStore::for_workspace(&command.directory);
     let id = match command.id {
         Some(id) => EvalId::new(id)?,
@@ -569,11 +689,15 @@ where
                 run_index,
                 directory: journal_directory.join(&sample_id),
             });
-            samples.push(EvalSamplePlan::new(
+            let plan = EvalSamplePlan::new(
                 sample_id.clone(),
                 journal_directory.join(&sample_id),
                 sample_request,
-            ));
+            );
+            samples.push(match &capture {
+                Some(capture) => plan.with_capture(capture.clone()),
+                None => plan,
+            });
         }
     }
     let run_report = super::run_eval(EvalRunRequest {
@@ -614,19 +738,18 @@ where
     data.report = Some(report);
     if judge_configured(
         &data.manifest,
-        command.judge_model.as_deref(),
+        command.judge_runner.as_deref(),
         command.judge_template.as_deref(),
     ) {
         judge_with_template(
             &store,
             &mut data,
             JudgeOptions {
-                model: command.judge_model,
+                runner: command.judge_runner,
                 template: command.judge_template,
                 scorer: Some(scorer_name),
                 executor: None,
             },
-            false,
         )
         .await?;
     }
@@ -712,12 +835,12 @@ pub(crate) fn sample_from_artifact(
             queue_wait_ms: timings.queue_wait_ms,
         },
         tokens: eval_tokens(token_usage),
+        cost_usd: None,
         delivered_revision,
         failure_reason,
         patch,
         criteria,
         reasoning,
-        judge_model: None,
         judge_template: None,
         judge_checkout,
         judge_executor: None,
@@ -737,12 +860,12 @@ fn failed_sample(eval_id: &EvalId, meta: &SamplePlanMeta, reason: String) -> Eva
             queue_wait_ms: 0,
         },
         tokens: TokenUsage::default(),
+        cost_usd: None,
         delivered_revision: None,
         failure_reason: Some(reason),
         patch: None,
         criteria: Default::default(),
         reasoning: Default::default(),
-        judge_model: None,
         judge_template: None,
         judge_checkout: None,
         judge_executor: None,
@@ -750,17 +873,20 @@ fn failed_sample(eval_id: &EvalId, meta: &SamplePlanMeta, reason: String) -> Eva
 }
 
 fn eval_tokens(usage: Option<ProtocolTokenUsage>) -> TokenUsage {
-    usage.map_or_else(TokenUsage::default, |usage| TokenUsage {
-        input: usage.input_tokens.get(),
-        output: usage.output_tokens.get(),
-        cache: usage
+    usage.map_or_else(TokenUsage::default, |usage| {
+        let cache_read = usage
             .cache_read_input_tokens
-            .map_or(0, |tokens| tokens.get())
-            .saturating_add(
-                usage
-                    .cache_creation_input_tokens
-                    .map_or(0, |tokens| tokens.get()),
-            ),
+            .map_or(0, |tokens| tokens.get());
+        let cache_write = usage
+            .cache_creation_input_tokens
+            .map_or(0, |tokens| tokens.get());
+        TokenUsage {
+            input: usage.input_tokens.get(),
+            output: usage.output_tokens.get(),
+            cache: cache_read.saturating_add(cache_write),
+            cache_read,
+            cache_write,
+        }
     })
 }
 
@@ -802,6 +928,52 @@ pub(crate) fn recompute(
             generated_at_ms: timestamp(),
         },
     ))
+}
+
+fn export(
+    store: &EvalStore,
+    id: &EvalId,
+    report: &EvalReport,
+    output: Option<&std::path::Path>,
+) -> Result<Value, EvalError> {
+    let comparison = report.baseline.as_ref().ok_or_else(|| {
+        EvalError::Command(format!(
+            "eval {id} has no baseline/candidate comparison; it needs at least two arms"
+        ))
+    })?;
+    let directory = match output {
+        Some(directory) => {
+            std::fs::create_dir_all(directory).map_err(|error| EvalError::io(directory, error))?;
+            for (file, bytes) in [
+                (super::SCORE_FILE, serde_json::to_vec_pretty(comparison)?),
+                (super::TABLE_FILE, super::table_csv(comparison).into_bytes()),
+                (super::RUNS_FILE, super::runs_csv(comparison).into_bytes()),
+            ] {
+                let path = directory.join(file);
+                std::fs::write(&path, bytes).map_err(|error| EvalError::io(&path, error))?;
+            }
+            directory.to_owned()
+        }
+        None => {
+            store.write_score_exports(id, report)?;
+            store.root().join(id.as_str())
+        }
+    };
+    let files = [super::SCORE_FILE, super::TABLE_FILE, super::RUNS_FILE]
+        .iter()
+        .map(|file| path_string(&directory.join(file)))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "evalId": id,
+        "baselineArm": comparison.baseline_arm,
+        "candidateArm": comparison.candidate_arm,
+        "a": comparison.a,
+        "b": comparison.b,
+        "costUnit": comparison.cost_unit,
+        "meanRatio": comparison.mean_ratio,
+        "medianRatio": comparison.median_ratio,
+        "files": files,
+    }))
 }
 
 fn clean(store: &EvalStore, id: Option<&str>, all: bool) -> Result<Value, EvalError> {

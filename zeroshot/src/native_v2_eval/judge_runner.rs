@@ -1,9 +1,9 @@
 //! Execute a judge over captured samples and persist its per-criterion results.
 //!
 //! The runner never re-executes an eval arm. It reads the stored `patch.diff` (or the slice-1
-//! `patches/<sample>.patch`) plus the captured `sample.json`, asks the selected judge model for a
-//! judgement per manifest criterion, and writes the resulting scores and reasoning back into the
-//! sample records before rebuilding the report.
+//! `patches/<sample>.patch`) plus the captured `sample.json`, asks the judge graph for a pass/fail
+//! verdict per acceptance trait, and writes the verdicts and reasons back into the sample records
+//! before rebuilding the report.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -12,16 +12,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    EvalArm, EvalCriterion, EvalData, EvalError, EvalId, EvalManifest, EvalSample, EvalStore,
-    Judge, JudgeRequest, JudgeResult, JUDGE_TEMPLATE_NAME, SampleStatus, SampleTiming, TokenUsage,
-    cli::recompute, judge_template::resolve_judge_template,
+    EvalCriterion, EvalData, EvalError, EvalId, EvalSample, EvalStore, Judge, JudgeRequest,
+    JudgeResult, JUDGE_TEMPLATE_NAME, SampleStatus, SampleTiming, TokenUsage, cli::recompute,
+    judge_template::resolve_judge_template,
 };
 
-/// Per-run judge overrides. Arm and manifest values remain the defaults.
+/// Per-run judge overrides. Manifest values remain the defaults.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct JudgeOptions {
-    /// Run-level model override; it wins over the arm and manifest defaults.
-    pub model: Option<String>,
+    /// Run-level judge runner override: `synthetic` (no model call) or `local` (`zeroshot run`).
+    pub runner: Option<String>,
     /// Run-level graph template override.
     pub template: Option<String>,
     /// Run-level scorer override used when rebuilding the report.
@@ -32,8 +32,8 @@ pub struct JudgeOptions {
 
 impl JudgeOptions {
     #[must_use]
-    pub fn with_model(mut self, model: impl Into<String>) -> Self {
-        self.model = Some(model.into());
+    pub fn with_runner(mut self, runner: impl Into<String>) -> Self {
+        self.runner = Some(runner.into());
         self
     }
 
@@ -66,7 +66,6 @@ pub struct CapturedSampleInput {
 #[derive(Clone, Debug, PartialEq)]
 pub struct JudgedSample {
     pub sample: EvalSample,
-    pub model: String,
     pub template: Option<String>,
     pub result: JudgeResult,
 }
@@ -84,7 +83,6 @@ pub struct JudgedSampleSummary {
     pub sample_id: String,
     pub arm_id: String,
     pub run_index: u32,
-    pub model: String,
     pub criteria: Vec<String>,
 }
 
@@ -92,7 +90,6 @@ pub struct JudgedSampleSummary {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct JudgeRunReport {
     pub eval_id: EvalId,
-    pub model: String,
     pub template: String,
     pub judged: Vec<JudgedSampleSummary>,
     /// Samples not judged because they did not succeed or lacked captured evidence.
@@ -134,7 +131,6 @@ pub async fn judge_eval<J: Judge>(
                 sample.id, sample.arm_id
             ))
         })?;
-        let model = judge_model_for(&data.manifest, &arm, options.model.as_deref())?;
         let patch = store.read_patch(
             &data.id,
             &sample
@@ -144,7 +140,8 @@ pub async fn judge_eval<J: Judge>(
                 .unwrap_or_default(),
         )?;
         let sample_json = serde_json::to_value(&sample)?;
-        let mut request = JudgeRequest::new(sample.clone(), criteria.clone(), patch, model.clone())
+        let mut request = JudgeRequest::new(sample.clone(), criteria.clone(), patch)
+            .with_task(arm.prompt.clone())
             .with_sample_json(sample_json)
             .with_template(template.clone());
         if let Some(checkout) = sample.judge_checkout.clone() {
@@ -156,14 +153,12 @@ pub async fn judge_eval<J: Judge>(
         let mut updated = sample;
         updated.criteria = result.criteria();
         updated.reasoning = result.reasoning();
-        updated.judge_model = Some(model.clone());
         updated.judge_template = Some(template.clone());
         updated.judge_executor = options.executor.clone();
         let summary = JudgedSampleSummary {
             sample_id: updated.id.clone(),
             arm_id: updated.arm_id.clone(),
             run_index: updated.run_index,
-            model,
             criteria: criteria
                 .iter()
                 .map(|criterion| criterion.id.clone())
@@ -187,14 +182,8 @@ pub async fn judge_eval<J: Judge>(
     store.write_report(&data.id, &report)?;
     store.write_report_markdown(&data.id, &report)?;
     data.report = Some(report);
-    let model = judged
-        .first()
-        .map(|sample| sample.model.clone())
-        .or(options.model)
-        .unwrap_or_default();
     Ok(JudgeRunReport {
         eval_id: data.id.clone(),
-        model,
         template,
         judged,
         skipped,
@@ -202,10 +191,20 @@ pub async fn judge_eval<J: Judge>(
 }
 
 /// Judge a set of capture directories without an eval store. Each directory must contain
-/// `sample.json` and `patch.diff`; results carry the same model provenance as stored reports.
+/// `sample.json` and `patch.diff`; `task` is the prompt the samples implemented.
 pub async fn judge_captured_samples<J: Judge>(
     judge: &J,
     criteria: &[EvalCriterion],
+    samples: Vec<CapturedSampleInput>,
+    options: JudgeOptions,
+) -> Result<JudgedCaptures, EvalError> {
+    judge_captured_samples_for_task(judge, (criteria, ""), samples, options).await
+}
+
+/// [`judge_captured_samples`] with the task prompt the judge graph receives.
+pub async fn judge_captured_samples_for_task<J: Judge>(
+    judge: &J,
+    (criteria, task): (&[EvalCriterion], &str),
     samples: Vec<CapturedSampleInput>,
     options: JudgeOptions,
 ) -> Result<JudgedCaptures, EvalError> {
@@ -214,13 +213,6 @@ pub async fn judge_captured_samples<J: Judge>(
         .clone()
         .unwrap_or_else(|| JUDGE_TEMPLATE_NAME.to_owned());
     let _ = resolve_judge_template(&template)?;
-    let model = options
-        .model
-        .clone()
-        .filter(|model| !model.trim().is_empty())
-        .ok_or_else(|| {
-            EvalError::Command("judge model is required for captured samples".to_owned())
-        })?;
     let mut judged = Vec::with_capacity(samples.len());
     let mut skipped = Vec::new();
     for captured in samples {
@@ -235,7 +227,8 @@ pub async fn judge_captured_samples<J: Judge>(
                 sample.id
             )));
         };
-        let mut request = JudgeRequest::new(sample.clone(), criteria.to_vec(), patch, &model)
+        let mut request = JudgeRequest::new(sample.clone(), criteria.to_vec(), patch)
+            .with_task(task)
             .with_sample_json(captured.sample_json)
             .with_template(template.clone());
         if let Some(checkout) = captured.checkout {
@@ -246,12 +239,10 @@ pub async fn judge_captured_samples<J: Judge>(
         validate_coverage(&result, criteria)?;
         sample.criteria = result.criteria();
         sample.reasoning = result.reasoning();
-        sample.judge_model = Some(model.clone());
         sample.judge_template = Some(template.clone());
         sample.judge_executor = options.executor.clone();
         judged.push(JudgedSample {
             sample,
-            model: model.clone(),
             template: Some(template.clone()),
             result,
         });
@@ -274,7 +265,7 @@ pub fn captured_sample_from_directory(
     // malformed current artifact is never treated as that legacy shape.
     let artifact = match super::SampleArtifact::read(directory) {
         Ok(artifact) => Some(artifact),
-        Err(_) if is_legacy_nested_document(&sample_json) => None,
+        Err(_) if has_legacy_or_partial_capture_shape(&sample_json) => None,
         Err(error) => {
             return Err(EvalError::data(
                 directory.join(super::SAMPLE_FILE),
@@ -320,8 +311,11 @@ pub fn captured_sample_from_directory(
     })
 }
 
-fn is_legacy_nested_document(document: &Value) -> bool {
+fn has_legacy_or_partial_capture_shape(document: &Value) -> bool {
     document.get("outcome").is_some_and(Value::is_object)
+        || !["captured", "captureError", "capturePending"]
+            .iter()
+            .any(|key| document.get(*key).is_some())
 }
 
 pub(crate) fn capture_relative_path(
@@ -354,36 +348,6 @@ pub(crate) fn capture_relative_path(
         return Ok(canonical);
     }
     Ok(joined)
-}
-
-/// Resolve the effective judge model: run override, then arm default, then manifest default.
-pub fn judge_model_for(
-    manifest: &EvalManifest,
-    arm: &EvalArm,
-    run_override: Option<&str>,
-) -> Result<String, EvalError> {
-    if let Some(model) = run_override.filter(|model| !model.trim().is_empty()) {
-        return Ok(model.to_owned());
-    }
-    if let Some(model) = arm
-        .judge_model
-        .as_deref()
-        .filter(|model| !model.trim().is_empty())
-    {
-        return Ok(model.to_owned());
-    }
-    if let Some(model) = manifest
-        .options
-        .judge_model
-        .as_deref()
-        .filter(|model| !model.trim().is_empty())
-    {
-        return Ok(model.to_owned());
-    }
-    Err(EvalError::Command(format!(
-        "arm {:?} has no judge model; set judgeModel on the arm, options.judgeModel in the manifest, or pass --judge-model",
-        arm.id
-    )))
 }
 
 fn selected_template(data: &EvalData, run_override: Option<&str>) -> String {
@@ -478,19 +442,33 @@ fn sample_from_capture(
             .unwrap_or(0),
     };
     let tokens = outcome.get("tokenUsage").and_then(Value::as_object);
+    let count = |key: &str| {
+        tokens
+            .and_then(|tokens| tokens.get(key))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let cache_read = count("cacheReadInputTokens");
+    let cache_write = count("cacheCreationInputTokens");
     let tokens = TokenUsage {
-        input: tokens
-            .and_then(|tokens| tokens.get("inputTokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        output: tokens
-            .and_then(|tokens| tokens.get("outputTokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        cache: tokens
-            .and_then(|tokens| tokens.get("cacheReadInputTokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        input: count("inputTokens"),
+        output: count("outputTokens"),
+        cache: cache_read.saturating_add(cache_write),
+        cache_read,
+        cache_write,
+    };
+    let cost_usd = match outcome.get("costUsd").or_else(|| document.get("costUsd")) {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_f64()
+                .filter(|cost| cost.is_finite() && *cost >= 0.0)
+                .ok_or_else(|| {
+                    EvalError::Command(
+                        "sample.json costUsd must be a finite nonnegative number".to_owned(),
+                    )
+                })?,
+        ),
     };
     let criteria = outcome
         .get("criteria")
@@ -514,6 +492,7 @@ fn sample_from_capture(
         status,
         timing,
         tokens,
+        cost_usd,
         delivered_revision: outcome
             .get("deliveredRevision")
             .and_then(Value::as_str)
@@ -529,7 +508,6 @@ fn sample_from_capture(
         }),
         criteria,
         reasoning,
-        judge_model: None,
         judge_template: None,
         judge_checkout: None,
         judge_executor: None,

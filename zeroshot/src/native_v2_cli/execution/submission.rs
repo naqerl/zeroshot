@@ -327,6 +327,21 @@ fn select_source_connections(params: &mut PreparedRunRequest) -> Result<(), Nati
     Ok(())
 }
 
+/// Resolve and validate one `zeroshot run` command exactly as `zeroshot run` does, without
+/// submitting it. Evals use this to prepare every sample through the same admission path.
+pub(crate) async fn prepare_run_submission<B>(
+    run: &RunCommand,
+    backend: &B,
+) -> Result<PreparedRunRequest, NativeV2CliError>
+where
+    B: NativeV2CliBackend,
+{
+    let environment = |name: &str| std::env::var_os(name);
+    let resolved = resolve_run_profile(run, backend).await?;
+    let input = review_input::resolve(run, &resolved, backend).await?;
+    prepare_validated_submission_with_environment(run, resolved, environment, input).await
+}
+
 pub(super) enum RunSubmission {
     Interrupted,
     Validated,

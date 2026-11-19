@@ -29,16 +29,15 @@ async fn cli_judge_action_without_a_runtime_names_the_missing_runtime_config() {
         directory: temporary.path().to_path_buf(),
         action: EvalAction::Judge(EvalJudgeCommand {
             id: data.id.to_string(),
-            judge_model: Some("relabel-attempt".to_owned()),
+            judge_runner: Some("local".to_owned()),
             judge_template: Some("eval-judge".to_owned()),
             scorer: None,
         }),
     })
     .await
-    .expect_err("eval judge --judge-model must not use the fixture executor");
+    .expect_err("a local judge without a runtime fails closed");
     assert!(matches!(error, EvalError::Judge(_)));
     assert!(error.to_string().contains("judgeRuntimeConfig"));
-    assert!(error.to_string().contains("relabel-attempt"));
 }
 
 #[test]

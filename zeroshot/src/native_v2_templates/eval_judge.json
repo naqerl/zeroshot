@@ -3,13 +3,13 @@
   "initialInput": {
     "kind": "record",
     "fields": {
-      "criterion": {
+      "task": {
         "type": {
           "kind": "string"
         },
         "required": true
       },
-      "criterionDescription": {
+      "traits": {
         "type": {
           "kind": "string"
         },
@@ -21,27 +21,32 @@
         },
         "required": true
       },
-      "sample": {
+      "verdicts": {
         "type": {
-          "kind": "string"
-        },
-        "required": true
-      },
-      "model": {
-        "type": {
-          "kind": "string"
-        },
-        "required": true
-      },
-      "score": {
-        "type": {
-          "kind": "number"
-        },
-        "required": true
-      },
-      "checkout": {
-        "type": {
-          "kind": "string"
+          "kind": "array",
+          "items": {
+            "kind": "record",
+            "fields": {
+              "id": {
+                "type": {
+                  "kind": "string"
+                },
+                "required": true
+              },
+              "pass": {
+                "type": {
+                  "kind": "boolean"
+                },
+                "required": true
+              },
+              "reason": {
+                "type": {
+                  "kind": "string"
+                },
+                "required": true
+              }
+            }
+          }
         },
         "required": true
       }
@@ -57,13 +62,13 @@
     "state": {
       "kind": "record",
       "fields": {
-        "criterion": {
+        "task": {
           "type": {
             "kind": "string"
           },
           "required": true
         },
-        "criterionDescription": {
+        "traits": {
           "type": {
             "kind": "string"
           },
@@ -75,42 +80,32 @@
           },
           "required": true
         },
-        "sample": {
-          "type": {
-            "kind": "string"
-          },
-          "required": true
-        },
-        "model": {
-          "type": {
-            "kind": "string"
-          },
-          "required": true
-        },
-        "score": {
-          "type": {
-            "kind": "number"
-          },
-          "required": true
-        },
-        "reasoning": {
-          "type": {
-            "kind": "string"
-          },
-          "required": true
-        },
-        "errors": {
+        "verdicts": {
           "type": {
             "kind": "array",
             "items": {
-              "kind": "string"
+              "kind": "record",
+              "fields": {
+                "id": {
+                  "type": {
+                    "kind": "string"
+                  },
+                  "required": true
+                },
+                "pass": {
+                  "type": {
+                    "kind": "boolean"
+                  },
+                  "required": true
+                },
+                "reason": {
+                  "type": {
+                    "kind": "string"
+                  },
+                  "required": true
+                }
+              }
             }
-          },
-          "required": true
-        },
-        "checkout": {
-          "type": {
-            "kind": "string"
           },
           "required": true
         }
@@ -121,17 +116,17 @@
         "kind": "step",
         "name": "judge",
         "worker": "builtin.agent.worker@1",
-        "instructions": "You are an independent evaluator. Judge exactly one captured sample against exactly one criterion. Read the captured patch.diff and the sample.json metadata supplied in the input. The supplied checkout path is the delivered tree for this sample and is also your working directory: inspect the surrounding code, call sites, and tests there in addition to the patch, because the patch alone can hide regressions outside its changed files. Treat the checkout as read-only. Do not modify the workspace, do not run delivery, and do not repair the patch. Return one JSON object with one judgement: criterion is the supplied criterion id, score is a number from 1 to 5 inclusive (3 is the pass threshold), reasoning is one short paragraph that references concrete lines or files in the patch or checkout, and errors is an array of concrete defects. Use an empty errors array when the patch has no concrete defect for this criterion. Do not include markdown fences or any prose outside the JSON object.",
+        "instructions": "You are an independent evaluator of a code change. The input has `task` (what the change was asked to do), `traits` (a JSON array of acceptance traits, each {\"id\", \"description\"}), and `patch` (the unified diff of the delivered change). Your working directory is the delivered checkout for this sample: inspect the surrounding code, call sites, and tests there in addition to the patch, because the patch alone can hide regressions outside its changed files. Treat the checkout as read-only. Do not modify any files, do not run delivery, and do not repair the patch. Judge the patch and checkout against every trait. Return `traits` as an array with exactly one entry per input trait, in input order: `id` is the trait id copied exactly, `pass` is true only when the change clearly satisfies the trait and false otherwise (including when the evidence is missing), and `reason` is one or two sentences that cite concrete files or lines in the patch or checkout. Do not add, rename, or skip traits.",
         "input": {
           "kind": "record",
           "fields": {
-            "criterion": {
+            "task": {
               "type": {
                 "kind": "string"
               },
               "required": true
             },
-            "criterionDescription": {
+            "traits": {
               "type": {
                 "kind": "string"
               },
@@ -142,53 +137,37 @@
                 "kind": "string"
               },
               "required": true
-            },
-            "sample": {
-              "type": {
-                "kind": "string"
-              },
-              "required": true
-            },
-            "model": {
-              "type": {
-                "kind": "string"
-              },
-              "required": true
-            },
-            "checkout": {
-              "type": {
-                "kind": "string"
-              },
-              "required": true
             }
           }
         },
         "output": {
           "kind": "record",
           "fields": {
-            "criterion": {
-              "type": {
-                "kind": "string"
-              },
-              "required": true
-            },
-            "score": {
-              "type": {
-                "kind": "number"
-              },
-              "required": true
-            },
-            "reasoning": {
-              "type": {
-                "kind": "string"
-              },
-              "required": true
-            },
-            "errors": {
+            "traits": {
               "type": {
                 "kind": "array",
                 "items": {
-                  "kind": "string"
+                  "kind": "record",
+                  "fields": {
+                    "id": {
+                      "type": {
+                        "kind": "string"
+                      },
+                      "required": true
+                    },
+                    "pass": {
+                      "type": {
+                        "kind": "boolean"
+                      },
+                      "required": true
+                    },
+                    "reason": {
+                      "type": {
+                        "kind": "string"
+                      },
+                      "required": true
+                    }
+                  }
                 }
               },
               "required": true
@@ -198,23 +177,23 @@
         "inputBindings": [
           {
             "target": [
-              "criterion"
+              "task"
             ],
             "value": {
               "source": "state",
               "path": [
-                "criterion"
+                "task"
               ]
             }
           },
           {
             "target": [
-              "criterionDescription"
+              "traits"
             ],
             "value": {
               "source": "state",
               "path": [
-                "criterionDescription"
+                "traits"
               ]
             }
           },
@@ -228,39 +207,6 @@
                 "patch"
               ]
             }
-          },
-          {
-            "target": [
-              "sample"
-            ],
-            "value": {
-              "source": "state",
-              "path": [
-                "sample"
-              ]
-            }
-          },
-          {
-            "target": [
-              "model"
-            ],
-            "value": {
-              "source": "state",
-              "path": [
-                "model"
-              ]
-            }
-          },
-          {
-            "target": [
-              "checkout"
-            ],
-            "value": {
-              "source": "state",
-              "path": [
-                "checkout"
-              ]
-            }
           }
         ],
         "writeBindings": [
@@ -269,47 +215,11 @@
               "node": "judge",
               "channel": "out",
               "path": [
-                "criterion"
+                "traits"
               ]
             },
             "target": [
-              "criterion"
-            ]
-          },
-          {
-            "value": {
-              "node": "judge",
-              "channel": "out",
-              "path": [
-                "score"
-              ]
-            },
-            "target": [
-              "score"
-            ]
-          },
-          {
-            "value": {
-              "node": "judge",
-              "channel": "out",
-              "path": [
-                "reasoning"
-              ]
-            },
-            "target": [
-              "reasoning"
-            ]
-          },
-          {
-            "value": {
-              "node": "judge",
-              "channel": "out",
-              "path": [
-                "errors"
-              ]
-            },
-            "target": [
-              "errors"
+              "verdicts"
             ]
           }
         ],
@@ -321,29 +231,31 @@
         "output": {
           "kind": "record",
           "fields": {
-            "criterion": {
-              "type": {
-                "kind": "string"
-              },
-              "required": true
-            },
-            "score": {
-              "type": {
-                "kind": "number"
-              },
-              "required": true
-            },
-            "reasoning": {
-              "type": {
-                "kind": "string"
-              },
-              "required": true
-            },
-            "errors": {
+            "traits": {
               "type": {
                 "kind": "array",
                 "items": {
-                  "kind": "string"
+                  "kind": "record",
+                  "fields": {
+                    "id": {
+                      "type": {
+                        "kind": "string"
+                      },
+                      "required": true
+                    },
+                    "pass": {
+                      "type": {
+                        "kind": "boolean"
+                      },
+                      "required": true
+                    },
+                    "reason": {
+                      "type": {
+                        "kind": "string"
+                      },
+                      "required": true
+                    }
+                  }
                 }
               },
               "required": true
@@ -353,45 +265,12 @@
         "bindings": [
           {
             "target": [
-              "criterion"
+              "traits"
             ],
             "value": {
               "source": "state",
               "path": [
-                "criterion"
-              ]
-            }
-          },
-          {
-            "target": [
-              "score"
-            ],
-            "value": {
-              "source": "state",
-              "path": [
-                "score"
-              ]
-            }
-          },
-          {
-            "target": [
-              "reasoning"
-            ],
-            "value": {
-              "source": "state",
-              "path": [
-                "reasoning"
-              ]
-            }
-          },
-          {
-            "target": [
-              "errors"
-            ],
-            "value": {
-              "source": "state",
-              "path": [
-                "errors"
+                "verdicts"
               ]
             }
           }

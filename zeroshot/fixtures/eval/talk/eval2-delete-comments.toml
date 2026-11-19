@@ -1,0 +1,101 @@
+# Eval 2: "Delete all the comments".
+#
+# Idea: agents explain away problems in comments instead of doing the refactor. The candidate
+# tells the implementing agent to delete every comment it would add or touch and to express
+# intent through code (names, extracted functions, tests) instead. Expected: quality goes up at
+# similar time and cost.
+#
+# Dry run:
+#   zeroshot eval run zeroshot/fixtures/eval/talk/eval2-delete-comments.toml --id eval2-dry
+# Real runs:
+#   zeroshot eval --directory /path/to/store run .../eval2-delete-comments.toml --runner local \
+#     --cwd /path/to/repo
+
+schema = "zeroshot.eval/v1"
+name = "eval2-delete-comments"
+runsPerArm = 5
+
+[options]
+scorer = "baseline-ratio"
+runner = "fake"
+seed = 2
+# The judge is the built-in `eval-judge` graph (`zeroshot template show eval-judge`), run as a
+# normal `zeroshot run` with the patch and the [[criteria]] traits as input. Its provider and model
+# are whatever the runtime config below sets; nothing judge-specific is hardcoded. The fake runner
+# uses a synthetic judge that calls no model.
+judgeTemplate = "eval-judge"
+judgeUniformRuntimeConfig = "runtime.json"
+# judgeRunner = "local"                 # default: "synthetic" for runner = "fake", else "local"
+# judgeRunArgs = ["--profile", "judge"] # or a profile instead of the runtime config
+deadlineMinutes = 90
+
+[options.score]
+a = 0.5
+b = 0.5
+baseline = "baseline"
+candidate = "delete-comments"
+
+# Token prices for C, in USD per 1M tokens. PLACEHOLDERS: set all four to your model's prices.
+# C = input*input + output*output + cacheRead*cacheRead + cacheWrite*cacheWrite (tokens / 1M).
+# There is no built-in default: a token kind used without a price makes C fall back to millions
+# of tokens and the report names the missing price. `eval score`/`export` accept
+# --price-input/--price-output/--price-cache-read/--price-cache-write overrides, and an arm may set
+# its own [arms.pricing].
+[options.pricing]
+input = 3.0       # set by user: uncached input (read) tokens
+output = 15.0     # set by user: output (write) tokens
+cacheRead = 0.3   # set by user: cache-read input tokens
+cacheWrite = 3.75 # set by user: cache-write (creation) input tokens
+
+[options.fake]
+queueWaitMs = 0
+jitter = 0.1
+
+[[arms]]
+id = "baseline"
+template = "software-change"
+delivery = "push"
+uniformRuntimeConfig = "runtime.json"
+prompt = "Refactor `zeroshot eval` report rendering so the Markdown and CSV writers share one formatting path for numbers and missing values."
+
+[arms.knobs]
+wallClockMs = 1260000
+inputTokens = 490000
+outputTokens = 52000
+passRate = 0.64
+
+[[arms]]
+id = "delete-comments"
+graph = "graphs/delete-comments.json"
+uniformRuntimeConfig = "runtime.json"
+prompt = "Refactor `zeroshot eval` report rendering so the Markdown and CSV writers share one formatting path for numbers and missing values."
+
+[arms.knobs]
+wallClockMs = 1536000
+inputTokens = 600000
+outputTokens = 63000
+passRate = 0.87
+
+[[criteria]]
+id = "single-path"
+description = "Markdown and CSV number and missing-value formatting go through one shared function."
+
+[[criteria]]
+id = "no-excuses"
+description = "No new comments that explain, apologize for, or defer a problem (TODO, FIXME, \"for now\", \"temporary\")."
+
+[[criteria]]
+id = "behavior"
+description = "Rendered Markdown and CSV output are byte-for-byte unchanged for existing fixtures."
+
+[[criteria]]
+id = "dead-code"
+description = "Formatting helpers made redundant by the refactor are removed."
+
+[[criteria]]
+id = "names"
+description = "Extracted functions and variables have intention-revealing names."
+
+[[criteria]]
+id = "tests"
+description = "Tests cover the shared formatting path, including a missing value."

@@ -89,6 +89,50 @@ impl Scorer for QualityVsCostScorer {
     }
 }
 
+/// The baseline/candidate ratio `S_candidate / S_baseline` with `S = Q / (C^a * T^b)` from means.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BaselineRatioScorer;
+
+impl Scorer for BaselineRatioScorer {
+    fn name(&self) -> &str {
+        "baseline-ratio"
+    }
+
+    fn score(&self, input: &ScorerInput<'_>) -> Result<ScorerOutput, EvalError> {
+        let comparison = super::baseline::compare(input.data);
+        let ratio = comparison
+            .as_ref()
+            .and_then(|comparison| comparison.mean_ratio);
+        let mut notes = vec![
+            "aggregate score is S_candidate / S_baseline with S = Q / (C^a * T^b) from the means"
+                .to_owned(),
+        ];
+        match (&comparison, ratio) {
+            (None, _) => notes.push(
+                "no baseline/candidate pair: the manifest needs two arms; aggregate score is 0"
+                    .to_owned(),
+            ),
+            (Some(_), None) => {
+                notes.push("the ratio is undefined; aggregate score is 0".to_owned())
+            }
+            _ => {}
+        }
+        if let Some(median) = comparison
+            .as_ref()
+            .and_then(|comparison| comparison.median_ratio)
+        {
+            notes.push(format!("median ratio (S from the medians): {median:.4}"));
+        }
+        Ok(ScorerOutput {
+            name: self.name().to_owned(),
+            score: ratio.unwrap_or(0.0),
+            quality: input.quality,
+            fit: None,
+            notes,
+        })
+    }
+}
+
 /// Registry of named scorers. Later slices can register additional implementations.
 #[derive(Default)]
 pub struct ScorerRegistry {
@@ -106,6 +150,7 @@ impl ScorerRegistry {
         let mut registry = Self::new();
         let _ = registry.register(Arc::new(QualityVsCostScorer));
         let _ = registry.register(Arc::new(NoneScorer));
+        let _ = registry.register(Arc::new(BaselineRatioScorer));
         registry
     }
 

@@ -11,6 +11,12 @@ use super::{
 };
 
 const STORE_SCHEMA: &str = "zeroshot.eval-store/v1";
+/// Baseline/candidate comparison JSON written beside `report.json`.
+pub const SCORE_FILE: &str = "score.json";
+/// The slide table: one row per run pair plus mean and ratio rows.
+pub const TABLE_FILE: &str = "table.csv";
+/// One row per sample, for Pareto plots.
+pub const RUNS_FILE: &str = "runs.csv";
 
 /// Filesystem-backed eval store rooted at `.zeroshot/eval`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -215,7 +221,35 @@ impl EvalStore {
     /// Persist `report.json` first. Markdown is rendered only from this stored report.
     pub fn write_report(&self, id: &EvalId, report: &EvalReport) -> Result<(), EvalError> {
         let directory = self.root.join(id.as_str());
-        write_json(&directory.join("report.json"), report)
+        write_json(&directory.join("report.json"), report)?;
+        self.write_score_exports(id, report)
+    }
+
+    /// Write `score.json`, `table.csv`, and `runs.csv` for the baseline/candidate comparison.
+    /// Stale exports are removed when the report has no comparison.
+    pub fn write_score_exports(&self, id: &EvalId, report: &EvalReport) -> Result<(), EvalError> {
+        let directory = self.root.join(id.as_str());
+        let files = [SCORE_FILE, TABLE_FILE, RUNS_FILE];
+        let Some(comparison) = &report.baseline else {
+            for file in files {
+                let path = directory.join(file);
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(EvalError::io(&path, error)),
+                }
+            }
+            return Ok(());
+        };
+        write_json(&directory.join(SCORE_FILE), comparison)?;
+        atomic_write(
+            &directory.join(TABLE_FILE),
+            super::baseline::table_csv(comparison).as_bytes(),
+        )?;
+        atomic_write(
+            &directory.join(RUNS_FILE),
+            super::baseline::runs_csv(comparison).as_bytes(),
+        )
     }
 
     pub fn write_report_markdown(&self, id: &EvalId, report: &EvalReport) -> Result<(), EvalError> {

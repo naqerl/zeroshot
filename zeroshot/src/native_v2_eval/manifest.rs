@@ -57,9 +57,71 @@ pub struct EvalArm {
     pub input: Value,
     #[serde(default)]
     pub knobs: serde_json::Map<String, Value>,
-    /// Default judge model for this arm. A run-level `--judge-model` overrides it.
+    /// Token prices for this arm. Overrides `options.pricing` when the arm uses other models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub judge_model: Option<String>,
+    pub pricing: Option<Pricing>,
+    /// Exact runtime plan JSON (`zeroshot run --runtime-config`) for the `local` runner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_config: Option<String>,
+    /// Uniform runtime JSON (`zeroshot run --uniform-runtime-config`) for the `local` runner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uniform_runtime_config: Option<String>,
+    /// Template delivery mode for the `local` runner (`push`, `pull_request`, `merge`, `none`).
+    /// Defaults to `push` so every run leaves a capturable branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<String>,
+    /// Extra `zeroshot run` arguments for the `local` runner, such as `["--environment", "env.json"]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run_args: Vec<String>,
+}
+
+/// USD price per one million tokens for each token kind. There is no default price: cost `C` is
+/// computed only when every token kind a sample used has a price, otherwise the sample stays
+/// unpriced and the report says which price is missing.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Pricing {
+    /// Uncached input (read) tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<f64>,
+    /// Output (write) tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<f64>,
+    /// Cache-read input tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<f64>,
+    /// Cache-creation (cache write) input tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<f64>,
+}
+
+/// Weights and arm roles for `S = Q / (C^a * T^b)`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ScoreOptions {
+    /// Cost exponent `a` in `[0, 1]`.
+    #[serde(default = "default_exponent")]
+    pub a: f64,
+    /// Time exponent `b` in `[0, 1]`.
+    #[serde(default = "default_exponent")]
+    pub b: f64,
+    /// Baseline arm id. Defaults to the first arm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<String>,
+    /// Candidate arm id. Defaults to the second arm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<String>,
+}
+
+impl Default for ScoreOptions {
+    fn default() -> Self {
+        Self {
+            a: default_exponent(),
+            b: default_exponent(),
+            baseline: None,
+            candidate: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -67,6 +129,8 @@ pub struct EvalArm {
 pub struct EvalCriterion {
     pub id: String,
     pub description: String,
+    /// Relative weight in `Q`. Equal weights (the default) make `Q = passed / total`.
+    #[serde(default = "default_weight")]
     pub weight: f64,
 }
 
@@ -81,16 +145,38 @@ pub struct EvalOptions {
     pub seed: u64,
     #[serde(default)]
     pub fake: FakeOptions,
-    /// Default judge model for every arm without its own `judgeModel`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub judge_model: Option<String>,
-    /// Default judge graph template. `eval-judge` is the built-in template.
+    /// Judge graph: `eval-judge` (the built-in template, also `zeroshot template show eval-judge`)
+    /// or a graph JSON path with the same input/output contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge_template: Option<String>,
-    /// Authored runtime plan for provider-backed judge graph execution. Relative paths resolve
-    /// against the eval directory; without it the CLI uses the synthetic graph executor.
+    /// How the judge runs: `synthetic` answers from recorded fake evidence without a model;
+    /// `local` submits the judge graph as a real `zeroshot run`. Defaults to `synthetic` for the
+    /// fake runner and `local` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_runner: Option<String>,
+    /// Exact runtime plan for the judge run (`zeroshot run --runtime-config`). The judge's
+    /// provider and model are whatever this plan (or the profile in `judgeRunArgs`) configures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge_runtime_config: Option<String>,
+    /// One runtime for every judge node (`zeroshot run --uniform-runtime-config`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_uniform_runtime_config: Option<String>,
+    /// Extra `zeroshot run` arguments for the judge run, such as `["--profile", "judge"]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub judge_run_args: Vec<String>,
+    /// Default token prices for cost `C` in USD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<Pricing>,
+    /// Baseline/candidate score weights.
+    #[serde(default)]
+    pub score: ScoreOptions,
+    /// Git remote that holds pushed `local` runner branches. Defaults to the workspace's
+    /// `origin` remote URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_remote: Option<String>,
+    /// Per-sample deadline for the `local` runner, in minutes. A run past it is stopped and failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_minutes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -112,6 +198,9 @@ pub struct FakeOptions {
     pub skip_every: Option<u32>,
     #[serde(default = "default_pass_rate")]
     pub pass_rate: f64,
+    /// Deterministic per-run spread of wall time and tokens, as a fraction (`0.1` = +/-10%).
+    #[serde(default)]
+    pub jitter: f64,
 }
 
 impl Default for EvalOptions {
@@ -121,9 +210,15 @@ impl Default for EvalOptions {
             runner: default_runner(),
             seed: 0,
             fake: FakeOptions::default(),
-            judge_model: None,
             judge_template: None,
+            judge_runner: None,
             judge_runtime_config: None,
+            judge_uniform_runtime_config: None,
+            judge_run_args: Vec::new(),
+            pricing: None,
+            score: ScoreOptions::default(),
+            capture_remote: None,
+            deadline_minutes: None,
         }
     }
 }
@@ -139,6 +234,7 @@ impl Default for FakeOptions {
             fail_every: None,
             skip_every: None,
             pass_rate: default_pass_rate(),
+            jitter: 0.0,
         }
     }
 }
@@ -208,8 +304,42 @@ impl EvalManifest {
             }
         }
         self.options.validate()?;
-        if let Some(model) = &self.options.judge_model {
-            validate_label("options.judgeModel", model, 256)?;
+        for (role, arm) in [
+            ("baseline", &self.options.score.baseline),
+            ("candidate", &self.options.score.candidate),
+        ] {
+            if let Some(arm) = arm {
+                if !arm_ids.contains(arm.as_str()) {
+                    return Err(invalid(format!(
+                        "options.score.{role} names unknown arm {arm:?}"
+                    )));
+                }
+            }
+        }
+        if let (Some(baseline), Some(candidate)) =
+            (&self.options.score.baseline, &self.options.score.candidate)
+        {
+            if baseline == candidate {
+                return Err(invalid(
+                    "options.score.baseline and options.score.candidate must name different arms",
+                ));
+            }
+        }
+        if let Some(runner) = &self.options.judge_runner {
+            validate_judge_runner(runner)?;
+        }
+        if self.options.judge_runtime_config.is_some()
+            && self.options.judge_uniform_runtime_config.is_some()
+        {
+            return Err(invalid(
+                "options must declare at most one of judgeRuntimeConfig or judgeUniformRuntimeConfig",
+            ));
+        }
+        if let Some(runtime) = &self.options.judge_uniform_runtime_config {
+            validate_label("options.judgeUniformRuntimeConfig", runtime, 4_096)?;
+        }
+        for argument in &self.options.judge_run_args {
+            validate_label("options.judgeRunArgs entry", argument, 4_096)?;
         }
         if let Some(template) = &self.options.judge_template {
             validate_label("options.judgeTemplate", template, 512)?;
@@ -266,10 +396,54 @@ impl EvalArm {
                 self.id
             )));
         }
-        if let Some(model) = &self.judge_model {
-            validate_label("arm judgeModel", model, 256)?;
+        if let Some(pricing) = &self.pricing {
+            pricing.validate(&format!("arms.{}.pricing", self.id))?;
+        }
+        if self.runtime_config.is_some() && self.uniform_runtime_config.is_some() {
+            return Err(invalid(format!(
+                "arm {:?} must declare at most one of runtimeConfig or uniformRuntimeConfig",
+                self.id
+            )));
+        }
+        for path in [&self.runtime_config, &self.uniform_runtime_config]
+            .into_iter()
+            .flatten()
+        {
+            validate_label("arm runtime config path", path, 4_096)?;
+        }
+        if let Some(delivery) = &self.delivery {
+            if !matches!(
+                delivery.as_str(),
+                "none" | "push" | "pull_request" | "merge" | "comment"
+            ) {
+                return Err(invalid(format!(
+                    "arm {:?} delivery {delivery:?} must be none, push, pull_request, merge, or comment",
+                    self.id
+                )));
+            }
+        }
+        if self.run_args.len() > 64
+            || self
+                .run_args
+                .iter()
+                .any(|argument| argument.is_empty() || argument.chars().any(char::is_control))
+        {
+            return Err(invalid(format!(
+                "arm {:?} runArgs must hold at most 64 nonempty arguments without control characters",
+                self.id
+            )));
         }
         Ok(())
+    }
+
+    /// Initial graph input: `input` when present, otherwise `{ "task": prompt }`.
+    #[must_use]
+    pub fn initial_input(&self) -> Value {
+        if self.input_absent() {
+            serde_json::json!({ "task": self.prompt })
+        } else {
+            self.input.clone()
+        }
     }
 
     fn input_absent(&self) -> bool {
@@ -340,7 +514,147 @@ impl EvalOptions {
                 "options.fake.passRate must be a finite number between 0 and 1",
             ));
         }
+        if !(0.0..=1.0).contains(&self.fake.jitter) {
+            return Err(invalid(
+                "options.fake.jitter must be a finite number between 0 and 1",
+            ));
+        }
+        if let Some(pricing) = &self.pricing {
+            pricing.validate("options.pricing")?;
+        }
+        for (name, value) in [("a", self.score.a), ("b", self.score.b)] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(invalid(format!(
+                    "options.score.{name} must be a finite number between 0 and 1"
+                )));
+            }
+        }
+        if let Some(remote) = &self.capture_remote {
+            validate_label("options.captureRemote", remote, 4_096)?;
+        }
+        if self
+            .deadline_minutes
+            .is_some_and(|minutes| !(1..=10_080).contains(&minutes))
+        {
+            return Err(invalid(
+                "options.deadlineMinutes must be between 1 and 10080",
+            ));
+        }
         Ok(())
+    }
+}
+
+impl Pricing {
+    fn validate(&self, field: &str) -> Result<(), EvalError> {
+        for (name, value) in self.fields() {
+            if let Some(value) = value {
+                if !value.is_finite() || !(0.0..=1_000_000.0).contains(&value) {
+                    return Err(invalid(format!(
+                        "{field}.{name} must be a finite nonnegative USD price per million tokens"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    const fn fields(&self) -> [(&'static str, Option<f64>); 4] {
+        [
+            ("input", self.input),
+            ("output", self.output),
+            ("cacheRead", self.cache_read),
+            ("cacheWrite", self.cache_write),
+        ]
+    }
+
+    /// Prices from `self`, with each unset field taken from `fallback`.
+    #[must_use]
+    pub fn or(self, fallback: Self) -> Self {
+        Self {
+            input: self.input.or(fallback.input),
+            output: self.output.or(fallback.output),
+            cache_read: self.cache_read.or(fallback.cache_read),
+            cache_write: self.cache_write.or(fallback.cache_write),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.input.is_none()
+            && self.output.is_none()
+            && self.cache_read.is_none()
+            && self.cache_write.is_none()
+    }
+
+    /// Price `tokens` in USD: the sum of each token kind's count times its price.
+    ///
+    /// Returns the names of the prices that are missing for token kinds with a nonzero count.
+    /// Cache tokens without a read/write split are priced only when `cacheRead` and `cacheWrite`
+    /// are equal, because the split decides the cost otherwise.
+    pub fn cost_usd(&self, tokens: &super::TokenUsage) -> Result<f64, Vec<&'static str>> {
+        let split = tokens.cache_read.saturating_add(tokens.cache_write);
+        let unsplit = tokens.cache.saturating_sub(split);
+        let mut missing = Vec::new();
+        let mut total = 0.0;
+        for (name, count, price) in [
+            ("input", tokens.input, self.input),
+            ("output", tokens.output, self.output),
+            ("cacheRead", tokens.cache_read, self.cache_read),
+            ("cacheWrite", tokens.cache_write, self.cache_write),
+        ] {
+            if count == 0 {
+                continue;
+            }
+            match price {
+                Some(price) => total += count as f64 * price,
+                None => missing.push(name),
+            }
+        }
+        if unsplit > 0 {
+            match (self.cache_read, self.cache_write) {
+                (Some(read), Some(write)) if read == write => total += unsplit as f64 * read,
+                _ => missing.push("cacheRead = cacheWrite (cache tokens have no read/write split)"),
+            }
+        }
+        if missing.is_empty() {
+            Ok(total / 1_000_000.0)
+        } else {
+            Err(missing)
+        }
+    }
+}
+
+/// Judge runner names accepted by `options.judgeRunner` and `--judge-runner`.
+pub const JUDGE_RUNNERS: [&str; 2] = ["synthetic", "local"];
+
+pub(crate) fn validate_judge_runner(runner: &str) -> Result<(), EvalError> {
+    if JUDGE_RUNNERS.contains(&runner) {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "judge runner {runner:?} must be one of {}",
+            JUDGE_RUNNERS.join(", ")
+        )))
+    }
+}
+
+impl EvalManifest {
+    /// The effective judge runner: the override, then `options.judgeRunner`, then `synthetic`
+    /// for the fake runner and `local` for every runner that executes real arms.
+    pub fn judge_runner(&self, run_override: Option<&str>) -> Result<&'static str, EvalError> {
+        let selected = run_override
+            .or(self.options.judge_runner.as_deref())
+            .unwrap_or(if self.options.runner == "fake" {
+                "synthetic"
+            } else {
+                "local"
+            });
+        validate_judge_runner(selected)?;
+        Ok(if selected == "local" {
+            "local"
+        } else {
+            "synthetic"
+        })
     }
 }
 
@@ -420,4 +734,12 @@ fn default_output_tokens() -> u64 {
 
 fn default_pass_rate() -> f64 {
     0.8
+}
+
+fn default_exponent() -> f64 {
+    0.5
+}
+
+fn default_weight() -> f64 {
+    1.0
 }
