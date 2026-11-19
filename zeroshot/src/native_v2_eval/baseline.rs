@@ -133,10 +133,11 @@ pub struct BaselineComparison {
     pub pairs: Vec<RunPair>,
     pub baseline: ArmAggregate,
     pub candidate: ArmAggregate,
-    /// `S_candidate / S_baseline` from the means; above 1 favors the candidate.
+    /// `S_candidate / S_baseline` with each `S` from the arm's mean T, C, Q; above 1 favors the
+    /// candidate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ratio: Option<f64>,
-    /// The same ratio from the medians.
+    pub mean_ratio: Option<f64>,
+    /// `S_candidate / S_baseline` with each `S` from the arm's median T, C, Q.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub median_ratio: Option<f64>,
     #[serde(default)]
@@ -196,26 +197,33 @@ pub fn compare(data: &EvalData) -> Option<BaselineComparison> {
     };
     let baseline_samples = attempted(baseline_arm);
     let candidate_samples = attempted(candidate_arm);
-    let priced = |arm: &EvalArm, sample: &EvalSample| {
-        sample.cost_usd.is_some() || arm.pricing.or(data.manifest.options.pricing).is_some()
-    };
-    let all_priced = baseline_samples
-        .iter()
-        .all(|sample| priced(baseline_arm, sample))
-        && candidate_samples
-            .iter()
-            .all(|sample| priced(candidate_arm, sample));
-    let cost_unit = if all_priced {
+    let mut missing_prices = Vec::new();
+    for (arm, samples) in [
+        (baseline_arm, &baseline_samples),
+        (candidate_arm, &candidate_samples),
+    ] {
+        let pricing = effective_pricing(data, arm);
+        let mut missing = std::collections::BTreeSet::new();
+        for sample in samples.iter().filter(|sample| sample.cost_usd.is_none()) {
+            if let Err(kinds) = pricing.cost_usd(&sample.tokens) {
+                missing.extend(kinds);
+            }
+        }
+        if !missing.is_empty() {
+            missing_prices.push((arm.id.clone(), missing));
+        }
+    }
+    let cost_unit = if missing_prices.is_empty() {
         CostUnit::Usd
     } else {
         CostUnit::Mtok
     };
     let mut notes = Vec::new();
-    if cost_unit == CostUnit::Mtok {
-        notes.push(
-            "cost is millions of tokens: add [options.pricing] (USD per million tokens) to report USD"
-                .to_owned(),
-        );
+    for (arm, missing) in &missing_prices {
+        notes.push(format!(
+            "cost is millions of tokens, not USD: arm {arm} used tokens without a price ({}); set them in [options.pricing] or [arms.pricing] (USD per 1M tokens) or pass --price-* to `eval score`/`export`",
+            missing.iter().copied().collect::<Vec<_>>().join(", ")
+        ));
     }
     let metrics = |arm: &EvalArm| -> Vec<RunMetrics> {
         let mut samples = data
@@ -288,8 +296,9 @@ pub fn compare(data: &EvalData) -> Option<BaselineComparison> {
             ));
         }
     }
-    let ratio = score_ratio(candidate.score, baseline.score);
-    if ratio.is_none() {
+    let mean_ratio = score_ratio(candidate.score, baseline.score);
+    let median_ratio = score_ratio(candidate.median_score, baseline.median_score);
+    if mean_ratio.is_none() || median_ratio.is_none() {
         notes.push(
             "the score ratio is undefined: a side has no measured runs, no judged quality, zero cost or time, or a zero baseline score"
                 .to_owned(),
@@ -306,8 +315,8 @@ pub fn compare(data: &EvalData) -> Option<BaselineComparison> {
         cost_unit,
         runs_per_arm: data.manifest.runs_per_arm,
         pairs,
-        ratio,
-        median_ratio: score_ratio(candidate.median_score, baseline.median_score),
+        mean_ratio,
+        median_ratio,
         baseline,
         candidate,
         notes,
@@ -327,12 +336,10 @@ fn run_metrics(context: &MetricContext<'_>, arm: &EvalArm, sample: &EvalSample) 
         unit,
         weights,
     } = *context;
-    let pricing = arm.pricing.or(data.manifest.options.pricing);
-    let (cost, cost_source) = match (unit, sample.cost_usd, pricing) {
+    let priced = effective_pricing(data, arm).cost_usd(&sample.tokens).ok();
+    let (cost, cost_source) = match (unit, sample.cost_usd, priced) {
         (CostUnit::Usd, Some(cost), _) => (cost, CostSource::Recorded),
-        (CostUnit::Usd, None, Some(pricing)) => {
-            (pricing.cost_usd(&sample.tokens), CostSource::Priced)
-        }
+        (CostUnit::Usd, None, Some(cost)) => (cost, CostSource::Priced),
         _ => (
             sample.tokens.total() as f64 / 1_000_000.0,
             CostSource::Tokens,
@@ -422,6 +429,13 @@ fn aggregate(arm_id: &str, runs: &[RunMetrics], weights: (f64, f64)) -> ArmAggre
     }
 }
 
+/// Arm prices with each unset field taken from `[options.pricing]`.
+fn effective_pricing(data: &EvalData, arm: &EvalArm) -> super::Pricing {
+    arm.pricing
+        .unwrap_or_default()
+        .or(data.manifest.options.pricing.unwrap_or_default())
+}
+
 fn is_measured(sample: &EvalSample) -> bool {
     match sample.status {
         SampleStatus::Succeeded => true,
@@ -448,10 +462,13 @@ fn median(values: &[f64]) -> Option<f64> {
     })
 }
 
-/// The slide table as CSV: one row per run pair, then `mean` and `ratio` rows.
+/// The slide table as CSV: one row per run pair, then `mean`, `median`, `ratio_mean`, and
+/// `ratio_median` rows.
 ///
 /// Columns: `run,t_base_min,c_base,q_base,s_base,t_min,c,q,s`. Cost is in `cost_unit`. Empty cells
-/// mean "not measured". The `ratio` row carries `S_candidate / S_baseline` in the `s` column.
+/// mean "not measured". The `mean`/`median` rows hold each arm's mean/median T, C, Q and the `S`
+/// computed from them; the ratio rows carry `S_candidate / S_baseline` from those `S` values in
+/// the `s` column.
 #[must_use]
 pub fn table_csv(comparison: &BaselineComparison) -> String {
     let mut out = String::from("run,t_base_min,c_base,q_base,s_base,t_min,c,q,s\n");
@@ -483,13 +500,33 @@ pub fn table_csv(comparison: &BaselineComparison) -> String {
         ]
         .join(",")
     };
+    let median_side = |side: &ArmAggregate| {
+        [
+            number(side.median_time_minutes),
+            number(side.median_cost),
+            number(side.median_quality),
+            number(side.median_score),
+        ]
+        .join(",")
+    };
     let _ = writeln!(
         out,
         "mean,{},{}",
         mean_side(&comparison.baseline),
         mean_side(&comparison.candidate)
     );
-    let _ = writeln!(out, "ratio,,,,,,,,{}", number(comparison.ratio));
+    let _ = writeln!(
+        out,
+        "median,{},{}",
+        median_side(&comparison.baseline),
+        median_side(&comparison.candidate)
+    );
+    let _ = writeln!(out, "ratio_mean,,,,,,,,{}", number(comparison.mean_ratio));
+    let _ = writeln!(
+        out,
+        "ratio_median,,,,,,,,{}",
+        number(comparison.median_ratio)
+    );
     out
 }
 
@@ -583,8 +620,22 @@ pub fn render_markdown(comparison: &BaselineComparison) -> String {
         mean_side(&comparison.baseline),
         mean_side(&comparison.candidate)
     );
+    let median_side = |side: &ArmAggregate| {
+        format!(
+            "{} | {} | {}",
+            fixed(side.median_time_minutes, 1),
+            fixed(side.median_cost, 2),
+            fixed(side.median_quality, 2)
+        )
+    };
+    let _ = writeln!(
+        out,
+        "| median | {} | {} |",
+        median_side(&comparison.baseline),
+        median_side(&comparison.candidate)
+    );
     let _ = writeln!(out);
-    let verdict = match comparison.ratio {
+    let verdict = |ratio: Option<f64>| match ratio {
         Some(ratio) if ratio > 1.0 => "candidate better",
         Some(ratio) if ratio < 1.0 => "baseline better",
         Some(_) => "no difference",
@@ -592,11 +643,19 @@ pub fn render_markdown(comparison: &BaselineComparison) -> String {
     };
     let _ = writeln!(
         out,
-        "**S_candidate / S_baseline = {}** (from the means; {verdict}). S_base = {}, S_cand = {}. Median ratio: {}.",
-        fixed(comparison.ratio, 2),
+        "- **Mean ratio S_candidate / S_baseline = {}** ({}). S_base = {}, S_cand = {} (from the means).",
+        fixed(comparison.mean_ratio, 2),
+        verdict(comparison.mean_ratio),
         fixed(comparison.baseline.score, 4),
         fixed(comparison.candidate.score, 4),
-        fixed(comparison.median_ratio, 2)
+    );
+    let _ = writeln!(
+        out,
+        "- **Median ratio S_candidate / S_baseline = {}** ({}). S_base = {}, S_cand = {} (from the medians).",
+        fixed(comparison.median_ratio, 2),
+        verdict(comparison.median_ratio),
+        fixed(comparison.baseline.median_score, 4),
+        fixed(comparison.candidate.median_score, 4),
     );
     for note in &comparison.notes {
         let _ = writeln!(out);

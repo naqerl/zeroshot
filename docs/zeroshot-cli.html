@@ -653,6 +653,7 @@ Options:
           - auto-research:   Research with ten iterations by default and independent evidence gates
           - issue-review:    Inspect an issue proposal and post a review report
           - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
+          - eval-judge:      Judge a patch against acceptance traits and return per-trait pass/fail JSON (eval judge)
 
       --runtime-config &lt;FILE&gt;
 
@@ -796,6 +797,7 @@ Arguments:
           - auto-research:   Research with ten iterations by default and independent evidence gates
           - issue-review:    Inspect an issue proposal and post a review report
           - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
+          - eval-judge:      Judge a patch against acceptance traits and return per-trait pass/fail JSON (eval judge)
 
 Options:
       --delivery &lt;MODE&gt;
@@ -982,8 +984,8 @@ Options:
       --judge-template &lt;NAME|PATH&gt;
           Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions
 
-      --judge-model &lt;MODEL&gt;
-          Judge model identifier, overriding per-arm and manifest defaults
+      --judge-runner &lt;RUNNER&gt;
+          Judge runner: `synthetic` (recorded fake evidence, no model call) or `local` (the judge graph as a real `zeroshot run`), overriding `options.judgeRunner`
 
   -h, --help
           Print help (see a summary with &#39;-h&#39;)</code></pre></section>
@@ -1013,8 +1015,8 @@ Options:
       --scorer &lt;NAME&gt;
           Override the manifest&#39;s scorer for this run
 
-      --judge-model &lt;MODEL&gt;
-          Judge model identifier, overriding per-arm and manifest defaults
+      --judge-runner &lt;RUNNER&gt;
+          Judge runner: `synthetic` (recorded fake evidence, no model call) or `local` (the judge graph as a real `zeroshot run`), overriding `options.judgeRunner`
 
       --runner &lt;RUNNER&gt;
           Override `options.runner` (`fake` or `local`)
@@ -1038,8 +1040,8 @@ Options:
       --judge-template &lt;NAME|PATH&gt;
           Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions
 
-      --judge-model &lt;MODEL&gt;
-          Judge model identifier, overriding per-arm and manifest defaults
+      --judge-runner &lt;RUNNER&gt;
+          Judge runner: `synthetic` (recorded fake evidence, no model call) or `local` (the judge graph as a real `zeroshot run`), overriding `options.judgeRunner`
 
   -h, --help
           Print help</code></pre></section>
@@ -1061,8 +1063,8 @@ Options:
       --judge-template &lt;NAME|PATH&gt;
           Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions
 
-      --judge-model &lt;MODEL&gt;
-          Judge model identifier, overriding per-arm and manifest defaults
+      --judge-runner &lt;RUNNER&gt;
+          Judge runner: `synthetic` (recorded fake evidence, no model call) or `local` (the judge graph as a real `zeroshot run`), overriding `options.judgeRunner`
 
   -h, --help
           Print help</code></pre></section>
@@ -1084,8 +1086,8 @@ Options:
       --judge-template &lt;NAME|PATH&gt;
           Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions
 
-      --judge-model &lt;MODEL&gt;
-          Judge model identifier, overriding per-arm and manifest defaults
+      --judge-runner &lt;RUNNER&gt;
+          Judge runner: `synthetic` (recorded fake evidence, no model call) or `local` (the judge graph as a real `zeroshot run`), overriding `options.judgeRunner`
 
   -h, --help
           Print help</code></pre></section>
@@ -1113,11 +1115,23 @@ Options:
       --judge-template &lt;NAME|PATH&gt;
           Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions
 
-      --judge-model &lt;MODEL&gt;
-          Judge model identifier, overriding per-arm and manifest defaults
+      --judge-runner &lt;RUNNER&gt;
+          Judge runner: `synthetic` (recorded fake evidence, no model call) or `local` (the judge graph as a real `zeroshot run`), overriding `options.judgeRunner`
 
       --time-weight &lt;B&gt;
           Time exponent `b` in `S = Q / (C^a * T^b)`, overriding `options.score.b`
+
+      --price-input &lt;USD&gt;
+          USD per 1M uncached input (read) tokens, overriding the manifest pricing
+
+      --price-output &lt;USD&gt;
+          USD per 1M output (write) tokens, overriding the manifest pricing
+
+      --price-cache-read &lt;USD&gt;
+          USD per 1M cache-read input tokens, overriding the manifest pricing
+
+      --price-cache-write &lt;USD&gt;
+          USD per 1M cache-write (cache creation) input tokens, overriding the manifest pricing
 
   -h, --help
           Print help</code></pre></section>
@@ -1145,11 +1159,23 @@ Options:
       --judge-template &lt;NAME|PATH&gt;
           Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions
 
-      --judge-model &lt;MODEL&gt;
-          Judge model identifier, overriding per-arm and manifest defaults
+      --judge-runner &lt;RUNNER&gt;
+          Judge runner: `synthetic` (recorded fake evidence, no model call) or `local` (the judge graph as a real `zeroshot run`), overriding `options.judgeRunner`
 
       --time-weight &lt;B&gt;
           Time exponent `b` in `S = Q / (C^a * T^b)`, overriding `options.score.b`
+
+      --price-input &lt;USD&gt;
+          USD per 1M uncached input (read) tokens, overriding the manifest pricing
+
+      --price-output &lt;USD&gt;
+          USD per 1M output (write) tokens, overriding the manifest pricing
+
+      --price-cache-read &lt;USD&gt;
+          USD per 1M cache-read input tokens, overriding the manifest pricing
+
+      --price-cache-write &lt;USD&gt;
+          USD per 1M cache-write (cache creation) input tokens, overriding the manifest pricing
 
   -h, --help
           Print help</code></pre></section>
@@ -1174,8 +1200,8 @@ Options:
       --judge-template &lt;NAME|PATH&gt;
           Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions
 
-      --judge-model &lt;MODEL&gt;
-          Judge model identifier, overriding per-arm and manifest defaults
+      --judge-runner &lt;RUNNER&gt;
+          Judge runner: `synthetic` (recorded fake evidence, no model call) or `local` (the judge graph as a real `zeroshot run`), overriding `options.judgeRunner`
 
   -h, --help
           Print help</code></pre></section>
@@ -1203,8 +1229,8 @@ Options:
       --judge-template &lt;NAME|PATH&gt;
           Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions
 
-      --judge-model &lt;MODEL&gt;
-          Judge model identifier, overriding per-arm and manifest defaults
+      --judge-runner &lt;RUNNER&gt;
+          Judge runner: `synthetic` (recorded fake evidence, no model call) or `local` (the judge graph as a real `zeroshot run`), overriding `options.judgeRunner`
 
       --scorer &lt;NAME&gt;
           Override the manifest&#39;s scorer while rebuilding the judged report
@@ -1232,8 +1258,8 @@ Options:
       --judge-template &lt;NAME|PATH&gt;
           Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions
 
-      --judge-model &lt;MODEL&gt;
-          Judge model identifier, overriding per-arm and manifest defaults
+      --judge-runner &lt;RUNNER&gt;
+          Judge runner: `synthetic` (recorded fake evidence, no model call) or `local` (the judge graph as a real `zeroshot run`), overriding `options.judgeRunner`
 
   -h, --help
           Print help</code></pre></section>
@@ -1278,6 +1304,7 @@ Options:
           - auto-research:   Research with ten iterations by default and independent evidence gates
           - issue-review:    Inspect an issue proposal and post a review report
           - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
+          - eval-judge:      Judge a patch against acceptance traits and return per-trait pass/fail JSON (eval judge)
 
       --input &lt;FILE&gt;
           Load the graph&#39;s initial input from this JSON file

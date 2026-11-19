@@ -82,9 +82,9 @@ impl CliCommand {
             Self::Eval {
                 directory,
                 judge_template,
-                judge_model,
+                judge_runner,
                 command,
-            } => command.into_command(directory, judge_template, judge_model),
+            } => command.into_command(directory, judge_template, judge_runner),
             Self::Run(args) => args.into_command(),
             Self::Utility(command) => command.into_command(),
             _ => Err(usage("expected an execution or management command")),
@@ -194,8 +194,16 @@ impl EvalCliCommand {
         self,
         directory: PathBuf,
         judge_template: Option<String>,
-        judge_model: Option<String>,
+        judge_runner: Option<String>,
     ) -> Result<NativeV2CliCommand, NativeV2CliError> {
+        if let Some(runner) = judge_runner.as_deref() {
+            if !crate::native_v2_eval::JUDGE_RUNNERS.contains(&runner) {
+                return Err(usage(format!(
+                    "--judge-runner must be one of {}",
+                    crate::native_v2_eval::JUDGE_RUNNERS.join(", ")
+                )));
+            }
+        }
         let action = match self {
             Self::Run(args) => EvalAction::Run(EvalRunCommand {
                 manifest: args.manifest,
@@ -203,7 +211,7 @@ impl EvalCliCommand {
                 id: args.id.map(validate_eval_id).transpose()?,
                 scorer: args.scorer,
                 judge_template,
-                judge_model,
+                judge_runner: judge_runner.clone(),
                 runner: args.runner,
                 workspace: args.cwd,
             }),
@@ -226,7 +234,7 @@ impl EvalCliCommand {
             },
             Self::Judge(args) => EvalAction::Judge(EvalJudgeCommand {
                 id: validate_eval_id(args.id)?,
-                judge_model,
+                judge_runner: judge_runner.clone(),
                 judge_template,
                 scorer: args.scorer,
             }),
@@ -234,7 +242,7 @@ impl EvalCliCommand {
                 manifest: args.manifest,
                 captures: args.captures,
                 id: args.id.map(validate_eval_id).transpose()?,
-                judge_model,
+                judge_runner: judge_runner.clone(),
                 judge_template,
                 scorer: args.scorer,
             }),
@@ -258,9 +266,27 @@ fn eval_weights(
             return Err(usage(format!("{flag} must be a number between 0 and 1")));
         }
     }
+    for (flag, value) in [
+        ("--price-input", args.price_input),
+        ("--price-output", args.price_output),
+        ("--price-cache-read", args.price_cache_read),
+        ("--price-cache-write", args.price_cache_write),
+    ] {
+        if value.is_some_and(|value| !value.is_finite() || !(0.0..=1_000_000.0).contains(&value)) {
+            return Err(usage(format!(
+                "{flag} must be a nonnegative USD price per million tokens"
+            )));
+        }
+    }
     Ok(crate::native_v2_eval::ScoreWeights {
         a: args.cost_weight,
         b: args.time_weight,
+        pricing: crate::native_v2_eval::Pricing {
+            input: args.price_input,
+            output: args.price_output,
+            cache_read: args.price_cache_read,
+            cache_write: args.price_cache_write,
+        },
     })
 }
 
@@ -414,6 +440,7 @@ impl TemplateName {
             Self::AutoResearch => "auto-research",
             Self::IssueReview => "issue-review",
             Self::PrReview => "pr-review",
+            Self::EvalJudge => "eval-judge",
         };
         BuiltinGraphTemplate::parse(name)
             .ok_or_else(|| usage("Clap template value is outside the built-in catalog"))
@@ -755,7 +782,9 @@ fn validate_template_delivery(
         ));
     }
     let supported = match template {
-        BuiltinGraphTemplate::SingleWorker => delivery == TemplateDelivery::None,
+        BuiltinGraphTemplate::SingleWorker | BuiltinGraphTemplate::EvalJudge => {
+            delivery == TemplateDelivery::None
+        }
         BuiltinGraphTemplate::SoftwareChange => delivery != TemplateDelivery::Comment,
         BuiltinGraphTemplate::AutoResearch => {
             matches!(delivery, TemplateDelivery::None | TemplateDelivery::Push)

@@ -12,10 +12,10 @@ use super::{
     BackendSampleRequest, Capacity, CapacitySource, EvalArm, EvalCriterion, EvalData, EvalError,
     EvalId, EvalManifest, EvalReport, EvalRunError, EvalRunRequest, EvalSample, EvalSamplePlan,
     EvalStore, FakeRunner, FakeSampleRequest, FixtureJudgeGraphExecutor, JUDGE_TEMPLATE_NAME,
-    JudgeGraphExecutor, JudgeOptions, LocalJudgeGraphExecutor, LocalRunner, PatchArtifact,
-    PlatformRunner, SampleArtifact, SampleOutcome, SampleRunner, SampleStatus, SampleTiming,
-    ScorerInput, ScorerRegistry, TemplateJudge, TokenUsage, captured_sample_from_directory,
-    judge_eval, load_judge_runtime, model::now_ms, report, resolve_judge_template,
+    JudgeGraphExecutor, JudgeOptions, JudgeRunConfig, LocalJudgeGraphExecutor, LocalRunner,
+    PatchArtifact, PlatformRunner, SampleArtifact, SampleOutcome, SampleRunner, SampleStatus,
+    SampleTiming, ScorerInput, ScorerRegistry, TemplateJudge, TokenUsage,
+    captured_sample_from_directory, judge_eval, model::now_ms, report, resolve_judge_template,
     store::timestamp,
 };
 
@@ -55,13 +55,16 @@ pub enum EvalAction {
     },
 }
 
-/// Optional overrides of `options.score.a` (cost) and `options.score.b` (time).
+/// Optional overrides of `options.score.a` (cost), `options.score.b` (time), and token prices.
 ///
 /// Values are validated to be finite numbers in `0..=1`, so equality is total.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ScoreWeights {
     pub a: Option<f64>,
     pub b: Option<f64>,
+    /// Per-field price overrides (USD per 1M tokens); each set field wins over the manifest's
+    /// `[options.pricing]` and every `[arms.pricing]`.
+    pub pricing: super::Pricing,
 }
 
 impl Eq for ScoreWeights {}
@@ -74,10 +77,19 @@ impl ScoreWeights {
         if let Some(b) = self.b {
             data.manifest.options.score.b = b;
         }
+        if !self.pricing.is_empty() {
+            let options = &mut data.manifest.options;
+            options.pricing = Some(self.pricing.or(options.pricing.unwrap_or_default()));
+            for arm in &mut data.manifest.arms {
+                if let Some(pricing) = arm.pricing {
+                    arm.pricing = Some(self.pricing.or(pricing));
+                }
+            }
+        }
     }
 
     const fn is_empty(self) -> bool {
-        self.a.is_none() && self.b.is_none()
+        self.a.is_none() && self.b.is_none() && self.pricing.is_empty()
     }
 }
 
@@ -85,7 +97,8 @@ impl ScoreWeights {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvalJudgeCommand {
     pub id: String,
-    pub judge_model: Option<String>,
+    /// Judge runner override: `synthetic` or `local`.
+    pub judge_runner: Option<String>,
     pub judge_template: Option<String>,
     pub scorer: Option<String>,
 }
@@ -96,7 +109,8 @@ pub struct EvalJudgeCapturesCommand {
     pub manifest: PathBuf,
     pub captures: PathBuf,
     pub id: Option<String>,
-    pub judge_model: Option<String>,
+    /// Judge runner override: `synthetic` or `local`.
+    pub judge_runner: Option<String>,
     pub judge_template: Option<String>,
     pub scorer: Option<String>,
 }
@@ -108,7 +122,8 @@ pub struct EvalRunCommand {
     pub id: Option<String>,
     pub scorer: Option<String>,
     pub judge_template: Option<String>,
-    pub judge_model: Option<String>,
+    /// Judge runner override: `synthetic` or `local`.
+    pub judge_runner: Option<String>,
     /// Override `options.runner`, e.g. `fake` for a dry run of a `local` manifest.
     pub runner: Option<String>,
     /// Checkout the `local` runner runs in. Defaults to `directory` (the eval store workspace).
@@ -219,7 +234,7 @@ pub async fn execute(command: &EvalCommand) -> Result<Value, EvalError> {
             let id = EvalId::new(command.id.clone())?;
             let mut data = store.load(&id)?;
             let options = JudgeOptions {
-                model: command.judge_model.clone(),
+                runner: command.judge_runner.clone(),
                 template: command.judge_template.clone(),
                 scorer: command.scorer.clone(),
                 executor: None,
@@ -306,7 +321,7 @@ async fn run_captures_through_judge(
         .clone()
         .unwrap_or_else(|| manifest.options.scorer.clone());
     let options = JudgeOptions {
-        model: command.judge_model,
+        runner: command.judge_runner,
         template: command.judge_template,
         scorer: Some(scorer_name),
         executor: None,
@@ -369,11 +384,15 @@ fn resolve_judge_paths(
         std::path::absolute(base).map_err(|error| EvalError::io(base, error))?
     };
     let mut changed = false;
-    if let Some(runtime) = manifest.options.judge_runtime_config.clone() {
-        if !std::path::Path::new(&runtime).is_absolute() {
-            let resolved = base.join(runtime);
-            manifest.options.judge_runtime_config = Some(path_string(&resolved));
-            changed = true;
+    for runtime in [
+        &mut manifest.options.judge_runtime_config,
+        &mut manifest.options.judge_uniform_runtime_config,
+    ] {
+        if let Some(path) = runtime.clone() {
+            if !std::path::Path::new(&path).is_absolute() {
+                *runtime = Some(path_string(&base.join(path)));
+                changed = true;
+            }
         }
     }
     let effective = template_override
@@ -399,14 +418,15 @@ fn path_string(path: &std::path::Path) -> String {
 
 fn judge_configured(
     manifest: &EvalManifest,
-    run_model: Option<&str>,
+    run_runner: Option<&str>,
     run_template: Option<&str>,
 ) -> bool {
-    run_model.is_some()
+    run_runner.is_some()
         || run_template.is_some()
-        || manifest.options.judge_model.is_some()
         || manifest.options.judge_template.is_some()
-        || manifest.arms.iter().any(|arm| arm.judge_model.is_some())
+        || manifest.options.judge_runner.is_some()
+        || manifest.options.judge_runtime_config.is_some()
+        || manifest.options.judge_uniform_runtime_config.is_some()
 }
 
 async fn judge_with_template(
@@ -420,34 +440,50 @@ async fn judge_with_template(
         .or(data.manifest.options.judge_template.as_deref())
         .unwrap_or(JUDGE_TEMPLATE_NAME);
     let template = resolve_judge_template(reference)?;
+    let options_manifest = &data.manifest.options;
     let (executor, executor_kind): (Box<dyn JudgeGraphExecutor>, &str) =
-        match data.manifest.options.judge_runtime_config.as_deref() {
-            Some(runtime_path) => {
+        match data.manifest.judge_runner(options.runner.as_deref())? {
+            "local" => {
                 let workspace = store
                     .root()
                     .parent()
                     .and_then(std::path::Path::parent)
                     .unwrap_or_else(|| store.root())
                     .to_owned();
-                let runtime_path = if std::path::Path::new(runtime_path).is_absolute() {
-                    std::path::PathBuf::from(runtime_path)
-                } else {
-                    workspace.join(runtime_path)
+                let absolute = |path: &str| {
+                    std::path::absolute(path).map_err(|error| EvalError::io(path, error))
                 };
-                let runtime = load_judge_runtime(&runtime_path)?;
+                let run = JudgeRunConfig {
+                    template: if template.name == JUDGE_TEMPLATE_NAME {
+                        JUDGE_TEMPLATE_NAME.to_owned()
+                    } else {
+                        path_string(&absolute(&template.name)?)
+                    },
+                    runtime_config: options_manifest
+                        .judge_runtime_config
+                        .as_deref()
+                        .map(absolute)
+                        .transpose()?,
+                    uniform_runtime_config: options_manifest
+                        .judge_uniform_runtime_config
+                        .as_deref()
+                        .map(absolute)
+                        .transpose()?,
+                    run_args: options_manifest.judge_run_args.clone(),
+                };
                 let backend = crate::native_v2_cli::local::LocalCliBackend::production().map_err(
                     |error| EvalError::Command(format!("judge backend is unavailable: {error}")),
                 )?;
                 (
                     Box::new(LocalJudgeGraphExecutor::new(
                         Arc::new(backend),
-                        runtime,
+                        run,
                         workspace,
                     )),
                     "graph",
                 )
             }
-            None => (Box::new(FixtureJudgeGraphExecutor), "fixture"),
+            _ => (Box::new(FixtureJudgeGraphExecutor), "synthetic"),
         };
     options.executor = Some(executor_kind.to_owned());
     let judge = TemplateJudge::new(executor, template);
@@ -674,14 +710,14 @@ where
     data.report = Some(report);
     if judge_configured(
         &data.manifest,
-        command.judge_model.as_deref(),
+        command.judge_runner.as_deref(),
         command.judge_template.as_deref(),
     ) {
         judge_with_template(
             &store,
             &mut data,
             JudgeOptions {
-                model: command.judge_model,
+                runner: command.judge_runner,
                 template: command.judge_template,
                 scorer: Some(scorer_name),
                 executor: None,
@@ -777,7 +813,6 @@ pub(crate) fn sample_from_artifact(
         patch,
         criteria,
         reasoning,
-        judge_model: None,
         judge_template: None,
         judge_checkout,
         judge_executor: None,
@@ -803,7 +838,6 @@ fn failed_sample(eval_id: &EvalId, meta: &SamplePlanMeta, reason: String) -> Eva
         patch: None,
         criteria: Default::default(),
         reasoning: Default::default(),
-        judge_model: None,
         judge_template: None,
         judge_checkout: None,
         judge_executor: None,
@@ -908,7 +942,8 @@ fn export(
         "a": comparison.a,
         "b": comparison.b,
         "costUnit": comparison.cost_unit,
-        "ratio": comparison.ratio,
+        "meanRatio": comparison.mean_ratio,
+        "medianRatio": comparison.median_ratio,
         "files": files,
     }))
 }

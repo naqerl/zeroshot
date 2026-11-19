@@ -56,6 +56,14 @@ const ACCEPTED_LABEL: &str = "accepted";
 const REJECTED_LABEL: &str = "rejected";
 const DELIVERY_NODE: &str = "deliver";
 
+/// Source of the built-in `eval-judge` template: one read-only judge step that returns a
+/// `{traits: [{id, pass, reason}]}` verdict for every acceptance trait of one captured patch.
+pub(crate) const EVAL_JUDGE_GRAPH_JSON: &str = include_str!("native_v2_templates/eval_judge.json");
+
+fn eval_judge_graph() -> Result<GraphSpec, BuiltinTemplateError> {
+    static_value(serde_json::from_str(EVAL_JUDGE_GRAPH_JSON))
+}
+
 fn single_worker_graph() -> Result<GraphSpec, BuiltinTemplateError> {
     let state = task_type()?;
     let worker = task_worker(

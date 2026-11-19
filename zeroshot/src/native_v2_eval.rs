@@ -45,21 +45,21 @@ pub use cli::{
 pub use error::EvalError;
 pub use fake::{FakeFixtureRequest, FakeRunner, FakeSampleRequest};
 pub use judge::{
-    JUDGE_PASS_SCORE, JUDGE_SCORE_MAX, JUDGE_SCORE_MIN, JUDGE_TEMPLATE_NAME, Judge,
-    JudgeParseError, JudgeRequest, JudgeResult, Judgement, parse_judgement,
+    JUDGE_TEMPLATE_NAME, Judge, JudgeParseError, JudgeRequest, JudgeResult, Judgement,
+    parse_judgement, parse_judgement_value,
 };
-pub use judge_backend::{LocalJudgeGraphExecutor, load_judge_runtime, runtime_with_model};
+pub use judge_backend::{JudgeRunConfig, LocalJudgeGraphExecutor};
 pub use judge_runner::{
     CapturedSampleInput, JudgeOptions, JudgeRunReport, JudgedSample, JudgedSampleSummary,
-    captured_sample_from_directory, judge_captured_samples, judge_eval, judge_model_for,
+    captured_sample_from_directory, judge_captured_samples, judge_eval,
 };
 pub use judge_template::{
     FixtureJudgeGraphExecutor, JUDGE_TEMPLATE_JSON, JudgeGraphExecutor, JudgeTemplate,
     TemplateJudge, judge_input, judge_input_for_template, resolve_judge_template,
 };
 pub use manifest::{
-    EvalArm, EvalCriterion, EvalManifest, EvalOptions, FakeOptions, MANIFEST_SCHEMA, Pricing,
-    ScoreOptions,
+    EvalArm, EvalCriterion, EvalManifest, EvalOptions, FakeOptions, JUDGE_RUNNERS, MANIFEST_SCHEMA,
+    Pricing, ScoreOptions,
 };
 pub use model::{
     CriterionResult, EvalData, EvalId, EvalSample, PatchArtifact, SampleCounts, SampleStatus,
@@ -98,7 +98,7 @@ pub async fn run_fixture(
         id,
         scorer: None,
         judge_template: None,
-        judge_model: None,
+        judge_runner: None,
         runner: None,
         workspace: None,
     })

@@ -100,7 +100,9 @@ impl Scorer for BaselineRatioScorer {
 
     fn score(&self, input: &ScorerInput<'_>) -> Result<ScorerOutput, EvalError> {
         let comparison = super::baseline::compare(input.data);
-        let ratio = comparison.as_ref().and_then(|comparison| comparison.ratio);
+        let ratio = comparison
+            .as_ref()
+            .and_then(|comparison| comparison.mean_ratio);
         let mut notes = vec![
             "aggregate score is S_candidate / S_baseline with S = Q / (C^a * T^b) from the means"
                 .to_owned(),
@@ -114,6 +116,12 @@ impl Scorer for BaselineRatioScorer {
                 notes.push("the ratio is undefined; aggregate score is 0".to_owned())
             }
             _ => {}
+        }
+        if let Some(median) = comparison
+            .as_ref()
+            .and_then(|comparison| comparison.median_ratio)
+        {
+            notes.push(format!("median ratio (S from the medians): {median:.4}"));
         }
         Ok(ScorerOutput {
             name: self.name().to_owned(),

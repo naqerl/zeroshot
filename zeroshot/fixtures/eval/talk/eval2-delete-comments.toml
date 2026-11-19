@@ -19,9 +19,14 @@ runsPerArm = 5
 scorer = "baseline-ratio"
 runner = "fake"
 seed = 2
+# The judge is the built-in `eval-judge` graph (`zeroshot template show eval-judge`), run as a
+# normal `zeroshot run` with the patch and the [[criteria]] traits as input. Its provider and model
+# are whatever the runtime config below sets; nothing judge-specific is hardcoded. The fake runner
+# uses a synthetic judge that calls no model.
 judgeTemplate = "eval-judge"
-judgeModel = "synthetic-judge"
-# judgeRuntimeConfig = "judge-runtime.json"
+judgeUniformRuntimeConfig = "runtime.json"
+# judgeRunner = "local"                 # default: "synthetic" for runner = "fake", else "local"
+# judgeRunArgs = ["--profile", "judge"] # or a profile instead of the runtime config
 deadlineMinutes = 90
 
 [options.score]
@@ -30,11 +35,17 @@ b = 0.5
 baseline = "baseline"
 candidate = "delete-comments"
 
+# Token prices for C, in USD per 1M tokens. PLACEHOLDERS: set all four to your model's prices.
+# C = input*input + output*output + cacheRead*cacheRead + cacheWrite*cacheWrite (tokens / 1M).
+# There is no built-in default: a token kind used without a price makes C fall back to millions
+# of tokens and the report names the missing price. `eval score`/`export` accept
+# --price-input/--price-output/--price-cache-read/--price-cache-write overrides, and an arm may set
+# its own [arms.pricing].
 [options.pricing]
-input = 3.0
-output = 15.0
-cacheRead = 0.3
-cacheWrite = 3.75
+input = 3.0       # set by user: uncached input (read) tokens
+output = 15.0     # set by user: output (write) tokens
+cacheRead = 0.3   # set by user: cache-read input tokens
+cacheWrite = 3.75 # set by user: cache-write (creation) input tokens
 
 [options.fake]
 queueWaitMs = 0

@@ -71,26 +71,27 @@ pub(crate) fn run_arguments(arm: &EvalArm, context: &LocalArmContext<'_>) -> Vec
 }
 
 /// Parse the arguments with the public CLI schema so evals accept exactly what `zeroshot run` does.
-pub(crate) fn run_command(arguments: Vec<OsString>, arm: &str) -> Result<RunCommand, EvalError> {
+/// `label` names the source in errors, such as `arm "baseline"` or `judge`.
+pub(crate) fn run_command(arguments: Vec<OsString>, label: &str) -> Result<RunCommand, EvalError> {
     match crate::native_v2_cli::parse_native_v2_args(arguments) {
         Ok(NativeV2CliCommand::Run(run)) => {
             if run.target.is_some() {
                 return Err(EvalError::Manifest(format!(
-                    "arm {arm:?} runArgs must not select --target for the local runner"
+                    "{label} runArgs must not select --target for the local runner"
                 )));
             }
             if run.detach || run.validate_only {
                 return Err(EvalError::Manifest(format!(
-                    "arm {arm:?} runArgs must not pass --detach or --validate-only"
+                    "{label} runArgs must not pass --detach or --validate-only"
                 )));
             }
             Ok(*run)
         }
         Ok(_) => Err(EvalError::Manifest(format!(
-            "arm {arm:?} did not produce a `zeroshot run` command"
+            "{label} did not produce a `zeroshot run` command"
         ))),
         Err(error) => Err(EvalError::Manifest(format!(
-            "arm {arm:?} is not a valid `zeroshot run`: {error}"
+            "{label} is not a valid `zeroshot run`: {error}"
         ))),
     }
 }
@@ -139,7 +140,7 @@ pub(crate) async fn run_manifest_locally(
                         title: &title,
                     },
                 ),
-                &arm.id,
+                &format!("arm {:?}", arm.id),
             )?;
             let request =
                 crate::native_v2_cli::execution::prepare_run_submission(&run, backend.as_ref())

@@ -96,9 +96,10 @@ enum CliCommand {
         #[arg(long, global = true, value_name = "NAME|PATH")]
         judge_template: Option<String>,
 
-        /// Judge model identifier, overriding per-arm and manifest defaults.
-        #[arg(long, global = true, value_name = "MODEL")]
-        judge_model: Option<String>,
+        /// Judge runner: `synthetic` (recorded fake evidence, no model call) or `local` (the judge
+        /// graph as a real `zeroshot run`), overriding `options.judgeRunner`.
+        #[arg(long, global = true, value_name = "RUNNER")]
+        judge_runner: Option<String>,
 
         #[command(subcommand)]
         command: EvalCommand,
@@ -276,6 +277,22 @@ struct EvalWeightArgs {
     /// Time exponent `b` in `S = Q / (C^a * T^b)`, overriding `options.score.b`.
     #[arg(long, value_name = "B")]
     time_weight: Option<f64>,
+
+    /// USD per 1M uncached input (read) tokens, overriding the manifest pricing.
+    #[arg(long, value_name = "USD")]
+    price_input: Option<f64>,
+
+    /// USD per 1M output (write) tokens, overriding the manifest pricing.
+    #[arg(long, value_name = "USD")]
+    price_output: Option<f64>,
+
+    /// USD per 1M cache-read input tokens, overriding the manifest pricing.
+    #[arg(long, value_name = "USD")]
+    price_cache_read: Option<f64>,
+
+    /// USD per 1M cache-write (cache creation) input tokens, overriding the manifest pricing.
+    #[arg(long, value_name = "USD")]
+    price_cache_write: Option<f64>,
 }
 
 #[derive(Debug, Args)]
@@ -568,6 +585,9 @@ enum TemplateName {
 
     /// Review a PR diff, conditionally reproduce behavior, and post a concise report.
     PrReview,
+
+    /// Judge a patch against acceptance traits and return per-trait pass/fail JSON (eval judge).
+    EvalJudge,
 }
 
 #[derive(Debug, Args)]

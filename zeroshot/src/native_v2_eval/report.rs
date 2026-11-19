@@ -59,8 +59,6 @@ pub struct TraitMatrixRow {
     pub run_index: u32,
     pub status: SampleStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub judge_model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge_executor: Option<String>,
     pub cells: BTreeMap<String, TraitCell>,
 }
@@ -88,7 +86,7 @@ pub struct TraitSummary {
     pub attempted: u64,
     pub skipped: u64,
     pub rate: f64,
-    /// Judge score mean on the 1..=5 scale. Old boolean-only results omit it.
+    /// Mean of the judge's pass indicator (1 pass, 0 fail) over judged samples.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mean_score: Option<f64>,
     #[serde(default)]
@@ -149,16 +147,12 @@ pub struct XyOutlier {
     pub run_index: u32,
     pub x_score: f64,
     pub y_score: f64,
-    /// Y - X on the 1..=5 scale.
+    /// Y - X of the per-trait pass rates (1 = pass, 0 = fail).
     pub difference: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub x_reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub y_reasoning: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub x_judge_model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub y_judge_model: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -342,7 +336,7 @@ pub fn render_markdown(report: &EvalReport) -> String {
             escape(&row.arm_id),
             row.run_index,
             status_label(row.status),
-            judge_label(row.judge_model.as_deref(), row.judge_executor.as_deref())
+            judge_label(row.judge_executor.as_deref())
         );
         for column in &report.matrix.columns {
             let cell = row.cells.get(&column.id);
@@ -448,7 +442,7 @@ pub fn render_markdown(report: &EvalReport) -> String {
         let _ = writeln!(out);
         let _ = writeln!(
             out,
-            "X is `{}`, Y is `{}`. Difference is Y - X on the judge's 1..=5 scale; positive values favor Y.",
+            "X is `{}`, Y is `{}`. Means are pass rates (1 = pass, 0 = fail); the difference is Y - X, and positive values favor Y.",
             escape(&comparison.arm_x),
             escape(&comparison.arm_y)
         );
@@ -488,20 +482,10 @@ pub fn render_markdown(report: &EvalReport) -> String {
                     outlier.difference
                 );
                 if let Some(reasoning) = &outlier.x_reasoning {
-                    let _ = writeln!(
-                        out,
-                        "  - X{}: {}",
-                        model_suffix(outlier.x_judge_model.as_deref()),
-                        escape(reasoning)
-                    );
+                    let _ = writeln!(out, "  - X: {}", escape(reasoning));
                 }
                 if let Some(reasoning) = &outlier.y_reasoning {
-                    let _ = writeln!(
-                        out,
-                        "  - Y{}: {}",
-                        model_suffix(outlier.y_judge_model.as_deref()),
-                        escape(reasoning)
-                    );
+                    let _ = writeln!(out, "  - Y: {}", escape(reasoning));
                 }
             }
         }
@@ -615,7 +599,6 @@ fn matrix_row(sample: &EvalSample, columns: &[TraitColumn]) -> TraitMatrixRow {
         arm_id: sample.arm_id.clone(),
         run_index: sample.run_index,
         status: sample.status,
-        judge_model: sample.judge_model.clone(),
         judge_executor: sample.judge_executor.clone(),
         cells,
     }
@@ -804,8 +787,6 @@ fn comparison(
                     difference: y.values.0 - x.values.0,
                     x_reasoning: x.values.1,
                     y_reasoning: y.values.1,
-                    x_judge_model: x_sample.judge_model.clone(),
-                    y_judge_model: y_sample.judge_model.clone(),
                 })
                 .collect::<Vec<_>>();
             XyTrait {
@@ -923,19 +904,8 @@ fn mean_label(value: Option<f64>) -> String {
     value.map_or_else(|| "-".to_owned(), |value| format!("{value:.2}"))
 }
 
-fn model_suffix(model: Option<&str>) -> String {
-    model.map_or_else(String::new, |model| format!(" (`{}`)", escape(model)))
-}
-
-fn judge_label(model: Option<&str>, executor: Option<&str>) -> String {
-    match (model, executor) {
-        (Some(model), Some(executor)) => {
-            format!("`{}` ({})", escape(model), escape(executor))
-        }
-        (Some(model), None) => format!("`{}`", escape(model)),
-        (None, Some(executor)) => format!("- ({})", escape(executor)),
-        (None, None) => "-".to_owned(),
-    }
+fn judge_label(executor: Option<&str>) -> String {
+    executor.map_or_else(|| "-".to_owned(), escape)
 }
 
 fn escape(value: &str) -> String {

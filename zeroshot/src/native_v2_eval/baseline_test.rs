@@ -85,7 +85,6 @@ fn sample(manifest: &EvalManifest, run: &Run) -> EvalSample {
         patch: None,
         criteria,
         reasoning: BTreeMap::new(),
-        judge_model: None,
         judge_template: None,
         judge_checkout: None,
         judge_executor: None,
@@ -190,7 +189,7 @@ fn slide_table_ratio_comes_from_the_means() {
     assert_eq!(comparison.cost_unit, CostUnit::Usd);
     assert_eq!(comparison.pairs.len(), 5);
     assert_eq!(comparison.baseline.runs, 5);
-    let ratio = comparison.ratio.expect("ratio");
+    let ratio = comparison.mean_ratio.expect("ratio");
     assert!(
         (ratio - expected_ratio).abs() < 1e-6,
         "{ratio} vs {expected_ratio}"
@@ -272,7 +271,7 @@ fn failed_runs_count_with_zero_quality_and_skipped_runs_are_excluded() {
     assert!(close(candidate.quality.expect("q"), 0.5));
     assert!(close(candidate.cost.expect("c"), 1.0));
     let expected = (0.5 / (1.0_f64 * 10.0).sqrt()) / (0.5 / (2.0_f64 * 15.0).sqrt());
-    assert!(close(comparison.ratio.expect("ratio"), expected));
+    assert!(close(comparison.mean_ratio.expect("ratio"), expected));
     assert!(
         comparison
             .notes
@@ -320,7 +319,7 @@ fn runs_that_failed_before_starting_are_excluded_from_the_means() {
     assert_eq!(comparison.baseline.runs, 1);
     assert_eq!(comparison.baseline.not_started, 1);
     assert_eq!(comparison.baseline.failed, 0);
-    assert!(close(comparison.ratio.expect("ratio"), 1.0));
+    assert!(close(comparison.mean_ratio.expect("ratio"), 1.0));
     assert!(
         comparison
             .notes
@@ -340,10 +339,10 @@ fn runs_that_failed_before_starting_are_excluded_from_the_means() {
 fn cost_prefers_recorded_usd_then_pricing_then_tokens() {
     let mut manifest = manifest();
     manifest.options.pricing = Some(Pricing {
-        input: 3.0,
-        output: 15.0,
-        cache_read: 0.3,
-        cache_write: 3.75,
+        input: Some(3.0),
+        output: Some(15.0),
+        cache_read: Some(0.3),
+        cache_write: Some(3.75),
     });
     let runs = [
         Run {
@@ -390,10 +389,10 @@ fn cost_prefers_recorded_usd_then_pricing_then_tokens() {
 #[test]
 fn pricing_splits_cache_reads_and_writes() {
     let pricing = Pricing {
-        input: 1.0,
-        output: 2.0,
-        cache_read: 0.1,
-        cache_write: 1.25,
+        input: Some(1.0),
+        output: Some(2.0),
+        cache_read: Some(0.1),
+        cache_write: Some(1.25),
     };
     let split = TokenUsage {
         input: 1_000_000,
@@ -402,14 +401,115 @@ fn pricing_splits_cache_reads_and_writes() {
         cache_read: 2_000_000,
         cache_write: 1_000_000,
     };
-    assert!(close(pricing.cost_usd(&split), 1.0 + 2.0 + 0.2 + 1.25));
+    assert!(close(
+        pricing.cost_usd(&split).expect("all prices set"),
+        1.0 + 2.0 + 0.2 + 1.25
+    ));
     let unsplit = TokenUsage {
         input: 0,
         output: 0,
         cache: 1_000_000,
         ..TokenUsage::default()
     };
-    assert!(close(pricing.cost_usd(&unsplit), 0.1));
+    // Without a read/write split the cost depends on which price applies, so it is not guessed.
+    assert!(pricing.cost_usd(&unsplit).is_err());
+    let flat_cache = Pricing {
+        cache_read: Some(0.5),
+        cache_write: Some(0.5),
+        ..pricing
+    };
+    assert!(close(
+        flat_cache.cost_usd(&unsplit).expect("equal cache prices"),
+        0.5
+    ));
+}
+
+#[test]
+fn missing_prices_are_named_and_never_invented() {
+    let tokens = TokenUsage {
+        input: 1_000_000,
+        output: 1_000_000,
+        cache: 1_000_000,
+        cache_read: 1_000_000,
+        cache_write: 0,
+    };
+    let only_input = Pricing {
+        input: Some(1.0),
+        ..Pricing::default()
+    };
+    assert_eq!(
+        only_input
+            .cost_usd(&tokens)
+            .expect_err("output and cacheRead are unpriced"),
+        vec!["output", "cacheRead"]
+    );
+    // A missing price for a token kind that was not used is fine.
+    let no_cache = Pricing {
+        input: Some(1.0),
+        output: Some(2.0),
+        ..Pricing::default()
+    };
+    assert!(close(
+        no_cache
+            .cost_usd(&TokenUsage {
+                input: 1_000_000,
+                output: 500_000,
+                ..TokenUsage::default()
+            })
+            .expect("only used kinds need a price"),
+        2.0
+    ));
+
+    let mut manifest = manifest();
+    manifest.options.pricing = Some(only_input);
+    let runs = [
+        Run {
+            arm: "baseline",
+            index: 0,
+            status: SampleStatus::Succeeded,
+            minutes: 1.0,
+            cost: None,
+            passed: &[true, true],
+        },
+        Run {
+            arm: "candidate",
+            index: 0,
+            status: SampleStatus::Succeeded,
+            minutes: 1.0,
+            cost: None,
+            passed: &[true, true],
+        },
+    ];
+    let comparison = compare(&data(manifest.clone(), &runs)).expect("comparison");
+    assert_eq!(comparison.cost_unit, CostUnit::Mtok);
+    assert!(
+        comparison
+            .notes
+            .iter()
+            .any(|note| note.contains("without a price (output)"))
+    );
+
+    // An arm price fills the gap for that arm only; options pricing covers the rest.
+    manifest.options.pricing = Some(only_input);
+    manifest.arms[1].pricing = Some(Pricing {
+        output: Some(10.0),
+        ..Pricing::default()
+    });
+    manifest.arms[0].pricing = Some(Pricing {
+        output: Some(20.0),
+        ..Pricing::default()
+    });
+    let comparison = compare(&data(manifest, &runs)).expect("comparison");
+    assert_eq!(comparison.cost_unit, CostUnit::Usd);
+    // 1M input * $1 + 100k output * $20 or $10 per million tokens.
+    assert!(close(
+        comparison.pairs[0].baseline.as_ref().unwrap().cost,
+        3.0
+    ));
+    assert!(close(
+        comparison.pairs[0].candidate.as_ref().unwrap().cost,
+        2.0
+    ));
 }
 
 #[test]
@@ -452,8 +552,10 @@ fn csv_exports_have_the_slide_table_and_long_rows() {
         lines[2]
     );
     assert!(lines[3].starts_with("mean,25,2.5,0.75,"), "{}", lines[3]);
-    assert!(lines[4].starts_with("ratio,,,,,,,,"));
-    assert_eq!(lines.len(), 5);
+    assert!(lines[4].starts_with("median,25,2.5,0.75,"), "{}", lines[4]);
+    assert!(lines[5].starts_with("ratio_mean,,,,,,,,"), "{}", lines[5]);
+    assert!(lines[6].starts_with("ratio_median,,,,,,,,"), "{}", lines[6]);
+    assert_eq!(lines.len(), 7);
 
     let runs_csv = runs_csv(&comparison);
     let rows = runs_csv.lines().collect::<Vec<_>>();
@@ -506,7 +608,7 @@ fn score_options_select_arms_and_validate_weights() {
     assert_eq!(comparison.baseline_arm, "candidate");
     assert_eq!(comparison.candidate_arm, "baseline");
     assert!(close(comparison.a, 0.2));
-    assert!(close(comparison.ratio.expect("ratio"), 2.0));
+    assert!(close(comparison.mean_ratio.expect("ratio"), 2.0));
 
     for (replacement, message) in [
         ("a = 1.5", "options.score.a"),

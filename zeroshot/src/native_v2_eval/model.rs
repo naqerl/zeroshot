@@ -128,9 +128,6 @@ pub struct EvalSample {
     pub criteria: BTreeMap<String, CriterionResult>,
     #[serde(default)]
     pub reasoning: BTreeMap<String, String>,
-    /// Provider-owned model identifier that judged this sample, when it was judged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub judge_model: Option<String>,
     /// Judge graph template used for this sample, when it was judged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge_template: Option<String>,
@@ -197,7 +194,7 @@ impl TokenUsage {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CriterionResult {
     pub passed: bool,
-    /// Judge score on the documented 1..=5 scale. Older boolean results omit it.
+    /// Judge verdict as a number: 1 for pass, 0 for fail. Older captures may carry other scores.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
