@@ -1,3 +1,4 @@
+use super::cli::execute_fixture;
 use super::*;
 use serde_json::json;
 
@@ -496,13 +497,15 @@ fn eval_judge_template_is_a_valid_builtin_graph() {
     assert_eq!(template.name, "eval-judge");
     assert_eq!(template.graph.root.name().as_str(), "run");
     assert!(template.source.contains("policy.native-v2@1"));
+    assert!(template.source.contains("working directory"));
+    assert!(template.source.contains("checkout"));
 }
 
 #[tokio::test]
 async fn cli_judge_action_records_synthetic_model_and_comparison() {
     let temporary = tempfile::tempdir().expect("temporary workspace");
     let data = run_fixture_in(temporary.path(), "fixture-cli-judge", fixture_source()).await;
-    let report = execute(&EvalCommand {
+    let report = execute_fixture(&EvalCommand {
         directory: temporary.path().to_path_buf(),
         action: EvalAction::Judge(EvalJudgeCommand {
             id: data.id.to_string(),
@@ -512,7 +515,7 @@ async fn cli_judge_action_records_synthetic_model_and_comparison() {
         }),
     })
     .await
-    .expect("judge action succeeds");
+    .expect("fixture judge action succeeds");
     assert_eq!(report["comparison"]["armX"], "baseline");
     assert_eq!(report["comparison"]["armY"], "candidate");
     assert_eq!(report["comparison"]["traits"][0]["scoredPairs"], 2);
@@ -538,19 +541,40 @@ fn custom_judge_template_loads_from_a_graph_json_path() {
 }
 
 #[tokio::test]
-async fn manifest_judge_defaults_judge_a_plain_run() {
+async fn manifest_judge_defaults_without_a_runtime_fail_closed() {
     let temporary = tempfile::tempdir().expect("temporary workspace");
-    let data = run_fixture_in(temporary.path(), "fixture-default-judge", fixture_source()).await;
-    let report = data
-        .report
-        .as_ref()
-        .expect("plain run writes a judged report");
-    assert!(report.comparison.is_some());
-    assert!(report.matrix.rows.iter().any(|row| {
-        row.status == SampleStatus::Succeeded
-            && row.judge_model.as_deref() == Some("synthetic-judge")
-            && row.judge_executor.as_deref() == Some("fixture")
-    }));
+    let source = fixture_source().replace(
+        "seed = 7",
+        "seed = 7\njudgeModel = \"synthetic-judge\"\njudgeTemplate = \"eval-judge\"",
+    );
+    let manifest = write_fixture(temporary.path(), &source);
+    let error = run_fixture(
+        manifest,
+        temporary.path(),
+        Some("fixture-default-judge".to_owned()),
+    )
+    .await
+    .expect_err("judging without a real runtime fails closed");
+    assert!(error.to_string().contains("judgeRuntimeConfig"));
+}
+
+#[tokio::test]
+async fn fixture_judge_refuses_to_relabel_another_models_scores() {
+    let template = resolve_judge_template("eval-judge").expect("built-in template");
+    let sample = serde_json::to_string(&json!({
+        "id": "baseline-0000",
+        "judgeModel": "model-a",
+        "criteria": {
+            "correctness": { "passed": true, "score": 5.0, "reasoning": "old" }
+        }
+    }))
+    .expect("sample serializes");
+    let input = json!({ "criterion": "correctness", "sample": sample });
+    let error = FixtureJudgeGraphExecutor
+        .execute(&template, "model-b", input)
+        .await
+        .expect_err("fixture evidence cannot be relabeled");
+    assert!(error.to_string().contains("refusing to relabel"));
 }
 
 #[derive(Clone)]
@@ -769,7 +793,7 @@ async fn judge_captures_command_imports_slice_two_directories() {
             );
         }
     }
-    let report = execute(&EvalCommand {
+    let report = execute_fixture(&EvalCommand {
         directory: temporary.path().to_path_buf(),
         action: EvalAction::JudgeCaptures(EvalJudgeCapturesCommand {
             manifest,
@@ -807,7 +831,7 @@ async fn judge_captures_fail_closed_without_recorded_evidence_or_runtime() {
     let manifest = write_fixture(temporary.path(), fixture_source());
     let captures = temporary.path().join("captures");
     write_checkout_capture(&captures.join("baseline").join("run-0"), "baseline-0000");
-    let error = execute(&EvalCommand {
+    let error = execute_fixture(&EvalCommand {
         directory: temporary.path().to_path_buf(),
         action: EvalAction::JudgeCaptures(EvalJudgeCapturesCommand {
             manifest,
@@ -919,7 +943,7 @@ async fn judge_captures_keeps_failed_captures_without_a_patch_reproducibly() {
         "candidate-0000",
         "run-candidate-0",
     );
-    let report = execute(&EvalCommand {
+    let report = execute_fixture(&EvalCommand {
         directory: temporary.path().to_path_buf(),
         action: EvalAction::JudgeCaptures(EvalJudgeCapturesCommand {
             manifest,
@@ -945,7 +969,7 @@ async fn judge_captures_keeps_failed_captures_without_a_patch_reproducibly() {
             .count(),
         1
     );
-    let rescored = execute(&EvalCommand {
+    let rescored = execute_fixture(&EvalCommand {
         directory: temporary.path().to_path_buf(),
         action: EvalAction::Score {
             id: id.to_string(),
@@ -1078,7 +1102,7 @@ async fn judge_capture_pairing_uses_the_sample_id_run_suffix() {
         "candidate-0007",
         "run-candidate-7",
     );
-    execute(&EvalCommand {
+    execute_fixture(&EvalCommand {
         directory: temporary.path().to_path_buf(),
         action: EvalAction::JudgeCaptures(EvalJudgeCapturesCommand {
             manifest,
@@ -1674,6 +1698,28 @@ fn nested_outcome_capture_document_is_still_importable() {
 }
 
 #[tokio::test]
+async fn judge_captured_samples_reports_skipped_captures() {
+    let temporary = tempfile::tempdir().expect("temporary workspace");
+    let succeeded = temporary.path().join("succeeded");
+    write_capture(&succeeded, "baseline-0000", "run-baseline-0");
+    let failed = temporary.path().join("failed");
+    write_failed_capture(&failed, "baseline-0001", "run-baseline-1");
+    let result = judge_captured_samples(
+        &FakeJudge,
+        &[criterion("correctness")],
+        vec![
+            captured_sample_from_directory(&succeeded, "baseline", 0).expect("succeeded capture"),
+            captured_sample_from_directory(&failed, "baseline", 1).expect("failed capture"),
+        ],
+        JudgeOptions::default().with_model("judge-model"),
+    )
+    .await
+    .expect("captures are judged");
+    assert_eq!(result.judged.len(), 1);
+    assert_eq!(result.skipped, vec!["baseline-0001".to_owned()]);
+}
+
+#[tokio::test]
 async fn judge_captured_samples_fails_closed_without_a_patch() {
     let captured = CapturedSampleInput {
         sample: EvalSample {
@@ -1769,7 +1815,7 @@ async fn judge_captures_rolls_back_a_new_eval_when_a_later_judgement_is_invalid(
     std::fs::write(&sample_path, serde_json::to_vec(&document).unwrap()).expect("rewrite capture");
 
     let store = EvalStore::for_workspace(temporary.path());
-    let error = execute(&EvalCommand {
+    let error = execute_fixture(&EvalCommand {
         directory: temporary.path().to_path_buf(),
         action: EvalAction::JudgeCaptures(EvalJudgeCapturesCommand {
             manifest,

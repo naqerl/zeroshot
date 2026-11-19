@@ -118,7 +118,7 @@ impl JudgeGraphExecutor for FixtureJudgeGraphExecutor {
     async fn execute(
         &self,
         template: &JudgeTemplate,
-        _model: &str,
+        model: &str,
         input: Value,
     ) -> Result<Value, EvalError> {
         if !has_step(&template.graph.root) {
@@ -137,6 +137,13 @@ impl JudgeGraphExecutor for FixtureJudgeGraphExecutor {
         let sample: Value = serde_json::from_str(sample_source).map_err(|error| {
             EvalError::Judge(format!("judge input sample is not JSON: {error}"))
         })?;
+        if let Some(existing) = sample.get("judgeModel").and_then(Value::as_str) {
+            if existing != model {
+                return Err(EvalError::Judge(format!(
+                    "synthetic judge evidence was produced by model {existing:?}; refusing to relabel it as {model:?} without a real judgeRuntimeConfig"
+                )));
+            }
+        }
         let result = sample
             .get("criteria")
             .and_then(|criteria| criteria.get(criterion))

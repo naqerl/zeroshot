@@ -71,6 +71,13 @@ pub struct JudgedSample {
     pub result: JudgeResult,
 }
 
+/// Result of judging capture directories, including the samples that were not judged.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JudgedCaptures {
+    pub judged: Vec<JudgedSample>,
+    pub skipped: Vec<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct JudgedSampleSummary {
@@ -201,7 +208,7 @@ pub async fn judge_captured_samples<J: Judge>(
     criteria: &[EvalCriterion],
     samples: Vec<CapturedSampleInput>,
     options: JudgeOptions,
-) -> Result<Vec<JudgedSample>, EvalError> {
+) -> Result<JudgedCaptures, EvalError> {
     let template = options
         .template
         .clone()
@@ -215,9 +222,11 @@ pub async fn judge_captured_samples<J: Judge>(
             EvalError::Command("judge model is required for captured samples".to_owned())
         })?;
     let mut judged = Vec::with_capacity(samples.len());
+    let mut skipped = Vec::new();
     for captured in samples {
         let mut sample = captured.sample;
         if sample.status != SampleStatus::Succeeded {
+            skipped.push(sample.id);
             continue;
         }
         let Some(patch) = captured.patch else {
@@ -247,7 +256,7 @@ pub async fn judge_captured_samples<J: Judge>(
             result,
         });
     }
-    Ok(judged)
+    Ok(JudgedCaptures { judged, skipped })
 }
 
 /// Read `sample.json` and `patch.diff` from one capture directory. `arm_id` and `run_index` are
@@ -261,8 +270,18 @@ pub fn captured_sample_from_directory(
     let bytes = std::fs::read(&sample_path).map_err(|error| EvalError::io(&sample_path, error))?;
     let sample_json: Value = serde_json::from_slice(&bytes)?;
     // The public artifact is the preferred shape; older nested `outcome` documents fall back to
-    // the conventional `patch.diff` path and their optional checkout metadata is unavailable.
-    let artifact = super::SampleArtifact::read(directory).ok();
+    // the conventional `patch.diff` path and their optional checkout metadata is unavailable. A
+    // malformed current artifact is never treated as that legacy shape.
+    let artifact = match super::SampleArtifact::read(directory) {
+        Ok(artifact) => Some(artifact),
+        Err(_) if is_legacy_nested_document(&sample_json) => None,
+        Err(error) => {
+            return Err(EvalError::data(
+                directory.join(super::SAMPLE_FILE),
+                error.to_string(),
+            ));
+        }
+    };
     let patch_relative = artifact
         .as_ref()
         .and_then(|artifact| artifact.captured.as_ref())
@@ -299,6 +318,10 @@ pub fn captured_sample_from_directory(
         sample_json,
         checkout,
     })
+}
+
+fn is_legacy_nested_document(document: &Value) -> bool {
+    document.get("outcome").is_some_and(Value::is_object)
 }
 
 pub(crate) fn capture_relative_path(
@@ -512,3 +535,7 @@ fn sample_from_capture(
         judge_executor: None,
     })
 }
+
+#[cfg(test)]
+#[path = "judge_runner_test.rs"]
+mod tests;

@@ -1082,7 +1082,7 @@ async fn cli_backend_path_runs_the_selected_platform_runner() {
 }
 
 #[tokio::test]
-async fn local_judge_graph_executor_applies_the_model_and_parses_terminal_output() {
+async fn local_judge_graph_executor_applies_the_model_and_uses_the_delivered_checkout() {
     use crate::native_v2_contract::{DeclaredConnections, ModelId, NodeRuntimeBinding, RuntimePlan};
     use crate::native_v2_eval::{
         EvalCriterion, EvalSample, Judge, JudgeRequest, LocalJudgeGraphExecutor, SampleStatus,
@@ -1113,6 +1113,9 @@ async fn local_judge_graph_executor_applies_the_model_and_parses_terminal_output
         LocalJudgeGraphExecutor::new(Arc::clone(&backend), runtime, live_workspace.path());
     let template = resolve_judge_template("eval-judge").expect("template");
     let judge = TemplateJudge::new(executor, template);
+    let checkout = tempfile::tempdir().expect("delivered checkout");
+    std::fs::write(checkout.path().join("source.rs"), "fn delivered() {}\n")
+        .expect("checkout file");
     let sample = EvalSample {
         id: "baseline-0000".to_owned(),
         run_id: "run".to_owned(),
@@ -1140,7 +1143,8 @@ async fn local_judge_graph_executor_applies_the_model_and_parses_terminal_output
         }],
         "patch",
         "per-arm-model",
-    );
+    )
+    .with_checkout(checkout.path().to_string_lossy());
     let result = judge.judge(request).await.expect("judge executes");
     assert_eq!(result.judgements["correctness"].score, 4.0);
     let submitted = backend.last_request().expect("request submitted");
@@ -1152,13 +1156,51 @@ async fn local_judge_graph_executor_applies_the_model_and_parses_terminal_output
         NodeRuntimeBinding::Agent { model, .. } => assert_eq!(model.as_str(), "per-arm-model"),
         _ => panic!("agent binding"),
     }
-    assert!(
-        submitted
-            .cwd
-            .expect("scratch cwd")
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with("zeroshot-judge-"))
+    assert_eq!(
+        submitted.cwd.as_deref(),
+        Some(
+            std::fs::canonicalize(checkout.path())
+                .expect("canonical checkout")
+                .as_path()
+        )
     );
+}
+
+#[tokio::test]
+async fn local_judge_graph_executor_fails_closed_without_a_checkout() {
+    use crate::native_v2_contract::{DeclaredConnections, ModelId, NodeRuntimeBinding};
+    use crate::native_v2_eval::{JudgeGraphExecutor, LocalJudgeGraphExecutor, resolve_judge_template};
+    use openengine_cluster_protocol::{NodeName, RunSize, SessionScope};
+    use std::collections::BTreeMap;
+
+    let backend = Arc::new(ScriptedBackend::new(Vec::new(), Duration::ZERO));
+    let node = NodeName::new("judge").expect("node");
+    let mut nodes = BTreeMap::new();
+    nodes.insert(
+        node,
+        NodeRuntimeBinding::Agent {
+            lane: None,
+            model: ModelId::new("authored-model").expect("model"),
+            effort: None,
+            session_scope: SessionScope::Execution,
+            connections: DeclaredConnections::empty(),
+        },
+    );
+    let runtime = crate::native_v2_candidate::test_support::codex_runtime(RunSize::Small, nodes);
+    let live_workspace = tempfile::tempdir().expect("live workspace");
+    let executor =
+        LocalJudgeGraphExecutor::new(Arc::clone(&backend), runtime, live_workspace.path());
+    let template = resolve_judge_template("eval-judge").expect("template");
+    let error = executor
+        .execute(
+            &template,
+            "per-arm-model",
+            json!({"criterion":"correctness","checkout":""}),
+        )
+        .await
+        .expect_err("a missing checkout fails closed");
+    assert!(error.to_string().contains("captured checkout"));
+    assert_eq!(backend.submits(), 0);
 }
 
 #[tokio::test]
@@ -1192,6 +1234,7 @@ async fn local_judge_graph_executor_rejects_connection_requirements_before_submi
     );
     let runtime = crate::native_v2_candidate::test_support::codex_runtime(RunSize::Small, nodes);
     let live_workspace = tempfile::tempdir().expect("live workspace");
+    let checkout = tempfile::tempdir().expect("delivered checkout");
     let executor =
         LocalJudgeGraphExecutor::new(Arc::clone(&backend), runtime, live_workspace.path());
     let template = resolve_judge_template("eval-judge").expect("template");
@@ -1199,7 +1242,10 @@ async fn local_judge_graph_executor_rejects_connection_requirements_before_submi
         .execute(
             &template,
             "per-arm-model",
-            json!({"criterion":"correctness"}),
+            json!({
+                "criterion": "correctness",
+                "checkout": checkout.path().to_string_lossy(),
+            }),
         )
         .await
         .expect_err("connection requirements fail closed");

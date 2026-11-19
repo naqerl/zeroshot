@@ -915,20 +915,69 @@ fn mean_label(value: Option<f64>) -> String {
 }
 
 fn model_suffix(model: Option<&str>) -> String {
-    model.map_or_else(String::new, |model| format!(" (`{}`)", escape(model)))
+    model.map_or_else(String::new, |model| format!(" ({})", code_span(model)))
 }
 
 fn judge_label(model: Option<&str>, executor: Option<&str>) -> String {
     match (model, executor) {
         (Some(model), Some(executor)) => {
-            format!("`{}` ({})", escape(model), escape(executor))
+            format!("{} ({})", code_span(model), escape(executor))
         }
-        (Some(model), None) => format!("`{}`", escape(model)),
+        (Some(model), None) => code_span(model),
         (None, Some(executor)) => format!("- ({})", escape(executor)),
         (None, None) => "-".to_owned(),
     }
 }
 
-fn escape(value: &str) -> String {
-    value.replace('|', "\\|").replace(['\n', '\r'], " ")
+fn code_span(value: &str) -> String {
+    let content = escape(value);
+    let fence = "`".repeat(longest_backtick_run(&content).saturating_add(1));
+    if content.starts_with('`') || content.ends_with('`') {
+        format!("{fence} {content} {fence}")
+    } else {
+        format!("{fence}{content}{fence}")
+    }
 }
+
+fn escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '|' => escaped.push_str("\\|"),
+            _ if is_cell_control(character) => escaped.push(' '),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn is_cell_control(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
+fn longest_backtick_run(value: &str) -> usize {
+    let mut longest = 0;
+    let mut current = 0;
+    for character in value.chars() {
+        if character == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
+}
+
+#[cfg(test)]
+#[path = "report_test.rs"]
+mod tests;

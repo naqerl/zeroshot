@@ -11,12 +11,11 @@ use crate::native_v2_cli::NativeV2CliBackend;
 use super::{
     BackendSampleRequest, Capacity, CapacitySource, EvalArm, EvalCriterion, EvalData, EvalError,
     EvalId, EvalManifest, EvalReport, EvalRunError, EvalRunRequest, EvalSample, EvalSamplePlan,
-    EvalStore, FakeRunner, FakeSampleRequest, FixtureJudgeGraphExecutor, JUDGE_TEMPLATE_NAME,
-    JudgeGraphExecutor, JudgeOptions, LocalJudgeGraphExecutor, LocalRunner, PatchArtifact,
-    PlatformRunner, SampleArtifact, SampleOutcome, SampleRunner, SampleStatus, SampleTiming,
-    ScorerInput, ScorerRegistry, TemplateJudge, TokenUsage, captured_sample_from_directory,
-    judge_eval, load_judge_runtime, model::now_ms, report, resolve_judge_template,
-    store::timestamp,
+    EvalStore, FakeRunner, FakeSampleRequest, JUDGE_TEMPLATE_NAME, JudgeGraphExecutor,
+    JudgeOptions, LocalJudgeGraphExecutor, LocalRunner, PatchArtifact, PlatformRunner,
+    SampleArtifact, SampleOutcome, SampleRunner, SampleStatus, SampleTiming, ScorerInput,
+    ScorerRegistry, TemplateJudge, TokenUsage, captured_sample_from_directory, judge_eval,
+    load_judge_runtime, model::now_ms, report, resolve_judge_template, store::timestamp,
 };
 
 /// CLI command family wired as `zeroshot eval ...`.
@@ -114,6 +113,20 @@ pub fn select_runner(manifest: &EvalManifest) -> Result<RunnerSelection, EvalErr
 }
 
 pub async fn execute(command: &EvalCommand) -> Result<Value, EvalError> {
+    execute_impl(command, false).await
+}
+
+/// Explicit unit-test entrypoint for the synthetic fixture judge. Production CLI execution never
+/// reaches the fixture executor because [`execute`] passes `false`.
+#[cfg(test)]
+pub(super) async fn execute_fixture(command: &EvalCommand) -> Result<Value, EvalError> {
+    execute_impl(command, true).await
+}
+
+async fn execute_impl(
+    command: &EvalCommand,
+    allow_fixture_executor: bool,
+) -> Result<Value, EvalError> {
     let store = EvalStore::for_workspace(&command.directory);
     match &command.action {
         EvalAction::Run(run) => {
@@ -152,14 +165,15 @@ pub async fn execute(command: &EvalCommand) -> Result<Value, EvalError> {
                 scorer: command.scorer.clone(),
                 executor: None,
             };
-            judge_with_template(&store, &mut data, options).await?;
+            judge_with_template(&store, &mut data, options, allow_fixture_executor).await?;
             let report = data
                 .report
                 .ok_or_else(|| EvalError::ReportUnavailable(data.id.to_string()))?;
             Ok(serde_json::to_value(report)?)
         }
         EvalAction::JudgeCaptures(command) => {
-            let report = run_captures_through_judge(&store, command.clone()).await?;
+            let report =
+                run_captures_through_judge(&store, command.clone(), allow_fixture_executor).await?;
             Ok(serde_json::to_value(report)?)
         }
         EvalAction::Clean { id, all } => clean(&store, id.as_deref(), *all),
@@ -169,6 +183,7 @@ pub async fn execute(command: &EvalCommand) -> Result<Value, EvalError> {
 async fn run_captures_through_judge(
     store: &EvalStore,
     mut command: EvalJudgeCapturesCommand,
+    allow_fixture_executor: bool,
 ) -> Result<EvalReport, EvalError> {
     if !command.captures.is_dir() {
         return Err(EvalError::Command(format!(
@@ -261,7 +276,7 @@ async fn run_captures_through_judge(
             samples,
             report: None,
         };
-        judge_with_template(store, &mut data, options).await?;
+        judge_with_template(store, &mut data, options, allow_fixture_executor).await?;
         data.report
             .ok_or_else(|| EvalError::ReportUnavailable(data.id.to_string()))
     }
@@ -341,6 +356,7 @@ async fn judge_with_template(
     store: &EvalStore,
     data: &mut EvalData,
     mut options: JudgeOptions,
+    allow_fixture_executor: bool,
 ) -> Result<(), EvalError> {
     let reference = options
         .template
@@ -348,39 +364,64 @@ async fn judge_with_template(
         .or(data.manifest.options.judge_template.as_deref())
         .unwrap_or(JUDGE_TEMPLATE_NAME);
     let template = resolve_judge_template(reference)?;
-    let (executor, executor_kind): (Box<dyn JudgeGraphExecutor>, &str) =
-        match data.manifest.options.judge_runtime_config.as_deref() {
-            Some(runtime_path) => {
-                let workspace = store
-                    .root()
-                    .parent()
-                    .and_then(std::path::Path::parent)
-                    .unwrap_or_else(|| store.root())
-                    .to_owned();
-                let runtime_path = if std::path::Path::new(runtime_path).is_absolute() {
-                    std::path::PathBuf::from(runtime_path)
-                } else {
-                    workspace.join(runtime_path)
-                };
-                let runtime = load_judge_runtime(&runtime_path)?;
-                let backend = crate::native_v2_cli::local::LocalCliBackend::production().map_err(
-                    |error| EvalError::Command(format!("judge backend is unavailable: {error}")),
-                )?;
-                (
-                    Box::new(LocalJudgeGraphExecutor::new(
-                        Arc::new(backend),
-                        runtime,
-                        workspace,
-                    )),
-                    "graph",
-                )
-            }
-            None => (Box::new(FixtureJudgeGraphExecutor), "fixture"),
-        };
+    let (executor, executor_kind): (Box<dyn JudgeGraphExecutor>, &str) = match data
+        .manifest
+        .options
+        .judge_runtime_config
+        .as_deref()
+    {
+        Some(runtime_path) => {
+            let manifest_directory = store.root().join(data.id.as_str());
+            let workspace = store
+                .root()
+                .parent()
+                .and_then(std::path::Path::parent)
+                .unwrap_or_else(|| store.root())
+                .to_owned();
+            let runtime_path = resolve_manifest_path(&manifest_directory, runtime_path)?;
+            let runtime = load_judge_runtime(&runtime_path)?;
+            let backend =
+                crate::native_v2_cli::local::LocalCliBackend::production().map_err(|error| {
+                    EvalError::Command(format!("judge backend is unavailable: {error}"))
+                })?;
+            (
+                Box::new(LocalJudgeGraphExecutor::new(
+                    Arc::new(backend),
+                    runtime,
+                    workspace,
+                )),
+                "graph",
+            )
+        }
+        None if allow_fixture_executor => (Box::new(super::FixtureJudgeGraphExecutor), "fixture"),
+        None => {
+            return Err(EvalError::Judge(format!(
+                "eval judge requires a real judge runtime; set options.judgeRuntimeConfig in the manifest (the synthetic fixture executor is test-only and cannot judge model {})",
+                options.model.as_deref().unwrap_or("<unset>")
+            )));
+        }
+    };
     options.executor = Some(executor_kind.to_owned());
     let judge = TemplateJudge::new(executor, template);
     judge_eval(store, data, &judge, options).await?;
     Ok(())
+}
+
+pub(super) fn resolve_manifest_path(
+    manifest_directory: &std::path::Path,
+    value: &str,
+) -> Result<std::path::PathBuf, EvalError> {
+    let path = std::path::Path::new(value);
+    if path.is_absolute() {
+        return Ok(path.to_owned());
+    }
+    let base = if manifest_directory.is_absolute() {
+        manifest_directory.to_owned()
+    } else {
+        std::path::absolute(manifest_directory)
+            .map_err(|error| EvalError::io(manifest_directory, error))?
+    };
+    Ok(base.join(path))
 }
 
 pub(crate) async fn run_manifest_through_fake(
@@ -585,6 +626,7 @@ where
                 scorer: Some(scorer_name),
                 executor: None,
             },
+            false,
         )
         .await?;
     }
@@ -791,3 +833,7 @@ fn hex_digest(bytes: &[u8]) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
+
+#[cfg(test)]
+#[path = "cli_test.rs"]
+mod tests;

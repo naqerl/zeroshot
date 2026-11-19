@@ -132,10 +132,12 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   fields their own `initialInput` declares. Provider-backed CLI execution uses an authored
   `options.judgeRuntimeConfig` plan through the native-v2 local runner and applies the effective
   model to every agent binding; runtime plans with connection requirements fail closed. Without a
-  runtime plan the synthetic executor reuses recorded fake evidence and fails closed when a capture
-  has none; a succeeded sample with no captured patch is an error. Captured patch/checkout paths
-  stay inside the capture directory, graph judges run in private scratch, and slice-2 capture
-  directories are importable through `zeroshot eval judge-captures`.
+  runtime plan judging fails with an explicit error naming `options.judgeRuntimeConfig`; the
+  synthetic fixture executor is test-only. A succeeded sample with no captured patch or delivered
+  checkout is an error. Captured patch/checkout paths stay inside the capture directory,
+  provider-backed graph judges run with the delivered checkout as their working directory while
+  run artifacts use private scratch, and slice-2 capture directories are importable through
+  `zeroshot eval judge-captures`.
 - Protocol Rust types are the source of truth. Generated files under
   `protocol/openengine-cluster/v1/` must be regenerated through the Rust testkit, not hand-edited.
 - Initial input remains caller-owned and is validated unchanged. A root group may add required

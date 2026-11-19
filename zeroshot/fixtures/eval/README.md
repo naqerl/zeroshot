@@ -81,10 +81,12 @@ re-runs an arm. Configure the model per run, per arm, or in `[options]`:
 [options]
 judgeModel = "provider/default-judge"
 judgeTemplate = "eval-judge"
+judgeRuntimeConfig = "judge-runtime.json" # required for a real judge
 ```
 
 The `eval-judge` graph lives at `zeroshot/src/native_v2_templates/eval_judge.json`. A custom graph
 is any JSON path with the same input/output shape. Judgements use the inclusive 1..=5 scale, with
-3 as the pass threshold, and must provide short reasoning plus an `errors` array. The checked-in
-fixture declares both defaults, so a plain `zeroshot eval run` judges its captured samples. See
-`docs/guides/eval.md` for the contract and the X/Y report section.
+3 as the pass threshold, and must provide short reasoning plus an `errors` array. A plain
+`zeroshot eval run` records synthetic sample evidence; judging it requires an authored judge
+runtime. Without `judgeRuntimeConfig`, judging fails explicitly instead of relabeling synthetic
+scores as a model's judgement. See `docs/guides/eval.md` for the contract and the X/Y report section.

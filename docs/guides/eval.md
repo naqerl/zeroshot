@@ -11,10 +11,8 @@ for every manifest criterion, so a report explains *why* one arm scored above an
 The synthetic fixture is the smallest complete example:
 
 ```bash
-zeroshot eval run zeroshot/fixtures/eval/synthetic.toml --directory . --id synthetic-fixture \
-  --judge-model synthetic-judge --judge-template eval-judge
+zeroshot eval run zeroshot/fixtures/eval/synthetic.toml --directory . --id synthetic-fixture
 zeroshot eval report synthetic-fixture
-zeroshot eval judge synthetic-fixture --judge-model synthetic-judge
 zeroshot eval score synthetic-fixture --scorer quality-vs-cost
 ```
 
@@ -23,10 +21,10 @@ Every run keeps `manifest.toml`, `eval.json`, `samples/<arm>-<run>.json`, `patch
 
 ## Judgement contract
 
-A judge inspects one captured `patch.diff` (plus `sample.json` when the platform capture provides
-it) and returns one judgement per criterion. Scores use an inclusive **1..=5** scale; **3 is the
-pass threshold**. Reasoning is short prose that refers to the patch. Errors are concrete defects,
-not parser or provider noise.
+A judge inspects one captured `patch.diff`, the delivered checkout, and `sample.json` metadata when
+the platform capture provides them, then returns one judgement per criterion. Scores use an
+inclusive **1..=5** scale; **3 is the pass threshold**. Reasoning is short prose that refers to the
+patch or surrounding code. Errors are concrete defects, not parser or provider noise.
 
 ```json
 {
@@ -76,8 +74,8 @@ scorer = "quality-vs-cost"
 runner = "fake"
 judgeModel = "provider/default-judge"
 judgeTemplate = "eval-judge"
-# Optional: execute the graph with this runtime instead of the synthetic executor.
-# judgeRuntimeConfig = "judge-runtime.json"
+# Required for judging: an authored, secret-free native-v2 runtime plan.
+judgeRuntimeConfig = "judge-runtime.json"
 
 [[arms]]
 id = "baseline"
@@ -103,26 +101,28 @@ description = "The change avoids unnecessary work."
 weight = 1.0
 ```
 
-The stored report records the exact model and executor (`fixture` or `graph`) on each judged sample
-and in the matrix's `Judge` column, so a judged report is reproducible and a synthetic judgement is
-distinguishable from a provider-backed one. A capture without recorded criterion evidence fails
-closed unless a `judgeRuntimeConfig` selects the real graph executor, and a succeeded sample with no
-captured patch is an error rather than a silent skip. Failed or skipped samples have no patch and are skipped
-by the judge rather than judged from missing evidence.
+The stored report records the exact model and executor (`graph` for a real judge) on each judged
+sample and in the matrix's `Judge` column, so a judged report is reproducible. A succeeded sample
+with no captured patch is an error rather than a silent skip. Failed or skipped samples have no
+patch and are skipped by the judge rather than judged from missing evidence.
 
 `zeroshot eval run` accepts the same `--judge-model` and `--judge-template` overrides and judges the
 new run when any effective judge configuration exists, including the manifest and per-arm defaults.
+It still requires `options.judgeRuntimeConfig`; otherwise the run reports the explicit judge error.
 `zeroshot eval judge <id>` judges an existing store from its captured artifacts.
 
 To execute the judge graph with a real model, set `options.judgeRuntimeConfig` to an authored
-secret-free native-v2 runtime plan. Relative paths resolve against the manifest directory and the
-resolved absolute path is stored with the eval. The CLI then
-submits the selected template through the native-v2 local runner and applies the effective
-per-sample judge model to every agent binding before submission. Without a runtime plan, the
-synthetic CLI runner uses `FixtureJudgeGraphExecutor`, which reuses the fake runner's recorded
-criterion evidence instead of calling a model. Embedding runners can also pass a provider-backed
-`native_v2_eval::Judge` (or a `TemplateJudge` with their own `JudgeGraphExecutor`) directly to
-`judge_eval`.
+secret-free native-v2 runtime plan. Relative paths resolve against the manifest file (the stored
+eval's `manifest.toml` when judging an existing eval) and the resolved absolute path is stored with
+the eval. The CLI then submits the selected template through the native-v2 local runner and applies
+the effective per-sample judge model to every agent binding before submission.
+
+A judge run without `judgeRuntimeConfig` is an explicit `judgeError` that names the missing
+setting. The CLI never falls back to the synthetic `FixtureJudgeGraphExecutor`, so
+`eval judge --judge-model` cannot relabel another model's recorded scores as its own. The fixture
+executor remains available only behind the explicit unit-test entrypoint. Embedding runners can
+also pass a provider-backed `native_v2_eval::Judge` (or a `TemplateJudge` with their own
+`JudgeGraphExecutor`) directly to `judge_eval`.
 
 ## Judging platform capture directories
 
@@ -130,38 +130,53 @@ Slice-2 captures live in per-sample directories rather than the slice-1 store. P
 judge-captures` at a capture root laid out as `<captures>/<arm-id>/<sample>/`, where each sample
 directory contains `sample.json` and `patch.diff`:
 
+```toml
+# eval-with-judge.toml: the fixture manifest plus a real judge
+[options]
+judgeModel = "provider/default-judge"
+judgeTemplate = "eval-judge"
+judgeRuntimeConfig = "judge-runtime.json" # required for a real judge
+```
+
 ```bash
-zeroshot eval judge-captures zeroshot/fixtures/eval/synthetic.toml \
-  --captures /path/to/captures --directory . --id captured-judged \
-  --judge-model synthetic-judge --judge-template eval-judge
+zeroshot eval judge-captures ./eval-with-judge.toml \
+  --captures /path/to/captures --directory . --id captured-judged
 ```
 
 The command reads the manifest's criteria and arms, imports every capture directory, reads the
 flattened `sample.json`, the captured patch path, and any recorded `judge` checkout, and writes the
-judged samples and report to the eval store. Run indices come from the numeric suffix of each
-sample id, so a missing directory cannot shift the X/Y pairing; ids without a numeric suffix and
-duplicate ids or run indices are rejected. Failed and skipped captures without a patch are retained
-but not judged, and captured patch/checkout paths are required to stay inside the capture
-directory. It never re-runs an arm.
+judged samples and report to the eval store. The manifest must declare `options.judgeRuntimeConfig`
+for the judge to run; without it the command fails with the same explicit `judgeError` as
+`eval judge`. The provider-backed judge also needs the captured `judge` checkout, so a capture
+without one is reported as a judge error rather than scored from the patch alone. Run indices come
+from the numeric suffix of each sample id, so a missing directory cannot shift the X/Y pairing; ids
+without a numeric suffix and duplicate ids or run indices are rejected. Failed and skipped captures
+without a patch are retained but not judged and are reported as skipped, and captured
+patch/checkout paths are required to stay inside the capture directory. It never re-runs an arm.
 
 ## Custom judge graphs
 
 `--judge-template eval-judge` (or `judgeTemplate = "eval-judge"`) uses
 `zeroshot/src/native_v2_templates/eval_judge.json`. The template is a real native-v2 graph: its
 judge step receives `criterion`, `criterionDescription`, `patch`, `sample`, the effective `model`,
-and the optional read-only delivered `checkout` path. It returns `criterion`, `score`, `reasoning`,
-and `errors` through an explicit succeed terminal. The built-in template additionally reserves an
-internal required numeric `score` placeholder (`0.0`) in its initial input so the root group can
-materialize number state before the worker writes the real score. Custom graphs receive only the
-fields their own `initialInput` declares from this standard set, so they do not need to accept the
-placeholder; declare `score` only when using the same materialization pattern. Point the same
-setting at your own JSON graph to change the instructions, worker, or surrounding nodes. `TemplateJudge` runs the selected graph
-through a `JudgeGraphExecutor`; the CLI supplies the synthetic executor, and an embedding runner
-supplies a provider-backed one. A runtime plan that declares connection requirements currently
-fails with a clear error because eval judge does not resolve connection values; use an ambient
-native-login lane or supply the connections through an embedding runner. The graph runs in a private
-scratch directory and receives the captured checkout path as input, so it cannot mutate the live
-eval workspace.
+and the delivered `checkout` path. It returns `criterion`, `score`, `reasoning`, and `errors`
+through an explicit succeed terminal. The built-in template additionally reserves an internal
+required numeric `score` placeholder (`0.0`) in its initial input so the root group can materialize
+number state before the worker writes the real score. Custom graphs receive only the fields their
+own `initialInput` declares from this standard set, so they do not need to accept the placeholder;
+declare `score` only when using the same materialization pattern. Point the same setting at your own
+JSON graph to change the instructions, worker, or surrounding nodes. `TemplateJudge` runs the
+selected graph through a `JudgeGraphExecutor`; the CLI supplies the provider-backed executor, and
+an embedding runner can supply its own. A runtime plan that declares connection requirements
+currently fails with a clear error because eval judge does not resolve connection values; use an
+ambient native-login lane or supply the connections through an embedding runner.
+
+The provider-backed judge runs with the sample's delivered checkout as its working directory and
+also receives that path as the `checkout` input, so it can inspect surrounding code, call sites,
+and tests, not only the patch. The template instructions say to do so. If a checkout cannot be
+produced for a succeeded sample, the judge fails with a `judgeError` instead of inventing a verdict.
+Only capture metadata and run artifacts are written to a separate private scratch directory; the
+live eval workspace is never used as the judge's working directory.
 
 The runner reads capture artifacts; it never re-runs an eval arm to judge it. Slice-1 samples use
 `patches/<sample>.patch`; platform captures use `<sample>/sample.json` plus `<sample>/patch.diff`.
@@ -193,12 +208,16 @@ X is `baseline`, Y is `candidate`. Difference is Y - X on the judge's 1..=5 scal
 ### Outlier reasoning
 
 - correctness / run 0 / `baseline-0000` -> `candidate-0000`: X 5.00, Y 5.00, difference +0.00
-  - X (`synthetic-judge`): fake judgement: correctness passed for arm baseline run 0
-  - Y (`synthetic-judge`): fake judgement: correctness passed for arm candidate run 0
+  - X (`provider/default-judge`): The patch keeps the parser guard and the checkout's call sites still pass the existing tests.
+  - Y (`provider/default-judge`): The patch keeps the parser guard and the checkout's call sites still pass the existing tests.
 - efficiency / run 0 / `baseline-0000` -> `candidate-0000`: X 1.00, Y 5.00, difference +4.00
-  - X (`synthetic-judge`): fake judgement: efficiency failed for arm baseline run 0
-  - Y (`synthetic-judge`): fake judgement: efficiency passed for arm candidate run 0
+  - X (`provider/default-judge`): The patch adds an unnecessary second pass over the captured input.
+  - Y (`provider/default-judge`): The patch reaches the same result in one pass and the checkout shows no duplicate work.
 ```
+
+This excerpt is a provider-backed judged report. A plain synthetic fixture run instead records
+sample evidence from the fixture runner; its scores are synthetic sample evidence, not a model
+judgement.
 
 The `Trait rates` table also lists each criterion's mean judge score and the number of scored
 samples, so aggregate per-trait means remain visible outside the X/Y section. Use the outlier
@@ -210,16 +229,20 @@ Actionable defects are listed in the `Judge errors` section beside the reasoning
 ## Worked example on the synthetic fixture
 
 The checked-in `synthetic.toml` runs two arms with three runs each. Both arms pass correctness;
-the baseline arm fails efficiency while the candidate arm passes it. The fixture judge records 5
-for a pass and 1 for a fail, so the X/Y section reports a 0 difference for correctness and +4 for
-efficiency:
+the baseline arm fails efficiency while the candidate arm passes it. The synthetic runner records 5
+for a pass and 1 for a fail, so the plain fixture run's X/Y table reports a 0 difference for
+correctness and +4 for efficiency:
 
 ```bash
-zeroshot eval run zeroshot/fixtures/eval/synthetic.toml --directory . --id judged-synthetic
+zeroshot eval run zeroshot/fixtures/eval/synthetic.toml --directory . --id synthetic-fixture
 ```
 
-The fixture's `judgeModel` and `judgeTemplate` defaults are enough, so the plain run is judged.
-`.zeroshot/eval/judged-synthetic/report.md` then contains the trait matrix with a `Judge` column, the
-X/Y means above, and the outlier reasoning that references each captured patch. The JSON report and
-Markdown are rebuilt from the stored samples and report, so `zeroshot eval show`, `report`, and
-`score` never depend on the process that ran the eval.
+Those values are synthetic sample evidence from the fixture runner, not a model judgement, and they
+are not labelled with a judge model. The fixture has no delivered `judge` checkout, so it cannot be
+provider-judged in place. To produce the judged X/Y excerpt above, run a backend arm whose capture
+includes a `judge` checkout, or import those captures with `eval judge-captures` and a manifest that
+carries `judgeModel`, `judgeTemplate`, and the required `judgeRuntimeConfig`. A provider-backed
+judge fails with an explicit `judgeError` when the runtime or checkout is unavailable instead of
+relabelling the synthetic evidence. The JSON report and Markdown are rebuilt from the stored samples
+and report, so `zeroshot eval show`, `report`, and `score` never depend on the process that ran the
+eval.

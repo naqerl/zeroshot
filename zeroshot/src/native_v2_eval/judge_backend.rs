@@ -82,6 +82,28 @@ impl<B: NativeV2CliBackend> JudgeGraphExecutor for LocalJudgeGraphExecutor<B> {
         model: &str,
         input: Value,
     ) -> Result<Value, EvalError> {
+        let checkout = input
+            .get("checkout")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|checkout| !checkout.is_empty())
+            .ok_or_else(|| {
+                EvalError::Judge(
+                    "judge requires a captured checkout; no delivered checkout was available for this sample"
+                        .to_owned(),
+                )
+            })?;
+        let checkout = std::fs::canonicalize(checkout).map_err(|error| {
+            EvalError::Judge(format!(
+                "judge checkout {checkout:?} is unavailable: {error}"
+            ))
+        })?;
+        if !checkout.is_dir() {
+            return Err(EvalError::Judge(format!(
+                "judge checkout {} is not a directory",
+                checkout.display()
+            )));
+        }
         let runtime = runtime_with_model(&self.runtime, model)?;
         let identity = uuid::Uuid::now_v7().simple().to_string();
         let run_id = RunId::new(format!("eval-judge-{identity}"));
@@ -118,7 +140,7 @@ impl<B: NativeV2CliBackend> JudgeGraphExecutor for LocalJudgeGraphExecutor<B> {
             connections: BTreeMap::new(),
             github_token: None,
             git_credentials: None,
-            cwd: Some(directory.path().to_path_buf()),
+            cwd: Some(checkout.clone()),
             source_connection: None,
             source: None,
             profile: None,
@@ -134,19 +156,16 @@ impl<B: NativeV2CliBackend> JudgeGraphExecutor for LocalJudgeGraphExecutor<B> {
                 live_workspace.display()
             )));
         }
-        let (resolved, _) = crate::native_v2_local::prepare_local_source(
-            &request,
-            directory.path(),
-            Path::new("git"),
-        )
-        .map_err(|error| {
-            EvalError::Command(format!("judge scratch workspace is invalid: {error}"))
-        })?;
-        if resolved != scratch {
-            return Err(EvalError::Command(format!(
-                "judge workspace resolved to {} instead of private scratch {}",
+        let (resolved, _) =
+            crate::native_v2_local::prepare_local_source(&request, &checkout, Path::new("git"))
+                .map_err(|error| {
+                    EvalError::Command(format!("judge checkout workspace is invalid: {error}"))
+                })?;
+        if resolved != checkout {
+            return Err(EvalError::Judge(format!(
+                "judge checkout resolved to {} instead of {}",
                 resolved.display(),
-                scratch.display()
+                checkout.display()
             )));
         }
         let runner = LocalRunner::new(Arc::clone(&self.backend));
