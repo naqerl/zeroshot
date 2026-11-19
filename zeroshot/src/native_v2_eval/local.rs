@@ -122,8 +122,9 @@ pub(crate) async fn run_manifest_locally(
         EvalError::Command(format!("local run backend is unavailable: {error}"))
     })?);
     let inputs = tempfile::tempdir().map_err(|error| EvalError::io(".", error))?;
+    command.validate_arms(&manifest)?;
     let mut prepared = std::collections::BTreeMap::new();
-    for arm in &manifest.arms {
+    for arm in manifest.arms.iter().filter(|arm| command.runs_arm(&arm.id)) {
         for run_index in 0..manifest.runs_per_arm {
             let sample_id = format!("{}-{run_index:04}", arm.id);
             let input = inputs.path().join(format!("{sample_id}.json"));

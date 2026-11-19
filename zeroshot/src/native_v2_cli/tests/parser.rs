@@ -981,12 +981,14 @@ fn parser_wires_eval_run_report_score_and_clean_actions() {
                     judge_runner: None,
                     runner: None,
                     workspace: None,
+                    arms,
                 }),
         }) => {
             assert_eq!(directory, PathBuf::from("workspace"));
             assert_eq!(run_directory, PathBuf::from("workspace"));
             assert_eq!(manifest, PathBuf::from("manifest.toml"));
             assert_eq!(id.as_deref(), Some("fixture"));
+            assert!(arms.is_empty());
         }
         command => panic!("unexpected eval command: {command:?}"),
     }
@@ -1127,4 +1129,70 @@ fn parser_wires_eval_run_report_score_and_clean_actions() {
         })
     ));
     assert!(parse_native_v2_args(args(&["eval", "clean"])).is_err());
+}
+
+#[test]
+fn parser_wires_eval_import_baseline_and_run_arm_selection() {
+    let command = parse_native_v2_args(args(&[
+        "eval",
+        "import-baseline",
+        "talk",
+        "--manifest",
+        "eval.toml",
+        "--arm",
+        "baseline",
+        "--run",
+        "run-a",
+        "--run",
+        "run-b",
+        "--runs-file",
+        "runs.txt",
+        "--title-prefix",
+        "baseline:",
+        "--target",
+        "platform",
+        "--capture-remote",
+        "https://github.com/acme/project.git",
+    ]))
+    .assert_value();
+    match command {
+        NativeV2CliCommand::Eval(crate::native_v2_eval::EvalCommand {
+            action: crate::native_v2_eval::EvalAction::ImportBaseline(import),
+            ..
+        }) => {
+            assert_eq!(
+                import,
+                crate::native_v2_eval::EvalImportRunsCommand {
+                    id: "talk".to_owned(),
+                    manifest: Some(PathBuf::from("eval.toml")),
+                    arm: Some("baseline".to_owned()),
+                    runs: vec!["run-a".to_owned(), "run-b".to_owned()],
+                    runs_file: Some(PathBuf::from("runs.txt")),
+                    title_prefix: Some("baseline:".to_owned()),
+                    target: Some("platform".to_owned()),
+                    capture_remote: Some("https://github.com/acme/project.git".to_owned()),
+                }
+            );
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+    assert!(
+        parse_native_v2_args(args(&["eval", "import-baseline", "bad id!", "--run", "r"])).is_err()
+    );
+
+    let command = parse_native_v2_args(args(&[
+        "eval",
+        "run",
+        "manifest.toml",
+        "--arm",
+        "candidate",
+    ]))
+    .assert_value();
+    match command {
+        NativeV2CliCommand::Eval(crate::native_v2_eval::EvalCommand {
+            action: crate::native_v2_eval::EvalAction::Run(run),
+            ..
+        }) => assert_eq!(run.arms, vec!["candidate".to_owned()]),
+        other => panic!("unexpected command: {other:?}"),
+    }
 }

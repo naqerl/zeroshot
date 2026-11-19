@@ -1054,6 +1054,7 @@ async fn cli_backend_path_runs_the_selected_platform_runner() {
             judge_runner: None,
             runner: None,
             workspace: None,
+            arms: Vec::new(),
         },
         backend,
         target: Some("platform".to_owned()),
@@ -1100,6 +1101,7 @@ fn judge_test_sample() -> crate::native_v2_eval::EvalSample {
         judge_template: None,
         judge_checkout: None,
         judge_executor: None,
+        notes: Vec::new(),
     }
 }
 

@@ -296,6 +296,26 @@ pub fn compare(data: &EvalData) -> Option<BaselineComparison> {
             ));
         }
     }
+    if baseline_runs.len() != candidate_runs.len() {
+        notes.push(format!(
+            "arm {} has {} run(s) and arm {} has {}: pairs are formed by run index, a row without a partner shows one side, and means and medians are per arm over all of its runs",
+            baseline_arm.id,
+            baseline_runs.len(),
+            candidate_arm.id,
+            candidate_runs.len()
+        ));
+    }
+    for arm in [baseline_arm, candidate_arm] {
+        let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+        for sample in data.samples.iter().filter(|sample| sample.arm_id == arm.id) {
+            for note in &sample.notes {
+                *counts.entry(note.as_str()).or_default() += 1;
+            }
+        }
+        for (note, count) in counts {
+            notes.push(format!("arm {} ({count} run(s)): {note}", arm.id));
+        }
+    }
     let mean_ratio = score_ratio(candidate.score, baseline.score);
     let median_ratio = score_ratio(candidate.median_score, baseline.median_score);
     if mean_ratio.is_none() || median_ratio.is_none() {

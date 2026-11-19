@@ -137,6 +137,10 @@ pub struct EvalSample {
     /// Executor that produced the judgement: `fixture`, `graph`, or a caller-defined label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge_executor: Option<String>,
+    /// Facts the source did not expose, such as a missing cache split or queue time, recorded by
+    /// `eval import-baseline` instead of being guessed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -666,6 +666,7 @@ async fn template_judge_executes_the_graph_once_per_sample_with_every_trait() {
         judge_template: None,
         judge_checkout: None,
         judge_executor: None,
+        notes: Vec::new(),
     };
     let criteria = vec![criterion("correctness"), criterion("efficiency")];
     let result = judge
@@ -1444,6 +1445,7 @@ async fn eval_judge_input_admits_after_filtering_to_the_declared_fields() {
                 judge_template: None,
                 judge_checkout: None,
                 judge_executor: None,
+                notes: Vec::new(),
             },
             vec![criterion("correctness")],
             "patch",
@@ -1550,6 +1552,7 @@ async fn judge_eval_errors_on_a_succeeded_sample_without_a_patch() {
         judge_template: None,
         judge_checkout: None,
         judge_executor: None,
+        notes: Vec::new(),
     };
     let mut data = EvalData {
         id,
@@ -1649,6 +1652,7 @@ async fn judge_captured_samples_fails_closed_without_a_patch() {
             judge_template: None,
             judge_checkout: None,
             judge_executor: None,
+            notes: Vec::new(),
         },
         patch: None,
         sample_json: serde_json::Value::Null,
@@ -1773,6 +1777,7 @@ async fn talk_evals_dry_run_produce_the_slide_table_and_exports() {
                 judge_runner: None,
                 runner: Some("fake".to_owned()),
                 workspace: None,
+                arms: Vec::new(),
             }),
         })
         .await

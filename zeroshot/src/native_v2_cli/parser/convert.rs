@@ -214,6 +214,7 @@ impl EvalCliCommand {
                 judge_runner: judge_runner.clone(),
                 runner: args.runner,
                 workspace: args.cwd,
+                arms: args.arms,
             }),
             Self::List => EvalAction::List,
             Self::Show(args) => EvalAction::Show {
@@ -246,6 +247,18 @@ impl EvalCliCommand {
                 judge_template,
                 scorer: args.scorer,
             }),
+            Self::ImportBaseline(args) => {
+                EvalAction::ImportBaseline(crate::native_v2_eval::EvalImportRunsCommand {
+                    id: validate_eval_id(args.id)?,
+                    manifest: args.manifest,
+                    arm: args.arm,
+                    runs: args.runs,
+                    runs_file: args.runs_file,
+                    title_prefix: args.title_prefix,
+                    target: args.target,
+                    capture_remote: args.capture_remote,
+                })
+            }
             Self::Clean(args) => EvalAction::Clean {
                 id: args.id.map(validate_eval_id).transpose()?,
                 all: args.all,
