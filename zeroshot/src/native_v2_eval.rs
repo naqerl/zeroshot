@@ -6,6 +6,7 @@
 //! core, the capacity/capture/resume support, and one `Submit`/`Wait`/`Stop` runner seam implemented
 //! by the platform, local, and synthetic runners.
 
+mod baseline;
 mod capacity;
 mod capture;
 mod cli;
@@ -15,6 +16,7 @@ mod judge;
 mod judge_backend;
 mod judge_runner;
 mod judge_template;
+mod local;
 mod manifest;
 mod model;
 mod report;
@@ -23,6 +25,11 @@ mod runner;
 mod scorer;
 mod store;
 
+pub use baseline::{
+    ArmAggregate, BaselineComparison, CostSource, CostUnit, RunMetrics, RunPair, SCORE_SCHEMA,
+    compare as compare_baseline, render_markdown as render_baseline_markdown, runs_csv, score,
+    score_ratio, table_csv,
+};
 pub use capacity::{
     Capacity, CapacityError, CapacitySource, CapacitySourceKind, StaticCapacity, resolve_capacity,
 };
@@ -32,25 +39,28 @@ pub use capture::{
 };
 pub use cli::{
     BackendRunRequest, EvalAction, EvalCommand, EvalJudgeCapturesCommand, EvalJudgeCommand,
-    EvalRunCommand, ManifestRunRequest, RunnerSelection, execute, run_manifest_with_backend,
-    run_manifest_with_runner, select_runner,
+    EvalRunCommand, ManifestRunRequest, RunnerSelection, ScoreWeights, execute,
+    run_manifest_with_backend, run_manifest_with_runner, select_runner,
 };
 pub use error::EvalError;
 pub use fake::{FakeFixtureRequest, FakeRunner, FakeSampleRequest};
 pub use judge::{
-    JUDGE_PASS_SCORE, JUDGE_SCORE_MAX, JUDGE_SCORE_MIN, JUDGE_TEMPLATE_NAME, Judge,
-    JudgeParseError, JudgeRequest, JudgeResult, Judgement, parse_judgement,
+    JUDGE_TEMPLATE_NAME, Judge, JudgeParseError, JudgeRequest, JudgeResult, Judgement,
+    parse_judgement, parse_judgement_value,
 };
-pub use judge_backend::{LocalJudgeGraphExecutor, load_judge_runtime, runtime_with_model};
+pub use judge_backend::{JudgeRunConfig, LocalJudgeGraphExecutor};
 pub use judge_runner::{
     CapturedSampleInput, JudgeOptions, JudgeRunReport, JudgedSample, JudgedSampleSummary,
-    captured_sample_from_directory, judge_captured_samples, judge_eval, judge_model_for,
+    captured_sample_from_directory, judge_captured_samples, judge_eval,
 };
 pub use judge_template::{
     FixtureJudgeGraphExecutor, JUDGE_TEMPLATE_JSON, JudgeGraphExecutor, JudgeTemplate,
     TemplateJudge, judge_input, judge_input_for_template, resolve_judge_template,
 };
-pub use manifest::{EvalArm, EvalCriterion, EvalManifest, EvalOptions, FakeOptions, MANIFEST_SCHEMA};
+pub use manifest::{
+    EvalArm, EvalCriterion, EvalManifest, EvalOptions, FakeOptions, JUDGE_RUNNERS, MANIFEST_SCHEMA,
+    Pricing, ScoreOptions,
+};
 pub use model::{
     CriterionResult, EvalData, EvalId, EvalSample, PatchArtifact, SampleCounts, SampleStatus,
     SampleTiming, TokenUsage,
@@ -70,8 +80,11 @@ pub use runner::{
     SampleExecutionError, SampleFailure, SampleOutcome, SamplePatch, SampleRequest, SampleRun,
     SampleRunner, SampleRunnerError, SampleTimings, run_eval, run_sample,
 };
-pub use scorer::{NoneScorer, QualityVsCostScorer, Scorer, ScorerInput, ScorerOutput, ScorerRegistry};
-pub use store::{EvalStore, EvalSummary};
+pub use scorer::{
+    BaselineRatioScorer, NoneScorer, QualityVsCostScorer, Scorer, ScorerInput, ScorerOutput,
+    ScorerRegistry,
+};
+pub use store::{EvalStore, EvalSummary, RUNS_FILE, SCORE_FILE, TABLE_FILE};
 
 /// Runs a manifest end to end through the synthetic runner.
 pub async fn run_fixture(
@@ -85,7 +98,9 @@ pub async fn run_fixture(
         id,
         scorer: None,
         judge_template: None,
-        judge_model: None,
+        judge_runner: None,
+        runner: None,
+        workspace: None,
     })
     .await
 }

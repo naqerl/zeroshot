@@ -8,12 +8,13 @@ use openengine_cluster_protocol::{GraphNode, GraphSpec, PayloadType};
 use serde_json::{Value, json};
 
 use super::{
-    EvalError, Judge, JudgeRequest, JudgeResult, JUDGE_TEMPLATE_NAME, JudgeParseError,
-    parse_judgement,
+    EvalError, Judge, JudgeParseError, JudgeRequest, JudgeResult, JUDGE_TEMPLATE_NAME,
+    parse_judgement_value,
 };
 
-/// Built-in JSON graph used when no custom judge template is selected.
-pub const JUDGE_TEMPLATE_JSON: &str = include_str!("../native_v2_templates/eval_judge.json");
+/// Built-in JSON graph used when no custom judge template is selected. It is the same source as
+/// the `eval-judge` built-in template (`zeroshot template show eval-judge`).
+pub const JUDGE_TEMPLATE_JSON: &str = crate::native_v2_cli::EVAL_JUDGE_GRAPH_JSON;
 
 /// A parsed judge graph and the stable identity recorded in reports.
 #[derive(Clone, Debug, PartialEq)]
@@ -57,38 +58,41 @@ pub fn resolve_judge_template(reference: &str) -> Result<JudgeTemplate, EvalErro
     })
 }
 
-/// The graph input for one criterion of one captured sample.
+/// The full judge input for one captured sample: the task, the acceptance traits as a JSON
+/// string of `[{id, description}]`, and the captured patch. `verdicts` is the empty placeholder
+/// the built-in graph's state needs; `sample` and `checkout` are offered to custom graphs that
+/// declare them.
 #[must_use]
-pub fn judge_input(request: &JudgeRequest, criterion: &super::EvalCriterion) -> Value {
+pub fn judge_input(request: &JudgeRequest) -> Value {
     let sample = request
         .sample_json
         .clone()
         .unwrap_or_else(|| serde_json::to_value(&request.sample).unwrap_or(Value::Null));
+    let traits = request
+        .criteria
+        .iter()
+        .map(|criterion| json!({"id": criterion.id, "description": criterion.description}))
+        .collect::<Vec<_>>();
     json!({
-        "criterion": criterion.id,
-        "criterionDescription": criterion.description,
+        "task": request.task,
+        "traits": Value::Array(traits).to_string(),
         "patch": request.patch,
-        "sample": serde_json::to_string(&sample).unwrap_or_else(|_| "null".to_owned()),
-        "model": request.model,
+        "verdicts": [],
+        "sample": sample.to_string(),
         "checkout": request.checkout.clone().unwrap_or_default(),
-        // Required number field so the root group can materialize state before the judge step.
-        "score": 0.0,
     })
 }
 
 /// The input for a selected template, restricted to the fields its `initialInput` declares.
-/// Custom graphs therefore receive exactly the documented contract they author; the built-in
-/// template additionally declares its internal `score` placeholder.
+/// Custom graphs therefore receive exactly the documented contract they author.
 pub fn judge_input_for_template(
     template: &JudgeTemplate,
-    request: &JudgeRequest,
-    criterion: &super::EvalCriterion,
+    input: Value,
 ) -> Result<Value, EvalError> {
-    let full = judge_input(request, criterion);
     let PayloadType::Record { fields } = &template.graph.initial_input else {
-        return Ok(full);
+        return Ok(input);
     };
-    let Value::Object(mut object) = full else {
+    let Value::Object(mut object) = input else {
         return Err(EvalError::Judge(
             "judge input construction did not produce an object".to_owned(),
         ));
@@ -106,83 +110,70 @@ pub fn judge_input_for_template(
     Ok(Value::Object(object))
 }
 
-/// Executor for the synthetic CLI runner. It reads the sample evidence already recorded by the
-/// fake runner, but still runs the graph contract: the selected template must be a single judge
-/// step, and its input/output shape is the judge response shape. Provider-backed embeddings use a
-/// real executor instead; this keeps `zeroshot eval` runnable without credentials.
+/// Synthetic judge for dry runs. It calls no model: it answers in the judge graph's output shape
+/// from the evidence the fake runner already recorded on the sample, so `zeroshot eval` stays
+/// runnable without credentials.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FixtureJudgeGraphExecutor;
 
 #[async_trait]
 impl JudgeGraphExecutor for FixtureJudgeGraphExecutor {
-    async fn execute(
-        &self,
-        template: &JudgeTemplate,
-        _model: &str,
-        input: Value,
-    ) -> Result<Value, EvalError> {
+    async fn execute(&self, template: &JudgeTemplate, input: Value) -> Result<Value, EvalError> {
         if !has_step(&template.graph.root) {
             return Err(EvalError::Judge(
                 "judge graph template has no executable step".to_owned(),
             ));
         }
-        let criterion = input
-            .get("criterion")
-            .and_then(Value::as_str)
-            .ok_or_else(|| EvalError::Judge("judge input has no criterion".to_owned()))?;
-        let sample_source = input
-            .get("sample")
-            .and_then(Value::as_str)
-            .ok_or_else(|| EvalError::Judge("judge input has no sample".to_owned()))?;
-        let sample: Value = serde_json::from_str(sample_source).map_err(|error| {
+        let field = |name: &str| {
+            input
+                .get(name)
+                .and_then(Value::as_str)
+                .ok_or_else(|| EvalError::Judge(format!("judge input has no {name}")))
+        };
+        let traits: Vec<Value> = serde_json::from_str(field("traits")?).map_err(|error| {
+            EvalError::Judge(format!("judge input traits are not JSON: {error}"))
+        })?;
+        let sample: Value = serde_json::from_str(field("sample")?).map_err(|error| {
             EvalError::Judge(format!("judge input sample is not JSON: {error}"))
         })?;
-        let result = sample
-            .get("criteria")
-            .and_then(|criteria| criteria.get(criterion))
-            .ok_or_else(|| {
-                EvalError::Judge(format!(
-                    "synthetic judge has no recorded evidence for sample {} criterion {criterion}; configure judgeRuntimeConfig to run a real judge graph",
-                    sample
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                ))
-            })?;
-        let score = result
-            .get("score")
-            .and_then(Value::as_f64)
-            .or_else(|| {
-                result
-                    .get("passed")
-                    .and_then(Value::as_bool)
-                    .map(|passed| if passed { 5.0 } else { 1.0 })
-            })
-            .ok_or_else(|| {
-                EvalError::Judge(format!(
-                    "synthetic judge evidence for criterion {criterion} has no score"
-                ))
-            })?;
-        let reasoning = result
-            .get("reasoning")
+        let sample_id = sample
+            .get("id")
             .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
-                format!(
-                    "Synthetic sample {} has no captured evidence for {criterion}.",
-                    sample
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                )
-            });
-        let errors = result.get("errors").cloned().unwrap_or_else(|| json!([]));
-        Ok(json!({
-            "criterion": criterion,
-            "score": score,
-            "reasoning": reasoning,
-            "errors": errors,
-        }))
+            .unwrap_or("unknown");
+        let mut verdicts = Vec::with_capacity(traits.len());
+        for item in &traits {
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| EvalError::Judge("judge input trait has no id".to_owned()))?;
+            let result = sample
+                .get("criteria")
+                .and_then(|criteria| criteria.get(id))
+                .ok_or_else(|| {
+                    EvalError::Judge(format!(
+                        "synthetic judge has no recorded evidence for sample {sample_id} trait {id}; use judgeRunner = \"local\" to run the judge graph"
+                    ))
+                })?;
+            let pass = result
+                .get("passed")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| {
+                    EvalError::Judge(format!(
+                        "synthetic judge evidence for trait {id} has no passed flag"
+                    ))
+                })?;
+            let reason = result.get("reasoning").and_then(Value::as_str).map_or_else(
+                || {
+                    format!(
+                        "Synthetic sample {sample_id} recorded {id} as {}.",
+                        if pass { "passed" } else { "failed" }
+                    )
+                },
+                str::to_owned,
+            );
+            verdicts.push(json!({"id": id, "pass": pass, "reason": reason}));
+        }
+        Ok(json!({ "traits": verdicts }))
     }
 }
 fn has_step(node: &GraphNode) -> bool {
@@ -206,30 +197,20 @@ fn has_step(node: &GraphNode) -> bool {
 /// Executes one admitted judge graph with a JSON input and returns its terminal output.
 #[async_trait]
 pub trait JudgeGraphExecutor: Send + Sync {
-    /// Run one graph node for the effective per-sample judge model. Provider-backed executors use
-    /// `model` to build the runtime binding; synthetic executors may record or ignore it.
-    async fn execute(
-        &self,
-        template: &JudgeTemplate,
-        model: &str,
-        input: Value,
-    ) -> Result<Value, EvalError>;
+    /// Run the judge graph once for one sample. `input` is the full [`judge_input`]; executors
+    /// that submit a real run restrict it to the template's declared fields first.
+    async fn execute(&self, template: &JudgeTemplate, input: Value) -> Result<Value, EvalError>;
 }
 
 #[async_trait]
 impl<T: JudgeGraphExecutor + ?Sized> JudgeGraphExecutor for Box<T> {
-    async fn execute(
-        &self,
-        template: &JudgeTemplate,
-        model: &str,
-        input: Value,
-    ) -> Result<Value, EvalError> {
-        (**self).execute(template, model, input).await
+    async fn execute(&self, template: &JudgeTemplate, input: Value) -> Result<Value, EvalError> {
+        (**self).execute(template, input).await
     }
 }
 
-/// A judge that runs the selected graph once per criterion. The graph is a real native-v2 node;
-/// this adapter only maps its terminal output onto the strict judgement contract.
+/// A judge that runs the selected graph once per sample with every trait, then parses its
+/// `{traits: [{id, pass, reason}]}` output strictly.
 pub struct TemplateJudge<E> {
     executor: E,
     template: JudgeTemplate,
@@ -250,38 +231,12 @@ impl<E> TemplateJudge<E> {
 #[async_trait]
 impl<E: JudgeGraphExecutor> Judge for TemplateJudge<E> {
     async fn judge(&self, request: JudgeRequest) -> Result<JudgeResult, EvalError> {
-        let mut judgements = std::collections::BTreeMap::new();
-        for criterion in &request.criteria {
-            let input = judge_input_for_template(&self.template, &request, criterion)?;
-            let output = self
-                .executor
-                .execute(&self.template, &request.model, input)
-                .await?;
-            let response = normalize_template_output(output, criterion)?;
-            let parsed = parse_judgement(&response, std::slice::from_ref(criterion))
-                .map_err(|error| EvalError::Judge(error.to_string()))?;
-            judgements.extend(parsed.judgements);
-        }
-        Ok(JudgeResult { judgements })
+        let output = self
+            .executor
+            .execute(&self.template, judge_input(&request))
+            .await?;
+        parse_judgement_value(&output, &request.criteria).map_err(EvalError::from)
     }
-}
-
-fn normalize_template_output(
-    output: Value,
-    criterion: &super::EvalCriterion,
-) -> Result<String, EvalError> {
-    let value = if output.get("judgements").is_some() || output.get("criteria").is_some() {
-        output
-    } else {
-        let mut entry = output.as_object().cloned().ok_or_else(|| {
-            EvalError::Judge("judge graph returned a non-object output".to_owned())
-        })?;
-        if !entry.contains_key("criterion") && !entry.contains_key("id") {
-            entry.insert("criterion".to_owned(), Value::String(criterion.id.clone()));
-        }
-        json!({ "judgements": [entry] })
-    };
-    serde_json::to_string(&value).map_err(EvalError::from)
 }
 
 impl From<JudgeParseError> for EvalError {

@@ -978,7 +978,9 @@ fn parser_wires_eval_run_report_score_and_clean_actions() {
                     id,
                     scorer: None,
                     judge_template: None,
-                    judge_model: None,
+                    judge_runner: None,
+                    runner: None,
+                    workspace: None,
                 }),
         }) => {
             assert_eq!(directory, PathBuf::from("workspace"));
@@ -1002,17 +1004,49 @@ fn parser_wires_eval_run_report_score_and_clean_actions() {
     assert!(matches!(
         command,
         NativeV2CliCommand::Eval(crate::native_v2_eval::EvalCommand {
-            action: crate::native_v2_eval::EvalAction::Score { id, scorer },
+            action: crate::native_v2_eval::EvalAction::Score { id, scorer, .. },
             ..
         }) if id == "fixture" && scorer == "none"
     ));
 
     let command = parse_native_v2_args(args(&[
         "eval",
+        "score",
+        "fixture",
+        "--scorer",
+        "baseline-ratio",
+        "--price-input",
+        "1.5",
+        "--price-output",
+        "6",
+        "--price-cache-read",
+        "0.15",
+        "--price-cache-write",
+        "1.875",
+    ]))
+    .assert_value();
+    match command {
+        NativeV2CliCommand::Eval(crate::native_v2_eval::EvalCommand {
+            action: crate::native_v2_eval::EvalAction::Score { weights, .. },
+            ..
+        }) => assert_eq!(
+            weights.pricing,
+            crate::native_v2_eval::Pricing {
+                input: Some(1.5),
+                output: Some(6.0),
+                cache_read: Some(0.15),
+                cache_write: Some(1.875),
+            }
+        ),
+        command => panic!("unexpected eval command: {command:?}"),
+    }
+
+    let command = parse_native_v2_args(args(&[
+        "eval",
         "judge",
         "fixture",
-        "--judge-model",
-        "provider/judge",
+        "--judge-runner",
+        "local",
         "--judge-template",
         "eval-judge",
         "--scorer",
@@ -1025,14 +1059,14 @@ fn parser_wires_eval_run_report_score_and_clean_actions() {
             action: crate::native_v2_eval::EvalAction::Judge(
                 crate::native_v2_eval::EvalJudgeCommand {
                     id,
-                    judge_model: Some(model),
+                    judge_runner: Some(runner),
                     judge_template: Some(template),
                     scorer: Some(scorer),
                 }
             ),
             ..
         }) if id == "fixture"
-            && model == "provider/judge"
+            && runner == "local"
             && template == "eval-judge"
             && scorer == "none"
     ));
@@ -1045,8 +1079,8 @@ fn parser_wires_eval_run_report_score_and_clean_actions() {
         "captures",
         "--id",
         "captured",
-        "--judge-model",
-        "provider/judge",
+        "--judge-runner",
+        "synthetic",
     ]))
     .assert_value();
     assert!(matches!(
@@ -1057,7 +1091,7 @@ fn parser_wires_eval_run_report_score_and_clean_actions() {
                     manifest,
                     captures,
                     id: Some(id),
-                    judge_model: Some(model),
+                    judge_runner: Some(runner),
                     judge_template: None,
                     scorer: None,
                 }
@@ -1066,8 +1100,20 @@ fn parser_wires_eval_run_report_score_and_clean_actions() {
         }) if manifest.as_path() == std::path::Path::new("manifest.toml")
             && captures.as_path() == std::path::Path::new("captures")
             && id == "captured"
-            && model == "provider/judge"
+            && runner == "synthetic"
     ));
+
+    let error = parse_native_v2_args(args(&["eval", "judge", "fixture", "--judge-runner", "gpt"]))
+        .expect_err("unknown judge runner is rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("--judge-runner must be one of synthetic, local")
+    );
+    assert!(
+        parse_native_v2_args(args(&["eval", "judge", "fixture", "--judge-model", "m"])).is_err(),
+        "the judge model is not an eval option; the judge runtime configures it"
+    );
 
     let command = parse_native_v2_args(args(&["eval", "clean", "--all"])).assert_value();
     assert!(matches!(

@@ -1,0 +1,5 @@
+{
+  "harness": "claude",
+  "provider": "anthropic",
+  "model": "claude-sonnet-4-5"
+}

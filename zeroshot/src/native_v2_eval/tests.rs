@@ -186,6 +186,7 @@ async fn report_and_score_reconstruct_from_stored_data_after_the_run() {
     let scored = execute(&EvalCommand {
         directory: temporary.path().to_path_buf(),
         action: EvalAction::Score {
+            weights: Default::default(),
             id: id.to_string(),
             scorer: "quality-vs-cost".to_owned(),
         },
@@ -270,6 +271,7 @@ async fn unmatched_reasoning_and_clean_are_visible() {
     let report = execute(&EvalCommand {
         directory: temporary.path().to_path_buf(),
         action: EvalAction::Score {
+            weights: Default::default(),
             id: id.to_string(),
             scorer: "none".to_owned(),
         },
@@ -295,94 +297,102 @@ fn criterion(id: &str) -> EvalCriterion {
 }
 
 #[test]
-fn judge_parser_table_names_the_invalid_field() {
-    let criteria = vec![criterion("correctness")];
+fn judge_parser_reads_trait_verdicts_and_names_the_invalid_field() {
+    let criteria = vec![criterion("correctness"), criterion("tests")];
     let valid = r#"{
-      "judgements": [
-        {
-          "criterion": "correctness",
-          "score": 4,
-          "reasoning": "The patch updates the parser and adds a regression test.",
-          "errors": []
-        }
+      "traits": [
+        {"id": "correctness", "pass": true, "reason": "The patch updates the parser."},
+        {"id": "tests", "pass": false, "reason": "line one\nline two\tindented"}
       ]
     }"#;
-    let parsed = parse_judgement(valid, &criteria).expect("valid judgement parses");
-    let judgement = parsed
-        .judgements
-        .get("correctness")
-        .expect("criterion exists");
-    assert_eq!(judgement.score, 4.0);
-    assert!(judgement.passed());
-    assert!(judgement.errors.is_empty());
-
-    let multiline = parse_judgement(
-        "{\"judgements\":[{\"criterion\":\"correctness\",\"score\":4,\"reasoning\":\"line one\\nline two\\tindented\",\"errors\":[]}]}",
-        &criteria,
-    )
-    .expect("multiline reasoning is valid prose");
-    assert!(
-        multiline.judgements["correctness"]
-            .reasoning
-            .contains("line two")
+    let parsed = parse_judgement(valid, &criteria).expect("valid verdicts parse");
+    assert!(parsed.judgements["correctness"].passed());
+    assert!(!parsed.judgements["tests"].passed());
+    assert!(parsed.judgements["tests"].reason.contains("line two"));
+    let stored = parsed.criteria();
+    assert!(stored["correctness"].passed);
+    assert_eq!(stored["correctness"].score, Some(1.0));
+    assert_eq!(stored["tests"].score, Some(0.0));
+    assert_eq!(
+        parsed.reasoning()["correctness"],
+        "The patch updates the parser."
     );
 
+    let one = r#"{"id":"correctness","pass":true,"reason":"ok"}"#;
     let cases = [
+        // malformed output
+        ("not json".to_owned(), "<json>", "expected"),
+        ("[]".to_owned(), "<root>", "JSON object"),
         (
-            r#"{"judgements":[{"criterion":"correctness","reasoning":"ok","errors":[]}]}"#,
-            "judgements[0].score",
+            r#"{"judgements":[]}"#.to_owned(),
+            "judgements",
+            "expected `traits`",
+        ),
+        (r#"{"traits":{}}"#.to_owned(), "traits", "must be an array"),
+        (
+            r#"{"traits":["x"]}"#.to_owned(),
+            "traits[0]",
+            "must be an object",
+        ),
+        (
+            format!(r#"{{"traits":[{one},{{"id":"tests","reason":"ok"}}]}}"#),
+            "traits[1].pass",
             "is required",
         ),
         (
-            r#"{"judgements":[{"criterion":"correctness","score":6,"reasoning":"ok","errors":[]}]}"#,
-            "judgements[0].score",
-            "between 1 and 5",
+            format!(r#"{{"traits":[{one},{{"id":"tests","pass":"yes","reason":"ok"}}]}}"#),
+            "traits[1].pass",
+            "must be a boolean",
         ),
         (
-            r#"{"judgements":[{"criterion":"correctness","score":0,"reasoning":"ok","errors":[]}]}"#,
-            "judgements[0].score",
-            "between 1 and 5",
-        ),
-        (
-            r#"{"judgements":[{"criterion":"correctness","score":3,"reasoning":"  ","errors":[]}]}"#,
-            "judgements[0].reasoning",
+            format!(r#"{{"traits":[{one},{{"id":"tests","pass":true,"reason":"  "}}]}}"#),
+            "traits[1].reason",
             "must not be empty",
         ),
         (
-            r#"{"judgements":[{"criterion":"correctness","score":3,"reasoning":"bad\u0001text","errors":[]}]}"#,
-            "judgements[0].reasoning",
+            format!(
+                r#"{{"traits":[{one},{{"id":"tests","pass":true,"reason":"bad\u0001text"}}]}}"#
+            ),
+            "traits[1].reason",
             "control characters",
         ),
         (
-            r#"{"judgements":[{"criterion":"correctness","score":3,"reasoning":"ok","errors":["bad\u001b[31mtext"]}]}"#,
-            "judgements[0].errors[0]",
-            "control characters",
+            format!(r#"{{"traits":[{one},{{"id":"tests","pass":true,"reason":"ok","score":4}}]}}"#),
+            "traits[1].score",
+            "unknown field",
         ),
         (
-            r#"{"judgements":[{"criterion":"correctness","score":3,"reasoning":"ok"}]}"#,
-            "judgements[0].errors",
+            format!(r#"{{"traits":[{one},{{"pass":true,"reason":"ok"}}]}}"#),
+            "traits[1].id",
             "is required",
         ),
+        // unknown, duplicate, and missing traits
         (
-            r#"{"judgements":[{"criterion":"correctness","score":3,"reasoning":"ok","errors":[""]}]}"#,
-            "judgements[0].errors[0]",
-            "must not be empty",
+            format!(r#"{{"traits":[{one},{{"id":"style","pass":true,"reason":"ok"}}]}}"#),
+            "traits[1].id",
+            "unknown trait \"style\"",
+        ),
+        (
+            format!(r#"{{"traits":[{one},{one}]}}"#),
+            "traits[1].id",
+            "duplicate verdict",
+        ),
+        (
+            format!(r#"{{"traits":[{one}]}}"#),
+            "traits",
+            "missing verdict for trait \"tests\"",
         ),
     ];
     for (source, field, message) in cases {
-        let error = parse_judgement(source, &criteria).expect_err("invalid judgement is rejected");
+        let error = parse_judgement(&source, &criteria).expect_err("invalid verdicts are rejected");
         assert_eq!(error.field, field, "{source}");
-        assert!(error.message.contains(message), "{}", error.message);
+        assert!(
+            error.message.contains(message),
+            "{source}: {}",
+            error.message
+        );
         assert!(error.to_string().contains(field));
     }
-
-    let error = parse_judgement(
-        r#"{"judgements":[{"criterion":"missing","score":3,"reasoning":"ok","errors":[]}]}"#,
-        &criteria,
-    )
-    .expect_err("unknown criterion is rejected");
-    assert_eq!(error.field, "judgements[0].criterion");
-    assert!(error.message.contains("unknown criterion"));
 }
 
 struct FakeJudge;
@@ -390,10 +400,7 @@ struct FakeJudge;
 #[async_trait::async_trait]
 impl Judge for FakeJudge {
     async fn judge(&self, request: JudgeRequest) -> Result<JudgeResult, EvalError> {
-        let score = match request.sample.arm_id.as_str() {
-            "baseline" => 5.0,
-            _ => 2.0,
-        };
+        let pass = request.sample.arm_id == "baseline";
         let judgements = request
             .criteria
             .iter()
@@ -401,12 +408,11 @@ impl Judge for FakeJudge {
                 (
                     criterion.id.clone(),
                     Judgement {
-                        score,
-                        reasoning: format!(
+                        pass,
+                        reason: format!(
                             "{} judge for {} run {} inspected the captured patch.diff",
                             criterion.id, request.sample.arm_id, request.sample.run_index
                         ),
-                        errors: Vec::new(),
                     },
                 )
             })
@@ -416,7 +422,7 @@ impl Judge for FakeJudge {
 }
 
 #[tokio::test]
-async fn judge_runner_judges_captured_samples_and_records_model_provenance() {
+async fn judge_runner_judges_captured_samples_and_records_template_provenance() {
     let temporary = tempfile::tempdir().expect("temporary workspace");
     let data = run_fixture_in(temporary.path(), "fixture-judge", fixture_source()).await;
     let store = EvalStore::for_workspace(temporary.path());
@@ -425,20 +431,17 @@ async fn judge_runner_judges_captured_samples_and_records_model_provenance() {
         &store,
         &mut loaded,
         &FakeJudge,
-        JudgeOptions::default()
-            .with_model("judge-test-model")
-            .with_template("eval-judge"),
+        JudgeOptions::default().with_template("eval-judge"),
     )
     .await
     .expect("judge run succeeds");
 
-    assert_eq!(judged.model, "judge-test-model");
     assert_eq!(judged.template, "eval-judge");
     assert_eq!(judged.judged.len(), 4);
     assert_eq!(judged.skipped.len(), 2);
     assert!(loaded.samples.iter().all(|sample| {
         sample.status != SampleStatus::Succeeded
-            || sample.judge_model.as_deref() == Some("judge-test-model")
+            || sample.judge_template.as_deref() == Some("eval-judge")
     }));
     let report = loaded.report.as_ref().expect("judged report exists");
     let comparison = report.comparison.as_ref().expect("X/Y comparison exists");
@@ -450,16 +453,15 @@ async fn judge_runner_judges_captured_samples_and_records_model_provenance() {
         .find(|trait_summary| trait_summary.id == "correctness")
         .expect("correctness trait");
     assert_eq!(correctness.scored_pairs, 2);
-    assert_eq!(correctness.x_mean, Some(5.0));
-    assert_eq!(correctness.y_mean, Some(2.0));
-    assert_eq!(correctness.paired_difference, Some(-3.0));
+    assert_eq!(correctness.x_mean, Some(1.0));
+    assert_eq!(correctness.y_mean, Some(0.0));
+    assert_eq!(correctness.paired_difference, Some(-1.0));
     assert!(!correctness.outliers.is_empty());
 
     let markdown = render_markdown(report);
     assert!(markdown.contains("## X vs Y"));
     assert!(markdown.contains("correctness judge for baseline run 0"));
     assert!(markdown.contains("correctness judge for candidate run 0"));
-    assert!(markdown.contains("judge-test-model"));
 
     let stored = store.load(&loaded.id).expect("judged eval reloads");
     assert_eq!(stored.report.as_ref(), Some(report));
@@ -471,20 +473,15 @@ async fn judge_report_markdown_carries_per_trait_reasoning() {
     let data = run_fixture_in(temporary.path(), "fixture-reasons", fixture_source()).await;
     let store = EvalStore::for_workspace(temporary.path());
     let mut loaded = store.load(&data.id).expect("stored eval loads");
-    judge_eval(
-        &store,
-        &mut loaded,
-        &FakeJudge,
-        JudgeOptions::default().with_model("reasoning-model"),
-    )
-    .await
-    .expect("judge run succeeds");
+    judge_eval(&store, &mut loaded, &FakeJudge, JudgeOptions::default())
+        .await
+        .expect("judge run succeeds");
     let report = loaded.report.as_ref().expect("judged report exists");
     let markdown = render_markdown(report);
     assert!(markdown.contains("### Outlier reasoning"));
     assert!(markdown.contains("inspected the captured patch.diff"));
-    assert!(markdown.contains("X (`reasoning-model`)"));
-    assert!(markdown.contains("Y (`reasoning-model`)"));
+    assert!(markdown.contains("  - X: "));
+    assert!(markdown.contains("  - Y: "));
     for trait_summary in &report.matrix.traits {
         assert!(markdown.contains(&format!("| {} |", trait_summary.id)));
     }
@@ -496,17 +493,83 @@ fn eval_judge_template_is_a_valid_builtin_graph() {
     assert_eq!(template.name, "eval-judge");
     assert_eq!(template.graph.root.name().as_str(), "run");
     assert!(template.source.contains("policy.native-v2@1"));
+    assert_eq!(
+        template.source,
+        crate::native_v2_cli::EVAL_JUDGE_GRAPH_JSON,
+        "the eval judge is the shipped `eval-judge` template"
+    );
+    let openengine_cluster_protocol::PayloadType::Record { fields } = &template.graph.initial_input
+    else {
+        panic!("judge input is a record");
+    };
+    assert_eq!(
+        fields
+            .keys()
+            .map(|field| field.as_str())
+            .collect::<Vec<_>>(),
+        ["patch", "task", "traits", "verdicts"]
+    );
+    assert!(
+        !template.source.contains("model"),
+        "the template names no model"
+    );
 }
 
 #[tokio::test]
-async fn cli_judge_action_records_synthetic_model_and_comparison() {
+async fn eval_judge_is_a_builtin_template_that_passes_validate_only() {
+    let shown = crate::native_v2_cli::BuiltinGraphTemplate::parse("eval-judge")
+        .expect("eval-judge is in the built-in catalog")
+        .materialize(crate::native_v2_cli::TemplateDelivery::None)
+        .expect("eval-judge materializes");
+    let template = resolve_judge_template("eval-judge").expect("built-in template");
+    assert_eq!(shown, template.graph);
+    let workspace = tempfile::tempdir().expect("workspace");
+    let runtime = workspace.path().join("runtime.json");
+    std::fs::write(
+        &runtime,
+        r#"{"harness":"claude","provider":"anthropic","model":"any-model"}"#,
+    )
+    .expect("runtime");
+    let input = workspace.path().join("input.json");
+    std::fs::write(
+        &input,
+        r#"{"task":"t","traits":"[]","patch":"","verdicts":[]}"#,
+    )
+    .expect("input");
+    let command = crate::native_v2_cli::parse_native_v2_args(
+        [
+            "run",
+            "--title",
+            "judge",
+            "--template",
+            "eval-judge",
+            "--uniform-runtime-config",
+            runtime.to_str().expect("utf-8"),
+            "--input",
+            input.to_str().expect("utf-8"),
+            "--validate-only",
+        ]
+        .map(std::ffi::OsString::from)
+        .to_vec(),
+    )
+    .expect("`zeroshot run --template eval-judge --validate-only` parses");
+    let mut output = Vec::new();
+    let outcome = crate::native_v2_cli::try_execute_native_v2_preflight(&command, &mut output)
+        .await
+        .expect("eval-judge validates");
+    assert!(outcome.is_some());
+    assert_eq!(output, b"{\"valid\":true}\n");
+}
+
+#[tokio::test]
+async fn cli_judge_action_records_the_synthetic_judge_and_comparison() {
     let temporary = tempfile::tempdir().expect("temporary workspace");
     let data = run_fixture_in(temporary.path(), "fixture-cli-judge", fixture_source()).await;
     let report = execute(&EvalCommand {
         directory: temporary.path().to_path_buf(),
         action: EvalAction::Judge(EvalJudgeCommand {
             id: data.id.to_string(),
-            judge_model: Some("cli-judge-model".to_owned()),
+            judge_runner: Some("synthetic".to_owned()),
             judge_template: Some("eval-judge".to_owned()),
             scorer: None,
         }),
@@ -522,7 +585,7 @@ async fn cli_judge_action_records_synthetic_model_and_comparison() {
             .join(".zeroshot/eval/fixture-cli-judge/report.md"),
     )
     .expect("judged markdown is stored");
-    assert!(markdown.contains("cli-judge-model"));
+    assert!(markdown.contains("| synthetic |"));
     assert!(markdown.contains("### Outlier reasoning"));
 }
 
@@ -547,9 +610,7 @@ async fn manifest_judge_defaults_judge_a_plain_run() {
         .expect("plain run writes a judged report");
     assert!(report.comparison.is_some());
     assert!(report.matrix.rows.iter().any(|row| {
-        row.status == SampleStatus::Succeeded
-            && row.judge_model.as_deref() == Some("synthetic-judge")
-            && row.judge_executor.as_deref() == Some("fixture")
+        row.status == SampleStatus::Succeeded && row.judge_executor.as_deref() == Some("synthetic")
     }));
 }
 
@@ -563,21 +624,26 @@ impl JudgeGraphExecutor for RecordingExecutor {
     async fn execute(
         &self,
         _template: &JudgeTemplate,
-        model: &str,
         input: serde_json::Value,
     ) -> Result<serde_json::Value, EvalError> {
         self.inputs.lock().unwrap().push(input.clone());
+        let traits: Vec<serde_json::Value> =
+            serde_json::from_str(input["traits"].as_str().expect("traits")).expect("JSON");
         Ok(json!({
-            "criterion": input["criterion"],
-            "score": 4,
-            "reasoning": format!("The captured patch handles this criterion for {model}."),
-            "errors": [],
+            "traits": traits
+                .iter()
+                .map(|item| json!({
+                    "id": item["id"],
+                    "pass": item["id"] == "correctness",
+                    "reason": format!("The captured patch handles {}.", item["id"]),
+                }))
+                .collect::<Vec<_>>(),
         }))
     }
 }
 
 #[tokio::test]
-async fn template_judge_executes_the_graph_once_per_criterion() {
+async fn template_judge_executes_the_graph_once_per_sample_with_every_trait() {
     let executor = RecordingExecutor {
         inputs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
     };
@@ -591,36 +657,40 @@ async fn template_judge_executes_the_graph_once_per_criterion() {
         status: SampleStatus::Succeeded,
         timing: SampleTiming::default(),
         tokens: TokenUsage::default(),
+        cost_usd: None,
         delivered_revision: None,
         failure_reason: None,
         patch: None,
         criteria: Default::default(),
         reasoning: Default::default(),
-        judge_model: None,
         judge_template: None,
         judge_checkout: None,
         judge_executor: None,
     };
     let criteria = vec![criterion("correctness"), criterion("efficiency")];
     let result = judge
-        .judge(JudgeRequest::new(
-            sample,
-            criteria,
-            "patch body",
-            "judge-model",
-        ))
+        .judge(JudgeRequest::new(sample, criteria, "patch body").with_task("Do the task."))
         .await
         .expect("template judge succeeds");
     assert_eq!(result.judgements.len(), 2);
     let inputs = executor.inputs.lock().unwrap();
-    assert_eq!(inputs.len(), 2);
-    assert_eq!(inputs[0]["criterion"], "correctness");
-    assert_eq!(inputs[1]["criterion"], "efficiency");
+    assert_eq!(inputs.len(), 1, "one judge run per sample");
     assert_eq!(inputs[0]["patch"], "patch body");
-    assert_eq!(inputs[0]["model"], "judge-model");
+    assert_eq!(inputs[0]["task"], "Do the task.");
+    assert!(
+        inputs[0].get("model").is_none(),
+        "no model is passed to the judge"
+    );
+    let traits: serde_json::Value =
+        serde_json::from_str(inputs[0]["traits"].as_str().expect("traits")).expect("JSON");
+    assert_eq!(traits[0]["id"], "correctness");
+    assert_eq!(traits[1]["id"], "efficiency");
+    assert_eq!(traits[1]["description"], "efficiency description");
+    assert!(result.judgements["correctness"].pass);
+    assert!(!result.judgements["efficiency"].pass);
     assert_eq!(
-        result.judgements["correctness"].reasoning,
-        "The captured patch handles this criterion for judge-model."
+        result.judgements["correctness"].reason,
+        "The captured patch handles \"correctness\"."
     );
 }
 
@@ -670,35 +740,6 @@ fn captured_sample_reads_the_flattened_slice_two_artifact() {
     assert_eq!(captured.sample.arm_id, "baseline");
     assert_eq!(captured.patch.as_deref(), Some("diff body\n"));
     assert_eq!(captured.sample_json["status"], "succeeded");
-}
-
-#[test]
-fn judge_runtime_applies_the_effective_model_to_agent_bindings() {
-    use openengine_cluster_protocol::{ModelId, NodeName, RunSize, SessionScope};
-    use crate::native_v2_contract::NodeRuntimeBinding;
-
-    let node = NodeName::new("judge").expect("node name");
-    let mut nodes = std::collections::BTreeMap::new();
-    nodes.insert(
-        node.clone(),
-        NodeRuntimeBinding::Agent {
-            lane: None,
-            model: ModelId::new("authored-model").expect("model"),
-            effort: None,
-            session_scope: SessionScope::Execution,
-            connections: Default::default(),
-        },
-    );
-    let runtime = crate::native_v2_candidate::test_support::codex_runtime(RunSize::Small, nodes);
-    let updated = runtime_with_model(&runtime, "per-arm-model").expect("runtime model applies");
-    let nodes = match updated {
-        openengine_cluster_protocol::RuntimePlan::Codex { nodes, .. } => nodes,
-        _ => panic!("fixture runtime is Codex"),
-    };
-    match nodes.get(&node).expect("judge binding") {
-        NodeRuntimeBinding::Agent { model, .. } => assert_eq!(model.as_str(), "per-arm-model"),
-        _ => panic!("judge binding is an agent"),
-    }
 }
 
 fn write_capture(directory: &std::path::Path, sample_id: &str, run_id: &str) {
@@ -775,7 +816,7 @@ async fn judge_captures_command_imports_slice_two_directories() {
             manifest,
             captures,
             id: Some("captured-judged".to_owned()),
-            judge_model: Some("capture-judge".to_owned()),
+            judge_runner: None,
             judge_template: Some("custom-judge.json".to_owned()),
             scorer: None,
         }),
@@ -795,7 +836,7 @@ async fn judge_captures_command_imports_slice_two_directories() {
         Some(resolved.to_string_lossy().as_ref())
     );
     assert!(loaded.samples.iter().all(|sample| {
-        sample.judge_model.as_deref() == Some("capture-judge")
+        sample.judge_executor.as_deref() == Some("synthetic")
             && sample.patch.is_some()
             && sample.judge_template.as_deref() == Some(resolved.to_string_lossy().as_ref())
     }));
@@ -813,7 +854,7 @@ async fn judge_captures_fail_closed_without_recorded_evidence_or_runtime() {
             manifest,
             captures,
             id: Some("no-evidence".to_owned()),
-            judge_model: Some("provider/real-judge".to_owned()),
+            judge_runner: Some("synthetic".to_owned()),
             judge_template: Some("eval-judge".to_owned()),
             scorer: None,
         }),
@@ -846,13 +887,10 @@ async fn eval_judge_template_passes_production_admission() {
     );
     let runtime = crate::native_v2_candidate::test_support::codex_runtime(RunSize::Small, nodes);
     let initial_input = json!({
-        "criterion": "correctness",
-        "criterionDescription": "The change satisfies the request.",
+        "task": "Fix the parser.",
+        "traits": "[{\"id\":\"correctness\",\"description\":\"The change satisfies the request.\"}]",
         "patch": "diff --git a/file b/file",
-        "sample": "{}",
-        "model": "judge-model",
-        "checkout": "",
-        "score": 0.0
+        "verdicts": []
     });
     NativeV2Admission
         .validate_intent(
@@ -925,7 +963,7 @@ async fn judge_captures_keeps_failed_captures_without_a_patch_reproducibly() {
             manifest,
             captures,
             id: Some("captured-with-failure".to_owned()),
-            judge_model: Some("capture-judge".to_owned()),
+            judge_runner: None,
             judge_template: Some("eval-judge".to_owned()),
             scorer: None,
         }),
@@ -948,6 +986,7 @@ async fn judge_captures_keeps_failed_captures_without_a_patch_reproducibly() {
     let rescored = execute(&EvalCommand {
         directory: temporary.path().to_path_buf(),
         action: EvalAction::Score {
+            weights: Default::default(),
             id: id.to_string(),
             scorer: "none".to_owned(),
         },
@@ -1028,24 +1067,20 @@ async fn judge_uses_the_captured_patch_and_read_only_checkout() {
                 judgements: std::collections::BTreeMap::from([(
                     "correctness".to_owned(),
                     Judgement {
-                        score: 5.0,
-                        reasoning: format!("The checked-out file contains {file:?}."),
-                        errors: Vec::new(),
+                        pass: true,
+                        reason: format!("The checked-out file contains {file:?}."),
                     },
                 )]),
             })
         }
     }
     let result = CheckoutJudge
-        .judge(
-            JudgeRequest::new(sample, criteria, captured.patch.unwrap(), "judge-model")
-                .with_checkout(checkout),
-        )
+        .judge(JudgeRequest::new(sample, criteria, captured.patch.unwrap()).with_checkout(checkout))
         .await
         .expect("judge cites checkout");
     assert!(
         result.judgements["correctness"]
-            .reasoning
+            .reason
             .contains("delivered file")
     );
 }
@@ -1084,7 +1119,7 @@ async fn judge_capture_pairing_uses_the_sample_id_run_suffix() {
             manifest,
             captures,
             id: Some("paired-by-id".to_owned()),
-            judge_model: Some("capture-judge".to_owned()),
+            judge_runner: None,
             judge_template: Some("eval-judge".to_owned()),
             scorer: None,
         }),
@@ -1114,9 +1149,8 @@ async fn report_omits_xy_when_no_scores_exist_and_renders_judge_errors() {
                     (
                         criterion.id.clone(),
                         Judgement {
-                            score: 2.0,
-                            reasoning: "The patch misses the requested guard.".to_owned(),
-                            errors: vec!["missing guard in parser.rs".to_owned()],
+                            pass: false,
+                            reason: "The patch misses the requested guard in parser.rs.".to_owned(),
                         },
                     )
                 })
@@ -1126,9 +1160,7 @@ async fn report_omits_xy_when_no_scores_exist_and_renders_judge_errors() {
     }
 
     let temporary = tempfile::tempdir().expect("temporary workspace");
-    let source = fixture_source()
-        .replace("judgeModel = \"synthetic-judge\"\n", "")
-        .replace("judgeTemplate = \"eval-judge\"\n", "");
+    let source = fixture_source().replace("judgeTemplate = \"eval-judge\"\n", "");
     let data = run_fixture_in(temporary.path(), "fixture-no-scores", &source).await;
     let store = EvalStore::for_workspace(temporary.path());
     let mut unscored = store.load(&data.id).expect("stored eval loads");
@@ -1143,6 +1175,7 @@ async fn report_omits_xy_when_no_scores_exist_and_renders_judge_errors() {
     let report = execute(&EvalCommand {
         directory: temporary.path().to_path_buf(),
         action: EvalAction::Score {
+            weights: Default::default(),
             id: unscored.id.to_string(),
             scorer: "none".to_owned(),
         },
@@ -1154,24 +1187,17 @@ async fn report_omits_xy_when_no_scores_exist_and_renders_judge_errors() {
     assert!(!render_markdown(unscored.report.as_ref().unwrap()).contains("## X vs Y"));
 
     let mut loaded = store.load(&data.id).expect("stored eval loads");
-    judge_eval(
-        &store,
-        &mut loaded,
-        &ErrorJudge,
-        JudgeOptions::default().with_model("error-model"),
-    )
-    .await
-    .expect("error judge runs");
+    judge_eval(&store, &mut loaded, &ErrorJudge, JudgeOptions::default())
+        .await
+        .expect("error judge runs");
     let markdown = render_markdown(loaded.report.as_ref().expect("judged report"));
-    assert!(markdown.contains("## Judge errors"));
-    assert!(markdown.contains("missing guard in parser.rs"));
+    assert!(markdown.contains("The patch misses the requested guard in parser.rs."));
 }
 
 #[tokio::test]
 async fn relative_judge_runtime_path_is_persisted_against_the_manifest_directory() {
     let temporary = tempfile::tempdir().expect("temporary workspace");
     let source = fixture_source()
-        .replace("judgeModel = \"synthetic-judge\"\n", "")
         .replace("judgeTemplate = \"eval-judge\"\n", "")
         .replace(
             "seed = 7",
@@ -1211,7 +1237,7 @@ async fn duplicate_capture_ids_are_rejected() {
             manifest,
             captures,
             id: Some("duplicate-ids".to_owned()),
-            judge_model: Some("capture-judge".to_owned()),
+            judge_runner: None,
             judge_template: Some("eval-judge".to_owned()),
             scorer: None,
         }),
@@ -1359,9 +1385,8 @@ async fn runner_artifact_checkout_round_trips_into_the_judge() {
                         (
                             criterion.id.clone(),
                             Judgement {
-                                score: 5.0,
-                                reasoning: format!("Runner checkout contains {file:?}."),
-                                errors: Vec::new(),
+                                pass: true,
+                                reason: format!("Runner checkout contains {file:?}."),
                             },
                         )
                     })
@@ -1377,14 +1402,9 @@ async fn runner_artifact_checkout_round_trips_into_the_judge() {
         samples: vec![sample],
         report: None,
     };
-    judge_eval(
-        &store,
-        &mut data,
-        &CheckoutJudge,
-        JudgeOptions::default().with_model("checkout-judge"),
-    )
-    .await
-    .expect("judge runs with runner checkout");
+    judge_eval(&store, &mut data, &CheckoutJudge, JudgeOptions::default())
+        .await
+        .expect("judge runs with runner checkout");
     assert!(data.samples[0].judge_checkout.is_some());
     assert!(
         data.samples[0].criteria["correctness"]
@@ -1396,46 +1416,15 @@ async fn runner_artifact_checkout_round_trips_into_the_judge() {
 }
 
 #[tokio::test]
-async fn user_shaped_custom_graph_admits_without_the_internal_score_placeholder() {
+async fn eval_judge_input_admits_after_filtering_to_the_declared_fields() {
     use openengine_cluster_protocol::{
         IdempotencyKey, ModelId, NodeName, RunSize, RunTitle, SessionScope,
     };
     use crate::native_v2_admission::{DeliveryPolicy, NativeV2Admission};
     use crate::native_v2_contract::{NodeRuntimeBinding, RunSubmissionIntent};
 
-    let mut value: serde_json::Value =
-        serde_json::from_str(JUDGE_TEMPLATE_JSON).expect("template JSON");
-    value["initialInput"]["fields"]
-        .as_object_mut()
-        .unwrap()
-        .remove("score");
-    value["root"]["state"]["fields"]
-        .as_object_mut()
-        .unwrap()
-        .remove("score");
-    value["root"]["children"][0]["output"]["fields"]
-        .as_object_mut()
-        .unwrap()
-        .remove("score");
-    value["root"]["children"][0]["writeBindings"]
-        .as_array_mut()
-        .unwrap()
-        .retain(|binding| binding["target"][0] != "score");
-    value["root"]["children"][1]["output"]["fields"]
-        .as_object_mut()
-        .unwrap()
-        .remove("score");
-    value["root"]["children"][1]["bindings"]
-        .as_array_mut()
-        .unwrap()
-        .retain(|binding| binding["target"][0] != "score");
-    let graph: openengine_cluster_protocol::GraphSpec =
-        serde_json::from_value(value).expect("custom graph parses");
-    let template = JudgeTemplate {
-        name: "custom".to_owned(),
-        graph: graph.clone(),
-        source: String::new(),
-    };
+    let template = resolve_judge_template("eval-judge").expect("built-in judge template");
+    let graph = template.graph.clone();
     let input = judge_input(
         &JudgeRequest::new(
             crate::native_v2_eval::EvalSample {
@@ -1446,53 +1435,31 @@ async fn user_shaped_custom_graph_admits_without_the_internal_score_placeholder(
                 status: SampleStatus::Succeeded,
                 timing: SampleTiming::default(),
                 tokens: TokenUsage::default(),
+                cost_usd: None,
                 delivered_revision: None,
                 failure_reason: None,
                 patch: None,
                 criteria: Default::default(),
                 reasoning: Default::default(),
-                judge_model: None,
                 judge_template: None,
                 judge_checkout: None,
                 judge_executor: None,
             },
             vec![criterion("correctness")],
             "patch",
-            "model",
-        ),
-        &criterion("correctness"),
+        )
+        .with_task("Fix the parser"),
     );
-    let filtered = judge_input_for_template(
-        &template,
-        &crate::native_v2_eval::JudgeRequest::new(
-            crate::native_v2_eval::EvalSample {
-                id: "baseline-0000".to_owned(),
-                run_id: "run".to_owned(),
-                arm_id: "baseline".to_owned(),
-                run_index: 0,
-                status: SampleStatus::Succeeded,
-                timing: SampleTiming::default(),
-                tokens: TokenUsage::default(),
-                delivered_revision: None,
-                failure_reason: None,
-                patch: None,
-                criteria: Default::default(),
-                reasoning: Default::default(),
-                judge_model: None,
-                judge_template: None,
-                judge_checkout: None,
-                judge_executor: None,
-            },
-            vec![criterion("correctness")],
-            "patch",
-            "model",
-        ),
-        &criterion("correctness"),
-    )
-    .expect("filtered input");
-    assert!(input.get("score").is_some());
-    assert!(filtered.get("score").is_none());
-    assert!(filtered.get("checkout").is_some());
+    // The runner offers sample and checkout; eval-judge declares neither, so they are dropped.
+    assert!(input.get("sample").is_some());
+    let filtered = judge_input_for_template(&template, input).expect("filtered input");
+    assert!(filtered.get("sample").is_none());
+    assert!(filtered.get("checkout").is_none());
+    assert_eq!(filtered["task"], "Fix the parser");
+    assert_eq!(filtered["verdicts"], json!([]));
+    let traits: serde_json::Value =
+        serde_json::from_str(filtered["traits"].as_str().expect("traits string")).expect("JSON");
+    assert_eq!(traits[0]["id"], "correctness");
 
     let node = NodeName::new("judge").expect("judge node");
     let mut nodes = std::collections::BTreeMap::new();
@@ -1574,12 +1541,12 @@ async fn judge_eval_errors_on_a_succeeded_sample_without_a_patch() {
         status: SampleStatus::Succeeded,
         timing: SampleTiming::default(),
         tokens: TokenUsage::default(),
+        cost_usd: None,
         delivered_revision: None,
         failure_reason: None,
         patch: None,
         criteria: Default::default(),
         reasoning: Default::default(),
-        judge_model: None,
         judge_template: None,
         judge_checkout: None,
         judge_executor: None,
@@ -1591,14 +1558,9 @@ async fn judge_eval_errors_on_a_succeeded_sample_without_a_patch() {
         samples: vec![sample],
         report: None,
     };
-    let error = judge_eval(
-        &store,
-        &mut data,
-        &FakeJudge,
-        JudgeOptions::default().with_model("judge-model"),
-    )
-    .await
-    .expect_err("missing patch fails closed");
+    let error = judge_eval(&store, &mut data, &FakeJudge, JudgeOptions::default())
+        .await
+        .expect_err("missing patch fails closed");
     assert!(error.to_string().contains("without a captured patch"));
 }
 
@@ -1616,9 +1578,8 @@ async fn judge_eval_rejects_an_in_process_judgement_outside_the_contract() {
                         (
                             criterion.id.clone(),
                             Judgement {
-                                score: 6.0,
-                                reasoning: String::new(),
-                                errors: vec![String::new()],
+                                pass: true,
+                                reason: String::new(),
                             },
                         )
                     })
@@ -1630,16 +1591,11 @@ async fn judge_eval_rejects_an_in_process_judgement_outside_the_contract() {
     let data = run_fixture_in(temporary.path(), "fixture-invalid-judge", fixture_source()).await;
     let store = EvalStore::for_workspace(temporary.path());
     let mut loaded = store.load(&data.id).expect("stored eval loads");
-    let error = judge_eval(
-        &store,
-        &mut loaded,
-        &InvalidJudge,
-        JudgeOptions::default().with_model("invalid-judge"),
-    )
-    .await
-    .expect_err("invalid judgement is rejected");
+    let error = judge_eval(&store, &mut loaded, &InvalidJudge, JudgeOptions::default())
+        .await
+        .expect_err("invalid judgement is rejected");
     assert!(error.to_string().contains("correctness"));
-    assert!(error.to_string().contains("score"));
+    assert!(error.to_string().contains("reason"));
 }
 
 #[test]
@@ -1684,12 +1640,12 @@ async fn judge_captured_samples_fails_closed_without_a_patch() {
             status: SampleStatus::Succeeded,
             timing: SampleTiming::default(),
             tokens: TokenUsage::default(),
+            cost_usd: None,
             delivered_revision: None,
             failure_reason: None,
             patch: None,
             criteria: Default::default(),
             reasoning: Default::default(),
-            judge_model: None,
             judge_template: None,
             judge_checkout: None,
             judge_executor: None,
@@ -1702,7 +1658,7 @@ async fn judge_captured_samples_fails_closed_without_a_patch() {
         &FakeJudge,
         &[criterion("correctness")],
         vec![captured],
-        JudgeOptions::default().with_model("judge-model"),
+        JudgeOptions::default(),
     )
     .await
     .expect_err("missing patch fails closed");
@@ -1721,7 +1677,7 @@ async fn judge_captures_rejects_missing_or_empty_capture_roots_without_creating_
             manifest: manifest.clone(),
             captures: missing,
             id: Some("missing-root".to_owned()),
-            judge_model: Some("judge".to_owned()),
+            judge_runner: None,
             judge_template: None,
             scorer: None,
         }),
@@ -1739,7 +1695,7 @@ async fn judge_captures_rejects_missing_or_empty_capture_roots_without_creating_
             manifest,
             captures: empty,
             id: Some("empty-root".to_owned()),
-            judge_model: Some("judge".to_owned()),
+            judge_runner: None,
             judge_template: None,
             scorer: None,
         }),
@@ -1765,7 +1721,7 @@ async fn judge_captures_rolls_back_a_new_eval_when_a_later_judgement_is_invalid(
     let sample_path = candidate.join("sample.json");
     let mut document: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&sample_path).unwrap()).unwrap();
-    document["criteria"]["correctness"]["score"] = serde_json::json!(6.0);
+    document["criteria"]["correctness"]["reasoning"] = serde_json::json!("");
     std::fs::write(&sample_path, serde_json::to_vec(&document).unwrap()).expect("rewrite capture");
 
     let store = EvalStore::for_workspace(temporary.path());
@@ -1775,13 +1731,400 @@ async fn judge_captures_rolls_back_a_new_eval_when_a_later_judgement_is_invalid(
             manifest,
             captures,
             id: Some("rollback".to_owned()),
-            judge_model: Some("judge".to_owned()),
+            judge_runner: None,
             judge_template: None,
             scorer: None,
         }),
     })
     .await
     .expect_err("invalid later judgement fails the command");
-    assert!(error.to_string().contains("score"));
+    assert!(error.to_string().contains("reason"), "{error}");
     assert!(store.list().expect("store lists").is_empty());
+}
+
+fn talk_manifests() -> [(&'static str, &'static str); 2] {
+    [
+        (
+            "eval1-ci-before-review",
+            include_str!("../../fixtures/eval/talk/eval1-ci-before-review.toml"),
+        ),
+        (
+            "eval2-delete-comments",
+            include_str!("../../fixtures/eval/talk/eval2-delete-comments.toml"),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn talk_evals_dry_run_produce_the_slide_table_and_exports() {
+    for (name, source) in talk_manifests() {
+        let temporary = tempfile::tempdir().expect("temporary workspace");
+        let manifest = write_fixture(temporary.path(), source);
+        let parsed = EvalManifest::parse(source).expect("talk manifest parses");
+        assert_eq!(parsed.options.score.baseline.as_deref(), Some("baseline"));
+        let value = execute(&EvalCommand {
+            directory: temporary.path().to_path_buf(),
+            action: EvalAction::Run(EvalRunCommand {
+                manifest,
+                directory: temporary.path().to_path_buf(),
+                id: Some(format!("{name}-dry")),
+                scorer: None,
+                judge_template: None,
+                judge_runner: None,
+                runner: Some("fake".to_owned()),
+                workspace: None,
+            }),
+        })
+        .await
+        .expect("dry run succeeds");
+        let report: EvalReport = serde_json::from_value(value).expect("report json");
+        let comparison = report.baseline.as_ref().expect("baseline comparison");
+        assert_eq!(comparison.pairs.len(), 5, "{name}");
+        assert_eq!(comparison.cost_unit, CostUnit::Usd, "{name}");
+        assert_eq!(comparison.baseline.runs, 5);
+        assert_eq!(comparison.candidate.runs, 5);
+        let ratio = comparison.mean_ratio.expect("ratio is defined");
+        assert!(
+            (report.aggregate_score - ratio).abs() < 1e-12,
+            "baseline-ratio scorer"
+        );
+        let means = |side: &ArmAggregate| {
+            side.quality.expect("q")
+                / (side.cost.expect("c").powf(0.5) * side.time_minutes.expect("t").powf(0.5))
+        };
+        assert!((ratio - means(&comparison.candidate) / means(&comparison.baseline)).abs() < 1e-12);
+        let directory = temporary
+            .path()
+            .join(".zeroshot/eval")
+            .join(format!("{name}-dry"));
+        let table = std::fs::read_to_string(directory.join(TABLE_FILE)).expect("table.csv");
+        // Header, five runs, then mean, median, ratio_mean and ratio_median rows.
+        assert_eq!(table.lines().count(), 1 + 5 + 4, "{table}");
+        let rows = table.lines().collect::<Vec<_>>();
+        assert!(rows[6].starts_with("mean,") && rows[7].starts_with("median,"));
+        let last = |row: &str| row.rsplit(',').next().unwrap().parse::<f64>().unwrap();
+        assert!(rows[8].starts_with("ratio_mean,") && (last(rows[8]) - ratio).abs() < 1e-6);
+        let median_ratio = comparison.median_ratio.expect("median ratio is defined");
+        assert!(
+            rows[9].starts_with("ratio_median,") && (last(rows[9]) - median_ratio).abs() < 1e-6
+        );
+        let runs = std::fs::read_to_string(directory.join(RUNS_FILE)).expect("runs.csv");
+        assert_eq!(runs.lines().count(), 1 + 10, "{runs}");
+        let stored: BaselineComparison =
+            serde_json::from_slice(&std::fs::read(directory.join(SCORE_FILE)).expect("score.json"))
+                .expect("score.json parses");
+        assert_eq!(stored.pairs.len(), comparison.pairs.len());
+        assert_eq!(stored.candidate_arm, comparison.candidate_arm);
+        assert!((stored.mean_ratio.expect("stored ratio") - ratio).abs() < 1e-12);
+        let markdown = std::fs::read_to_string(directory.join("report.md")).expect("report.md");
+        assert!(markdown.contains("## Baseline vs candidate"));
+
+        let exported = temporary.path().join("export");
+        let value = execute(&EvalCommand {
+            directory: temporary.path().to_path_buf(),
+            action: EvalAction::Export {
+                id: format!("{name}-dry"),
+                output: Some(exported.clone()),
+                weights: ScoreWeights {
+                    a: Some(0.2),
+                    b: Some(0.8),
+                    pricing: Default::default(),
+                },
+            },
+        })
+        .await
+        .expect("export succeeds");
+        assert_eq!(value["a"], json!(0.2));
+        let reweighted: BaselineComparison = serde_json::from_slice(
+            &std::fs::read(exported.join(SCORE_FILE)).expect("exported score.json"),
+        )
+        .expect("exported score parses");
+        let weighted = |side: &ArmAggregate| {
+            side.quality.expect("q")
+                / (side.cost.expect("c").powf(0.2) * side.time_minutes.expect("t").powf(0.8))
+        };
+        let expected = weighted(&reweighted.candidate) / weighted(&reweighted.baseline);
+        assert!((reweighted.mean_ratio.expect("ratio") - expected).abs() < 1e-12);
+        assert!(exported.join(TABLE_FILE).is_file());
+        assert!(exported.join(RUNS_FILE).is_file());
+        // The stored report keeps the manifest weights.
+        let stored_again: BaselineComparison =
+            serde_json::from_slice(&std::fs::read(directory.join(SCORE_FILE)).expect("score.json"))
+                .expect("score.json parses");
+        assert!((stored_again.a - 0.5).abs() < f64::EPSILON);
+    }
+}
+
+/// A mocked judge graph run: answers in the `eval-judge` output shape, failing `efficiency` for
+/// the candidate arm only.
+struct VerdictGraph;
+
+#[async_trait::async_trait]
+impl JudgeGraphExecutor for VerdictGraph {
+    async fn execute(
+        &self,
+        _template: &JudgeTemplate,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, EvalError> {
+        let sample: serde_json::Value =
+            serde_json::from_str(input["sample"].as_str().expect("sample")).expect("JSON");
+        let traits: Vec<serde_json::Value> =
+            serde_json::from_str(input["traits"].as_str().expect("traits")).expect("JSON");
+        let candidate = sample["armId"] == "candidate";
+        Ok(json!({
+            "traits": traits
+                .iter()
+                .map(|item| json!({
+                    "id": item["id"],
+                    "pass": !(candidate && item["id"] == "efficiency"),
+                    "reason": format!("{} verdict from patch", item["id"].as_str().unwrap_or("")),
+                }))
+                .collect::<Vec<_>>(),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn judged_trait_verdicts_drive_per_run_quality() {
+    let temporary = tempfile::tempdir().expect("temporary workspace");
+    let store = EvalStore::for_workspace(temporary.path());
+    let mut data = run_fixture_in(temporary.path(), "judged-quality", fixture_source()).await;
+    let judge = TemplateJudge::new(
+        VerdictGraph,
+        resolve_judge_template("eval-judge").expect("template"),
+    );
+    judge_eval(&store, &mut data, &judge, JudgeOptions::default())
+        .await
+        .expect("mock judge runs");
+    let report = data.report.as_ref().expect("report");
+    let comparison = report.baseline.as_ref().expect("comparison");
+    // failEvery = 2 fails run 1 on both arms: Q = 0 with measured T and C.
+    let baseline_runs = comparison
+        .pairs
+        .iter()
+        .map(|pair| pair.baseline.as_ref().expect("baseline run").quality)
+        .collect::<Vec<_>>();
+    assert_eq!(baseline_runs, vec![Some(1.0), Some(0.0), Some(1.0)]);
+    let candidate = comparison.pairs[0]
+        .candidate
+        .as_ref()
+        .expect("candidate run");
+    // correctness (weight 2) passes, efficiency (weight 1) fails.
+    assert!((candidate.quality.expect("q") - 2.0 / 3.0).abs() < 1e-12);
+    assert_eq!((candidate.traits_passed, candidate.traits_judged), (1, 2));
+    assert!((comparison.candidate.quality.expect("q") - 4.0 / 9.0).abs() < 1e-12);
+    let sample = data
+        .samples
+        .iter()
+        .find(|sample| sample.id == "candidate-0000")
+        .expect("candidate sample");
+    let verdict = sample
+        .criteria
+        .get("efficiency")
+        .expect("per-trait verdict");
+    assert!(!verdict.passed);
+    assert_eq!(verdict.score, Some(0.0));
+    assert_eq!(
+        verdict.reasoning.as_deref(),
+        Some("efficiency verdict from patch")
+    );
+    assert_eq!(sample.judge_template.as_deref(), Some("eval-judge"));
+}
+
+#[test]
+fn captured_cost_and_cache_split_are_imported() {
+    let temporary = tempfile::tempdir().expect("temporary workspace");
+    std::fs::write(
+        temporary.path().join("sample.json"),
+        serde_json::to_vec(&json!({
+            "sampleId": "baseline-0003",
+            "runId": "run-cost",
+            "status": "succeeded",
+            "timings": { "startedAtMs": 1, "wallClockMs": 120000, "queueWaitMs": 0 },
+            "tokenUsage": {
+                "inputTokens": 10,
+                "outputTokens": 20,
+                "cacheReadInputTokens": 30,
+                "cacheCreationInputTokens": 40
+            },
+            "costUsd": 1.25
+        }))
+        .expect("json"),
+    )
+    .expect("sample.json is written");
+    let captured =
+        captured_sample_from_directory(temporary.path(), "baseline", 3).expect("capture parses");
+    assert_eq!(captured.sample.cost_usd, Some(1.25));
+    assert_eq!(captured.sample.tokens.cache, 70);
+    assert_eq!(captured.sample.tokens.cache_read, 30);
+    assert_eq!(captured.sample.tokens.cache_write, 40);
+
+    std::fs::write(
+        temporary.path().join("sample.json"),
+        br#"{"sampleId":"baseline-0003","runId":"r","status":"succeeded","costUsd":-1}"#,
+    )
+    .expect("sample.json is written");
+    let error = captured_sample_from_directory(temporary.path(), "baseline", 3)
+        .expect_err("negative cost is rejected");
+    assert!(error.to_string().contains("costUsd"));
+}
+
+#[test]
+fn local_runner_arms_become_zeroshot_run_commands() {
+    use crate::native_v2_cli::{RunGraph, RunRuntime, RunSelection, TemplateDelivery};
+
+    let manifest = EvalManifest::parse(include_str!(
+        "../../fixtures/eval/talk/eval1-ci-before-review.toml"
+    ))
+    .expect("talk manifest parses");
+    let base = std::path::Path::new("/evals/talk");
+    let workspace = std::path::Path::new("/repo");
+    let input = std::path::Path::new("/tmp/input.json");
+    let context = local::LocalArmContext {
+        manifest_directory: base,
+        workspace,
+        input,
+        title: "eval sample",
+    };
+    let baseline = local::run_command(
+        local::run_arguments(&manifest.arms[0], &context),
+        &manifest.arms[0].id,
+    )
+    .expect("template arm parses");
+    assert_eq!(baseline.cwd.as_deref(), Some(workspace));
+    assert!(baseline.target.is_none());
+    match &baseline.selection {
+        RunSelection::Inline {
+            graph: RunGraph::Template { delivery, .. },
+            runtime: RunRuntime::Uniform(runtime),
+        } => {
+            assert_eq!(*delivery, TemplateDelivery::Push);
+            assert_eq!(runtime, &base.join("runtime.json"));
+        }
+        selection => panic!("unexpected selection {selection:?}"),
+    }
+    let candidate = local::run_command(
+        local::run_arguments(&manifest.arms[1], &context),
+        &manifest.arms[1].id,
+    )
+    .expect("graph arm parses");
+    match &candidate.selection {
+        RunSelection::Inline {
+            graph: RunGraph::File(graph),
+            ..
+        } => assert_eq!(graph, &base.join("graphs/ci-before-review.json")),
+        selection => panic!("unexpected selection {selection:?}"),
+    }
+
+    for extra in [["--target", "platform"], ["--detach", "--title"]] {
+        let mut arm = manifest.arms[1].clone();
+        arm.run_args = extra.iter().map(|value| (*value).to_owned()).collect();
+        if extra[0] == "--detach" {
+            arm.run_args.truncate(1);
+        }
+        let error = local::run_command(
+            local::run_arguments(&arm, &context),
+            &format!("arm {:?}", arm.id),
+        )
+        .expect_err("unsupported local runArgs are rejected");
+        assert!(error.to_string().contains("runArgs"), "{error}");
+    }
+    let mut arm = manifest.arms[1].clone();
+    arm.run_args = vec!["--no-such-flag".to_owned()];
+    let error = local::run_command(
+        local::run_arguments(&arm, &context),
+        &format!("arm {:?}", arm.id),
+    )
+    .expect_err("unknown flags are rejected");
+    assert!(
+        error.to_string().contains("not a valid `zeroshot run`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn local_arm_options_are_validated() {
+    let source = include_str!("../../fixtures/eval/talk/eval2-delete-comments.toml");
+    for (from, to, message) in [
+        ("delivery = \"push\"", "delivery = \"ftp\"", "delivery"),
+        (
+            "uniformRuntimeConfig = \"runtime.json\"\nprompt",
+            "uniformRuntimeConfig = \"runtime.json\"\nruntimeConfig = \"plan.json\"\nprompt",
+            "at most one of runtimeConfig",
+        ),
+        (
+            "deadlineMinutes = 90",
+            "deadlineMinutes = 0",
+            "deadlineMinutes",
+        ),
+        ("input = 3.0", "input = -3.0", "options.pricing.input"),
+    ] {
+        assert!(source.contains(from), "fixture contains {from}");
+        let error = EvalManifest::parse(&source.replacen(from, to, 1))
+            .expect_err("invalid manifest is rejected");
+        assert!(error.to_string().contains(message), "{error}");
+    }
+}
+
+#[test]
+fn judge_runner_defaults_to_synthetic_only_for_the_fake_runner() {
+    let fake = EvalManifest::parse(fixture_source()).expect("fixture manifest parses");
+    assert_eq!(fake.judge_runner(None).expect("default"), "synthetic");
+    assert_eq!(fake.judge_runner(Some("local")).expect("override"), "local");
+    let local =
+        EvalManifest::parse(&fixture_source().replace("runner = \"fake\"", "runner = \"local\""))
+            .expect("local manifest parses");
+    assert_eq!(local.judge_runner(None).expect("default"), "local");
+    assert!(fake.judge_runner(Some("some-model")).is_err());
+    let pinned = EvalManifest::parse(&fixture_source().replace(
+        "judgeTemplate = \"eval-judge\"",
+        "judgeTemplate = \"eval-judge\"\njudgeRunner = \"local\"",
+    ))
+    .expect("pinned manifest parses");
+    assert_eq!(pinned.judge_runner(None).expect("manifest"), "local");
+}
+
+#[tokio::test]
+async fn score_price_overrides_turn_token_costs_into_usd() {
+    let temporary = tempfile::tempdir().expect("temporary workspace");
+    let data = run_fixture_in(temporary.path(), "priced", fixture_source()).await;
+    let unpriced = data
+        .report
+        .as_ref()
+        .and_then(|report| report.baseline.as_ref())
+        .expect("comparison");
+    assert_eq!(unpriced.cost_unit, CostUnit::Mtok);
+    assert!(
+        unpriced
+            .notes
+            .iter()
+            .any(|note| note.contains("without a price"))
+    );
+    let report = execute(&EvalCommand {
+        directory: temporary.path().to_path_buf(),
+        action: EvalAction::Score {
+            weights: ScoreWeights {
+                a: None,
+                b: None,
+                pricing: Pricing {
+                    input: Some(2.0),
+                    output: Some(10.0),
+                    cache_read: Some(0.5),
+                    cache_write: Some(0.5),
+                },
+            },
+            id: data.id.to_string(),
+            scorer: "baseline-ratio".to_owned(),
+        },
+    })
+    .await
+    .expect("rescore with prices");
+    assert_eq!(report["baseline"]["costUnit"], "usd");
+    let baseline = &report["baseline"]["pairs"][0]["baseline"];
+    let tokens = |field: &str| baseline[field].as_f64().expect("token count");
+    let expected =
+        (tokens("inputTokens") * 2.0 + tokens("outputTokens") * 10.0 + tokens("cacheTokens") * 0.5)
+            / 1_000_000.0;
+    assert!((baseline["cost"].as_f64().expect("cost") - expected).abs() < 1e-12);
+    assert_eq!(baseline["costSource"], "priced");
 }

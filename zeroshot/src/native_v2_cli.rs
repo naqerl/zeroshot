@@ -34,6 +34,7 @@ use crate::native_v2_supervisor::RunEnvironmentError;
 #[path = "native_v2_templates.rs"]
 mod templates;
 pub use templates::{BuiltinGraphTemplate, TemplateDelivery};
+pub(crate) use templates::EVAL_JUDGE_GRAPH_JSON;
 
 #[path = "native_v2_cli/oecp.rs"]
 pub mod oecp;

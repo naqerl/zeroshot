@@ -34,6 +34,7 @@ mod submission;
 use attach::{RoutedAttach, follow_attach};
 pub(crate) use context::CliExecutionContext;
 pub use failure::RunFailure;
+pub(crate) use submission::prepare_run_submission;
 pub use submission::{try_execute_native_v2_preflight, try_execute_native_v2_static};
 use submission::{RunSubmission, select_connection_requirements, submit_run, validate_github_token};
 use status::outcome_for_status;

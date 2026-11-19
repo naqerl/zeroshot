@@ -22,15 +22,17 @@ pub enum BuiltinGraphTemplate {
     AutoResearch,
     IssueReview,
     PrReview,
+    EvalJudge,
 }
 
 impl BuiltinGraphTemplate {
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::SingleWorker,
         Self::SoftwareChange,
         Self::AutoResearch,
         Self::IssueReview,
         Self::PrReview,
+        Self::EvalJudge,
     ];
 
     #[must_use]
@@ -46,6 +48,7 @@ impl BuiltinGraphTemplate {
             Self::AutoResearch => "auto-research",
             Self::IssueReview => "issue-review",
             Self::PrReview => "pr-review",
+            Self::EvalJudge => "eval-judge",
         }
     }
 
@@ -57,6 +60,7 @@ impl BuiltinGraphTemplate {
             "auto-research" => Some(Self::AutoResearch),
             "issue-review" => Some(Self::IssueReview),
             "pr-review" => Some(Self::PrReview),
+            "eval-judge" => Some(Self::EvalJudge),
             _ => None,
         }
     }
@@ -90,6 +94,7 @@ impl BuiltinGraphTemplate {
             Self::AutoResearch => auto_research_graph(delivery),
             Self::IssueReview => super::review::issue_review_graph(delivery),
             Self::PrReview => super::pr_review::pr_review_graph(delivery),
+            Self::EvalJudge => super::eval_judge_graph(),
         }
     }
 
@@ -116,9 +121,11 @@ impl BuiltinGraphTemplate {
         let connections = delivery_connections(delivery)?;
         let name = match self {
             Self::AutoResearch => "checkpoint_delivery",
-            Self::SingleWorker | Self::SoftwareChange | Self::IssueReview | Self::PrReview => {
-                DELIVERY_NODE
-            }
+            Self::SingleWorker
+            | Self::SoftwareChange
+            | Self::IssueReview
+            | Self::PrReview
+            | Self::EvalJudge => DELIVERY_NODE,
         };
         Ok(Some((
             node_name(name)?,
@@ -135,7 +142,7 @@ impl BuiltinGraphTemplate {
 
     fn validate_delivery(self, delivery: TemplateDelivery) -> Result<(), BuiltinTemplateError> {
         let supported = match self {
-            Self::SingleWorker => delivery == TemplateDelivery::None,
+            Self::SingleWorker | Self::EvalJudge => delivery == TemplateDelivery::None,
             Self::SoftwareChange => delivery != TemplateDelivery::Comment,
             Self::AutoResearch => {
                 matches!(delivery, TemplateDelivery::None | TemplateDelivery::Push)

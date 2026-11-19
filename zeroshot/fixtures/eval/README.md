@@ -75,16 +75,24 @@ report is absent.
 ## Judging
 
 A run first records samples and patches. The judge reads those captured artifacts; it never
-re-runs an arm. Configure the model per run, per arm, or in `[options]`:
+re-runs an arm.
 
 ```toml
 [options]
-judgeModel = "provider/default-judge"
 judgeTemplate = "eval-judge"
+# judgeRunner = "local"                     # default: "synthetic" for the fake runner, else "local"
+# judgeUniformRuntimeConfig = "runtime.json" # the judge's harness, provider, and model
 ```
 
-The `eval-judge` graph lives at `zeroshot/src/native_v2_templates/eval_judge.json`. A custom graph
-is any JSON path with the same input/output shape. Judgements use the inclusive 1..=5 scale, with
-3 as the pass threshold, and must provide short reasoning plus an `errors` array. The checked-in
-fixture declares both defaults, so a plain `zeroshot eval run` judges its captured samples. See
-`docs/guides/eval.md` for the contract and the X/Y report section.
+`eval-judge` is a built-in graph template (`zeroshot template show eval-judge`, source
+`zeroshot/src/native_v2_templates/eval_judge.json`). The `local` judge runner submits it as a
+normal `zeroshot run` with the patch and the `[[criteria]]` traits as input, so the judge uses
+whatever model the runtime config or profile sets. It answers one `{id, pass, reason}` verdict
+per trait, and `Q = passed / total`. The fake runner uses a synthetic judge that calls no model.
+A custom graph is any JSON path with the same input/output shape. See `docs/guides/eval.md` for
+the contract and the X/Y report section.
+
+## Talk evals
+
+`talk/` holds the baseline-vs-candidate evals behind the `S = Q / (C^a * T^b)` score
+(`baseline-ratio` scorer, `zeroshot eval export`). See `talk/README.md`.

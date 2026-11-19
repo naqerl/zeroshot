@@ -389,10 +389,10 @@ fn finished_with_judge_output() -> CliRunStatusResult {
         "terminalResult": {
             "status": "succeeded",
             "output": {
-                "criterion": "correctness",
-                "score": 4.0,
-                "reasoning": "The captured patch adds the guard.",
-                "errors": []
+                "traits": [
+                    {"id": "correctness", "pass": true, "reason": "The captured patch adds the guard."},
+                    {"id": "tests", "pass": false, "reason": "No test covers the new guard."}
+                ]
             }
         },
         "metadata": {
@@ -1034,7 +1034,6 @@ async fn cli_backend_path_runs_the_selected_platform_runner() {
     let temporary = tempfile::tempdir().unwrap();
     let source = include_str!("../../fixtures/eval/synthetic.toml")
         .replace("runner = \"fake\"", "runner = \"platform\"")
-        .replace("judgeModel = \"synthetic-judge\"\n", "")
         .replace("judgeTemplate = \"eval-judge\"\n", "");
     let manifest_path = temporary.path().join("platform.toml");
     std::fs::write(&manifest_path, &source).unwrap();
@@ -1052,7 +1051,9 @@ async fn cli_backend_path_runs_the_selected_platform_runner() {
             id: Some("fixture-platform".to_owned()),
             scorer: None,
             judge_template: None,
-            judge_model: None,
+            judge_runner: None,
+            runner: None,
+            workspace: None,
         },
         backend,
         target: Some("platform".to_owned()),
@@ -1081,75 +1082,127 @@ async fn cli_backend_path_runs_the_selected_platform_runner() {
     assert_eq!(capacity.capacity_source.label(), "concurrency");
 }
 
-#[tokio::test]
-async fn local_judge_graph_executor_applies_the_model_and_parses_terminal_output() {
-    use crate::native_v2_contract::{DeclaredConnections, ModelId, NodeRuntimeBinding, RuntimePlan};
-    use crate::native_v2_eval::{
-        EvalCriterion, EvalSample, Judge, JudgeRequest, LocalJudgeGraphExecutor, SampleStatus,
-        SampleTiming, TemplateJudge, TokenUsage, resolve_judge_template,
-    };
-    use openengine_cluster_protocol::{NodeName, RunSize, SessionScope};
-    use std::collections::BTreeMap;
-
-    let backend = Arc::new(ScriptedBackend::new(
-        vec![queued(), finished_with_judge_output()],
-        Duration::from_millis(1),
-    ));
-    let node = NodeName::new("judge").expect("node");
-    let mut nodes = BTreeMap::new();
-    nodes.insert(
-        node.clone(),
-        NodeRuntimeBinding::Agent {
-            lane: None,
-            model: ModelId::new("authored-model").expect("model"),
-            effort: None,
-            session_scope: SessionScope::Execution,
-            connections: DeclaredConnections::empty(),
-        },
-    );
-    let runtime = crate::native_v2_candidate::test_support::codex_runtime(RunSize::Small, nodes);
-    let live_workspace = tempfile::tempdir().expect("live workspace");
-    let executor =
-        LocalJudgeGraphExecutor::new(Arc::clone(&backend), runtime, live_workspace.path());
-    let template = resolve_judge_template("eval-judge").expect("template");
-    let judge = TemplateJudge::new(executor, template);
-    let sample = EvalSample {
+fn judge_test_sample() -> crate::native_v2_eval::EvalSample {
+    crate::native_v2_eval::EvalSample {
         id: "baseline-0000".to_owned(),
         run_id: "run".to_owned(),
         arm_id: "baseline".to_owned(),
         run_index: 0,
         status: SampleStatus::Succeeded,
-        timing: SampleTiming::default(),
-        tokens: TokenUsage::default(),
+        timing: crate::native_v2_eval::SampleTiming::default(),
+        tokens: crate::native_v2_eval::TokenUsage::default(),
+        cost_usd: None,
         delivered_revision: None,
         failure_reason: None,
         patch: None,
         criteria: Default::default(),
         reasoning: Default::default(),
-        judge_model: None,
         judge_template: None,
         judge_checkout: None,
         judge_executor: None,
+    }
+}
+
+fn judge_runtime_file(
+    directory: &std::path::Path,
+    connections: crate::native_v2_contract::DeclaredConnections,
+) -> std::path::PathBuf {
+    use crate::native_v2_contract::{ModelId, NodeRuntimeBinding};
+    use openengine_cluster_protocol::{NodeName, RunSize, SessionScope};
+
+    let mut nodes = std::collections::BTreeMap::new();
+    nodes.insert(
+        NodeName::new("judge").expect("node"),
+        NodeRuntimeBinding::Agent {
+            lane: None,
+            model: ModelId::new("authored-model").expect("model"),
+            effort: None,
+            session_scope: SessionScope::Execution,
+            connections,
+        },
+    );
+    let runtime = crate::native_v2_candidate::test_support::codex_runtime(RunSize::Small, nodes);
+    let path = directory.join("judge-runtime.json");
+    std::fs::write(&path, serde_json::to_vec(&runtime).expect("runtime JSON")).expect("write");
+    path
+}
+
+#[tokio::test]
+async fn local_judge_runs_eval_judge_as_a_zeroshot_run_and_parses_trait_verdicts() {
+    use crate::native_v2_contract::{DeclaredConnections, NodeRuntimeBinding, RuntimePlan};
+    use crate::native_v2_eval::{
+        EvalCriterion, Judge, JudgeRequest, JudgeRunConfig, LocalJudgeGraphExecutor, TemplateJudge,
+        resolve_judge_template,
+    };
+    use openengine_cluster_protocol::NodeName;
+
+    let backend = Arc::new(ScriptedBackend::new(
+        vec![queued(), finished_with_judge_output()],
+        Duration::from_millis(1),
+    ));
+    let config_directory = tempfile::tempdir().expect("config directory");
+    let run = JudgeRunConfig {
+        template: "eval-judge".to_owned(),
+        runtime_config: Some(judge_runtime_file(
+            config_directory.path(),
+            DeclaredConnections::empty(),
+        )),
+        ..JudgeRunConfig::default()
+    };
+    let live_workspace = tempfile::tempdir().expect("live workspace");
+    let executor = LocalJudgeGraphExecutor::new(Arc::clone(&backend), run, live_workspace.path());
+    let template = resolve_judge_template("eval-judge").expect("template");
+    let judge = TemplateJudge::new(executor, template);
+    let sample = judge_test_sample();
+    let criterion = |id: &str| EvalCriterion {
+        id: id.to_owned(),
+        description: format!("{id} holds"),
+        weight: 1.0,
     };
     let request = JudgeRequest::new(
         sample,
-        vec![EvalCriterion {
-            id: "correctness".to_owned(),
-            description: "correct".to_owned(),
-            weight: 1.0,
-        }],
-        "patch",
-        "per-arm-model",
-    );
+        vec![criterion("correctness"), criterion("tests")],
+        "diff --git a/src/lib.rs b/src/lib.rs",
+    )
+    .with_task("Add the guard.");
     let result = judge.judge(request).await.expect("judge executes");
-    assert_eq!(result.judgements["correctness"].score, 4.0);
+    assert!(result.judgements["correctness"].pass);
+    assert!(!result.judgements["tests"].pass);
+    assert_eq!(
+        result.judgements["tests"].reason,
+        "No test covers the new guard."
+    );
+
     let submitted = backend.last_request().expect("request submitted");
+    let input = submitted
+        .intent
+        .initial_input
+        .as_object()
+        .expect("input object");
+    assert_eq!(
+        input.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["patch", "task", "traits", "verdicts"],
+        "the built-in template receives exactly its declared inputs"
+    );
+    assert_eq!(input["task"], "Add the guard.");
+    assert_eq!(input["patch"], "diff --git a/src/lib.rs b/src/lib.rs");
+    let traits: serde_json::Value =
+        serde_json::from_str(input["traits"].as_str().expect("traits string")).expect("JSON");
+    assert_eq!(traits[1]["id"], "tests");
+    assert_eq!(traits[1]["description"], "tests holds");
     let nodes = match submitted.intent.runtime {
         RuntimePlan::Codex { nodes, .. } => nodes,
         _ => panic!("codex runtime"),
     };
-    match nodes.get(&node).expect("judge binding") {
-        NodeRuntimeBinding::Agent { model, .. } => assert_eq!(model.as_str(), "per-arm-model"),
+    match nodes
+        .get(&NodeName::new("judge").expect("node"))
+        .expect("judge binding")
+    {
+        NodeRuntimeBinding::Agent { model, .. } => assert_eq!(
+            model.as_str(),
+            "authored-model",
+            "the judge model is whatever the runtime config sets"
+        ),
         _ => panic!("agent binding"),
     }
     assert!(
@@ -1159,50 +1212,4 @@ async fn local_judge_graph_executor_applies_the_model_and_parses_terminal_output
             .file_name()
             .is_some_and(|name| name.to_string_lossy().starts_with("zeroshot-judge-"))
     );
-}
-
-#[tokio::test]
-async fn local_judge_graph_executor_rejects_connection_requirements_before_submission() {
-    use crate::native_v2_contract::{
-        DeclaredConnections, DeclaredEnvironment, ModelId, NodeRuntimeBinding,
-    };
-    use crate::native_v2_eval::{JudgeGraphExecutor, LocalJudgeGraphExecutor, resolve_judge_template};
-    use openengine_cluster_protocol::{EnvironmentVariableName, NodeName, RunSize, SessionScope};
-    use std::collections::BTreeMap;
-
-    let backend = Arc::new(ScriptedBackend::new(Vec::new(), Duration::ZERO));
-    let node = NodeName::new("judge").expect("node");
-    let mut nodes = BTreeMap::new();
-    nodes.insert(
-        node,
-        NodeRuntimeBinding::Agent {
-            lane: None,
-            model: ModelId::new("authored-model").expect("model"),
-            effort: None,
-            session_scope: SessionScope::Execution,
-            connections: DeclaredConnections::single(
-                "gateway",
-                DeclaredEnvironment::new(
-                    [EnvironmentVariableName::new("GATEWAY_API_KEY").unwrap()],
-                )
-                .unwrap(),
-            )
-            .unwrap(),
-        },
-    );
-    let runtime = crate::native_v2_candidate::test_support::codex_runtime(RunSize::Small, nodes);
-    let live_workspace = tempfile::tempdir().expect("live workspace");
-    let executor =
-        LocalJudgeGraphExecutor::new(Arc::clone(&backend), runtime, live_workspace.path());
-    let template = resolve_judge_template("eval-judge").expect("template");
-    let error = executor
-        .execute(
-            &template,
-            "per-arm-model",
-            json!({"criterion":"correctness"}),
-        )
-        .await
-        .expect_err("connection requirements fail closed");
-    assert!(error.to_string().contains("connection requirements"));
-    assert_eq!(backend.submits(), 0);
 }

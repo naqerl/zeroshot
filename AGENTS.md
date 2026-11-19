@@ -123,19 +123,25 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   Capsule allocation reuses the resolved
   `ProductionHostingConfig`; instantiated diagnostic storage remains separate from configuration.
 
-- Eval judges read captured `patch.diff`/`sample.json` artifacts and never re-run an arm. The
-  judgement contract is strict: one score per criterion on an inclusive 1..=5 scale (3 passes),
-  short patch-referencing reasoning, and an `errors` array; malformed responses name the field.
-  Reports record the judging model and executor per sample and include the first-two-arm X/Y means,
-  paired difference, and outlier reasoning. `eval-judge` is a JSON graph template in
-  `zeroshot/src/native_v2_templates/`; custom graph JSON paths receive only the standard input
-  fields their own `initialInput` declares. Provider-backed CLI execution uses an authored
-  `options.judgeRuntimeConfig` plan through the native-v2 local runner and applies the effective
-  model to every agent binding; runtime plans with connection requirements fail closed. Without a
-  runtime plan the synthetic executor reuses recorded fake evidence and fails closed when a capture
-  has none; a succeeded sample with no captured patch is an error. Captured patch/checkout paths
-  stay inside the capture directory, graph judges run in private scratch, and slice-2 capture
-  directories are importable through `zeroshot eval judge-captures`.
+- Eval judges read captured `patch.diff`/`sample.json` artifacts and never re-run an arm. Judging
+  is the built-in `eval-judge` graph template (`zeroshot/src/native_v2_templates/eval_judge.json`),
+  run once per sample with `{task, traits, patch, verdicts: []}`; its output is
+  `{traits: [{id, pass, reason}]}`, parsed strictly (malformed responses name the field) into
+  `Q = passed / total`. Never wire a judge provider or model into code: the `local` judge runner
+  submits the graph as a normal `zeroshot run` with the manifest's `judgeRuntimeConfig`,
+  `judgeUniformRuntimeConfig`, or `judgeRunArgs`; the `synthetic` runner (default for the fake
+  runner) reuses recorded fake evidence, calls no model, and fails closed when a capture has none.
+  Custom graph JSON paths receive only the input fields their own `initialInput` declares
+  (optionally `sample` and `checkout`). A succeeded sample with no captured patch is an error.
+  Captured patch/checkout paths stay inside the capture directory, graph judges run in private
+  scratch, and slice-2 capture directories are importable through `zeroshot eval judge-captures`.
+  Baseline vs candidate scoring (`baseline.rs`) is `S = Q / (C^a * T^b)`, with `meanRatio` from
+  per-arm means and `medianRatio` from per-arm medians. `C` is a recorded `costUsd`, then tokens ×
+  the user-set `input`/`output`/`cacheRead`/`cacheWrite` prices (`--price-*`, `[arms.pricing]`,
+  `[options.pricing]`), then an Mtok fallback that names the missing prices; never invent a
+  default price. `zeroshot eval export` writes `score.json`, `table.csv`, and `runs.csv`.
+  `options.runner = "local"` runs each sample as a real `zeroshot run` (`local.rs`), so never
+  start one unless asked; use `--runner fake`.
 - Protocol Rust types are the source of truth. Generated files under
   `protocol/openengine-cluster/v1/` must be regenerated through the Rust testkit, not hand-edited.
 - Initial input remains caller-owned and is validated unchanged. A root group may add required
