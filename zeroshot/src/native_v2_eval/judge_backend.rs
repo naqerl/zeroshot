@@ -38,7 +38,7 @@ pub struct JudgeRunConfig {
 impl JudgeRunConfig {
     /// The `zeroshot run` argument vector for one judge input file in a scratch directory.
     #[must_use]
-    pub fn arguments(&self, input: &Path, scratch: &Path) -> Vec<OsString> {
+    pub fn arguments(&self, input: &Path, cwd: &Path) -> Vec<OsString> {
         let mut arguments: Vec<OsString> = vec![
             "run".into(),
             "--title".into(),
@@ -46,7 +46,7 @@ impl JudgeRunConfig {
             "--input".into(),
             input.as_os_str().to_owned(),
             "--cwd".into(),
-            scratch.as_os_str().to_owned(),
+            cwd.as_os_str().to_owned(),
         ];
         if self.template == JUDGE_TEMPLATE_NAME {
             arguments.extend(["--template".into(), JUDGE_TEMPLATE_NAME.into()]);
@@ -89,6 +89,28 @@ impl<B> LocalJudgeGraphExecutor<B> {
 #[async_trait]
 impl<B: NativeV2CliBackend> JudgeGraphExecutor for LocalJudgeGraphExecutor<B> {
     async fn execute(&self, template: &JudgeTemplate, input: Value) -> Result<Value, EvalError> {
+        let checkout = input
+            .get("checkout")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|checkout| !checkout.is_empty())
+            .ok_or_else(|| {
+                EvalError::Judge(
+                    "judge requires a captured checkout; no delivered checkout was available for this sample"
+                        .to_owned(),
+                )
+            })?;
+        let checkout = std::fs::canonicalize(checkout).map_err(|error| {
+            EvalError::Judge(format!(
+                "judge checkout {checkout:?} is unavailable: {error}"
+            ))
+        })?;
+        if !checkout.is_dir() {
+            return Err(EvalError::Judge(format!(
+                "judge checkout {} is not a directory",
+                checkout.display()
+            )));
+        }
         let input = judge_input_for_template(template, input)?;
         let identity = uuid::Uuid::now_v7().simple().to_string();
         let scratch = tempfile::Builder::new()
@@ -113,7 +135,7 @@ impl<B: NativeV2CliBackend> JudgeGraphExecutor for LocalJudgeGraphExecutor<B> {
         let input_path = inputs.path().join("judge-input.json");
         std::fs::write(&input_path, serde_json::to_vec(&input)?)
             .map_err(|error| EvalError::io(&input_path, error))?;
-        let run = run_command(self.run.arguments(&input_path, scratch.path()), "judge")?;
+        let run = run_command(self.run.arguments(&input_path, &checkout), "judge")?;
         let request =
             crate::native_v2_cli::execution::prepare_run_submission(&run, self.backend.as_ref())
                 .await

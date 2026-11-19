@@ -129,12 +129,16 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   `{traits: [{id, pass, reason}]}`, parsed strictly (malformed responses name the field) into
   `Q = passed / total`. Never wire a judge provider or model into code: the `local` judge runner
   submits the graph as a normal `zeroshot run` with the manifest's `judgeRuntimeConfig`,
-  `judgeUniformRuntimeConfig`, or `judgeRunArgs`; the `synthetic` runner (default for the fake
-  runner) reuses recorded fake evidence, calls no model, and fails closed when a capture has none.
-  Custom graph JSON paths receive only the input fields their own `initialInput` declares
-  (optionally `sample` and `checkout`). A succeeded sample with no captured patch is an error.
-  Captured patch/checkout paths stay inside the capture directory, graph judges run in private
-  scratch, and slice-2 capture directories are importable through `zeroshot eval judge-captures`.
+  `judgeUniformRuntimeConfig`, or `judgeRunArgs`. Selecting `local` without one of those fails with
+  an explicit judge error naming the missing `judgeRuntimeConfig` rather than falling back to the
+  synthetic runner; the `synthetic` runner (default for the fake runner) reuses recorded fake
+  evidence, calls no model, fails closed when a capture has none, and refuses to relabel verdicts
+  produced by another judge executor. Custom graph JSON paths
+  receive only the input fields their own `initialInput` declares (optionally `sample` and
+  `checkout`). A succeeded sample with no captured patch or checkout is an error. Captured
+  patch/checkout paths stay inside the capture directory, provider-backed graph judges run with
+  the delivered checkout as their working directory while run artifacts use private scratch, and
+  slice-2 capture directories are importable through `zeroshot eval judge-captures`.
   Baseline vs candidate scoring (`baseline.rs`) is `S = Q / (C^a * T^b)`, with `meanRatio` from
   per-arm means and `medianRatio` from per-arm medians. `C` is a recorded `costUsd`, then tokens ×
   the user-set `input`/`output`/`cacheRead`/`cacheWrite` prices (`--price-*`, `[arms.pricing]`,

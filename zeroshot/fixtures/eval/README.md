@@ -87,10 +87,13 @@ judgeTemplate = "eval-judge"
 `eval-judge` is a built-in graph template (`zeroshot template show eval-judge`, source
 `zeroshot/src/native_v2_templates/eval_judge.json`). The `local` judge runner submits it as a
 normal `zeroshot run` with the patch and the `[[criteria]]` traits as input, so the judge uses
-whatever model the runtime config or profile sets. It answers one `{id, pass, reason}` verdict
-per trait, and `Q = passed / total`. The fake runner uses a synthetic judge that calls no model.
-A custom graph is any JSON path with the same input/output shape. See `docs/guides/eval.md` for
-the contract and the X/Y report section.
+whatever model the runtime config or profile sets. It runs with the sample's delivered checkout as
+its working directory and requires a runtime config, uniform runtime config, or a profile selected
+through `judgeRunArgs`; without one it fails with an explicit judge error naming
+`judgeRuntimeConfig` instead of falling back to the synthetic runner. It answers one
+`{id, pass, reason}` verdict per trait, and `Q = passed / total`. The fake runner uses a synthetic
+judge that calls no model. A custom graph is any JSON path with the same input/output shape. See
+`docs/guides/eval.md` for the contract and the X/Y report section.
 
 ## Talk evals
 

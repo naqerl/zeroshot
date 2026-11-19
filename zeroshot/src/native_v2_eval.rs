@@ -50,8 +50,8 @@ pub use judge::{
 };
 pub use judge_backend::{JudgeRunConfig, LocalJudgeGraphExecutor};
 pub use judge_runner::{
-    CapturedSampleInput, JudgeOptions, JudgeRunReport, JudgedSample, JudgedSampleSummary,
-    captured_sample_from_directory, judge_captured_samples, judge_eval,
+    CapturedSampleInput, JudgeOptions, JudgeRunReport, JudgedCaptures, JudgedSample,
+    JudgedSampleSummary, captured_sample_from_directory, judge_captured_samples, judge_eval,
 };
 pub use judge_template::{
     FixtureJudgeGraphExecutor, JUDGE_TEMPLATE_JSON, JudgeGraphExecutor, JudgeTemplate,

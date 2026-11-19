@@ -88,13 +88,17 @@ judgeUniformRuntimeConfig = "runtime.json" # zeroshot run --uniform-runtime-conf
 ```
 
 - **`local`.** Each judgement is a real `zeroshot run --template eval-judge` (or `--graph <path>`)
-  with the runtime flags above, in a private scratch directory outside the live workspace. It goes
-  through the same profile and admission checks as the CLI, so the judge needs a runtime config
-  or a profile.
+  with the runtime flags above, using the sample's delivered checkout as its working directory so
+  it can inspect surrounding code, call sites, and tests. Run artifacts and the judge input stay
+  in private scratch outside the live workspace. It goes through the same profile and admission
+  checks as the CLI, so the judge needs a runtime config or a profile. Selecting `local` without
+  `judgeRuntimeConfig`, `judgeUniformRuntimeConfig`, or `judgeRunArgs` fails with an explicit judge
+  error naming the missing `judgeRuntimeConfig`; it never falls back to the synthetic judge.
 - **`synthetic`.** A dry-run judge that calls no model. It answers in the same output shape from
   the verdicts the fake runner recorded, and is labeled `synthetic` in the report's `Judge`
   column. A sample without recorded verdicts fails with a message that points to
-  `judgeRunner = "local"`.
+  `judgeRunner = "local"`. It also refuses to re-label verdicts produced by a different judge
+  executor, so re-judging a graph-judged sample as `synthetic` fails instead of mutating it.
 - **Overrides.** `--judge-runner` and `--judge-template` on `eval run`, `eval judge`, and
   `eval judge-captures` override the manifest. Relative paths in a manifest resolve against the
   manifest directory, and the resolved path is stored with the eval. An `eval judge
@@ -113,27 +117,39 @@ Slice-2 captures live in per-sample directories rather than the slice-1 store. P
 judge-captures` at a capture root laid out as `<captures>/<arm-id>/<sample>/`, where each sample
 directory contains `sample.json` and `patch.diff`:
 
+```toml
+# eval-with-judge.toml: the synthetic fixture plus a local judge runtime
+[options]
+judgeTemplate = "eval-judge"
+judgeRunner = "local"
+judgeRuntimeConfig = "judge-runtime.json"
+```
+
 ```bash
-zeroshot eval judge-captures zeroshot/fixtures/eval/synthetic.toml \
+zeroshot eval judge-captures ./eval-with-judge.toml \
   --captures /path/to/captures --directory . --id captured-judged --judge-runner local
 ```
 
 The command reads the manifest's criteria and arms, imports every capture directory, reads the
 flattened `sample.json`, the captured patch path, and any recorded `judge` checkout, and writes the
-judged samples and report to the eval store. Run indices come from the numeric suffix of each
-sample id, so a missing directory cannot shift the X/Y pairing; ids without a numeric suffix and
-duplicate ids or run indices are rejected. Failed and skipped captures without a patch are retained
-but not judged, and captured patch/checkout paths are required to stay inside the capture
-directory. It never re-runs an arm.
+judged samples and report to the eval store. The manifest must supply a judge runtime (or a profile
+through `judgeRunArgs`) for the local runner; the `synthetic` runner cannot import provider-backed
+captures. A capture without a delivered checkout fails with an explicit judge error rather than
+being scored from the patch alone. Run indices come from the numeric suffix of each sample id, so a
+missing directory cannot shift the X/Y pairing; ids without a numeric suffix and duplicate ids or
+run indices are rejected. Failed and skipped captures without a patch are retained but not judged
+and are reported as skipped, and captured patch/checkout paths are required to stay inside the
+capture directory. It never re-runs an arm.
 
 ## Custom judge graphs
 
 Point `judgeTemplate` (or `--judge-template`) at your own graph JSON to change the instructions,
 the worker, or the surrounding nodes. It must accept the input above and produce the same
-`traits` output. It may also declare `sample` (the sample JSON as a string) and `checkout` (a
-read-only delivered checkout path, or empty). Each graph receives only the fields its own
-`initialInput` declares. The graph runs in a private scratch directory, so it cannot change the
-live eval workspace.
+`traits` output. It may also declare `sample` (the sample JSON as a string) and `checkout` (the
+delivered checkout path). Each graph receives only the fields its own `initialInput` declares.
+Provider-backed graph runs use the delivered checkout as their working directory, so they can
+inspect surrounding code, call sites, and tests; run artifacts stay in private scratch. A succeeded
+sample without a captured checkout is a judge error, not a fabricated verdict.
 
 The runner reads capture artifacts; it never re-runs an eval arm to judge it. Slice-1 samples use
 `patches/<sample>.patch`; platform captures use `<sample>/sample.json` plus `<sample>/patch.diff`.

@@ -140,6 +140,13 @@ impl JudgeGraphExecutor for FixtureJudgeGraphExecutor {
             .get("id")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
+        if let Some(existing) = sample.get("judgeExecutor").and_then(Value::as_str) {
+            if existing != "synthetic" {
+                return Err(EvalError::Judge(format!(
+                    "synthetic judge refuses to relabel sample {sample_id} scores produced by judge executor {existing:?}; use judgeRunner = \"local\" or a fresh eval"
+                )));
+            }
+        }
         let mut verdicts = Vec::with_capacity(traits.len());
         for item in &traits {
             let id = item

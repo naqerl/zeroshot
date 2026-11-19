@@ -909,5 +909,30 @@ fn judge_label(executor: Option<&str>) -> String {
 }
 
 fn escape(value: &str) -> String {
-    value.replace('|', "\\|").replace(['\n', '\r'], " ")
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '|' => escaped.push_str("\\|"),
+            _ if is_cell_control(character) => escaped.push(' '),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }
+
+fn is_cell_control(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
+#[cfg(test)]
+#[path = "report_test.rs"]
+mod tests;

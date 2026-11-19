@@ -1153,6 +1153,9 @@ async fn local_judge_runs_eval_judge_as_a_zeroshot_run_and_parses_trait_verdicts
     let executor = LocalJudgeGraphExecutor::new(Arc::clone(&backend), run, live_workspace.path());
     let template = resolve_judge_template("eval-judge").expect("template");
     let judge = TemplateJudge::new(executor, template);
+    let checkout = tempfile::tempdir().expect("delivered checkout");
+    std::fs::write(checkout.path().join("source.rs"), "fn delivered() {}\n")
+        .expect("checkout file");
     let sample = judge_test_sample();
     let criterion = |id: &str| EvalCriterion {
         id: id.to_owned(),
@@ -1164,7 +1167,8 @@ async fn local_judge_runs_eval_judge_as_a_zeroshot_run_and_parses_trait_verdicts
         vec![criterion("correctness"), criterion("tests")],
         "diff --git a/src/lib.rs b/src/lib.rs",
     )
-    .with_task("Add the guard.");
+    .with_task("Add the guard.")
+    .with_checkout(checkout.path().to_string_lossy());
     let result = judge.judge(request).await.expect("judge executes");
     assert!(result.judgements["correctness"].pass);
     assert!(!result.judgements["tests"].pass);
@@ -1205,11 +1209,50 @@ async fn local_judge_runs_eval_judge_as_a_zeroshot_run_and_parses_trait_verdicts
         ),
         _ => panic!("agent binding"),
     }
-    assert!(
-        submitted
-            .cwd
-            .expect("scratch cwd")
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with("zeroshot-judge-"))
+    assert_eq!(
+        submitted.cwd.as_deref(),
+        Some(
+            std::fs::canonicalize(checkout.path())
+                .expect("canonical checkout")
+                .as_path()
+        )
     );
+}
+
+#[tokio::test]
+async fn local_judge_fails_closed_without_a_checkout() {
+    use crate::native_v2_contract::DeclaredConnections;
+    use crate::native_v2_eval::{
+        JudgeGraphExecutor, JudgeRunConfig, LocalJudgeGraphExecutor, judge_input,
+        resolve_judge_template,
+    };
+
+    let backend = Arc::new(ScriptedBackend::new(Vec::new(), Duration::ZERO));
+    let config_directory = tempfile::tempdir().expect("config directory");
+    let run = JudgeRunConfig {
+        template: "eval-judge".to_owned(),
+        runtime_config: Some(judge_runtime_file(
+            config_directory.path(),
+            DeclaredConnections::empty(),
+        )),
+        ..JudgeRunConfig::default()
+    };
+    let live_workspace = tempfile::tempdir().expect("live workspace");
+    let executor = LocalJudgeGraphExecutor::new(Arc::clone(&backend), run, live_workspace.path());
+    let template = resolve_judge_template("eval-judge").expect("template");
+    let request = crate::native_v2_eval::JudgeRequest::new(
+        judge_test_sample(),
+        vec![crate::native_v2_eval::EvalCriterion {
+            id: "correctness".to_owned(),
+            description: "correct".to_owned(),
+            weight: 1.0,
+        }],
+        "patch",
+    );
+    let error = executor
+        .execute(&template, judge_input(&request))
+        .await
+        .expect_err("a missing checkout fails closed");
+    assert!(error.to_string().contains("captured checkout"));
+    assert_eq!(backend.submits(), 0);
 }

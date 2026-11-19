@@ -412,6 +412,43 @@ fn resolve_judge_paths(
     Ok(changed)
 }
 
+pub(super) fn resolve_template_reference(
+    manifest_directory: &std::path::Path,
+    reference: &str,
+    override_reference: bool,
+) -> Result<String, EvalError> {
+    if reference == JUDGE_TEMPLATE_NAME {
+        return Ok(reference.to_owned());
+    }
+    let path = std::path::Path::new(reference);
+    if path.is_absolute() {
+        return Ok(reference.to_owned());
+    }
+    let resolved = if override_reference {
+        std::path::absolute(path).map_err(|error| EvalError::io(path, error))?
+    } else {
+        resolve_manifest_path(manifest_directory, reference)?
+    };
+    Ok(path_string(&resolved))
+}
+
+pub(super) fn resolve_manifest_path(
+    manifest_directory: &std::path::Path,
+    value: &str,
+) -> Result<std::path::PathBuf, EvalError> {
+    let path = std::path::Path::new(value);
+    if path.is_absolute() {
+        return Ok(path.to_owned());
+    }
+    let base = if manifest_directory.is_absolute() {
+        manifest_directory.to_owned()
+    } else {
+        std::path::absolute(manifest_directory)
+            .map_err(|error| EvalError::io(manifest_directory, error))?
+    };
+    Ok(base.join(path))
+}
+
 fn path_string(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -434,57 +471,68 @@ async fn judge_with_template(
     data: &mut EvalData,
     mut options: JudgeOptions,
 ) -> Result<(), EvalError> {
+    let manifest_directory = store.root().join(data.id.as_str());
+    let override_template = options.template.is_some();
     let reference = options
         .template
         .as_deref()
         .or(data.manifest.options.judge_template.as_deref())
         .unwrap_or(JUDGE_TEMPLATE_NAME);
-    let template = resolve_judge_template(reference)?;
+    let reference = resolve_template_reference(&manifest_directory, reference, override_template)?;
+    let template = resolve_judge_template(&reference)?;
     let options_manifest = &data.manifest.options;
-    let (executor, executor_kind): (Box<dyn JudgeGraphExecutor>, &str) =
-        match data.manifest.judge_runner(options.runner.as_deref())? {
-            "local" => {
-                let workspace = store
-                    .root()
-                    .parent()
-                    .and_then(std::path::Path::parent)
-                    .unwrap_or_else(|| store.root())
-                    .to_owned();
-                let absolute = |path: &str| {
-                    std::path::absolute(path).map_err(|error| EvalError::io(path, error))
-                };
-                let run = JudgeRunConfig {
-                    template: if template.name == JUDGE_TEMPLATE_NAME {
-                        JUDGE_TEMPLATE_NAME.to_owned()
-                    } else {
-                        path_string(&absolute(&template.name)?)
-                    },
-                    runtime_config: options_manifest
-                        .judge_runtime_config
-                        .as_deref()
-                        .map(absolute)
-                        .transpose()?,
-                    uniform_runtime_config: options_manifest
-                        .judge_uniform_runtime_config
-                        .as_deref()
-                        .map(absolute)
-                        .transpose()?,
-                    run_args: options_manifest.judge_run_args.clone(),
-                };
-                let backend = crate::native_v2_cli::local::LocalCliBackend::production().map_err(
-                    |error| EvalError::Command(format!("judge backend is unavailable: {error}")),
-                )?;
-                (
-                    Box::new(LocalJudgeGraphExecutor::new(
-                        Arc::new(backend),
-                        run,
-                        workspace,
-                    )),
-                    "graph",
-                )
-            }
-            _ => (Box::new(FixtureJudgeGraphExecutor), "synthetic"),
-        };
+    let selected_runner = data.manifest.judge_runner(options.runner.as_deref())?;
+    if selected_runner == "local"
+        && options_manifest.judge_runtime_config.is_none()
+        && options_manifest.judge_uniform_runtime_config.is_none()
+        && options_manifest.judge_run_args.is_empty()
+    {
+        return Err(EvalError::Judge(
+            "eval judge requires a real judge runtime; set options.judgeRuntimeConfig (or judgeUniformRuntimeConfig/judgeRunArgs) in the manifest before selecting the local judge runner"
+                .to_owned(),
+        ));
+    }
+    let (executor, executor_kind): (Box<dyn JudgeGraphExecutor>, &str) = match selected_runner {
+        "local" => {
+            let workspace = store
+                .root()
+                .parent()
+                .and_then(std::path::Path::parent)
+                .unwrap_or_else(|| store.root())
+                .to_owned();
+            let run = JudgeRunConfig {
+                template: if template.name == JUDGE_TEMPLATE_NAME {
+                    JUDGE_TEMPLATE_NAME.to_owned()
+                } else {
+                    template.name.clone()
+                },
+                runtime_config: options_manifest
+                    .judge_runtime_config
+                    .as_deref()
+                    .map(|path| resolve_manifest_path(&manifest_directory, path))
+                    .transpose()?,
+                uniform_runtime_config: options_manifest
+                    .judge_uniform_runtime_config
+                    .as_deref()
+                    .map(|path| resolve_manifest_path(&manifest_directory, path))
+                    .transpose()?,
+                run_args: options_manifest.judge_run_args.clone(),
+            };
+            let backend =
+                crate::native_v2_cli::local::LocalCliBackend::production().map_err(|error| {
+                    EvalError::Command(format!("judge backend is unavailable: {error}"))
+                })?;
+            (
+                Box::new(LocalJudgeGraphExecutor::new(
+                    Arc::new(backend),
+                    run,
+                    workspace,
+                )),
+                "graph",
+            )
+        }
+        _ => (Box::new(FixtureJudgeGraphExecutor), "synthetic"),
+    };
     options.executor = Some(executor_kind.to_owned());
     let judge = TemplateJudge::new(executor, template);
     judge_eval(store, data, &judge, options).await?;
@@ -977,3 +1025,7 @@ fn hex_digest(bytes: &[u8]) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
+
+#[cfg(test)]
+#[path = "cli_test.rs"]
+mod tests;
