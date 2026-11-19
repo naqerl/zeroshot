@@ -1057,11 +1057,12 @@ Evals are stored under `.zeroshot/eval/<id>/`. The manifest is strict TOML; see 
 Usage: zeroshot eval [OPTIONS] <COMMAND>
 
 Commands:
-  run             Validate a manifest, run it through the synthetic runner, and write its report
+  run             Validate a manifest, run every arm N times through its runner, and write its report
   list            List stored evals as JSON
   show            Show one stored eval, including its manifest, samples, and report, as JSON
   report          Print one eval report as JSON and refresh its Markdown rendering
   score           Recompute a stored eval with a registered scorer
+  export          Write the baseline/candidate table (`table.csv`), per-run rows (`runs.csv`), and `score.json` for plotting
   judge           Judge every captured sample and rebuild the report
   judge-captures  Judge slice-2 capture directories laid out as `<captures>/<arm-id>/<sample>/`
   clean           Delete one stored eval, or every stored eval
@@ -1086,7 +1087,9 @@ Options:
 #### `zeroshot eval run`
 
 ```text
-Validate a manifest, run it through the synthetic runner, and write its report
+Validate a manifest, run every arm N times through its runner, and write its report.
+
+`options.runner` selects `fake` (synthetic, no providers) or `local` (each sample is a real `zeroshot run` in --cwd, default --directory). Use --runner fake to dry-run a local manifest.
 
 Usage: zeroshot eval run [OPTIONS] <MANIFEST>
 
@@ -1112,8 +1115,14 @@ Options:
       --judge-model <MODEL>
           Judge model identifier, overriding per-arm and manifest defaults
 
+      --runner <RUNNER>
+          Override `options.runner` (`fake` or `local`)
+
+      --cwd <FOLDER>
+          Git checkout the `local` runner runs every sample in (default: --directory). Keep the eval store outside it so `.zeroshot/eval` never dirties the task's workspace
+
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 #### `zeroshot eval list`
@@ -1213,11 +1222,53 @@ Options:
       --scorer <NAME>
           Registered scorer name
 
+      --cost-weight <A>
+          Cost exponent `a` in `S = Q / (C^a * T^b)`, overriding `options.score.a`
+
       --judge-template <NAME|PATH>
           Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions
 
       --judge-model <MODEL>
           Judge model identifier, overriding per-arm and manifest defaults
+
+      --time-weight <B>
+          Time exponent `b` in `S = Q / (C^a * T^b)`, overriding `options.score.b`
+
+  -h, --help
+          Print help
+```
+
+#### `zeroshot eval export`
+
+```text
+Write the baseline/candidate table (`table.csv`), per-run rows (`runs.csv`), and `score.json` for plotting
+
+Usage: zeroshot eval export [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          Stored eval id
+
+Options:
+      --directory <DIR>
+          Workspace whose `.zeroshot/eval` store is used
+
+          [default: .]
+
+      --output <DIR>
+          Directory for the exported files (default: the eval's store directory)
+
+      --cost-weight <A>
+          Cost exponent `a` in `S = Q / (C^a * T^b)`, overriding `options.score.a`
+
+      --judge-template <NAME|PATH>
+          Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions
+
+      --judge-model <MODEL>
+          Judge model identifier, overriding per-arm and manifest defaults
+
+      --time-weight <B>
+          Time exponent `b` in `S = Q / (C^a * T^b)`, overriding `options.score.b`
 
   -h, --help
           Print help
@@ -1327,11 +1378,12 @@ Print this message or the help of the given subcommand(s)
 Usage: zeroshot eval help [COMMAND]
 
 Commands:
-  run             Validate a manifest, run it through the synthetic runner, and write its report
+  run             Validate a manifest, run every arm N times through its runner, and write its report
   list            List stored evals as JSON
   show            Show one stored eval, including its manifest, samples, and report, as JSON
   report          Print one eval report as JSON and refresh its Markdown rendering
   score           Recompute a stored eval with a registered scorer
+  export          Write the baseline/candidate table (`table.csv`), per-run rows (`runs.csv`), and `score.json` for plotting
   judge           Judge every captured sample and rebuild the report
   judge-captures  Judge slice-2 capture directories laid out as `<captures>/<arm-id>/<sample>/`
   clean           Delete one stored eval, or every stored eval

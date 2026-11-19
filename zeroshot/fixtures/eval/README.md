@@ -88,3 +88,8 @@ is any JSON path with the same input/output shape. Judgements use the inclusive 
 3 as the pass threshold, and must provide short reasoning plus an `errors` array. The checked-in
 fixture declares both defaults, so a plain `zeroshot eval run` judges its captured samples. See
 `docs/guides/eval.md` for the contract and the X/Y report section.
+
+## Talk evals
+
+`talk/` holds the baseline-vs-candidate evals behind the `S = Q / (C^a * T^b)` score
+(`baseline-ratio` scorer, `zeroshot eval export`). See `talk/README.md`.

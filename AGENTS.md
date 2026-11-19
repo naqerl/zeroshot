@@ -135,7 +135,11 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   runtime plan the synthetic executor reuses recorded fake evidence and fails closed when a capture
   has none; a succeeded sample with no captured patch is an error. Captured patch/checkout paths
   stay inside the capture directory, graph judges run in private scratch, and slice-2 capture
-  directories are importable through `zeroshot eval judge-captures`.
+  directories are importable through `zeroshot eval judge-captures`. Baseline vs candidate
+  scoring (`baseline.rs`) is `S = Q / (C^a * T^b)` from per-arm means. `C` is a recorded `costUsd`,
+  then `[options.pricing]` × tokens, then an Mtok fallback. `zeroshot eval export` writes
+  `score.json`, `table.csv`, and `runs.csv`. `options.runner = "local"` runs each sample as a real
+  `zeroshot run` (`local.rs`), so never start one unless asked; use `--runner fake`.
 - Protocol Rust types are the source of truth. Generated files under
   `protocol/openengine-cluster/v1/` must be regenerated through the Rust testkit, not hand-edited.
 - Initial input remains caller-owned and is validated unchanged. A root group may add required

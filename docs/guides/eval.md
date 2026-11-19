@@ -207,6 +207,71 @@ different task, a missing capture, or a judge that answered outside the contract
 pairs per criterion are retained even when their scores are equal, so reasoning stays visible.
 Actionable defects are listed in the `Judge errors` section beside the reasoning.
 
+## Baseline vs candidate score
+
+When an eval compares a baseline arm with a candidate arm, every report gets a
+"Baseline vs candidate" section. Each run is reduced to wall time `T` (minutes), cost `C` (USD),
+and quality `Q` (weighted passed traits / judged traits), and scored as:
+
+```text
+S = Q / (C^a * T^b)        a, b in [0, 1], default 0.5
+ratio = S_candidate / S_baseline   (from each arm's mean T, C, Q; the median ratio is also shown)
+```
+
+```toml
+[options]
+scorer = "baseline-ratio"        # aggregate score = the ratio
+deadlineMinutes = 90             # local runner: fail a sample that runs longer
+
+[options.score]
+a = 0.5
+b = 0.5
+baseline = "baseline"            # defaults: the first two arms
+candidate = "candidate"
+
+[options.pricing]                # USD per 1M tokens; [arms.pricing] overrides it per arm
+input = 3.0
+output = 15.0
+cacheRead = 0.3
+cacheWrite = 3.75
+```
+
+`C` comes from one of these sources, in order:
+
+1. a recorded `costUsd` in an imported capture's `sample.json`;
+2. tokens multiplied by the pricing;
+3. millions of tokens, flagged in the notes, used when any measured sample has neither of the
+   above.
+
+Rules for failed, skipped, and unjudged runs:
+
+- A failed run counts with `Q = 0` and its measured `T` and `C`.
+- A run that failed before starting is excluded, and so is a skipped one.
+- A succeeded but unjudged run is excluded from mean `Q` only.
+
+```bash
+zeroshot eval score <id> --scorer baseline-ratio --cost-weight 0.5 --time-weight 0.5
+zeroshot eval export <id> --output out/    # score.json, table.csv (slide table), runs.csv (per sample)
+```
+
+The export files are:
+
+- `table.csv`: one row per run pair, then a `mean` row and a `ratio` row.
+- `runs.csv`: one row per sample, intended for Pareto plots.
+- `score.json`: the `zeroshot.eval-score/v1` document.
+
+`zeroshot/fixtures/eval/talk/` has two complete evals, a candidate-graph generator, and
+`pareto.py` for the cost vs time and cost vs quality plots.
+
+`options.runner = "local"` (or `--runner local`) runs every sample as a real `zeroshot run` in
+the `--cwd` checkout:
+
+- Template arms use `delivery` (default `push`). Graph arms use their own delivery nodes.
+- Arms may set `runtimeConfig` or `uniformRuntimeConfig`, plus extra `runArgs`.
+- The delivered head revision is fetched from `options.captureRemote` (default `origin`) and
+  diffed against the starting `HEAD` into the judged patch.
+- `--runner fake` dry-runs the same manifest.
+
 ## Worked example on the synthetic fixture
 
 The checked-in `synthetic.toml` runs two arms with three runs each. Both arms pass correctness;
