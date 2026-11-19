@@ -134,7 +134,7 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   Custom graph JSON paths receive only the input fields their own `initialInput` declares
   (optionally `sample` and `checkout`). A succeeded sample with no captured patch is an error.
   Captured patch/checkout paths stay inside the capture directory, graph judges run in private
-  scratch, and slice-2 capture directories are importable through `zeroshot eval judge-captures`.
+  scratch, and slice-2 capture directories are importable through `zeroshot eval judge-captures`. Finished target runs are imported as one arm by `zeroshot eval import-baseline` (`import.rs`): read-only status + log replay, `T` = log span (no queue time), missing data recorded in `EvalSample.notes`, all-or-nothing; `eval run --arm` runs selected arms only.
   Baseline vs candidate scoring (`baseline.rs`) is `S = Q / (C^a * T^b)`, with `meanRatio` from
   per-arm means and `medianRatio` from per-arm medians. `C` is a recorded `costUsd`, then tokens ×
   the user-set `input`/`output`/`cacheRead`/`cacheWrite` prices (`--price-*`, `[arms.pricing]`,

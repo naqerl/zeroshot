@@ -74,8 +74,20 @@ zeroshot eval --directory /path/to/store \
 - **Cost.** Expect N × 2 full `software-change` runs plus one judge run per sample. Start with
   `runsPerArm = 1` (the manifests use 5).
 
-Platform runs are not driven by `eval run`. Produce capture directories elsewhere
-(`sample.json` with `costUsd` plus `patch.diff`) and import them with `zeroshot eval judge-captures`.
+Platform runs are not driven by `eval run`. To use runs that already finished on the platform as
+the baseline, run only the candidate arm and import the finished runs (read-only, no cost):
+
+```bash
+zeroshot eval --directory /path/to/store run zeroshot/fixtures/eval/talk/eval1-ci-before-review.toml \
+  --runner local --cwd /path/to/checkout --id eval1 --arm candidate
+zeroshot eval --directory /path/to/store import-baseline eval1 --run <run-id> --run <run-id>
+```
+
+Any number of runs works. `T` is the log span (queue time is not exposed), the token counts feed
+`C`, the patch is `source.revision..headRevision`, and anything missing is recorded in the
+sample's `notes`. See "Importing finished platform runs as an arm" in `docs/guides/eval.md`.
+Capture directories made elsewhere (`sample.json` plus `patch.diff`) still go through
+`zeroshot eval judge-captures`.
 
 ## Judge
 
