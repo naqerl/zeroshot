@@ -602,16 +602,8 @@ fn require_runtime_capabilities(
     controller: &ControllerDescriptor,
     runtime: &RuntimePlan,
 ) -> Result<(), TargetAuthorityError> {
-    if runtime.nodes().values().any(|binding| {
-        matches!(
-            binding,
-            openengine_cluster_protocol::NodeRuntimeBinding::Script { .. }
-        )
-    }) {
-        return Err(authority_error(
-            "script bindings currently require local execution",
-        ));
-    }
+    // hub boxes execute the runtime locally, so a script binding is legitimate there;
+    // the hosted platform keeps its own admission check in native_v2_capsule::gateway.
     require_node_runtime_lanes(controller, runtime)?;
     if runtime.nodes().values().any(|binding| {
         matches!(
