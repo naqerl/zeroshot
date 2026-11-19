@@ -12,6 +12,7 @@ mod capture;
 mod cli;
 mod error;
 mod fake;
+mod import;
 mod judge;
 mod judge_backend;
 mod judge_runner;
@@ -43,6 +44,10 @@ pub use cli::{
     run_manifest_with_backend, run_manifest_with_runner, select_runner,
 };
 pub use error::EvalError;
+pub use import::{
+    EvalImportRunsCommand, ImportSummary, ImportedRun, LOG_IDLE_TIMEOUT, QUEUE_NOTE, RunSelection,
+    import_runs, parse_runs_file,
+};
 pub use fake::{FakeFixtureRequest, FakeRunner, FakeSampleRequest};
 pub use judge::{
     JUDGE_TEMPLATE_NAME, Judge, JudgeParseError, JudgeRequest, JudgeResult, Judgement,
@@ -101,6 +106,7 @@ pub async fn run_fixture(
         judge_runner: None,
         runner: None,
         workspace: None,
+        arms: Vec::new(),
     })
     .await
 }

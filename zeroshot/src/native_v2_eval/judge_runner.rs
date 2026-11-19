@@ -485,5 +485,6 @@ fn sample_from_capture(
         judge_template: None,
         judge_checkout: None,
         judge_executor: None,
+        notes: Vec::new(),
     })
 }

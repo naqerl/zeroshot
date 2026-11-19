@@ -75,6 +75,7 @@ section { margin-block: 2.5rem; }
 <li><a href="#zeroshot-eval-export"><code>zeroshot eval export</code></a></li>
 <li><a href="#zeroshot-eval-judge"><code>zeroshot eval judge</code></a></li>
 <li><a href="#zeroshot-eval-judge-captures"><code>zeroshot eval judge-captures</code></a></li>
+<li><a href="#zeroshot-eval-import-baseline"><code>zeroshot eval import-baseline</code></a></li>
 <li><a href="#zeroshot-eval-clean"><code>zeroshot eval clean</code></a></li>
 <li><a href="#zeroshot-eval-help"><code>zeroshot eval help</code></a></li>
 <li><a href="#zeroshot-run"><code>zeroshot run</code></a></li>
@@ -964,16 +965,17 @@ Evals are stored under `.zeroshot/eval/&lt;id&gt;/`. The manifest is strict TOML
 Usage: zeroshot eval [OPTIONS] &lt;COMMAND&gt;
 
 Commands:
-  run             Validate a manifest, run every arm N times through its runner, and write its report
-  list            List stored evals as JSON
-  show            Show one stored eval, including its manifest, samples, and report, as JSON
-  report          Print one eval report as JSON and refresh its Markdown rendering
-  score           Recompute a stored eval with a registered scorer
-  export          Write the baseline/candidate table (`table.csv`), per-run rows (`runs.csv`), and `score.json` for plotting
-  judge           Judge every captured sample and rebuild the report
-  judge-captures  Judge slice-2 capture directories laid out as `&lt;captures&gt;/&lt;arm-id&gt;/&lt;sample&gt;/`
-  clean           Delete one stored eval, or every stored eval
-  help            Print this message or the help of the given subcommand(s)
+  run              Validate a manifest, run every arm N times through its runner, and write its report
+  list             List stored evals as JSON
+  show             Show one stored eval, including its manifest, samples, and report, as JSON
+  report           Print one eval report as JSON and refresh its Markdown rendering
+  score            Recompute a stored eval with a registered scorer
+  export           Write the baseline/candidate table (`table.csv`), per-run rows (`runs.csv`), and `score.json` for plotting
+  judge            Judge every captured sample and rebuild the report
+  judge-captures   Judge slice-2 capture directories laid out as `&lt;captures&gt;/&lt;arm-id&gt;/&lt;sample&gt;/`
+  import-baseline  Import finished target runs (default target `platform`) as one arm&#39;s unjudged samples
+  clean            Delete one stored eval, or every stored eval
+  help             Print this message or the help of the given subcommand(s)
 
 Options:
       --directory &lt;DIR&gt;
@@ -1023,6 +1025,9 @@ Options:
 
       --cwd &lt;FOLDER&gt;
           Git checkout the `local` runner runs every sample in (default: --directory). Keep the eval store outside it so `.zeroshot/eval` never dirties the task&#39;s workspace
+
+      --arm &lt;ARM&gt;
+          Run only this arm (repeatable), e.g. fresh candidate runs to pair with imported baseline runs. Default: every arm
 
   -h, --help
           Print help (see a summary with &#39;-h&#39;)</code></pre></section>
@@ -1237,6 +1242,52 @@ Options:
 
   -h, --help
           Print help</code></pre></section>
+<section id="zeroshot-eval-import-baseline"><h4><code>zeroshot eval import-baseline</code></h4>
+<pre><code>Import finished target runs (default target `platform`) as one arm&#39;s unjudged samples.
+
+Records T (first-to-last log record), token counts for C, and the delivered base..head patch. Any number of runs may be given; what the target does not expose is noted per sample. Judge them afterwards with `zeroshot eval judge &lt;ID&gt;`.
+
+Usage: zeroshot eval import-baseline [OPTIONS] &lt;ID&gt;
+
+Arguments:
+  &lt;ID&gt;
+          Eval to import into. Created from --manifest when it does not exist yet
+
+Options:
+      --directory &lt;DIR&gt;
+          Workspace whose `.zeroshot/eval` store is used
+
+          [default: .]
+
+      --manifest &lt;FILE&gt;
+          Strict TOML eval manifest; required when the eval does not exist yet
+
+      --arm &lt;ARM&gt;
+          Arm the runs become (default: `options.score.baseline`, else the first arm)
+
+      --judge-template &lt;NAME|PATH&gt;
+          Judge graph template (`eval-judge` or a graph JSON path) for run/judge actions
+
+      --judge-runner &lt;RUNNER&gt;
+          Judge runner: `synthetic` (recorded fake evidence, no model call) or `local` (the judge graph as a real `zeroshot run`), overriding `options.judgeRunner`
+
+      --run &lt;RUN_ID&gt;
+          Finished run id to import (repeatable)
+
+      --runs-file &lt;FILE&gt;
+          File with one `run-id [minutes]` per line; `minutes` overrides the log-derived T
+
+      --title-prefix &lt;PREFIX&gt;
+          Also import every finished run whose title starts with this prefix
+
+      --target &lt;NAME&gt;
+          Named target that owns the runs (default: `platform`)
+
+      --capture-remote &lt;URL&gt;
+          Git remote holding the delivered branches (default: `options.captureRemote`, then the run&#39;s recorded source remote). Set GH_TOKEN for a private HTTPS remote
+
+  -h, --help
+          Print help (see a summary with &#39;-h&#39;)</code></pre></section>
 <section id="zeroshot-eval-clean"><h4><code>zeroshot eval clean</code></h4>
 <pre><code>Delete one stored eval, or every stored eval
 
@@ -1269,16 +1320,17 @@ Options:
 Usage: zeroshot eval help [COMMAND]
 
 Commands:
-  run             Validate a manifest, run every arm N times through its runner, and write its report
-  list            List stored evals as JSON
-  show            Show one stored eval, including its manifest, samples, and report, as JSON
-  report          Print one eval report as JSON and refresh its Markdown rendering
-  score           Recompute a stored eval with a registered scorer
-  export          Write the baseline/candidate table (`table.csv`), per-run rows (`runs.csv`), and `score.json` for plotting
-  judge           Judge every captured sample and rebuild the report
-  judge-captures  Judge slice-2 capture directories laid out as `&lt;captures&gt;/&lt;arm-id&gt;/&lt;sample&gt;/`
-  clean           Delete one stored eval, or every stored eval
-  help            Print this message or the help of the given subcommand(s)</code></pre></section>
+  run              Validate a manifest, run every arm N times through its runner, and write its report
+  list             List stored evals as JSON
+  show             Show one stored eval, including its manifest, samples, and report, as JSON
+  report           Print one eval report as JSON and refresh its Markdown rendering
+  score            Recompute a stored eval with a registered scorer
+  export           Write the baseline/candidate table (`table.csv`), per-run rows (`runs.csv`), and `score.json` for plotting
+  judge            Judge every captured sample and rebuild the report
+  judge-captures   Judge slice-2 capture directories laid out as `&lt;captures&gt;/&lt;arm-id&gt;/&lt;sample&gt;/`
+  import-baseline  Import finished target runs (default target `platform`) as one arm&#39;s unjudged samples
+  clean            Delete one stored eval, or every stored eval
+  help             Print this message or the help of the given subcommand(s)</code></pre></section>
 <section id="zeroshot-run"><h3><code>zeroshot run</code></h3>
 <pre><code>Submit a graph run locally or to a named target.
 

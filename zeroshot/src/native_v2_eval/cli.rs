@@ -49,6 +49,8 @@ pub enum EvalAction {
     },
     Judge(EvalJudgeCommand),
     JudgeCaptures(EvalJudgeCapturesCommand),
+    /// Import finished target runs (e.g. platform runs) as one arm's unjudged samples.
+    ImportBaseline(super::EvalImportRunsCommand),
     Clean {
         id: Option<String>,
         all: bool,
@@ -128,6 +130,27 @@ pub struct EvalRunCommand {
     pub runner: Option<String>,
     /// Checkout the `local` runner runs in. Defaults to `directory` (the eval store workspace).
     pub workspace: Option<PathBuf>,
+    /// Run only these arms (all arms when empty), e.g. fresh candidate runs against imported
+    /// baseline runs.
+    pub arms: Vec<String>,
+}
+
+impl EvalRunCommand {
+    /// Whether `arm` is selected by `--arm`.
+    pub(crate) fn runs_arm(&self, arm: &str) -> bool {
+        self.arms.is_empty() || self.arms.iter().any(|selected| selected == arm)
+    }
+
+    pub(crate) fn validate_arms(&self, manifest: &EvalManifest) -> Result<(), EvalError> {
+        for selected in &self.arms {
+            if !manifest.arms.iter().any(|arm| &arm.id == selected) {
+                return Err(EvalError::Command(format!(
+                    "--arm {selected:?} is not declared in the manifest"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A manifest run through an already-constructed runner.
@@ -248,6 +271,14 @@ pub async fn execute(command: &EvalCommand) -> Result<Value, EvalError> {
         EvalAction::JudgeCaptures(command) => {
             let report = run_captures_through_judge(&store, command.clone()).await?;
             Ok(serde_json::to_value(report)?)
+        }
+        EvalAction::ImportBaseline(command) => {
+            let backend =
+                crate::native_v2_cli::local::LocalCliBackend::production().map_err(|error| {
+                    EvalError::Command(format!("run backend is unavailable: {error}"))
+                })?;
+            let summary = super::import_runs(&store, command, &backend).await?;
+            Ok(serde_json::to_value(summary)?)
         }
         EvalAction::Clean { id, all } => clean(&store, id.as_deref(), *all),
     }
@@ -637,7 +668,7 @@ where
         }
     }
     let store = EvalStore::for_workspace(&command.directory);
-    let id = match command.id {
+    let id = match command.id.take() {
         Some(id) => EvalId::new(id)?,
         None => EvalId::generate(&manifest.name)?,
     };
@@ -649,9 +680,10 @@ where
         .as_deref()
         .unwrap_or(&manifest.options.scorer)
         .to_owned();
+    command.validate_arms(&manifest)?;
     let mut planned = Vec::new();
     let mut samples = Vec::new();
-    for arm in &manifest.arms {
+    for arm in manifest.arms.iter().filter(|arm| command.runs_arm(&arm.id)) {
         for run_index in 0..manifest.runs_per_arm {
             let sample_id = format!("{}-{run_index:04}", arm.id);
             let sample_request = request(&id, &sample_id, arm, run_index, &manifest.criteria);
@@ -816,6 +848,7 @@ pub(crate) fn sample_from_artifact(
         judge_template: None,
         judge_checkout,
         judge_executor: None,
+        notes: Vec::new(),
     })
 }
 
@@ -841,10 +874,11 @@ fn failed_sample(eval_id: &EvalId, meta: &SamplePlanMeta, reason: String) -> Eva
         judge_template: None,
         judge_checkout: None,
         judge_executor: None,
+        notes: Vec::new(),
     }
 }
 
-fn eval_tokens(usage: Option<ProtocolTokenUsage>) -> TokenUsage {
+pub(crate) fn eval_tokens(usage: Option<ProtocolTokenUsage>) -> TokenUsage {
     usage.map_or_else(TokenUsage::default, |usage| {
         let cache_read = usage
             .cache_read_input_tokens

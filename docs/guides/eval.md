@@ -126,6 +126,50 @@ duplicate ids or run indices are rejected. Failed and skipped captures without a
 but not judged, and captured patch/checkout paths are required to stay inside the capture
 directory. It never re-runs an arm.
 
+## Importing finished platform runs as an arm
+
+Runs that already finished on a target (for example `platform`) can become one arm's samples
+without re-running them. `eval import-baseline` reads each run's status and log replay through the
+normal target login, so it is read-only and costs nothing:
+
+```bash
+# 1. Fresh candidate runs only; this creates the eval.
+zeroshot eval --directory /path/to/store run eval.toml --arm candidate --id talk1 \
+  --runner local --cwd /path/to/checkout
+# 2. Add the finished platform runs as the baseline arm (any number of runs).
+zeroshot eval --directory /path/to/store import-baseline talk1 \
+  --run run-0a1b --run run-2c3d --runs-file baseline-runs.txt --title-prefix "baseline:"
+# 3. Judge (this submits judge runs and costs money).
+zeroshot eval --directory /path/to/store judge talk1 --judge-runner local
+```
+
+- **Selection.** `--run` is repeatable. `--runs-file` takes one `run-id [minutes]` per line (`,` or
+  whitespace separated, `#` comments). `--title-prefix` adds every *finished* run on the target
+  whose title starts with the prefix (the run list has no server-side filter, so this is matched
+  client-side). Duplicates are dropped; a run already in the eval is refused.
+- **Eval and arm.** The eval is appended to when it exists, or created from `--manifest`. The arm
+  is `--arm`, else `options.score.baseline`, else the first manifest arm. New samples continue the
+  arm's run index (`<arm>-0003`, ...). `--target` defaults to `platform`.
+- **All or nothing.** Every status is read first; if any run is not finished, nothing is written.
+- **T.** A finished run's status has no timestamps, so `T` is the span from its first to its last
+  log record (target clock). Queue wait is not exposed and is excluded; `queueWaitMs` is 0. A
+  minutes column in `--runs-file` overrides `T` (use it for wall-clock times you measured).
+- **C.** `inputTokens` and `outputTokens` are always recorded. `cacheRead` and `cacheWrite` are
+  recorded when the provider reported them; a missing kind counts as 0. Prices come from the
+  manifest `[pricing]` table as usual. There is no USD cost on a platform run.
+- **Patch.** `base` is the run's `source.revision`; `head` is the delivery receipt's
+  `headRevision`. It is fetched from `--capture-remote`, else `options.captureRemote`, else the
+  run's recorded source remote. Set `GH_TOKEN` for a private HTTPS remote.
+- **Missing data is noted, never guessed.** Every sample gets a `notes` list (queue time not
+  exposed, no log records, incomplete token usage, no cache split, no delivery receipt, capture
+  failure, ...). The report adds one note per arm and note kind with its run count.
+- **Unequal N.** Pairs are formed by run index, so baseline run *k* sits next to candidate run *k*;
+  rows without a partner show one side. Means and medians (`meanRatio`, `medianRatio`) are per arm
+  over all of its runs, so the arms can have different run counts.
+- **Judging.** Imported samples are unjudged. `eval judge` judges the eval's samples with the
+  `eval-judge` graph; use `--judge-runner local`, since the `synthetic` judge has no recorded
+  evidence for imported runs.
+
 ## Custom judge graphs
 
 Point `judgeTemplate` (or `--judge-template`) at your own graph JSON to change the instructions,

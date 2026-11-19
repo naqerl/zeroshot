@@ -241,6 +241,13 @@ enum EvalCommand {
     /// Judge slice-2 capture directories laid out as `<captures>/<arm-id>/<sample>/`.
     JudgeCaptures(EvalJudgeCapturesArgs),
 
+    /// Import finished target runs (default target `platform`) as one arm's unjudged samples.
+    ///
+    /// Records T (first-to-last log record), token counts for C, and the delivered base..head
+    /// patch. Any number of runs may be given; what the target does not expose is noted per
+    /// sample. Judge them afterwards with `zeroshot eval judge <ID>`.
+    ImportBaseline(EvalImportBaselineArgs),
+
     /// Delete one stored eval, or every stored eval.
     Clean(EvalCleanArgs),
 }
@@ -266,6 +273,46 @@ struct EvalRunArgs {
     /// eval store outside it so `.zeroshot/eval` never dirties the task's workspace.
     #[arg(long, value_name = "FOLDER")]
     cwd: Option<PathBuf>,
+
+    /// Run only this arm (repeatable), e.g. fresh candidate runs to pair with imported baseline
+    /// runs. Default: every arm.
+    #[arg(long = "arm", value_name = "ARM")]
+    arms: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct EvalImportBaselineArgs {
+    /// Eval to import into. Created from --manifest when it does not exist yet.
+    id: String,
+
+    /// Strict TOML eval manifest; required when the eval does not exist yet.
+    #[arg(long, value_name = "FILE")]
+    manifest: Option<PathBuf>,
+
+    /// Arm the runs become (default: `options.score.baseline`, else the first arm).
+    #[arg(long, value_name = "ARM")]
+    arm: Option<String>,
+
+    /// Finished run id to import (repeatable).
+    #[arg(long = "run", value_name = "RUN_ID")]
+    runs: Vec<String>,
+
+    /// File with one `run-id [minutes]` per line; `minutes` overrides the log-derived T.
+    #[arg(long, value_name = "FILE")]
+    runs_file: Option<PathBuf>,
+
+    /// Also import every finished run whose title starts with this prefix.
+    #[arg(long, value_name = "PREFIX")]
+    title_prefix: Option<String>,
+
+    /// Named target that owns the runs (default: `platform`).
+    #[arg(long, value_name = "NAME")]
+    target: Option<String>,
+
+    /// Git remote holding the delivered branches (default: `options.captureRemote`, then the
+    /// run's recorded source remote). Set GH_TOKEN for a private HTTPS remote.
+    #[arg(long, value_name = "URL")]
+    capture_remote: Option<String>,
 }
 
 #[derive(Debug, Args)]
