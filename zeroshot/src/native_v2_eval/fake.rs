@@ -225,8 +225,22 @@ impl FakeRunner {
             )),
             SampleStatus::Succeeded => None,
         };
+        let spread = |axis: &str| {
+            let unit = unit_hash(self.seed, &fixture.arm.id, axis, fixture.run_index);
+            1.0 + settings.jitter * (2.0 * unit - 1.0)
+        };
+        let time_factor = spread("\0jitter-time");
+        let token_factor = spread("\0jitter-tokens");
+        let scale = |value: u64, factor: f64| (value as f64 * factor).round().max(0.0) as u64;
+        let wall_clock_ms = scale(settings.wall_clock_ms, time_factor);
+        let tokens = super::model::TokenUsage {
+            input: scale(settings.tokens.input, token_factor),
+            output: scale(settings.tokens.output, token_factor),
+            cache: scale(settings.tokens.cache, token_factor),
+            ..super::model::TokenUsage::default()
+        };
         let started_at_ms = run.submitted_at_ms.saturating_add(settings.queue_wait_ms);
-        let finished_at_ms = started_at_ms.saturating_add(settings.wall_clock_ms);
+        let finished_at_ms = started_at_ms.saturating_add(wall_clock_ms);
         Ok(SampleOutcome {
             run_id: run.run_id.clone(),
             status,
@@ -235,10 +249,10 @@ impl FakeRunner {
                 started_at_ms: Some(started_at_ms),
                 finished_at_ms,
                 queue_wait_ms: settings.queue_wait_ms,
-                wall_clock_ms: settings.wall_clock_ms,
+                wall_clock_ms,
                 concurrency: run.concurrency,
             },
-            token_usage: Some(protocol_tokens(settings.tokens)),
+            token_usage: Some(protocol_tokens(tokens)),
             delivered_revision: (status == SampleStatus::Succeeded)
                 .then(|| revision(self.seed, &fixture.arm.id, fixture.run_index)),
             delivered_branch: None,
@@ -395,6 +409,7 @@ struct FakeArmSettings {
     wall_clock_ms: u64,
     tokens: super::model::TokenUsage,
     pass_rate: f64,
+    jitter: f64,
     fail: bool,
     skip: bool,
     criteria: BTreeMap<String, bool>,
@@ -419,8 +434,10 @@ impl FakeArmSettings {
                     &request.arm.id,
                 )?,
                 cache: u64_knob(knobs, "cacheTokens", options.cache_tokens, &request.arm.id)?,
+                ..super::model::TokenUsage::default()
             },
             pass_rate: f64_knob(knobs, "passRate", options.pass_rate, &request.arm.id)?,
+            jitter: f64_knob(knobs, "jitter", options.jitter, &request.arm.id)?,
             fail: bool_knob(knobs, "fail", false, &request.arm.id)?,
             skip: bool_knob(knobs, "skip", false, &request.arm.id)?,
             criteria,

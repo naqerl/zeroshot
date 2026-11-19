@@ -1,0 +1,94 @@
+# Eval 1: "Run CI before any review turn".
+#
+# Idea: run the repository's deterministic CI checks before the review agents, so reviewers never
+# spend a turn on a change that does not build or pass tests. Expected: cost goes down.
+#
+# Baseline is the built-in `software-change` graph (implement -> review -> push). The candidate,
+# `graphs/ci-before-review.json`, is the same graph whose worker must run the full CI checks and
+# fix every failure before each hand-off to review (regenerate with ./make-graphs.sh).
+#
+# Dry run (no providers, deterministic synthetic data):
+#   zeroshot eval run zeroshot/fixtures/eval/talk/eval1-ci-before-review.toml --id eval1-dry
+# Real runs in a checkout (N runs per arm, sequential, one `zeroshot run` per sample):
+#   zeroshot eval --directory /path/to/store run .../eval1-ci-before-review.toml --runner local \
+#     --cwd /path/to/repo
+
+schema = "zeroshot.eval/v1"
+name = "eval1-ci-before-review"
+runsPerArm = 5
+
+[options]
+scorer = "baseline-ratio"
+runner = "fake"
+seed = 1
+judgeTemplate = "eval-judge"
+# Replace with the judge model, and point judgeRuntimeConfig at a runtime plan for the judge graph.
+judgeModel = "synthetic-judge"
+# judgeRuntimeConfig = "judge-runtime.json"
+deadlineMinutes = 90
+
+[options.score]
+a = 0.5
+b = 0.5
+baseline = "baseline"
+candidate = "ci-before-review"
+
+# USD per one million tokens for the implementing model. Set it to your provider's price list.
+[options.pricing]
+input = 3.0
+output = 15.0
+cacheRead = 0.3
+cacheWrite = 3.75
+
+# Synthetic runner only: shapes the dry-run data. Ignored by `--runner local`.
+[options.fake]
+queueWaitMs = 0
+passRate = 0.85
+jitter = 0.12
+
+[[arms]]
+id = "baseline"
+template = "software-change"
+delivery = "push"
+uniformRuntimeConfig = "runtime.json"
+prompt = "Add a `--format csv` option to `zeroshot eval list` that prints one row per stored eval with its id, name, sample counts, and creation time."
+
+[arms.knobs]
+wallClockMs = 1302000
+inputTokens = 500000
+outputTokens = 53000
+
+[[arms]]
+id = "ci-before-review"
+graph = "graphs/ci-before-review.json"
+uniformRuntimeConfig = "runtime.json"
+prompt = "Add a `--format csv` option to `zeroshot eval list` that prints one row per stored eval with its id, name, sample counts, and creation time."
+
+[arms.knobs]
+wallClockMs = 1542000
+inputTokens = 350000
+outputTokens = 36000
+
+[[criteria]]
+id = "flag"
+description = "`zeroshot eval list --format csv` exists and the default JSON output is unchanged."
+
+[[criteria]]
+id = "columns"
+description = "The CSV has a header and one row per stored eval with id, name, succeeded/failed/skipped counts, and creation time."
+
+[[criteria]]
+id = "escaping"
+description = "Fields containing commas, quotes, or newlines are quoted per RFC 4180."
+
+[[criteria]]
+id = "tests"
+description = "A test covers the CSV output, including an escaped field."
+
+[[criteria]]
+id = "docs"
+description = "The CLI reference documents the new option."
+
+[[criteria]]
+id = "ci-green"
+description = "The change passes the repository's formatting, lint, and test checks."

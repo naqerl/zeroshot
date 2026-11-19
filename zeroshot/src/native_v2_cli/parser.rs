@@ -212,7 +212,10 @@ enum UtilityCommand {
 
 #[derive(Debug, Subcommand)]
 enum EvalCommand {
-    /// Validate a manifest, run it through the synthetic runner, and write its report.
+    /// Validate a manifest, run every arm N times through its runner, and write its report.
+    ///
+    /// `options.runner` selects `fake` (synthetic, no providers) or `local` (each sample is a real
+    /// `zeroshot run` in --cwd, default --directory). Use --runner fake to dry-run a local manifest.
     Run(EvalRunArgs),
 
     /// List stored evals as JSON.
@@ -226,6 +229,10 @@ enum EvalCommand {
 
     /// Recompute a stored eval with a registered scorer.
     Score(EvalScoreArgs),
+
+    /// Write the baseline/candidate table (`table.csv`), per-run rows (`runs.csv`), and
+    /// `score.json` for plotting.
+    Export(EvalExportArgs),
 
     /// Judge every captured sample and rebuild the report.
     Judge(EvalJudgeArgs),
@@ -249,6 +256,39 @@ struct EvalRunArgs {
     /// Override the manifest's scorer for this run.
     #[arg(long, value_name = "NAME")]
     scorer: Option<String>,
+
+    /// Override `options.runner` (`fake` or `local`).
+    #[arg(long, value_name = "RUNNER")]
+    runner: Option<String>,
+
+    /// Git checkout the `local` runner runs every sample in (default: --directory). Keep the
+    /// eval store outside it so `.zeroshot/eval` never dirties the task's workspace.
+    #[arg(long, value_name = "FOLDER")]
+    cwd: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct EvalWeightArgs {
+    /// Cost exponent `a` in `S = Q / (C^a * T^b)`, overriding `options.score.a`.
+    #[arg(long, value_name = "A")]
+    cost_weight: Option<f64>,
+
+    /// Time exponent `b` in `S = Q / (C^a * T^b)`, overriding `options.score.b`.
+    #[arg(long, value_name = "B")]
+    time_weight: Option<f64>,
+}
+
+#[derive(Debug, Args)]
+struct EvalExportArgs {
+    /// Stored eval id.
+    id: String,
+
+    /// Directory for the exported files (default: the eval's store directory).
+    #[arg(long, value_name = "DIR")]
+    output: Option<PathBuf>,
+
+    #[command(flatten)]
+    weights: EvalWeightArgs,
 }
 
 #[derive(Debug, Args)]
@@ -293,6 +333,9 @@ struct EvalScoreArgs {
     /// Registered scorer name.
     #[arg(long, value_name = "NAME")]
     scorer: String,
+
+    #[command(flatten)]
+    weights: EvalWeightArgs,
 }
 
 #[derive(Debug, Args)]

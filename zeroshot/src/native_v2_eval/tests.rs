@@ -186,6 +186,7 @@ async fn report_and_score_reconstruct_from_stored_data_after_the_run() {
     let scored = execute(&EvalCommand {
         directory: temporary.path().to_path_buf(),
         action: EvalAction::Score {
+            weights: Default::default(),
             id: id.to_string(),
             scorer: "quality-vs-cost".to_owned(),
         },
@@ -270,6 +271,7 @@ async fn unmatched_reasoning_and_clean_are_visible() {
     let report = execute(&EvalCommand {
         directory: temporary.path().to_path_buf(),
         action: EvalAction::Score {
+            weights: Default::default(),
             id: id.to_string(),
             scorer: "none".to_owned(),
         },
@@ -591,6 +593,7 @@ async fn template_judge_executes_the_graph_once_per_criterion() {
         status: SampleStatus::Succeeded,
         timing: SampleTiming::default(),
         tokens: TokenUsage::default(),
+        cost_usd: None,
         delivered_revision: None,
         failure_reason: None,
         patch: None,
@@ -948,6 +951,7 @@ async fn judge_captures_keeps_failed_captures_without_a_patch_reproducibly() {
     let rescored = execute(&EvalCommand {
         directory: temporary.path().to_path_buf(),
         action: EvalAction::Score {
+            weights: Default::default(),
             id: id.to_string(),
             scorer: "none".to_owned(),
         },
@@ -1143,6 +1147,7 @@ async fn report_omits_xy_when_no_scores_exist_and_renders_judge_errors() {
     let report = execute(&EvalCommand {
         directory: temporary.path().to_path_buf(),
         action: EvalAction::Score {
+            weights: Default::default(),
             id: unscored.id.to_string(),
             scorer: "none".to_owned(),
         },
@@ -1446,6 +1451,7 @@ async fn user_shaped_custom_graph_admits_without_the_internal_score_placeholder(
                 status: SampleStatus::Succeeded,
                 timing: SampleTiming::default(),
                 tokens: TokenUsage::default(),
+                cost_usd: None,
                 delivered_revision: None,
                 failure_reason: None,
                 patch: None,
@@ -1473,6 +1479,7 @@ async fn user_shaped_custom_graph_admits_without_the_internal_score_placeholder(
                 status: SampleStatus::Succeeded,
                 timing: SampleTiming::default(),
                 tokens: TokenUsage::default(),
+                cost_usd: None,
                 delivered_revision: None,
                 failure_reason: None,
                 patch: None,
@@ -1574,6 +1581,7 @@ async fn judge_eval_errors_on_a_succeeded_sample_without_a_patch() {
         status: SampleStatus::Succeeded,
         timing: SampleTiming::default(),
         tokens: TokenUsage::default(),
+        cost_usd: None,
         delivered_revision: None,
         failure_reason: None,
         patch: None,
@@ -1684,6 +1692,7 @@ async fn judge_captured_samples_fails_closed_without_a_patch() {
             status: SampleStatus::Succeeded,
             timing: SampleTiming::default(),
             tokens: TokenUsage::default(),
+            cost_usd: None,
             delivered_revision: None,
             failure_reason: None,
             patch: None,
@@ -1784,4 +1793,308 @@ async fn judge_captures_rolls_back_a_new_eval_when_a_later_judgement_is_invalid(
     .expect_err("invalid later judgement fails the command");
     assert!(error.to_string().contains("score"));
     assert!(store.list().expect("store lists").is_empty());
+}
+
+fn talk_manifests() -> [(&'static str, &'static str); 2] {
+    [
+        (
+            "eval1-ci-before-review",
+            include_str!("../../fixtures/eval/talk/eval1-ci-before-review.toml"),
+        ),
+        (
+            "eval2-delete-comments",
+            include_str!("../../fixtures/eval/talk/eval2-delete-comments.toml"),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn talk_evals_dry_run_produce_the_slide_table_and_exports() {
+    for (name, source) in talk_manifests() {
+        let temporary = tempfile::tempdir().expect("temporary workspace");
+        let manifest = write_fixture(temporary.path(), source);
+        let parsed = EvalManifest::parse(source).expect("talk manifest parses");
+        assert_eq!(parsed.options.score.baseline.as_deref(), Some("baseline"));
+        let value = execute(&EvalCommand {
+            directory: temporary.path().to_path_buf(),
+            action: EvalAction::Run(EvalRunCommand {
+                manifest,
+                directory: temporary.path().to_path_buf(),
+                id: Some(format!("{name}-dry")),
+                scorer: None,
+                judge_template: None,
+                judge_model: None,
+                runner: Some("fake".to_owned()),
+                workspace: None,
+            }),
+        })
+        .await
+        .expect("dry run succeeds");
+        let report: EvalReport = serde_json::from_value(value).expect("report json");
+        let comparison = report.baseline.as_ref().expect("baseline comparison");
+        assert_eq!(comparison.pairs.len(), 5, "{name}");
+        assert_eq!(comparison.cost_unit, CostUnit::Usd, "{name}");
+        assert_eq!(comparison.baseline.runs, 5);
+        assert_eq!(comparison.candidate.runs, 5);
+        let ratio = comparison.ratio.expect("ratio is defined");
+        assert!(
+            (report.aggregate_score - ratio).abs() < 1e-12,
+            "baseline-ratio scorer"
+        );
+        let means = |side: &ArmAggregate| {
+            side.quality.expect("q")
+                / (side.cost.expect("c").powf(0.5) * side.time_minutes.expect("t").powf(0.5))
+        };
+        assert!((ratio - means(&comparison.candidate) / means(&comparison.baseline)).abs() < 1e-12);
+        let directory = temporary
+            .path()
+            .join(".zeroshot/eval")
+            .join(format!("{name}-dry"));
+        let table = std::fs::read_to_string(directory.join(TABLE_FILE)).expect("table.csv");
+        assert_eq!(table.lines().count(), 1 + 5 + 2, "{table}");
+        let runs = std::fs::read_to_string(directory.join(RUNS_FILE)).expect("runs.csv");
+        assert_eq!(runs.lines().count(), 1 + 10, "{runs}");
+        let stored: BaselineComparison =
+            serde_json::from_slice(&std::fs::read(directory.join(SCORE_FILE)).expect("score.json"))
+                .expect("score.json parses");
+        assert_eq!(stored.pairs.len(), comparison.pairs.len());
+        assert_eq!(stored.candidate_arm, comparison.candidate_arm);
+        assert!((stored.ratio.expect("stored ratio") - ratio).abs() < 1e-12);
+        let markdown = std::fs::read_to_string(directory.join("report.md")).expect("report.md");
+        assert!(markdown.contains("## Baseline vs candidate"));
+
+        let exported = temporary.path().join("export");
+        let value = execute(&EvalCommand {
+            directory: temporary.path().to_path_buf(),
+            action: EvalAction::Export {
+                id: format!("{name}-dry"),
+                output: Some(exported.clone()),
+                weights: ScoreWeights {
+                    a: Some(0.2),
+                    b: Some(0.8),
+                },
+            },
+        })
+        .await
+        .expect("export succeeds");
+        assert_eq!(value["a"], json!(0.2));
+        let reweighted: BaselineComparison = serde_json::from_slice(
+            &std::fs::read(exported.join(SCORE_FILE)).expect("exported score.json"),
+        )
+        .expect("exported score parses");
+        let weighted = |side: &ArmAggregate| {
+            side.quality.expect("q")
+                / (side.cost.expect("c").powf(0.2) * side.time_minutes.expect("t").powf(0.8))
+        };
+        let expected = weighted(&reweighted.candidate) / weighted(&reweighted.baseline);
+        assert!((reweighted.ratio.expect("ratio") - expected).abs() < 1e-12);
+        assert!(exported.join(TABLE_FILE).is_file());
+        assert!(exported.join(RUNS_FILE).is_file());
+        // The stored report keeps the manifest weights.
+        let stored_again: BaselineComparison =
+            serde_json::from_slice(&std::fs::read(directory.join(SCORE_FILE)).expect("score.json"))
+                .expect("score.json parses");
+        assert!((stored_again.a - 0.5).abs() < f64::EPSILON);
+    }
+}
+
+struct VerdictJudge;
+
+#[async_trait::async_trait]
+impl Judge for VerdictJudge {
+    async fn judge(&self, request: JudgeRequest) -> Result<JudgeResult, EvalError> {
+        let judgements = request
+            .criteria
+            .iter()
+            .map(|criterion| {
+                let score = match (request.sample.arm_id.as_str(), criterion.id.as_str()) {
+                    ("candidate", "efficiency") => 2.0,
+                    _ => 4.0,
+                };
+                (
+                    criterion.id.clone(),
+                    Judgement::new(
+                        score,
+                        format!("{} verdict from patch", criterion.id),
+                        Vec::new(),
+                    )
+                    .expect("valid judgement"),
+                )
+            })
+            .collect();
+        Ok(JudgeResult { judgements })
+    }
+}
+
+#[tokio::test]
+async fn judged_trait_verdicts_drive_per_run_quality() {
+    let temporary = tempfile::tempdir().expect("temporary workspace");
+    let store = EvalStore::for_workspace(temporary.path());
+    let mut data = run_fixture_in(temporary.path(), "judged-quality", fixture_source()).await;
+    judge_eval(
+        &store,
+        &mut data,
+        &VerdictJudge,
+        JudgeOptions::default().with_model("mock-judge"),
+    )
+    .await
+    .expect("mock judge runs");
+    let report = data.report.as_ref().expect("report");
+    let comparison = report.baseline.as_ref().expect("comparison");
+    // failEvery = 2 fails run 1 on both arms: Q = 0 with measured T and C.
+    let baseline_runs = comparison
+        .pairs
+        .iter()
+        .map(|pair| pair.baseline.as_ref().expect("baseline run").quality)
+        .collect::<Vec<_>>();
+    assert_eq!(baseline_runs, vec![Some(1.0), Some(0.0), Some(1.0)]);
+    let candidate = comparison.pairs[0]
+        .candidate
+        .as_ref()
+        .expect("candidate run");
+    // correctness (weight 2) passes, efficiency (weight 1) scores 2 < 3 and fails.
+    assert!((candidate.quality.expect("q") - 2.0 / 3.0).abs() < 1e-12);
+    assert_eq!((candidate.traits_passed, candidate.traits_judged), (1, 2));
+    assert!((comparison.candidate.quality.expect("q") - 4.0 / 9.0).abs() < 1e-12);
+    let sample = data
+        .samples
+        .iter()
+        .find(|sample| sample.id == "candidate-0000")
+        .expect("candidate sample");
+    let verdict = sample
+        .criteria
+        .get("efficiency")
+        .expect("per-trait verdict");
+    assert!(!verdict.passed);
+    assert_eq!(verdict.score, Some(2.0));
+    assert_eq!(sample.judge_model.as_deref(), Some("mock-judge"));
+}
+
+#[test]
+fn captured_cost_and_cache_split_are_imported() {
+    let temporary = tempfile::tempdir().expect("temporary workspace");
+    std::fs::write(
+        temporary.path().join("sample.json"),
+        serde_json::to_vec(&json!({
+            "sampleId": "baseline-0003",
+            "runId": "run-cost",
+            "status": "succeeded",
+            "timings": { "startedAtMs": 1, "wallClockMs": 120000, "queueWaitMs": 0 },
+            "tokenUsage": {
+                "inputTokens": 10,
+                "outputTokens": 20,
+                "cacheReadInputTokens": 30,
+                "cacheCreationInputTokens": 40
+            },
+            "costUsd": 1.25
+        }))
+        .expect("json"),
+    )
+    .expect("sample.json is written");
+    let captured =
+        captured_sample_from_directory(temporary.path(), "baseline", 3).expect("capture parses");
+    assert_eq!(captured.sample.cost_usd, Some(1.25));
+    assert_eq!(captured.sample.tokens.cache, 70);
+    assert_eq!(captured.sample.tokens.cache_read, 30);
+    assert_eq!(captured.sample.tokens.cache_write, 40);
+
+    std::fs::write(
+        temporary.path().join("sample.json"),
+        br#"{"sampleId":"baseline-0003","runId":"r","status":"succeeded","costUsd":-1}"#,
+    )
+    .expect("sample.json is written");
+    let error = captured_sample_from_directory(temporary.path(), "baseline", 3)
+        .expect_err("negative cost is rejected");
+    assert!(error.to_string().contains("costUsd"));
+}
+
+#[test]
+fn local_runner_arms_become_zeroshot_run_commands() {
+    use crate::native_v2_cli::{RunGraph, RunRuntime, RunSelection, TemplateDelivery};
+
+    let manifest = EvalManifest::parse(include_str!(
+        "../../fixtures/eval/talk/eval1-ci-before-review.toml"
+    ))
+    .expect("talk manifest parses");
+    let base = std::path::Path::new("/evals/talk");
+    let workspace = std::path::Path::new("/repo");
+    let input = std::path::Path::new("/tmp/input.json");
+    let context = local::LocalArmContext {
+        manifest_directory: base,
+        workspace,
+        input,
+        title: "eval sample",
+    };
+    let baseline = local::run_command(
+        local::run_arguments(&manifest.arms[0], &context),
+        &manifest.arms[0].id,
+    )
+    .expect("template arm parses");
+    assert_eq!(baseline.cwd.as_deref(), Some(workspace));
+    assert!(baseline.target.is_none());
+    match &baseline.selection {
+        RunSelection::Inline {
+            graph: RunGraph::Template { delivery, .. },
+            runtime: RunRuntime::Uniform(runtime),
+        } => {
+            assert_eq!(*delivery, TemplateDelivery::Push);
+            assert_eq!(runtime, &base.join("runtime.json"));
+        }
+        selection => panic!("unexpected selection {selection:?}"),
+    }
+    let candidate = local::run_command(
+        local::run_arguments(&manifest.arms[1], &context),
+        &manifest.arms[1].id,
+    )
+    .expect("graph arm parses");
+    match &candidate.selection {
+        RunSelection::Inline {
+            graph: RunGraph::File(graph),
+            ..
+        } => assert_eq!(graph, &base.join("graphs/ci-before-review.json")),
+        selection => panic!("unexpected selection {selection:?}"),
+    }
+
+    for extra in [["--target", "platform"], ["--detach", "--title"]] {
+        let mut arm = manifest.arms[1].clone();
+        arm.run_args = extra.iter().map(|value| (*value).to_owned()).collect();
+        if extra[0] == "--detach" {
+            arm.run_args.truncate(1);
+        }
+        let error = local::run_command(local::run_arguments(&arm, &context), &arm.id)
+            .expect_err("unsupported local runArgs are rejected");
+        assert!(error.to_string().contains("runArgs"), "{error}");
+    }
+    let mut arm = manifest.arms[1].clone();
+    arm.run_args = vec!["--no-such-flag".to_owned()];
+    let error = local::run_command(local::run_arguments(&arm, &context), &arm.id)
+        .expect_err("unknown flags are rejected");
+    assert!(
+        error.to_string().contains("not a valid `zeroshot run`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn local_arm_options_are_validated() {
+    let source = include_str!("../../fixtures/eval/talk/eval2-delete-comments.toml");
+    for (from, to, message) in [
+        ("delivery = \"push\"", "delivery = \"ftp\"", "delivery"),
+        (
+            "uniformRuntimeConfig = \"runtime.json\"\nprompt",
+            "uniformRuntimeConfig = \"runtime.json\"\nruntimeConfig = \"plan.json\"\nprompt",
+            "at most one of runtimeConfig",
+        ),
+        (
+            "deadlineMinutes = 90",
+            "deadlineMinutes = 0",
+            "deadlineMinutes",
+        ),
+        ("input = 3.0", "input = -3.0", "options.pricing.input"),
+    ] {
+        assert!(source.contains(from), "fixture contains {from}");
+        let error = EvalManifest::parse(&source.replacen(from, to, 1))
+            .expect_err("invalid manifest is rejected");
+        assert!(error.to_string().contains(message), "{error}");
+    }
 }

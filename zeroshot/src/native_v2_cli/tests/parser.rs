@@ -979,6 +979,8 @@ fn parser_wires_eval_run_report_score_and_clean_actions() {
                     scorer: None,
                     judge_template: None,
                     judge_model: None,
+                    runner: None,
+                    workspace: None,
                 }),
         }) => {
             assert_eq!(directory, PathBuf::from("workspace"));
@@ -1002,7 +1004,7 @@ fn parser_wires_eval_run_report_score_and_clean_actions() {
     assert!(matches!(
         command,
         NativeV2CliCommand::Eval(crate::native_v2_eval::EvalCommand {
-            action: crate::native_v2_eval::EvalAction::Score { id, scorer },
+            action: crate::native_v2_eval::EvalAction::Score { id, scorer, .. },
             ..
         }) if id == "fixture" && scorer == "none"
     ));

@@ -1,0 +1,90 @@
+# Eval 2: "Delete all the comments".
+#
+# Idea: agents explain away problems in comments instead of doing the refactor. The candidate
+# tells the implementing agent to delete every comment it would add or touch and to express
+# intent through code (names, extracted functions, tests) instead. Expected: quality goes up at
+# similar time and cost.
+#
+# Dry run:
+#   zeroshot eval run zeroshot/fixtures/eval/talk/eval2-delete-comments.toml --id eval2-dry
+# Real runs:
+#   zeroshot eval --directory /path/to/store run .../eval2-delete-comments.toml --runner local \
+#     --cwd /path/to/repo
+
+schema = "zeroshot.eval/v1"
+name = "eval2-delete-comments"
+runsPerArm = 5
+
+[options]
+scorer = "baseline-ratio"
+runner = "fake"
+seed = 2
+judgeTemplate = "eval-judge"
+judgeModel = "synthetic-judge"
+# judgeRuntimeConfig = "judge-runtime.json"
+deadlineMinutes = 90
+
+[options.score]
+a = 0.5
+b = 0.5
+baseline = "baseline"
+candidate = "delete-comments"
+
+[options.pricing]
+input = 3.0
+output = 15.0
+cacheRead = 0.3
+cacheWrite = 3.75
+
+[options.fake]
+queueWaitMs = 0
+jitter = 0.1
+
+[[arms]]
+id = "baseline"
+template = "software-change"
+delivery = "push"
+uniformRuntimeConfig = "runtime.json"
+prompt = "Refactor `zeroshot eval` report rendering so the Markdown and CSV writers share one formatting path for numbers and missing values."
+
+[arms.knobs]
+wallClockMs = 1260000
+inputTokens = 490000
+outputTokens = 52000
+passRate = 0.64
+
+[[arms]]
+id = "delete-comments"
+graph = "graphs/delete-comments.json"
+uniformRuntimeConfig = "runtime.json"
+prompt = "Refactor `zeroshot eval` report rendering so the Markdown and CSV writers share one formatting path for numbers and missing values."
+
+[arms.knobs]
+wallClockMs = 1536000
+inputTokens = 600000
+outputTokens = 63000
+passRate = 0.87
+
+[[criteria]]
+id = "single-path"
+description = "Markdown and CSV number and missing-value formatting go through one shared function."
+
+[[criteria]]
+id = "no-excuses"
+description = "No new comments that explain, apologize for, or defer a problem (TODO, FIXME, \"for now\", \"temporary\")."
+
+[[criteria]]
+id = "behavior"
+description = "Rendered Markdown and CSV output are byte-for-byte unchanged for existing fixtures."
+
+[[criteria]]
+id = "dead-code"
+description = "Formatting helpers made redundant by the refactor are removed."
+
+[[criteria]]
+id = "names"
+description = "Extracted functions and variables have intention-revealing names."
+
+[[criteria]]
+id = "tests"
+description = "Tests cover the shared formatting path, including a missing value."

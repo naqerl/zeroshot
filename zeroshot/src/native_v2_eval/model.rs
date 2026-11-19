@@ -114,6 +114,10 @@ pub struct EvalSample {
     pub status: SampleStatus,
     pub timing: SampleTiming,
     pub tokens: TokenUsage,
+    /// Implementation cost in USD when the runner or capture recorded it directly. When absent,
+    /// the report prices `tokens` with the manifest's `pricing` table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_revision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -166,7 +170,18 @@ pub struct SampleTiming {
 pub struct TokenUsage {
     pub input: u64,
     pub output: u64,
+    /// All cache tokens (`cacheRead + cacheWrite` when the split is known).
     pub cache: u64,
+    /// Cache-read input tokens, when the provider reported the split.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_read: u64,
+    /// Cache-creation input tokens, when the provider reported the split.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl TokenUsage {

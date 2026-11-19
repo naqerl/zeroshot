@@ -204,6 +204,8 @@ impl EvalCliCommand {
                 scorer: args.scorer,
                 judge_template,
                 judge_model,
+                runner: args.runner,
+                workspace: args.cwd,
             }),
             Self::List => EvalAction::List,
             Self::Show(args) => EvalAction::Show {
@@ -215,6 +217,12 @@ impl EvalCliCommand {
             Self::Score(args) => EvalAction::Score {
                 id: validate_eval_id(args.id)?,
                 scorer: args.scorer,
+                weights: eval_weights(&args.weights)?,
+            },
+            Self::Export(args) => EvalAction::Export {
+                id: validate_eval_id(args.id)?,
+                output: args.output,
+                weights: eval_weights(&args.weights)?,
             },
             Self::Judge(args) => EvalAction::Judge(EvalJudgeCommand {
                 id: validate_eval_id(args.id)?,
@@ -237,6 +245,23 @@ impl EvalCliCommand {
         };
         Ok(NativeV2CliCommand::Eval(EvalCommand { directory, action }))
     }
+}
+
+fn eval_weights(
+    args: &super::EvalWeightArgs,
+) -> Result<crate::native_v2_eval::ScoreWeights, NativeV2CliError> {
+    for (flag, value) in [
+        ("--cost-weight", args.cost_weight),
+        ("--time-weight", args.time_weight),
+    ] {
+        if value.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+            return Err(usage(format!("{flag} must be a number between 0 and 1")));
+        }
+    }
+    Ok(crate::native_v2_eval::ScoreWeights {
+        a: args.cost_weight,
+        b: args.time_weight,
+    })
 }
 
 fn validate_eval_id(value: String) -> Result<String, NativeV2CliError> {

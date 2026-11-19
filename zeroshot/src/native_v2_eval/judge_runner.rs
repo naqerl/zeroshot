@@ -455,19 +455,33 @@ fn sample_from_capture(
             .unwrap_or(0),
     };
     let tokens = outcome.get("tokenUsage").and_then(Value::as_object);
+    let count = |key: &str| {
+        tokens
+            .and_then(|tokens| tokens.get(key))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let cache_read = count("cacheReadInputTokens");
+    let cache_write = count("cacheCreationInputTokens");
     let tokens = TokenUsage {
-        input: tokens
-            .and_then(|tokens| tokens.get("inputTokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        output: tokens
-            .and_then(|tokens| tokens.get("outputTokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        cache: tokens
-            .and_then(|tokens| tokens.get("cacheReadInputTokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        input: count("inputTokens"),
+        output: count("outputTokens"),
+        cache: cache_read.saturating_add(cache_write),
+        cache_read,
+        cache_write,
+    };
+    let cost_usd = match outcome.get("costUsd").or_else(|| document.get("costUsd")) {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_f64()
+                .filter(|cost| cost.is_finite() && *cost >= 0.0)
+                .ok_or_else(|| {
+                    EvalError::Command(
+                        "sample.json costUsd must be a finite nonnegative number".to_owned(),
+                    )
+                })?,
+        ),
     };
     let criteria = outcome
         .get("criteria")
@@ -491,6 +505,7 @@ fn sample_from_capture(
         status,
         timing,
         tokens,
+        cost_usd,
         delivered_revision: outcome
             .get("deliveredRevision")
             .and_then(Value::as_str)

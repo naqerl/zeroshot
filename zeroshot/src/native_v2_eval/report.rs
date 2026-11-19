@@ -26,6 +26,9 @@ pub struct EvalReport {
     /// Paired X vs Y comparison for the first two arms, when judge scores exist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comparison: Option<XyComparison>,
+    /// Baseline vs candidate `S = Q / (C^a * T^b)` table and ratio, when two arms exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<super::BaselineComparison>,
     pub unmatched_reasoning: Vec<UnmatchedReasoning>,
     #[serde(default)]
     pub notes: Vec<String>,
@@ -286,6 +289,7 @@ impl EvalReport {
             matrix: analysis.matrix,
             cost_time,
             comparison: analysis.comparison,
+            baseline: super::baseline::compare(data),
             unmatched_reasoning: analysis.unmatched_reasoning,
             notes: output.notes,
         }
@@ -312,6 +316,11 @@ pub fn render_markdown(report: &EvalReport) -> String {
     let _ = writeln!(out, "- Aggregate score: {:.4}", report.aggregate_score);
     let _ = writeln!(out, "- Quality (Q): {:.4}", report.quality);
     let _ = writeln!(out);
+
+    if let Some(baseline) = &report.baseline {
+        out.push_str(&super::baseline::render_markdown(baseline));
+        let _ = writeln!(out);
+    }
 
     let _ = writeln!(out, "## Trait matrix");
     let _ = writeln!(out);
