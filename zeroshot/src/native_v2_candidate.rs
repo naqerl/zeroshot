@@ -242,6 +242,10 @@ pub(crate) fn build_local_native_v2_candidate_with_authority(
     )
 }
 
+fn hub_target_allows_scripts() -> bool {
+    std::env::var_os("ZEROSHOT_HUB_TARGET").is_some_and(|v| v != "0")
+}
+
 fn build_candidate(
     admitted: &AdmittedRun,
     config: NativeV2CandidateConfig,
@@ -255,7 +259,10 @@ fn build_candidate(
         .values()
         .any(|binding| matches!(binding, NodeRuntimeBinding::Script { .. }))
     {
-        if !placement.is_local() {
+        // A hub-rented target is a single-tenant machine that executes the graph
+        // itself, so script bindings are safe there even though the run carries a
+        // controller descriptor. Only a shared capsule must stay agent-only.
+        if !placement.is_local() && !hub_target_allows_scripts() {
             return Err(NativeV2CandidateError::ScriptLocalOnly);
         }
         Some(script::ScriptAdapter::new(

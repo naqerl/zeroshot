@@ -34,6 +34,9 @@ pub enum TargetServeError {
 }
 
 pub async fn serve_direct_target(config: TargetServe) -> Result<(), TargetServeError> {
+    // A direct target is a single-tenant machine that executes the graph itself, so
+    // script bindings are allowed here even though the run arrives with a controller.
+    std::env::set_var("ZEROSHOT_HUB_TARGET", "1");
     let shutdown = shutdown_signal()?;
     let public_origin = normalize_origin(&config.public_origin)
         .map_err(|error| TargetServeError::InvalidOrigin(error.to_string()))?;
