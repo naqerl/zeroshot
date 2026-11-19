@@ -412,6 +412,26 @@ fn resolve_judge_paths(
     Ok(changed)
 }
 
+pub(super) fn resolve_template_reference(
+    manifest_directory: &std::path::Path,
+    reference: &str,
+    override_reference: bool,
+) -> Result<String, EvalError> {
+    if reference == JUDGE_TEMPLATE_NAME {
+        return Ok(reference.to_owned());
+    }
+    let path = std::path::Path::new(reference);
+    if path.is_absolute() {
+        return Ok(reference.to_owned());
+    }
+    let resolved = if override_reference {
+        std::path::absolute(path).map_err(|error| EvalError::io(path, error))?
+    } else {
+        resolve_manifest_path(manifest_directory, reference)?
+    };
+    Ok(path_string(&resolved))
+}
+
 pub(super) fn resolve_manifest_path(
     manifest_directory: &std::path::Path,
     value: &str,
@@ -451,12 +471,15 @@ async fn judge_with_template(
     data: &mut EvalData,
     mut options: JudgeOptions,
 ) -> Result<(), EvalError> {
+    let manifest_directory = store.root().join(data.id.as_str());
+    let override_template = options.template.is_some();
     let reference = options
         .template
         .as_deref()
         .or(data.manifest.options.judge_template.as_deref())
         .unwrap_or(JUDGE_TEMPLATE_NAME);
-    let template = resolve_judge_template(reference)?;
+    let reference = resolve_template_reference(&manifest_directory, reference, override_template)?;
+    let template = resolve_judge_template(&reference)?;
     let options_manifest = &data.manifest.options;
     let selected_runner = data.manifest.judge_runner(options.runner.as_deref())?;
     if selected_runner == "local"
@@ -471,7 +494,6 @@ async fn judge_with_template(
     }
     let (executor, executor_kind): (Box<dyn JudgeGraphExecutor>, &str) = match selected_runner {
         "local" => {
-            let manifest_directory = store.root().join(data.id.as_str());
             let workspace = store
                 .root()
                 .parent()
@@ -482,9 +504,7 @@ async fn judge_with_template(
                 template: if template.name == JUDGE_TEMPLATE_NAME {
                     JUDGE_TEMPLATE_NAME.to_owned()
                 } else {
-                    resolve_manifest_path(&manifest_directory, &template.name)?
-                        .to_string_lossy()
-                        .into_owned()
+                    template.name.clone()
                 },
                 runtime_config: options_manifest
                     .judge_runtime_config

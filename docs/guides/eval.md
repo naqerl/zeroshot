@@ -97,7 +97,8 @@ judgeUniformRuntimeConfig = "runtime.json" # zeroshot run --uniform-runtime-conf
 - **`synthetic`.** A dry-run judge that calls no model. It answers in the same output shape from
   the verdicts the fake runner recorded, and is labeled `synthetic` in the report's `Judge`
   column. A sample without recorded verdicts fails with a message that points to
-  `judgeRunner = "local"`.
+  `judgeRunner = "local"`. It also refuses to re-label verdicts produced by a different judge
+  executor, so re-judging a graph-judged sample as `synthetic` fails instead of mutating it.
 - **Overrides.** `--judge-runner` and `--judge-template` on `eval run`, `eval judge`, and
   `eval judge-captures` override the manifest. Relative paths in a manifest resolve against the
   manifest directory, and the resolved path is stored with the eval. An `eval judge

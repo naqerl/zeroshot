@@ -132,7 +132,8 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   `judgeUniformRuntimeConfig`, or `judgeRunArgs`. Selecting `local` without one of those fails with
   an explicit judge error naming the missing `judgeRuntimeConfig` rather than falling back to the
   synthetic runner; the `synthetic` runner (default for the fake runner) reuses recorded fake
-  evidence, calls no model, and fails closed when a capture has none. Custom graph JSON paths
+  evidence, calls no model, fails closed when a capture has none, and refuses to relabel verdicts
+  produced by another judge executor. Custom graph JSON paths
   receive only the input fields their own `initialInput` declares (optionally `sample` and
   `checkout`). A succeeded sample with no captured patch or checkout is an error. Captured
   patch/checkout paths stay inside the capture directory, provider-backed graph judges run with
