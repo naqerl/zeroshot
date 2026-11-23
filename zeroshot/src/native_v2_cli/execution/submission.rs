@@ -146,6 +146,17 @@ pub fn try_execute_native_v2_static_with_terminal(
             delivery,
             json,
         } => execute_template_show(*template, *delivery, is_terminal && !json, output)?,
+        NativeV2CliCommand::EvalList { root } => {
+            return super::eval::list(root, output).map(Some);
+        }
+        NativeV2CliCommand::EvalShow { root, slug } => {
+            return super::eval::show(root, slug, output).map(Some);
+        }
+        NativeV2CliCommand::EvalCreate {
+            root,
+            file,
+            overwrite,
+        } => return super::eval::create(root, file, *overwrite, output).map(Some),
         _ => return Ok(None),
     };
     Ok(Some(outcome))

@@ -24,6 +24,7 @@ use crate::native_v2_cli::{
 #[path = "convert/profile_commands.rs"]
 mod profile_commands;
 use profile_commands::profile_name;
+use super::eval::EvalCommand;
 
 /// Parse public command-line arguments after the executable name.
 ///
@@ -75,6 +76,7 @@ impl CliCommand {
             Self::Connection { command } => command.into_command(),
             Self::Profile { command } => command.into_command(),
             Self::Template { command } => command.into_command(),
+            Self::Eval { directory, command } => command.into_command(directory),
             Self::Stack { command } => command.into_command(),
             Self::Run(args) => args.into_command(),
             Self::Utility(command) => command.into_command(),
@@ -424,6 +426,26 @@ impl TemplateCommand {
                     json: args.json,
                 })
             }
+        }
+    }
+}
+
+impl EvalCommand {
+    fn into_command(self, directory: PathBuf) -> Result<NativeV2CliCommand, NativeV2CliError> {
+        let root = crate::native_v2_eval::EvalStore::for_workspace(directory)
+            .root()
+            .to_path_buf();
+        match self {
+            Self::List => Ok(NativeV2CliCommand::EvalList { root }),
+            Self::Show(args) => Ok(NativeV2CliCommand::EvalShow {
+                root,
+                slug: args.slug,
+            }),
+            Self::Create(args) => Ok(NativeV2CliCommand::EvalCreate {
+                root,
+                file: args.file,
+                overwrite: args.overwrite,
+            }),
         }
     }
 }

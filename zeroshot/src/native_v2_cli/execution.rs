@@ -943,6 +943,9 @@ fn write_json(output: &mut impl Write, value: &impl Serialize) -> Result<(), Nat
     Ok(())
 }
 
+#[path = "execution/eval.rs"]
+mod eval;
+
 #[cfg(test)]
 #[path = "execution/incomplete_stream_tests.rs"]
 mod incomplete_stream_tests;
