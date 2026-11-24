@@ -146,17 +146,13 @@ pub fn try_execute_native_v2_static_with_terminal(
             delivery,
             json,
         } => execute_template_show(*template, *delivery, is_terminal && !json, output)?,
-        NativeV2CliCommand::EvalList { root } => {
-            return super::eval::list(root, output).map(Some);
+        NativeV2CliCommand::Eval(command) => {
+            if command.submits_runs() {
+                // `eval run` needs a target and is executed by the backend, never here.
+                return Ok(None);
+            }
+            return super::eval::execute_store_command(command, output).map(Some);
         }
-        NativeV2CliCommand::EvalShow { root, slug } => {
-            return super::eval::show(root, slug, output).map(Some);
-        }
-        NativeV2CliCommand::EvalCreate {
-            root,
-            file,
-            overwrite,
-        } => return super::eval::create(root, file, *overwrite, output).map(Some),
         _ => return Ok(None),
     };
     Ok(Some(outcome))

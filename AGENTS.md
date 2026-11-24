@@ -1820,6 +1820,21 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   errors are explicit failures, not accepted experiments. Saved profiles and admitted runs retain
   their stored graph, runtime and session policy.
 
+- Evals are self-contained documents under the workspace's `.zeroshot/evals/<slug>.json`.
+  `zeroshot eval list`, `show`, `create` and `clean` only touch that store, so they stay local
+  commands; `zeroshot eval run` is the one eval command that submits, and every sample goes to the
+  eval's named target through the ordinary `run submit` path from the eval's own checkout. One
+  named target and an optional judge template come from the document, and `eval run --target`
+  overrides the target. Sample bundles are published write-once under
+  `.zeroshot/evals/runs/<slug>/<stamp>/` (`input.json`, `judge/input.json`, `judge/result.json`,
+  `result.json`, `report.md`); only `summary.json` is rewritten under a fresh stamp directory per
+  rerun. The built-in `eval-judge` template judges one delivered sample against its authored
+  traits with no delivery, and its `builtin.eval.judge@1` step is the only step admission lets
+  retry: the dedicated ceiling covers it while every other authored step keeps one attempt.
+  A failed or verdictless judge run fails its sample and names that judge in the report, so an
+  unjudged sample is reported as unjudged only when the eval authored no judge or the eval stopped
+  before the judge settled; a detach request bounds the settlement status read and ends the command.
+
 - Target images apply current Debian Trixie package updates and install a checksum-verified upstream
   GitHub CLI. Image tests exercise GraphQL pagination with the installed CLI before publication.
   They ship one Rust toolchain baseline plus Node.js, Python and shared native build tools. They expose

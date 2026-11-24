@@ -77,6 +77,7 @@ pub(super) fn description(template: BuiltinGraphTemplate) -> &'static str {
         BuiltinGraphTemplate::CodeReview => {
             "Get a detailed code review from independent specialists."
         }
+        BuiltinGraphTemplate::EvalJudge => "Judge one eval sample against its acceptance traits.",
     }
 }
 

@@ -821,6 +821,8 @@ async fn all_supported_builtin_graphs_keep_success_independent_of_receipt_projec
                     context["linkedIssues"] = json!([]);
                 }
                 json!({"url":url,"context":context})
+            } else if template == BuiltinGraphTemplate::EvalJudge {
+                json!({"task":"Judge this change","traits":"[{\"id\":\"quality\",\"description\":\"Review quality\"}]","patch":""})
             } else {
                 json!({"task":"Implement this change"})
             };
@@ -908,7 +910,8 @@ async fn all_supported_builtin_graphs_keep_success_independent_of_receipt_projec
             checked_pairs += 1;
         }
     }
-    assert_eq!(checked_pairs, 11);
+    // Every supported template/delivery pair, including `eval-judge`'s single `None` delivery.
+    assert_eq!(checked_pairs, 12);
 }
 
 #[tokio::test]

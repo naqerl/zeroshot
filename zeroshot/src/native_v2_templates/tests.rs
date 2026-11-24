@@ -69,6 +69,7 @@ fn catalog_and_template_inputs_are_closed() {
             BuiltinGraphTemplate::IssueReview,
             BuiltinGraphTemplate::PrReview,
             BuiltinGraphTemplate::CodeReview,
+            BuiltinGraphTemplate::EvalJudge,
         ]
     );
     assert_eq!(

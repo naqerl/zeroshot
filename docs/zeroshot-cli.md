@@ -752,6 +752,7 @@ Options:
           - issue-review:    Inspect an issue proposal and post a review report
           - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
           - code-review:     Review a PR with parallel specialist reviewers, verify their findings, and post one report
+          - eval-judge:      Judge one delivered eval sample against its authored acceptance traits
 
       --runtime-config <FILE>
 
@@ -924,6 +925,7 @@ Arguments:
           - issue-review:    Inspect an issue proposal and post a review report
           - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
           - code-review:     Review a PR with parallel specialist reviewers, verify their findings, and post one report
+          - eval-judge:      Judge one delivered eval sample against its authored acceptance traits
 
 Options:
       --json
@@ -974,6 +976,8 @@ Commands:
   list    List stored eval summaries in slug order as JSON
   show    Show one eval document as JSON
   create  Store a self-contained eval JSON document
+  clean   Remove a stored eval and the run bundles published for it
+  run     Run one stored eval's samples on its target and judge the delivered patches
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1048,6 +1052,51 @@ Options:
           Print help
 ```
 
+#### `zeroshot eval clean`
+
+```text
+Remove a stored eval and the run bundles published for it
+
+Usage: zeroshot eval clean [OPTIONS] <SLUG>
+
+Arguments:
+  <SLUG>
+          Eval slug, matching its file name without the .json suffix
+
+Options:
+      --directory <DIR>
+          Workspace directory whose `.zeroshot/evals` directory holds the evals
+
+          [default: .]
+
+  -h, --help
+          Print help
+```
+
+#### `zeroshot eval run`
+
+```text
+Run one stored eval's samples on its target and judge the delivered patches
+
+Usage: zeroshot eval run [OPTIONS] <SLUG>
+
+Arguments:
+  <SLUG>
+          Stored eval to run
+
+Options:
+      --directory <DIR>
+          Workspace directory whose `.zeroshot/evals` directory holds the evals
+
+          [default: .]
+
+      --target <NAME>
+          Named target that receives the sample runs; overrides the eval's own target
+
+  -h, --help
+          Print help
+```
+
 #### `zeroshot eval help`
 
 ```text
@@ -1059,6 +1108,8 @@ Commands:
   list    List stored eval summaries in slug order as JSON
   show    Show one eval document as JSON
   create  Store a self-contained eval JSON document
+  clean   Remove a stored eval and the run bundles published for it
+  run     Run one stored eval's samples on its target and judge the delivered patches
   help    Print this message or the help of the given subcommand(s)
 ```
 
@@ -1267,6 +1318,7 @@ Options:
           - issue-review:    Inspect an issue proposal and post a review report
           - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
           - code-review:     Review a PR with parallel specialist reviewers, verify their findings, and post one report
+          - eval-judge:      Judge one delivered eval sample against its authored acceptance traits
 
       --input <FILE>
           Load the graph's initial input from this JSON file

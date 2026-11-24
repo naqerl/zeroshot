@@ -16,7 +16,9 @@ pub(super) fn templates(workspace_checkpoint_opt_out: bool) -> Result<Vec<Value>
     let mut result = Vec::new();
     for template in BuiltinGraphTemplate::all() {
         let deliveries = match template {
-            BuiltinGraphTemplate::SingleWorker => &[TemplateDelivery::None][..],
+            BuiltinGraphTemplate::SingleWorker | BuiltinGraphTemplate::EvalJudge => {
+                &[TemplateDelivery::None][..]
+            }
             BuiltinGraphTemplate::SoftwareChange => &[
                 TemplateDelivery::PullRequest,
                 TemplateDelivery::None,
@@ -215,6 +217,7 @@ fn named_node<'a>(graph: &'a GraphSpec, name: &str) -> Result<&'a GraphNode, Api
 fn template_label(template: BuiltinGraphTemplate, delivery: TemplateDelivery) -> &'static str {
     match template {
         BuiltinGraphTemplate::SingleWorker => "Single worker",
+        BuiltinGraphTemplate::EvalJudge => "Eval judge",
         BuiltinGraphTemplate::SoftwareChange => software_change_label(delivery),
         BuiltinGraphTemplate::AutoResearch => {
             if delivery == TemplateDelivery::Push {

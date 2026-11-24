@@ -5,7 +5,10 @@ use openengine_cluster_protocol::{
     WorkerContract, WorkerRef, PayloadType, MAX_DECLARED_ENVIRONMENT_NAMES, RUNTIME_WORKER_ERRORS,
 };
 
-use super::{DeliveryPolicy, NativeV2AdmissionError, RuntimePlan, MAX_AGENT_VERIFIER_ATTEMPTS};
+use super::{
+    DeliveryPolicy, NativeV2AdmissionError, RuntimePlan, MAX_AGENT_STEP_ATTEMPTS,
+    MAX_AGENT_VERIFIER_ATTEMPTS,
+};
 use crate::native_v2_contract::{
     AdmittedRun, NodeRuntimeBinding, PullRequestFeedback, GIT_DELIVERY_MERGE_V2_WORKER_REF,
     GIT_DELIVERY_MERGE_V3_WORKER_REF, GIT_DELIVERY_MERGE_WORKER_REF, GIT_DELIVERY_PR_V2_WORKER_REF,
@@ -181,18 +184,37 @@ fn collect_declarations(node: &GraphNode, declarations: &mut Vec<ExecutableDecla
 }
 
 fn validate_attempts(declarations: &[ExecutableDeclaration]) -> Result<(), NativeV2AdmissionError> {
-    if let Some(declaration) = declarations.iter().find(|item| {
-        item.attempts != 1
-            && !(item.kind == LeafKind::Verifier
-                && !is_git_delivery_worker(&item.worker)
-                && item.attempts <= MAX_AGENT_VERIFIER_ATTEMPTS)
-    }) {
+    if let Some(declaration) = declarations
+        .iter()
+        .find(|item| !within_attempt_ceiling(item))
+    {
         return Err(NativeV2AdmissionError::Attempts {
             node: declaration.name.clone(),
             attempts: declaration.attempts,
         });
     }
     Ok(())
+}
+
+/// Whether one declaration stays within the attempt budget its kind and worker allow.
+///
+/// One attempt is always allowed. Beyond that a verifier may retry a read-only check, and the eval
+/// judge is the only step allowed to retry because its output is a judgement rather than a write.
+fn within_attempt_ceiling(item: &ExecutableDeclaration) -> bool {
+    if item.attempts == 1 {
+        return true;
+    }
+    let worker = item.worker.as_str();
+    match item.kind {
+        LeafKind::Step => {
+            item.attempts <= MAX_AGENT_STEP_ATTEMPTS
+                || (worker == crate::native_v2_eval::EVAL_JUDGE_WORKER_REF
+                    && item.attempts <= crate::native_v2_eval::EVAL_JUDGE_ATTEMPTS)
+        }
+        LeafKind::Verifier => {
+            !is_git_delivery_worker(&item.worker) && item.attempts <= MAX_AGENT_VERIFIER_ATTEMPTS
+        }
+    }
 }
 
 fn validate_binding_coverage(

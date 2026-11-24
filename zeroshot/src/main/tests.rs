@@ -110,6 +110,37 @@ fn assert_run_routing_follows_the_authored_target() {
     ]);
 }
 
+/// `eval run` submits samples to the target its eval names, so a backend has to serve it.
+///
+/// The store commands read and write only this checkout's own eval documents, so they stay local
+/// even though they live under the same subcommand.
+fn assert_eval_routing_follows_the_submitted_runs() {
+    for arguments in [
+        vec!["eval", "list"],
+        vec!["eval", "show", "compare"],
+        vec!["eval", "create", "compare.json"],
+        vec!["eval", "clean", "compare"],
+    ] {
+        let command =
+            parse_native_v2_args(arguments.iter().copied().map(OsString::from)).assert_value();
+        assert!(
+            is_local_command(&command),
+            "{arguments:?} only reads this checkout's eval store"
+        );
+    }
+    for arguments in [
+        vec!["eval", "run", "compare"],
+        vec!["eval", "run", "compare", "--target", "prod"],
+    ] {
+        let command =
+            parse_native_v2_args(arguments.iter().copied().map(OsString::from)).assert_value();
+        assert!(
+            !is_local_command(&command),
+            "{arguments:?} submits its samples to a target"
+        );
+    }
+}
+
 fn assert_management_routing_follows_the_authored_target() {
     assert_route_pairs(&[
         (
@@ -460,6 +491,7 @@ async fn wave10_cli_contract_process_dispatch_and_routing_matrix_is_exact() {
     assert_target_serve_is_part_of_the_public_command_schema();
     assert_run_routing_follows_the_authored_target();
     assert_management_routing_follows_the_authored_target();
+    assert_eval_routing_follows_the_submitted_runs();
     assert_private_bootstrap_is_exact_and_public_startup_stays_public().await;
     assert_static_dispatch_and_remaining_management_routes_are_exact().await;
     assert_process_diagnostics_preserve_cli_detail_and_classify_runtime_failures();
