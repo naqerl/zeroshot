@@ -243,6 +243,8 @@ pub(in crate::native_v2_cli) struct FakeBackend {
     trusted_resume_requirements: Option<RunConnectionRequirements>,
     resource_scope: Option<openengine_cluster_protocol::ConnectionScope>,
     unavailable_machine_identity: bool,
+    finished_output: Option<Value>,
+    failed_judge: bool,
     review: Option<crate::native_v2_review::PreparedReview>,
     review_file_change: Option<(std::path::PathBuf, String)>,
     workspace_export: Arc<Mutex<Option<WorkspaceExportStream>>>,
@@ -252,6 +254,20 @@ pub(in crate::native_v2_cli) struct FakeBackend {
 pub(super) enum CursorCallKind {
     Watch,
     Logs,
+}
+
+/// Whether the eval's most recent submission was its judge run.
+fn last_submission_named_the_judge(calls: &Mutex<Vec<Call>>) -> bool {
+    calls
+        .lock()
+        .assert_value()
+        .iter()
+        .rev()
+        .find_map(|call| match call {
+            Call::Submit { title, .. } => Some(title.as_str().contains("judge")),
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 impl FakeBackend {
@@ -350,6 +366,23 @@ impl FakeBackend {
     pub(super) fn with_failed_watch() -> Self {
         Self {
             failed_watch: true,
+            ..Self::default()
+        }
+    }
+
+    /// Report every submitted run as finished, succeeded, with `output`.
+    pub(super) fn with_finished_output(output: Value) -> Self {
+        Self {
+            finished_output: Some(output),
+            ..Self::default()
+        }
+    }
+
+    /// Report the eval's judge runs as finished, failed, while every other run still succeeds.
+    pub(super) fn with_failed_judge() -> Self {
+        Self {
+            finished_output: Some(json!({})),
+            failed_judge: true,
             ..Self::default()
         }
     }
@@ -841,8 +874,38 @@ impl NativeV2CliBackend for FakeBackend {
             let _ = started.send(());
             return std::future::pending().await;
         }
+        if self.failed_judge && last_submission_named_the_judge(&self.calls) {
+            return serde_json::from_value(json!({
+                "runId":params.run_id,
+                "title":"Judge sample",
+                "source":source(),
+                "size":"medium",
+                "atCursor":"v2:3",
+                "status":{
+                    "phase":"finished",
+                    "terminalResult":{"status":"failed","reason":"worker_failed"},
+                    "metadata":{}
+                }
+            }))
+            .map_err(NativeV2CliError::OutputJson);
+        }
         if self.runtime_failure_before_terminal {
             return Ok(runtime_failure_status(&params.run_id));
+        }
+        if let Some(output) = &self.finished_output {
+            return serde_json::from_value(json!({
+                "runId":params.run_id,
+                "title":"Judge sample",
+                "source":source(),
+                "size":"medium",
+                "atCursor":"v2:3",
+                "status":{
+                    "phase":"finished",
+                    "terminalResult":{"status":"succeeded","output":output},
+                    "metadata":{}
+                }
+            }))
+            .map_err(NativeV2CliError::OutputJson);
         }
         if let Some(requirements) = &self.resume_requirements {
             return serde_json::from_value(json!({

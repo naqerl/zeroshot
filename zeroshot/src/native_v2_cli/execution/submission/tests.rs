@@ -542,6 +542,13 @@ fn named_validation_command(
 }
 
 fn template_validation_input(template: BuiltinGraphTemplate) -> serde_json::Value {
+    if template == BuiltinGraphTemplate::EvalJudge {
+        return serde_json::json!({
+            "task":"Validate the judge without a source or credential",
+            "traits":"[{\"id\":\"quality\",\"description\":\"Review quality\"}]",
+            "patch":""
+        });
+    }
     if !matches!(
         template,
         BuiltinGraphTemplate::IssueReview

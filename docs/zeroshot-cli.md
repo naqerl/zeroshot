@@ -22,6 +22,7 @@ Commands:
   connection         Inspect and manage named runtime connections
   profile            Manage reusable graph/runtime profiles
   template           Inspect built-in graph templates
+  eval               Inspect and create local eval definitions
   stack              Validate, submit, and observe hosted stacks of dependent runs
   run                Submit a graph run locally or to a named target
   update             Update this executable and managed agent skills to the newest canonical release
@@ -751,6 +752,7 @@ Options:
           - issue-review:    Inspect an issue proposal and post a review report
           - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
           - code-review:     Review a PR with parallel specialist reviewers, verify their findings, and post one report
+          - eval-judge:      Judge one delivered eval sample against its authored acceptance traits
 
       --runtime-config <FILE>
 
@@ -923,6 +925,7 @@ Arguments:
           - issue-review:    Inspect an issue proposal and post a review report
           - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
           - code-review:     Review a PR with parallel specialist reviewers, verify their findings, and post one report
+          - eval-judge:      Judge one delivered eval sample against its authored acceptance traits
 
 Options:
       --json
@@ -958,6 +961,156 @@ Commands:
   list  List built-in template names as JSON
   show  Show a built-in graph as a tree in terminals, or JSON when piped
   help  Print this message or the help of the given subcommand(s)
+```
+
+### `zeroshot eval`
+
+```text
+Inspect and create local eval definitions.
+
+Evals live in `.zeroshot/evals/<slug>.json`. Each document is self-contained: its arms, per-arm graphs and runtimes, input, and scoring configuration all live in that one file.
+
+Usage: zeroshot eval [OPTIONS] <COMMAND>
+
+Commands:
+  list    List stored eval summaries in slug order as JSON
+  show    Show one eval document as JSON
+  create  Store a self-contained eval JSON document
+  clean   Remove a stored eval and the run bundles published for it
+  run     Run one stored eval's samples on its target and judge the delivered patches
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --directory <DIR>
+          Workspace directory whose `.zeroshot/evals` directory holds the evals
+
+          [default: .]
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+#### `zeroshot eval list`
+
+```text
+List stored eval summaries in slug order as JSON
+
+Usage: zeroshot eval list [OPTIONS]
+
+Options:
+      --directory <DIR>
+          Workspace directory whose `.zeroshot/evals` directory holds the evals
+
+          [default: .]
+
+  -h, --help
+          Print help
+```
+
+#### `zeroshot eval show`
+
+```text
+Show one eval document as JSON
+
+Usage: zeroshot eval show [OPTIONS] <SLUG>
+
+Arguments:
+  <SLUG>
+          Eval slug, matching its file name without the .json suffix
+
+Options:
+      --directory <DIR>
+          Workspace directory whose `.zeroshot/evals` directory holds the evals
+
+          [default: .]
+
+  -h, --help
+          Print help
+```
+
+#### `zeroshot eval create`
+
+```text
+Store a self-contained eval JSON document
+
+Usage: zeroshot eval create [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>
+          Self-contained eval JSON document
+
+Options:
+      --directory <DIR>
+          Workspace directory whose `.zeroshot/evals` directory holds the evals
+
+          [default: .]
+
+      --overwrite
+          Replace an existing eval instead of refusing the write
+
+  -h, --help
+          Print help
+```
+
+#### `zeroshot eval clean`
+
+```text
+Remove a stored eval and the run bundles published for it
+
+Usage: zeroshot eval clean [OPTIONS] <SLUG>
+
+Arguments:
+  <SLUG>
+          Eval slug, matching its file name without the .json suffix
+
+Options:
+      --directory <DIR>
+          Workspace directory whose `.zeroshot/evals` directory holds the evals
+
+          [default: .]
+
+  -h, --help
+          Print help
+```
+
+#### `zeroshot eval run`
+
+```text
+Run one stored eval's samples on its target and judge the delivered patches
+
+Usage: zeroshot eval run [OPTIONS] <SLUG>
+
+Arguments:
+  <SLUG>
+          Stored eval to run
+
+Options:
+      --directory <DIR>
+          Workspace directory whose `.zeroshot/evals` directory holds the evals
+
+          [default: .]
+
+      --target <NAME>
+          Named target that receives the sample runs; overrides the eval's own target
+
+  -h, --help
+          Print help
+```
+
+#### `zeroshot eval help`
+
+```text
+Print this message or the help of the given subcommand(s)
+
+Usage: zeroshot eval help [COMMAND]
+
+Commands:
+  list    List stored eval summaries in slug order as JSON
+  show    Show one eval document as JSON
+  create  Store a self-contained eval JSON document
+  clean   Remove a stored eval and the run bundles published for it
+  run     Run one stored eval's samples on its target and judge the delivered patches
+  help    Print this message or the help of the given subcommand(s)
 ```
 
 ### `zeroshot stack`
@@ -1165,6 +1318,7 @@ Options:
           - issue-review:    Inspect an issue proposal and post a review report
           - pr-review:       Review a PR diff, conditionally reproduce behavior, and post a concise report
           - code-review:     Review a PR with parallel specialist reviewers, verify their findings, and post one report
+          - eval-judge:      Judge one delivered eval sample against its authored acceptance traits
 
       --input <FILE>
           Load the graph's initial input from this JSON file
@@ -1872,6 +2026,7 @@ Commands:
   connection         Inspect and manage named runtime connections
   profile            Manage reusable graph/runtime profiles
   template           Inspect built-in graph templates
+  eval               Inspect and create local eval definitions
   stack              Validate, submit, and observe hosted stacks of dependent runs
   run                Submit a graph run locally or to a named target
   update             Update this executable and managed agent skills to the newest canonical release

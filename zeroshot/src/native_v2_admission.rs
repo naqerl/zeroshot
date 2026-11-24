@@ -30,6 +30,13 @@ use openengine_cluster_protocol::MAX_DECLARED_ENVIRONMENT_NAMES;
 
 pub(crate) const MAX_AGENT_VERIFIER_ATTEMPTS: u64 = 2;
 
+/// Most attempts an ordinary authored agent step may declare.
+///
+/// A step that runs more than once re-applies its writes to a workspace the earlier attempt already
+/// changed, so retrying is reserved for the one product-owned step whose output is a judgement:
+/// [`crate::native_v2_eval::EVAL_JUDGE_WORKER_REF`] gets its own ceiling below.
+pub(crate) const MAX_AGENT_STEP_ATTEMPTS: u64 = 1;
+
 pub mod profile_expansion;
 
 mod sizes;

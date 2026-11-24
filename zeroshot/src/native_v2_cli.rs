@@ -387,6 +387,53 @@ pub struct RunLogsCommand {
     pub execution: Option<ExecutionRef>,
 }
 
+/// Local eval store commands.
+///
+/// Only [`EvalCommand::Run`] reaches a backend. The store commands read or write the eval directory
+/// on disk, so they stay available without a target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EvalCommand {
+    List {
+        root: PathBuf,
+    },
+    Show {
+        root: PathBuf,
+        slug: String,
+    },
+    Create {
+        root: PathBuf,
+        file: PathBuf,
+        overwrite: bool,
+    },
+    Clean {
+        root: PathBuf,
+        slug: String,
+    },
+    Run(EvalRunCommand),
+}
+
+impl EvalCommand {
+    /// Whether this command submits runs instead of reading or writing the eval directory.
+    ///
+    /// Delivery and observation decide whether such a command is local or belongs to a named
+    /// target; every other eval command is disk-only.
+    #[must_use]
+    pub const fn submits_runs(&self) -> bool {
+        matches!(self, Self::Run(_))
+    }
+}
+
+/// One `eval run` request for the stored eval at `root`/`slug`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvalRunCommand {
+    /// Directory that holds the eval documents.
+    pub root: PathBuf,
+    /// Eval slug, matching its document file name without the .json suffix.
+    pub slug: String,
+    /// Named target that receives the sample runs; overrides the eval's own target.
+    pub target: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeV2CliCommand {
     Memory(MemoryCommand),
@@ -443,6 +490,7 @@ pub enum NativeV2CliCommand {
         delivery: TemplateDelivery,
         json: bool,
     },
+    Eval(EvalCommand),
     StackValidate {
         file: PathBuf,
     },
@@ -654,6 +702,16 @@ pub enum NativeV2CliError {
     Output(#[from] std::io::Error),
     #[error("could not encode CLI output: {0}")]
     OutputJson(#[from] serde_json::Error),
+}
+
+impl From<crate::native_v2_eval::EvalError> for NativeV2CliError {
+    fn from(error: crate::native_v2_eval::EvalError) -> Self {
+        match &error {
+            crate::native_v2_eval::EvalError::Io { .. }
+            | crate::native_v2_eval::EvalError::Encode(_) => Self::Local(error.to_string()),
+            _ => Self::Usage(error.to_string()),
+        }
+    }
 }
 
 #[async_trait]

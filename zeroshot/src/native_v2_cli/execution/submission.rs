@@ -146,6 +146,13 @@ pub fn try_execute_native_v2_static_with_terminal(
             delivery,
             json,
         } => execute_template_show(*template, *delivery, is_terminal && !json, output)?,
+        NativeV2CliCommand::Eval(command) => {
+            if command.submits_runs() {
+                // `eval run` needs a target and is executed by the backend, never here.
+                return Ok(None);
+            }
+            return super::eval::execute_store_command(command, output).map(Some);
+        }
         _ => return Ok(None),
     };
     Ok(Some(outcome))

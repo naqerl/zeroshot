@@ -139,6 +139,9 @@ fn is_local_command(command: &NativeV2CliCommand) -> bool {
     match command {
         NativeV2CliCommand::Run(run) => run.target.is_none(),
         NativeV2CliCommand::List { target } => target.is_none(),
+        // Only the eval store commands belong to this checkout; `eval run` submits its samples to
+        // the target the eval names, so a backend has to serve it.
+        NativeV2CliCommand::Eval(command) => !command.submits_runs(),
         command => run_operation_is_local(command)
             .or_else(|| management_operation_is_local(command))
             .unwrap_or(false),

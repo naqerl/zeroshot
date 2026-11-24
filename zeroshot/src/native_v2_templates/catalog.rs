@@ -5,7 +5,10 @@ use thiserror::Error;
 
 use crate::native_v2_contract::{DeclaredConnections, NodeRuntimeBinding};
 
-use super::{auto_research_graph, node_name, single_worker_graph, software_change_graph, DELIVERY_NODE};
+use super::{
+    auto_research_graph, eval_judge_graph, node_name, single_worker_graph, software_change_graph,
+    DELIVERY_NODE,
+};
 
 /// The deliberately small set of built-in graph templates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -16,16 +19,18 @@ pub enum BuiltinGraphTemplate {
     IssueReview,
     PrReview,
     CodeReview,
+    EvalJudge,
 }
 
 impl BuiltinGraphTemplate {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::SingleWorker,
         Self::SoftwareChange,
         Self::AutoResearch,
         Self::IssueReview,
         Self::PrReview,
         Self::CodeReview,
+        Self::EvalJudge,
     ];
 
     #[must_use]
@@ -42,6 +47,7 @@ impl BuiltinGraphTemplate {
             Self::IssueReview => "issue-review",
             Self::PrReview => "pr-review",
             Self::CodeReview => "code-review",
+            Self::EvalJudge => "eval-judge",
         }
     }
 
@@ -54,6 +60,7 @@ impl BuiltinGraphTemplate {
             "issue-review" => Some(Self::IssueReview),
             "pr-review" => Some(Self::PrReview),
             "code-review" => Some(Self::CodeReview),
+            "eval-judge" => Some(Self::EvalJudge),
             _ => None,
         }
     }
@@ -88,6 +95,7 @@ impl BuiltinGraphTemplate {
             Self::IssueReview => super::review::issue_review_graph(delivery),
             Self::PrReview => super::pr_review::pr_review_graph(delivery),
             Self::CodeReview => super::code_review::code_review_graph(delivery),
+            Self::EvalJudge => eval_judge_graph(),
         }
     }
 
@@ -118,7 +126,8 @@ impl BuiltinGraphTemplate {
             | Self::SoftwareChange
             | Self::IssueReview
             | Self::PrReview
-            | Self::CodeReview => DELIVERY_NODE,
+            | Self::CodeReview
+            | Self::EvalJudge => DELIVERY_NODE,
         };
         Ok(Some((
             node_name(name)?,
@@ -144,6 +153,7 @@ impl BuiltinGraphTemplate {
                 matches!(delivery, TemplateDelivery::None | TemplateDelivery::Comment)
             }
             Self::PrReview | Self::CodeReview => delivery == TemplateDelivery::Comment,
+            Self::EvalJudge => delivery == TemplateDelivery::None,
         };
         if supported {
             Ok(())

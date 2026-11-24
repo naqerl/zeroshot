@@ -16,6 +16,7 @@ pub mod native_v2_contract;
 #[path = "harnesses/adapters/core/copilot/mod.rs"]
 pub mod native_v2_copilot;
 pub mod native_v2_delivery;
+pub mod native_v2_eval;
 pub mod native_v2_hosting;
 pub mod native_v2_local;
 pub mod native_v2_observability;

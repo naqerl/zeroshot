@@ -24,6 +24,7 @@ use crate::native_v2_cli::{
 #[path = "convert/profile_commands.rs"]
 mod profile_commands;
 use profile_commands::profile_name;
+use super::eval::EvalCommand;
 
 /// Parse public command-line arguments after the executable name.
 ///
@@ -75,6 +76,7 @@ impl CliCommand {
             Self::Connection { command } => command.into_command(),
             Self::Profile { command } => command.into_command(),
             Self::Template { command } => command.into_command(),
+            Self::Eval { directory, command } => command.into_command(directory),
             Self::Stack { command } => command.into_command(),
             Self::Run(args) => args.into_command(),
             Self::Utility(command) => command.into_command(),
@@ -428,6 +430,38 @@ impl TemplateCommand {
     }
 }
 
+impl EvalCommand {
+    fn into_command(self, directory: PathBuf) -> Result<NativeV2CliCommand, NativeV2CliError> {
+        use crate::native_v2_cli::{EvalCommand as Cli, EvalRunCommand};
+
+        let root = crate::native_v2_eval::EvalStore::for_workspace(directory)
+            .root()
+            .to_path_buf();
+        let command = match self {
+            Self::List => Cli::List { root },
+            Self::Show(args) => Cli::Show {
+                root,
+                slug: args.slug,
+            },
+            Self::Create(args) => Cli::Create {
+                root,
+                file: args.file,
+                overwrite: args.overwrite,
+            },
+            Self::Clean(args) => Cli::Clean {
+                root,
+                slug: args.slug,
+            },
+            Self::Run(args) => Cli::Run(EvalRunCommand {
+                root,
+                slug: args.slug,
+                target: args.target,
+            }),
+        };
+        Ok(NativeV2CliCommand::Eval(command))
+    }
+}
+
 impl StackCommand {
     fn into_command(self) -> Result<NativeV2CliCommand, NativeV2CliError> {
         match self {
@@ -472,6 +506,7 @@ impl TemplateName {
             Self::IssueReview => "issue-review",
             Self::PrReview => "pr-review",
             Self::CodeReview => "code-review",
+            Self::EvalJudge => "eval-judge",
         };
         BuiltinGraphTemplate::parse(name)
             .ok_or_else(|| usage("Clap template value is outside the built-in catalog"))
@@ -856,6 +891,7 @@ fn validate_template_delivery(
         BuiltinGraphTemplate::AutoResearch => {
             matches!(delivery, TemplateDelivery::None | TemplateDelivery::Push)
         }
+        BuiltinGraphTemplate::EvalJudge => matches!(delivery, TemplateDelivery::None),
         BuiltinGraphTemplate::IssueReview => {
             matches!(delivery, TemplateDelivery::None | TemplateDelivery::Comment)
         }

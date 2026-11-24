@@ -26,6 +26,8 @@ mod delegation_tests;
 mod documented_example_tests;
 #[path = "tests/environment.rs"]
 mod environment_tests;
+#[path = "tests/eval.rs"]
+mod eval_tests;
 #[path = "tests/lifecycle.rs"]
 mod lifecycle_tests;
 #[path = "tests/management.rs"]
@@ -594,7 +596,8 @@ fn template_list_and_show_are_static_and_emit_ordinary_json() {
             "auto-research",
             "issue-review",
             "pr-review",
-            "code-review"
+            "code-review",
+            "eval-judge"
         ])
     );
 

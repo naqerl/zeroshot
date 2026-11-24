@@ -94,6 +94,7 @@ where
     }
     match command {
         NativeV2CliCommand::Run(run) => execute_run(*run, context, signal, output).await,
+        NativeV2CliCommand::Eval(command) => eval::execute(command, context, signal, output).await,
         NativeV2CliCommand::Update
         | NativeV2CliCommand::TargetServe(_)
         | NativeV2CliCommand::Ui { .. } => Err(NativeV2CliError::ProcessCommand),
@@ -942,6 +943,9 @@ fn write_json(output: &mut impl Write, value: &impl Serialize) -> Result<(), Nat
     output.flush()?;
     Ok(())
 }
+
+#[path = "execution/eval.rs"]
+mod eval;
 
 #[cfg(test)]
 #[path = "execution/incomplete_stream_tests.rs"]

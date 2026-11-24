@@ -28,6 +28,9 @@ use auto_research::auto_research_graph;
 mod catalog;
 #[path = "native_v2_templates/code_review.rs"]
 mod code_review;
+#[path = "native_v2_templates/eval_judge.rs"]
+mod eval_judge;
+use eval_judge::eval_judge_graph;
 #[path = "native_v2_templates/pr_review.rs"]
 mod pr_review;
 #[path = "native_v2_templates/review.rs"]

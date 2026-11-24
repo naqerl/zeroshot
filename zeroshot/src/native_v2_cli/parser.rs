@@ -7,6 +7,9 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 mod delegations;
 use delegations::DelegationCliCommand;
 
+#[path = "parser/eval.rs"]
+mod eval;
+
 /// Enforce your team's QA process on coding agents: run the graph you define locally or on named
 /// Zeroshot targets.
 ///
@@ -75,6 +78,18 @@ enum CliCommand {
     Template {
         #[command(subcommand)]
         command: TemplateCommand,
+    },
+
+    /// Inspect and create local eval definitions.
+    ///
+    /// Evals live in `.zeroshot/evals/<slug>.json`. Each document is self-contained: its arms,
+    /// per-arm graphs and runtimes, input, and scoring configuration all live in that one file.
+    Eval {
+        /// Workspace directory whose `.zeroshot/evals` directory holds the evals.
+        #[arg(long, global = true, value_name = "DIR", default_value = ".")]
+        directory: PathBuf,
+        #[command(subcommand)]
+        command: eval::EvalCommand,
     },
 
     /// Validate, submit, and observe hosted stacks of dependent runs.
@@ -539,6 +554,9 @@ enum TemplateName {
 
     /// Review a PR with parallel specialist reviewers, verify their findings, and post one report.
     CodeReview,
+
+    /// Judge one delivered eval sample against its authored acceptance traits.
+    EvalJudge,
 }
 
 #[derive(Debug, Args)]

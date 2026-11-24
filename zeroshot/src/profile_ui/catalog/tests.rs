@@ -57,7 +57,7 @@ fn delivery_choices_use_native_contracts_and_preserve_legacy_identities() {
 #[tokio::test]
 async fn template_variants_keep_exact_factory_graphs_and_admit_with_factory_bindings() {
     let templates = templates(false).assert_value();
-    assert_eq!(templates.len(), 11);
+    assert_eq!(templates.len(), 12);
     for template in templates {
         let kind =
             BuiltinGraphTemplate::parse(template["name"].as_str().assert_value()).assert_value();
