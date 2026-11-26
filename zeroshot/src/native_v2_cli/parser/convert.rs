@@ -432,21 +432,33 @@ impl TemplateCommand {
 
 impl EvalCommand {
     fn into_command(self, directory: PathBuf) -> Result<NativeV2CliCommand, NativeV2CliError> {
+        use crate::native_v2_cli::{EvalCommand as Cli, EvalRunCommand};
+
         let root = crate::native_v2_eval::EvalStore::for_workspace(directory)
             .root()
             .to_path_buf();
-        match self {
-            Self::List => Ok(NativeV2CliCommand::EvalList { root }),
-            Self::Show(args) => Ok(NativeV2CliCommand::EvalShow {
+        let command = match self {
+            Self::List => Cli::List { root },
+            Self::Show(args) => Cli::Show {
                 root,
                 slug: args.slug,
-            }),
-            Self::Create(args) => Ok(NativeV2CliCommand::EvalCreate {
+            },
+            Self::Create(args) => Cli::Create {
                 root,
                 file: args.file,
                 overwrite: args.overwrite,
+            },
+            Self::Clean(args) => Cli::Clean {
+                root,
+                slug: args.slug,
+            },
+            Self::Run(args) => Cli::Run(EvalRunCommand {
+                root,
+                slug: args.slug,
+                target: args.target,
             }),
-        }
+        };
+        Ok(NativeV2CliCommand::Eval(command))
     }
 }
 
@@ -494,6 +506,7 @@ impl TemplateName {
             Self::IssueReview => "issue-review",
             Self::PrReview => "pr-review",
             Self::CodeReview => "code-review",
+            Self::EvalJudge => "eval-judge",
         };
         BuiltinGraphTemplate::parse(name)
             .ok_or_else(|| usage("Clap template value is outside the built-in catalog"))
@@ -884,6 +897,7 @@ fn validate_template_delivery(
         BuiltinGraphTemplate::PrReview | BuiltinGraphTemplate::CodeReview => {
             delivery == TemplateDelivery::Comment
         }
+        BuiltinGraphTemplate::EvalJudge => delivery == TemplateDelivery::None,
     };
     if !supported {
         return Err(usage(format!(

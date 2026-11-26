@@ -110,6 +110,18 @@ fn assert_run_routing_follows_the_authored_target() {
     ]);
 }
 
+fn assert_eval_routing_submits_only_runs() {
+    assert_route_pairs(&[
+        (&["eval", "list"], &["eval", "run", "alpha"]),
+        (&["eval", "show", "alpha"], &["eval", "run", "alpha"]),
+        (&["eval", "create", "eval.json"], &["eval", "run", "alpha"]),
+        (
+            &["eval", "clean", "alpha"],
+            &["eval", "run", "alpha", "--target", "prod"],
+        ),
+    ]);
+}
+
 fn assert_management_routing_follows_the_authored_target() {
     assert_route_pairs(&[
         (
@@ -459,6 +471,7 @@ async fn assert_static_dispatch_and_remaining_management_routes_are_exact() {
 async fn wave10_cli_contract_process_dispatch_and_routing_matrix_is_exact() {
     assert_target_serve_is_part_of_the_public_command_schema();
     assert_run_routing_follows_the_authored_target();
+    assert_eval_routing_submits_only_runs();
     assert_management_routing_follows_the_authored_target();
     assert_private_bootstrap_is_exact_and_public_startup_stays_public().await;
     assert_static_dispatch_and_remaining_management_routes_are_exact().await;

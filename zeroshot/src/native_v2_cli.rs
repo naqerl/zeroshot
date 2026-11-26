@@ -387,6 +387,50 @@ pub struct RunLogsCommand {
     pub execution: Option<ExecutionRef>,
 }
 
+/// One eval store or execution command.
+///
+/// `list`, `show`, `create`, and `clean` only read or write the eval directory. `run` is the one
+/// command that submits work, so it is the only one that needs a target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EvalCommand {
+    List {
+        root: PathBuf,
+    },
+    Show {
+        root: PathBuf,
+        slug: String,
+    },
+    Create {
+        root: PathBuf,
+        file: PathBuf,
+        overwrite: bool,
+    },
+    Clean {
+        root: PathBuf,
+        slug: String,
+    },
+    Run(EvalRunCommand),
+}
+
+impl EvalCommand {
+    /// Whether this command submits runs instead of reading or writing the eval directory.
+    #[must_use]
+    pub const fn submits_runs(&self) -> bool {
+        matches!(self, Self::Run(_))
+    }
+}
+
+/// One `eval run` request for the stored eval at `root`/`slug`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvalRunCommand {
+    /// Directory that holds the eval documents.
+    pub root: PathBuf,
+    /// Eval slug, matching its document file name without the .json suffix.
+    pub slug: String,
+    /// Named target that receives the sample runs; overrides the eval's own target.
+    pub target: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeV2CliCommand {
     Memory(MemoryCommand),
@@ -443,18 +487,7 @@ pub enum NativeV2CliCommand {
         delivery: TemplateDelivery,
         json: bool,
     },
-    EvalList {
-        root: PathBuf,
-    },
-    EvalShow {
-        root: PathBuf,
-        slug: String,
-    },
-    EvalCreate {
-        root: PathBuf,
-        file: PathBuf,
-        overwrite: bool,
-    },
+    Eval(EvalCommand),
     StackValidate {
         file: PathBuf,
     },

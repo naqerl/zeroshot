@@ -243,6 +243,24 @@ async fn bounds_attempts_and_rejects_runtime_coverage_errors() {
         }
     }
 
+    for attempts in 1..=crate::native_v2_eval::EVAL_JUDGE_ATTEMPTS + 1 {
+        let mut judge = null_step("judge", crate::native_v2_eval::EVAL_JUDGE_WORKER_REF);
+        *judge.get_mut("attempts").assert_value() = json!(attempts);
+        let judge_graph = graph(vec![judge, succeed("done")]);
+        let judge_nodes = BTreeMap::from([(named("judge"), binding("gpt-6.1-sol", None))]);
+        let admission = NativeV2Admission
+            .admit(submission(judge_graph, judge_nodes))
+            .await;
+        if attempts <= crate::native_v2_eval::EVAL_JUDGE_ATTEMPTS {
+            admission.assert_value();
+        } else {
+            assert!(matches!(
+                admission,
+                Err(NativeV2AdmissionError::Attempts { .. })
+            ));
+        }
+    }
+
     let mut value = null_step("work", "agent.work@1");
     *value.get_mut("attempts").assert_value() = json!(MAX_AGENT_VERIFIER_ATTEMPTS);
     let attempts_graph = graph(vec![value, succeed("done")]);

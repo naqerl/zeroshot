@@ -8,6 +8,10 @@ pub(super) enum EvalCommand {
     Show(EvalSlugArgs),
     /// Store a self-contained eval JSON document.
     Create(EvalCreateArgs),
+    /// Remove a stored eval and the run bundles published for it.
+    Clean(EvalSlugArgs),
+    /// Run one stored eval's samples on its target and judge the delivered patches.
+    Run(EvalRunArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -25,4 +29,14 @@ pub(super) struct EvalCreateArgs {
     /// Replace an existing eval instead of refusing the write.
     #[arg(long)]
     pub(super) overwrite: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub(super) struct EvalRunArgs {
+    /// Stored eval to run.
+    #[arg(value_name = "SLUG")]
+    pub(super) slug: String,
+    /// Named target that receives the sample runs; overrides the eval's own target.
+    #[arg(long, value_name = "NAME")]
+    pub(super) target: Option<String>,
 }

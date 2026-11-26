@@ -189,9 +189,9 @@ fn empty_directory_lists_as_stable_json() {
 
     let mut output = Vec::new();
     let outcome = try_execute_native_v2_static(
-        &NativeV2CliCommand::EvalList {
+        &NativeV2CliCommand::Eval(crate::native_v2_cli::EvalCommand::List {
             root: store.root().to_path_buf(),
-        },
+        }),
         &mut output,
     )
     .unwrap()
@@ -230,14 +230,14 @@ fn parses_eval_commands_against_a_workspace() {
 
     assert_eq!(
         parse(&["eval", "--directory", directory, "list"]),
-        NativeV2CliCommand::EvalList { root: root.clone() }
+        NativeV2CliCommand::Eval(crate::native_v2_cli::EvalCommand::List { root: root.clone() })
     );
     assert_eq!(
         parse(&["eval", "--directory", directory, "show", "alpha"]),
-        NativeV2CliCommand::EvalShow {
+        NativeV2CliCommand::Eval(crate::native_v2_cli::EvalCommand::Show {
             root: root.clone(),
             slug: "alpha".to_owned(),
-        }
+        })
     );
     assert_eq!(
         parse(&[
@@ -248,10 +248,258 @@ fn parses_eval_commands_against_a_workspace() {
             "eval.json",
             "--overwrite"
         ]),
-        NativeV2CliCommand::EvalCreate {
-            root,
+        NativeV2CliCommand::Eval(crate::native_v2_cli::EvalCommand::Create {
+            root: root.clone(),
             file: std::path::PathBuf::from("eval.json"),
             overwrite: true,
-        }
+        })
+    );
+    assert_eq!(
+        parse(&["eval", "--directory", directory, "clean", "alpha"]),
+        NativeV2CliCommand::Eval(crate::native_v2_cli::EvalCommand::Clean {
+            root: root.clone(),
+            slug: "alpha".to_owned(),
+        })
+    );
+    assert_eq!(
+        parse(&["eval", "--directory", directory, "run", "alpha"]),
+        NativeV2CliCommand::Eval(crate::native_v2_cli::EvalCommand::Run(
+            crate::native_v2_cli::EvalRunCommand {
+                root: root.clone(),
+                slug: "alpha".to_owned(),
+                target: None,
+            }
+        ))
+    );
+    assert_eq!(
+        parse(&[
+            "eval",
+            "--directory",
+            directory,
+            "run",
+            "alpha",
+            "--target",
+            "prod"
+        ]),
+        NativeV2CliCommand::Eval(crate::native_v2_cli::EvalCommand::Run(
+            crate::native_v2_cli::EvalRunCommand {
+                root,
+                slug: "alpha".to_owned(),
+                target: Some("prod".to_owned()),
+            }
+        ))
+    );
+}
+
+fn agent_document(slug: &str) -> EvalDocument {
+    use crate::native_v2_cli::{BuiltinGraphTemplate, TemplateDelivery};
+
+    let graph = BuiltinGraphTemplate::SingleWorker
+        .materialize(TemplateDelivery::None)
+        .unwrap();
+    let mut nodes = serde_json::Map::new();
+    for (name, delivery) in crate::native_v2_admission::executable_runtime_roles(&graph.root) {
+        assert!(!delivery, "single-worker binds no delivery worker");
+        nodes.insert(
+            name.as_str().to_owned(),
+            json!({"kind":"agent","model":"gpt-6.1-sol","effort":"high"}),
+        );
+    }
+    let graph = serde_json::to_value(&graph).unwrap();
+    let runtime = json!({
+        "harness":"codex",
+        "provider":"openai",
+        "size":"medium",
+        "globalAgents":{"postmortem":{"sourceNode":"worker"}},
+        "nodes":nodes
+    });
+    let mut evaluation = document(slug);
+    for arm in &mut evaluation.arms {
+        arm.graph = serde_json::from_value(graph.clone()).unwrap();
+        arm.runtime = serde_json::from_value(runtime.clone()).unwrap();
+    }
+    evaluation
+}
+
+#[test]
+fn judge_runtime_clears_an_arm_postmortem_source_the_judge_graph_lacks() {
+    use crate::native_v2_cli::{BuiltinGraphTemplate, TemplateDelivery};
+
+    let evaluation = agent_document("alpha");
+    assert_eq!(
+        evaluation.arms[0]
+            .runtime
+            .global_agents
+            .postmortem
+            .source_node
+            .as_ref()
+            .map(|node| node.as_str()),
+        Some("worker"),
+        "the fixture reproduces an arm whose postmortem names its own worker"
+    );
+    let template = BuiltinGraphTemplate::EvalJudge;
+    let graph = template.materialize(TemplateDelivery::None).unwrap();
+    let runtime = super::config::judge_runtime(&evaluation, template, &graph).unwrap();
+
+    assert_eq!(
+        runtime.global_agents.postmortem.source_node, None,
+        "the judge runtime must not name a node its own graph lacks"
+    );
+    assert_eq!(
+        runtime
+            .nodes
+            .keys()
+            .map(|name| name.as_str())
+            .collect::<Vec<_>>(),
+        ["judge"]
+    );
+}
+
+#[tokio::test]
+async fn judge_plan_is_validated_against_the_judge_graph_before_sampling() {
+    use crate::native_v2_cli::{BuiltinGraphTemplate, TemplateDelivery};
+
+    let evaluation = agent_document("alpha");
+    let template = BuiltinGraphTemplate::EvalJudge;
+    let graph = template.materialize(TemplateDelivery::None).unwrap();
+    let mut runtime = super::config::judge_runtime(&evaluation, template, &graph).unwrap();
+    runtime.nodes.clear();
+    let plan = super::config::JudgePlan { graph, runtime };
+
+    let error = super::config::validate_judge_plan(&evaluation, &plan)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, EvalError::Invalid(message) if message.contains("cannot derive a judge runtime")),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn verdicts_reject_unknown_criteria_and_score_duplicates_at_most_once() {
+    use super::run::{Verdict, verdicts, weighted_score};
+
+    let evaluation = document("alpha");
+    let criteria = &evaluation.scoring.criteria;
+    let output = json!({
+        "verdicts": [
+            {"id": "quality", "pass": true, "reason": "first"},
+            {"id": "quality", "pass": false, "reason": "duplicate must not score"},
+            {"id": "missing", "pass": false, "reason": "declared only in the eval"}
+        ]
+    });
+
+    let error = verdicts(&output, criteria).unwrap_err();
+    assert!(
+        matches!(&error, EvalError::Invalid(message) if message.contains("unknown criterion \"missing\"")),
+        "{error:?}"
+    );
+
+    let output = json!({
+        "verdicts": [
+            {"id": "quality", "pass": true, "reason": "first"},
+            {"id": "quality", "pass": false, "reason": "duplicate must not score"}
+        ]
+    });
+    let parsed = verdicts(&output, criteria).unwrap();
+    assert_eq!(
+        parsed,
+        [Verdict {
+            id: "quality".to_owned(),
+            pass: true,
+            reason: "first".to_owned(),
+        }]
+    );
+    let recorded = parsed.iter().collect::<Vec<_>>();
+    assert_eq!(weighted_score(criteria, &recorded), Some(1.0));
+
+    let output = json!({"verdicts": [{"id": "quality", "pass": false, "reason": "no"}]});
+    let parsed = verdicts(&output, criteria).unwrap();
+    let recorded = parsed.iter().collect::<Vec<_>>();
+    assert_eq!(weighted_score(criteria, &recorded), Some(0.0));
+}
+
+fn git(workspace: &std::path::Path, arguments: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .current_dir(workspace)
+        .args(arguments)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env("GIT_AUTHOR_NAME", "Zeroshot")
+        .env("GIT_AUTHOR_EMAIL", "eval@zeroshot.invalid")
+        .env("GIT_COMMITTER_NAME", "Zeroshot")
+        .env("GIT_COMMITTER_EMAIL", "eval@zeroshot.invalid")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {arguments:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn a_branch_named_arm_is_resolved_once_to_the_same_revision() {
+    let workspace = TempDir::new().unwrap();
+    git(
+        workspace.path(),
+        &["init", "--quiet", "--initial-branch=main"],
+    );
+    fs::write(workspace.path().join("README.md"), "eval fixture\n").unwrap();
+    git(workspace.path(), &["add", "README.md"]);
+    git(
+        workspace.path(),
+        &["commit", "--quiet", "-m", "eval fixture"],
+    );
+    git(workspace.path(), &["branch", "candidate"]);
+    let expected = git(workspace.path(), &["rev-parse", "candidate^{commit}"]);
+    let expected = expected.trim();
+
+    let mut evaluation = document("alpha");
+    evaluation.arms[0].head = "candidate".to_owned();
+    let source = super::config::pin_arm_source(workspace.path(), &evaluation, &evaluation.arms[0])
+        .await
+        .unwrap();
+    assert_eq!(source.branch, None, "the branch name is never submitted");
+    assert_eq!(
+        source.revision.as_ref().map(|revision| revision.as_str()),
+        Some(expected)
+    );
+    let first = source.revision.clone();
+
+    git(workspace.path(), &["checkout", "--quiet", "candidate"]);
+    fs::write(workspace.path().join("README.md"), "moved\n").unwrap();
+    git(workspace.path(), &["add", "README.md"]);
+    git(
+        workspace.path(),
+        &["commit", "--quiet", "-m", "move candidate"],
+    );
+    let moved = super::config::pin_arm_source(workspace.path(), &evaluation, &evaluation.arms[0])
+        .await
+        .unwrap();
+    assert_ne!(
+        moved.revision, first,
+        "a fresh run resolves the branch again"
+    );
+    assert_eq!(first, source.revision);
+}
+
+#[tokio::test]
+async fn an_unresolvable_branch_is_refused_instead_of_sent_as_a_name() {
+    let workspace = TempDir::new().unwrap();
+    git(
+        workspace.path(),
+        &["init", "--quiet", "--initial-branch=main"],
+    );
+    let mut evaluation = document("alpha");
+    evaluation.arms[0].head = "no-such-branch".to_owned();
+    let error = super::config::pin_arm_source(workspace.path(), &evaluation, &evaluation.arms[0])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, EvalError::Invalid(message)
+            if message.contains("cannot resolve head branch \"no-such-branch\"")),
+        "{error:?}"
     );
 }

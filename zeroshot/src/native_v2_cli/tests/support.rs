@@ -99,6 +99,7 @@ pub(in crate::native_v2_cli) enum Call {
         connections: RunConnectionValues,
         github_token: Option<String>,
         branch: Option<String>,
+        revision: Option<String>,
         submission_key: String,
     },
     Watch {
@@ -246,6 +247,7 @@ pub(in crate::native_v2_cli) struct FakeBackend {
     review: Option<crate::native_v2_review::PreparedReview>,
     review_file_change: Option<(std::path::PathBuf, String)>,
     workspace_export: Arc<Mutex<Option<WorkspaceExportStream>>>,
+    run_outputs: Arc<Mutex<VecDeque<Value>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -324,6 +326,13 @@ impl FakeBackend {
             },
             gate,
         )
+    }
+
+    pub(super) fn with_run_outputs(outputs: Vec<Value>) -> Self {
+        Self {
+            run_outputs: Arc::new(Mutex::new(outputs.into())),
+            ..Self::default()
+        }
     }
 
     pub(super) fn with_pending_watch() -> Self {
@@ -781,7 +790,7 @@ impl NativeV2CliBackend for FakeBackend {
             connections,
             github_token,
             run_id: _,
-            source: _,
+            source,
             context_sources: _,
             profile: _,
             git_credentials: _,
@@ -798,6 +807,7 @@ impl NativeV2CliBackend for FakeBackend {
             connections,
             github_token,
             branch: intent.branch.map(|branch| branch.as_str().to_owned()),
+            revision: source.map(|source| source.resolved.revision.as_str().to_owned()),
             submission_key: intent.submission_key.as_str().to_owned(),
         });
         if let Some(gate) = &self.submit_gate {
@@ -843,6 +853,21 @@ impl NativeV2CliBackend for FakeBackend {
         }
         if self.runtime_failure_before_terminal {
             return Ok(runtime_failure_status(&params.run_id));
+        }
+        if let Some(output) = self.run_outputs.lock().assert_value().pop_front() {
+            return serde_json::from_value(json!({
+                "runId":params.run_id,
+                "title":"Repair checkout",
+                "source":source(),
+                "size":"medium",
+                "atCursor":"v2:3",
+                "status":{
+                    "phase":"finished",
+                    "terminalResult":{"status":"succeeded","output":output},
+                    "metadata":{}
+                }
+            }))
+            .map_err(NativeV2CliError::OutputJson);
         }
         if let Some(requirements) = &self.resume_requirements {
             return serde_json::from_value(json!({

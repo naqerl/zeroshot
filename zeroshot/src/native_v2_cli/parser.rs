@@ -554,6 +554,9 @@ enum TemplateName {
 
     /// Review a PR with parallel specialist reviewers, verify their findings, and post one report.
     CodeReview,
+
+    /// Judge one eval sample against its acceptance traits.
+    EvalJudge,
 }
 
 #[derive(Debug, Args)]

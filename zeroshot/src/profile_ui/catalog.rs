@@ -16,7 +16,9 @@ pub(super) fn templates(workspace_checkpoint_opt_out: bool) -> Result<Vec<Value>
     let mut result = Vec::new();
     for template in BuiltinGraphTemplate::all() {
         let deliveries = match template {
-            BuiltinGraphTemplate::SingleWorker => &[TemplateDelivery::None][..],
+            BuiltinGraphTemplate::SingleWorker | BuiltinGraphTemplate::EvalJudge => {
+                &[TemplateDelivery::None][..]
+            }
             BuiltinGraphTemplate::SoftwareChange => &[
                 TemplateDelivery::PullRequest,
                 TemplateDelivery::None,
@@ -244,6 +246,7 @@ fn template_label(template: BuiltinGraphTemplate, delivery: TemplateDelivery) ->
                 "Code review"
             }
         }
+        BuiltinGraphTemplate::EvalJudge => "Eval judge",
     }
 }
 fn software_change_label(delivery: TemplateDelivery) -> &'static str {

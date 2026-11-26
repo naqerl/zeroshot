@@ -138,6 +138,7 @@ async fn execute_backend_command<B: NativeV2CliBackend>(
 fn is_local_command(command: &NativeV2CliCommand) -> bool {
     match command {
         NativeV2CliCommand::Run(run) => run.target.is_none(),
+        NativeV2CliCommand::Eval(command) => !command.submits_runs(),
         NativeV2CliCommand::List { target } => target.is_none(),
         command => run_operation_is_local(command)
             .or_else(|| management_operation_is_local(command))

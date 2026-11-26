@@ -8,6 +8,10 @@
 //! Writes are published by writing and syncing a temporary file in the destination directory and
 //! then renaming it over the target. A write-once create links the complete temporary file into
 //! place with a no-clobber hard link, so two concurrent creators cannot both claim a slug.
+//!
+//! `eval run` keeps its per-sample artifacts under `runs/<slug>/<stamp>/`, beside the documents and
+//! never among them: the loader only reads top-level `.json` files, so published runs cannot turn
+//! into eval definitions.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -21,11 +25,28 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+#[path = "native_v2_eval/config.rs"]
+pub(crate) mod config;
+#[path = "native_v2_eval/run.rs"]
+pub(crate) mod run;
+
 /// Directory below a workspace that owns the per-eval JSON documents.
 pub const EVAL_DIRECTORY: &str = ".zeroshot/evals";
 
+/// Directory below the eval store that holds the artifacts of every `eval run`.
+pub const EVAL_RUNS_DIRECTORY: &str = "runs";
+
 /// Schema accepted by the eval store.
 pub const EVAL_SCHEMA: &str = "zeroshot.eval/v1";
+
+/// Worker reference reserved for the judge step of the built-in eval-judge template.
+///
+/// Judging writes no file, so admission lets this one step retry a transient provider failure while
+/// every other authored step keeps a single attempt.
+pub(crate) const EVAL_JUDGE_WORKER_REF: &str = "builtin.eval.judge@1";
+
+/// Attempts the eval judge step declares, and the ceiling admission applies to it.
+pub(crate) const EVAL_JUDGE_ATTEMPTS: u64 = 3;
 
 const MAX_ID_BYTES: usize = 128;
 
@@ -41,6 +62,12 @@ pub struct EvalDocument {
     /// Human-readable summary shown by `eval list`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Named target that receives this eval's sample runs. `eval run --target` overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Optional judging configuration; `eval run` expands and verifies its template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge: Option<EvalJudge>,
     /// Number of samples to run for every arm during execution.
     #[serde(default = "default_runs_per_arm")]
     pub runs_per_arm: u32,
@@ -66,6 +93,14 @@ pub struct EvalArm {
     pub graph: GraphSpec,
     /// Complete runtime for this arm.
     pub runtime: RuntimePlan,
+}
+
+/// Judging configuration for one eval.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EvalJudge {
+    /// Name of the built-in graph template that judges one sample.
+    pub template: String,
 }
 
 /// Scoring configuration for one eval.
@@ -307,6 +342,35 @@ impl EvalStore {
         Ok(destination)
     }
 
+    /// Directory that holds the run bundles `eval run` publishes for one eval.
+    #[must_use]
+    pub fn runs_root(&self, slug: &str) -> PathBuf {
+        self.root.join(EVAL_RUNS_DIRECTORY).join(slug)
+    }
+
+    /// Remove one eval document together with the run bundles published for it.
+    pub fn remove(&self, slug: &str) -> Result<PathBuf, EvalError> {
+        let path = self.path(slug)?;
+        fs::remove_file(&path).map_err(|source| {
+            if source.kind() == io::ErrorKind::NotFound {
+                EvalError::NotFound {
+                    slug: slug.to_owned(),
+                    root: self.root.clone(),
+                }
+            } else {
+                EvalError::Io {
+                    path: path.clone(),
+                    source,
+                }
+            }
+        })?;
+        let runs = self.runs_root(slug);
+        if runs.exists() {
+            fs::remove_dir_all(&runs).map_err(|source| EvalError::Io { path: runs, source })?;
+        }
+        Ok(path)
+    }
+
     fn path(&self, slug: &str) -> Result<PathBuf, EvalError> {
         validate_slug(slug)?;
         Ok(self.root.join(format!("{slug}.json")))
@@ -331,6 +395,13 @@ impl EvalDocument {
             return Err(EvalError::Invalid(
                 "an eval must declare at least one arm".to_owned(),
             ));
+        }
+
+        if let Some(target) = self.target.as_deref() {
+            validate_identifier("target", target)?;
+        }
+        if let Some(judge) = &self.judge {
+            validate_identifier("judge template", &judge.template)?;
         }
 
         let mut arm_ids = BTreeSet::new();
@@ -483,6 +554,22 @@ fn validate_file_name(path: &Path, slug: &str) -> Result<(), EvalError> {
             path: path.to_path_buf(),
         })
     }
+}
+
+/// Publish `bytes` at `destination` once, refusing to replace an existing file.
+///
+/// `eval run` publishes its artifacts this way, so a rerun never overwrites evidence an earlier
+/// run already recorded.
+pub(crate) fn write_once(destination: &Path, bytes: &[u8]) -> Result<(), EvalError> {
+    publish_atomic(destination, bytes, false, |_| Ok(()))
+}
+
+/// Publish `bytes` at `destination`, replacing an existing file atomically.
+///
+/// `eval run` uses this for the one aggregate it keeps for the newest run, so a reader never sees
+/// a partially written summary.
+pub(crate) fn write_replacing(destination: &Path, bytes: &[u8]) -> Result<(), EvalError> {
+    publish_atomic(destination, bytes, true, |_| Ok(()))
 }
 
 /// Publish `bytes` at `destination` through a synced same-directory temporary.

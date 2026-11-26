@@ -30,6 +30,12 @@ use openengine_cluster_protocol::MAX_DECLARED_ENVIRONMENT_NAMES;
 
 pub(crate) const MAX_AGENT_VERIFIER_ATTEMPTS: u64 = 2;
 
+/// A step that runs more than once re-applies its writes to a workspace the earlier attempt already
+/// changed, so retrying is reserved for the one product-owned step whose output is a judgement:
+/// [`crate::native_v2_eval::EVAL_JUDGE_WORKER_REF`] gets its own ceiling in
+/// [`crate::native_v2_eval::EVAL_JUDGE_ATTEMPTS`].
+pub(crate) const MAX_AGENT_STEP_ATTEMPTS: u64 = 1;
+
 pub mod profile_expansion;
 
 mod sizes;
@@ -558,7 +564,7 @@ mod networks;
 mod validation;
 use networks::validate_graph_bindings;
 use concurrency::validate_delivery_concurrency;
-pub(crate) use validation::{sole_delivery_node, writer_nodes};
+pub(crate) use validation::{sole_delivery_node, validate_global_agents, writer_nodes};
 use validation::{
     ExecutableDeclaration, executable_declarations, validate_executable_bindings,
     validate_graph_input,

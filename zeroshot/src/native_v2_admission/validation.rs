@@ -5,7 +5,10 @@ use openengine_cluster_protocol::{
     WorkerContract, WorkerRef, PayloadType, MAX_DECLARED_ENVIRONMENT_NAMES, RUNTIME_WORKER_ERRORS,
 };
 
-use super::{DeliveryPolicy, NativeV2AdmissionError, RuntimePlan, MAX_AGENT_VERIFIER_ATTEMPTS};
+use super::{
+    DeliveryPolicy, NativeV2AdmissionError, RuntimePlan, MAX_AGENT_STEP_ATTEMPTS,
+    MAX_AGENT_VERIFIER_ATTEMPTS,
+};
 use crate::native_v2_contract::{
     AdmittedRun, NodeRuntimeBinding, PullRequestFeedback, GIT_DELIVERY_MERGE_V2_WORKER_REF,
     GIT_DELIVERY_MERGE_V3_WORKER_REF, GIT_DELIVERY_MERGE_WORKER_REF, GIT_DELIVERY_PR_V2_WORKER_REF,
@@ -84,7 +87,7 @@ pub(super) fn validate_executable_bindings(
     validate_declared_environment(runtime, None)
 }
 
-fn validate_global_agents(runtime: &RuntimePlan) -> Result<(), NativeV2AdmissionError> {
+pub(crate) fn validate_global_agents(runtime: &RuntimePlan) -> Result<(), NativeV2AdmissionError> {
     runtime
         .global_agents()
         .postmortem
@@ -181,18 +184,26 @@ fn collect_declarations(node: &GraphNode, declarations: &mut Vec<ExecutableDecla
 }
 
 fn validate_attempts(declarations: &[ExecutableDeclaration]) -> Result<(), NativeV2AdmissionError> {
-    if let Some(declaration) = declarations.iter().find(|item| {
-        item.attempts != 1
-            && !(item.kind == LeafKind::Verifier
-                && !is_git_delivery_worker(&item.worker)
-                && item.attempts <= MAX_AGENT_VERIFIER_ATTEMPTS)
-    }) {
+    if let Some(declaration) = declarations
+        .iter()
+        .find(|item| item.attempts == 0 || item.attempts > allowed_attempts(item))
+    {
         return Err(NativeV2AdmissionError::Attempts {
             node: declaration.name.clone(),
             attempts: declaration.attempts,
         });
     }
     Ok(())
+}
+
+fn allowed_attempts(declaration: &ExecutableDeclaration) -> u64 {
+    if declaration.kind == LeafKind::Verifier && !is_git_delivery_worker(&declaration.worker) {
+        MAX_AGENT_VERIFIER_ATTEMPTS
+    } else if declaration.worker.as_str() == crate::native_v2_eval::EVAL_JUDGE_WORKER_REF {
+        crate::native_v2_eval::EVAL_JUDGE_ATTEMPTS
+    } else {
+        MAX_AGENT_STEP_ATTEMPTS
+    }
 }
 
 fn validate_binding_coverage(

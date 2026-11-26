@@ -26,6 +26,8 @@ mod delegation_tests;
 mod documented_example_tests;
 #[path = "tests/environment.rs"]
 mod environment_tests;
+#[path = "tests/eval.rs"]
+mod eval_tests;
 #[path = "tests/lifecycle.rs"]
 mod lifecycle_tests;
 #[path = "tests/management.rs"]
@@ -594,7 +596,8 @@ fn template_list_and_show_are_static_and_emit_ordinary_json() {
             "auto-research",
             "issue-review",
             "pr-review",
-            "code-review"
+            "code-review",
+            "eval-judge"
         ])
     );
 
@@ -672,6 +675,7 @@ async fn run_follows_by_default_and_forwards_per_run_intent_unchanged() {
                 connections: BTreeMap::new(),
                 github_token: None,
                 branch: Some("feature".to_owned()),
+                revision: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
                 submission_key: "stable-key".to_owned(),
             },
             Call::Watch {
