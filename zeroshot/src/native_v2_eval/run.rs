@@ -265,6 +265,12 @@ pub(crate) struct ResumeSample {
     pub stage: RunStage,
     /// Submission attempt of [`Self::stage`], starting at one.
     pub attempt: u32,
+    /// Latest sample-stage attempt, retained when the journal moves on to the judge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_attempt: Option<u32>,
+    /// Latest judge-stage attempt, retained when a retry moves back to the sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_attempt: Option<u32>,
     pub run_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submitted_at: Option<u64>,
@@ -273,6 +279,42 @@ pub(crate) struct ResumeSample {
     /// Whether the recorded stage can never settle because its run vanished.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub failed: bool,
+    /// A stage whose recorded failure `--retry-failed` already retired.
+    ///
+    /// The canonical result is gone while this marker remains, so a resumed pass cannot mistake
+    /// the retired run for one that still has evidence to poll: it measures the stage again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired: Option<RunStage>,
+}
+
+impl ResumeSample {
+    /// The latest attempt of one stage, including one the journal has since moved past.
+    fn attempt_of(&self, stage: RunStage) -> u32 {
+        let recorded = match stage {
+            RunStage::Sample => self.sample_attempt,
+            RunStage::Judge => self.judge_attempt,
+        };
+        recorded
+            .into_iter()
+            .chain((self.stage == stage).then_some(self.attempt))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Keep the latest attempt of both stages while a claim replaces the current one.
+    fn attempts(&self) -> (Option<u32>, Option<u32>) {
+        let sample = if self.stage == RunStage::Sample {
+            Some(self.attempt).max(self.sample_attempt)
+        } else {
+            self.sample_attempt
+        };
+        let judge = if self.stage == RunStage::Judge {
+            Some(self.attempt).max(self.judge_attempt)
+        } else {
+            self.judge_attempt
+        };
+        (sample, judge)
+    }
 }
 
 /// The facts a stamp was created with, so a resumed pass cannot measure something else.
@@ -395,8 +437,26 @@ impl ResumeJournal {
     /// How many times one stage of a sample was submitted; zero when it never was.
     pub(crate) fn attempt(&self, arm: &str, sample: u32, stage: RunStage) -> u32 {
         self.entry(arm, sample)
-            .filter(|entry| entry.stage == stage)
-            .map_or(0, |entry| entry.attempt)
+            .map_or(0, |entry| entry.attempt_of(stage))
+    }
+
+    /// The stage of this sample whose recorded failure was retired for a retry.
+    pub(crate) fn retired(&self, arm: &str, sample: u32) -> Option<RunStage> {
+        self.entry(arm, sample)
+            .and_then(|entry| entry.retired.filter(|stage| *stage == entry.stage))
+    }
+
+    /// Record that the current stage's failure is retired, before its result is removed.
+    ///
+    /// Writing this before the result means an interrupted retry leaves either the old result or
+    /// this marker, never neither: a resumed pass then submits the retry instead of adopting the
+    /// run whose evidence was intentionally discarded.
+    pub(crate) fn retire(&mut self, arm: &str, sample: u32, stage: RunStage) {
+        if let Some(entry) = self.entry_mut(arm, sample) {
+            if entry.stage == stage {
+                entry.retired = Some(stage);
+            }
+        }
     }
 
     /// Record that one stage was submitted, returning the attempt it was submitted as.
@@ -404,15 +464,25 @@ impl ResumeJournal {
         let arm = stage.arm;
         let sample = stage.sample;
         let attempt = self.attempt(arm, sample, stage.stage).saturating_add(1);
+        let (sample_attempt, judge_attempt) = self
+            .entry(arm, sample)
+            .map_or((None, None), ResumeSample::attempts);
         let entry = ResumeSample {
             arm: arm.to_owned(),
             sample,
             stage: stage.stage,
             attempt,
+            sample_attempt: (stage.stage == RunStage::Sample)
+                .then_some(attempt)
+                .or(sample_attempt),
+            judge_attempt: (stage.stage == RunStage::Judge)
+                .then_some(attempt)
+                .or(judge_attempt),
             run_id: run_id.to_owned(),
             submitted_at: Some(millis(at)),
             settled_at: None,
             failed: false,
+            retired: None,
         };
         match self.entry_mut(arm, sample) {
             Some(recorded) => *recorded = entry,
@@ -426,6 +496,7 @@ impl ResumeJournal {
         if let Some(entry) = self.entry_mut(arm, sample) {
             entry.settled_at = Some(millis(at));
             entry.failed = false;
+            entry.retired = None;
         }
     }
 
@@ -434,6 +505,7 @@ impl ResumeJournal {
         if let Some(entry) = self.entry_mut(arm, sample) {
             entry.settled_at = Some(millis(at));
             entry.failed = true;
+            entry.retired = None;
         }
     }
 }

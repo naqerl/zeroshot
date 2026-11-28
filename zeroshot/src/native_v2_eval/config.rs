@@ -83,6 +83,12 @@ pub(crate) fn judge_plan(document: &EvalDocument) -> Result<Option<JudgePlan>, E
             available_templates()
         ))
     })?;
+    if document.scoring.criteria.is_empty() {
+        return Err(EvalError::Invalid(format!(
+            "eval {:?} declares judge template {:?} but no scoring criteria to judge against",
+            document.slug, judge.template
+        )));
+    }
     let graph = template
         .materialize(TemplateDelivery::None)
         .map_err(|error| {

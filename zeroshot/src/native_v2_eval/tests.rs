@@ -573,6 +573,59 @@ fn resume_journal_records_each_stage_attempt_and_its_outcome() {
 }
 
 #[test]
+fn resume_journal_keeps_retired_stage_attempts_when_a_retry_moves_back() {
+    use super::run::{ResumeJournal, RunStage};
+
+    let stamp = TempDir::new().unwrap();
+    let at = std::time::SystemTime::now();
+    let mut journal = ResumeJournal::new(pin("prod", "abc", 1));
+    assert_eq!(
+        journal.claim(stage("arm-0", 0, RunStage::Sample), "run-1", at),
+        1
+    );
+    assert_eq!(
+        journal.claim(stage("arm-0", 0, RunStage::Judge), "run-2", at),
+        1
+    );
+    assert_eq!(
+        journal.claim(stage("arm-0", 0, RunStage::Judge), "run-3", at),
+        2
+    );
+    assert_eq!(
+        journal.attempt("arm-0", 0, RunStage::Sample),
+        1,
+        "moving to the judge keeps the sample attempt"
+    );
+    assert_eq!(
+        journal.claim(stage("arm-0", 0, RunStage::Sample), "run-4", at),
+        2,
+        "a sample retried after its judge is a fresh attempt, not attempt one again"
+    );
+    assert_eq!(
+        journal.attempt("arm-0", 0, RunStage::Judge),
+        2,
+        "moving back to the sample keeps the judge attempt for its own retry"
+    );
+    journal.retire("arm-0", 0, RunStage::Sample);
+    journal.save(stamp.path()).unwrap();
+    let mut loaded = ResumeJournal::load(stamp.path()).unwrap().unwrap();
+    assert_eq!(
+        loaded.retired("arm-0", 0),
+        Some(RunStage::Sample),
+        "a retirement survives until the replacement stage is claimed"
+    );
+    assert_eq!(
+        loaded.claim(stage("arm-0", 0, RunStage::Sample), "run-5", at),
+        3
+    );
+    assert_eq!(
+        loaded.retired("arm-0", 0),
+        None,
+        "claiming the replacement clears the retirement marker"
+    );
+}
+
+#[test]
 fn stamp_pin_names_the_first_fact_that_no_longer_matches() {
     let pinned = pin("prod", "abc", 1);
     assert_eq!(pinned.difference(&pin("prod", "abc", 1)), None);

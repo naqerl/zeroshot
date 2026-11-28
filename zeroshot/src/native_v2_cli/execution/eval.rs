@@ -457,17 +457,30 @@ where
         let arm = task.arm;
         let path = task.directory.join(RESULT_ARTIFACT);
         let mut retry = false;
+        let retired = self.journal.retired(&arm.id, task.index) == Some(RunStage::Sample);
         if let Some(recorded) = artifacts::read_result::<SampleResult>(&path).map_err(cli_error)? {
-            if recorded.status != SampleStatus::Failed || !self.retry_failed {
+            if recorded.status != SampleStatus::Failed || (!self.retry_failed && !retired) {
                 // Already measured: the recorded evidence is the answer, not a reason to resubmit.
                 return Ok(Some(recorded));
             }
-            // Keep the failed evidence under its attempt, so a retry cannot destroy what it repeats.
+            if !retired {
+                // Keep the failed evidence under its attempt, so a retry cannot destroy what it
+                // repeats. Journal the retirement first: if this pass dies before the new run is
+                // claimed, the next pass measures the stage again instead of adopting the run
+                // whose evidence was intentionally discarded.
+                self.retire_stage(&arm.id, task.index, RunStage::Sample)?;
+            }
+            // A judge verdict describes the output of the failed sample. Retrying the sample
+            // invalidates that evidence before it can be mistaken for a verdict on the new run.
+            self.retire_judge(task)?;
             artifacts::retire_result(
                 &path,
                 self.journal.attempt(&arm.id, task.index, RunStage::Sample),
             )
             .map_err(cli_error)?;
+            retry = true;
+        } else if retired {
+            // An earlier retry retired the result but stopped before admitting its replacement.
             retry = true;
         }
         self.publish_sample(task)?;
@@ -507,6 +520,35 @@ where
         Ok(Some(result))
     }
 
+    /// Retire a judge result that belonged to a sample whose run is being replaced.
+    ///
+    /// The journal only names the current stage, so a result left by an earlier judge attempt is
+    /// removed here, before the sample result itself, and without needing a second retirement
+    /// marker: an interruption at any point still leaves the sample marker or its failed result.
+    fn retire_judge(&mut self, task: &SampleTask<'_>) -> Result<(), NativeV2CliError> {
+        let directory = task.directory.join(JUDGE_DIRECTORY);
+        // The input and the verdict both describe the failed sample's output. Keeping either for
+        // the replacement run would either judge the wrong patch or make the refreshed input look
+        // like conflicting evidence.
+        let paths = [
+            directory.join(JUDGE_INPUT_ARTIFACT),
+            directory.join(JUDGE_RESULT_ARTIFACT),
+        ];
+        if paths.iter().all(|path| !path.is_file()) {
+            return Ok(());
+        }
+        if self.journal.retired(&task.arm.id, task.index) != Some(RunStage::Judge) {
+            self.retire_stage(&task.arm.id, task.index, RunStage::Judge)?;
+        }
+        let attempt = self
+            .journal
+            .attempt(&task.arm.id, task.index, RunStage::Judge);
+        for path in paths.iter().filter(|path| path.is_file()) {
+            artifacts::retire_result(path, attempt).map_err(cli_error)?;
+        }
+        Ok(())
+    }
+
     /// Publish the artifacts that describe one sample's submission, once.
     fn publish_sample(&self, task: &SampleTask<'_>) -> Result<(), NativeV2CliError> {
         artifacts::write_json_checked(&task.directory.join(INPUT_ARTIFACT), &self.input)
@@ -530,6 +572,9 @@ where
         let Some(output) = result.output.as_ref() else {
             return Ok(());
         };
+        if result.status != SampleStatus::Succeeded {
+            return Ok(());
+        }
         let Some((judge_graph, judge_runtime)) = self
             .judge
             .as_ref()
@@ -540,12 +585,20 @@ where
         let judge_directory = task.directory.join(JUDGE_DIRECTORY);
         let path = judge_directory.join(JUDGE_RESULT_ARTIFACT);
         let mut retry = false;
+        let retired = self.journal.retired(&arm.id, index) == Some(RunStage::Judge);
         if let Some(recorded) = artifacts::read_result::<JudgeResult>(&path).map_err(cli_error)? {
-            if recorded.status != SampleStatus::Failed || !self.retry_failed {
+            if recorded.status != SampleStatus::Failed || (!self.retry_failed && !retired) {
                 return Ok(());
+            }
+            if !retired {
+                // Like a sample retry, journal the retirement before removing its evidence.
+                self.retire_stage(&arm.id, index, RunStage::Judge)?;
             }
             artifacts::retire_result(&path, self.journal.attempt(&arm.id, index, RunStage::Judge))
                 .map_err(cli_error)?;
+            retry = true;
+        } else if retired {
+            // An earlier retry retired the judge but stopped before admitting its replacement.
             retry = true;
         }
         let judge_input = judge_directory.join(JUDGE_INPUT_ARTIFACT);
@@ -630,6 +683,17 @@ where
             None if self.interrupted => Ok(StageSettlement::Stopped),
             None => Ok(StageSettlement::Vanished { run_id }),
         }
+    }
+
+    /// Journal that a failed stage is retired, before its result is removed.
+    fn retire_stage(
+        &mut self,
+        arm: &str,
+        sample: u32,
+        stage: RunStage,
+    ) -> Result<(), NativeV2CliError> {
+        self.journal.retire(arm, sample, stage);
+        self.journal.save(self.stamp).map_err(cli_error)
     }
 
     /// Journal one submitted run, durably, before it is polled.

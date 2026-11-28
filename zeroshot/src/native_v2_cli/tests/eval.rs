@@ -312,6 +312,25 @@ async fn execute_until_detached(
     (outcome, serde_json::from_slice(&output).assert_value())
 }
 
+/// Detach at the first opportunity, before a retired stage is submitted again.
+struct DetachNow;
+
+#[async_trait::async_trait]
+impl DetachSignal for DetachNow {
+    async fn wait(&mut self) {}
+}
+
+/// Execute one pass that retires a failed stage and stops before newly submitting it.
+async fn execute_until_detached_before_submitting(
+    command: NativeV2CliCommand,
+    backend: &FakeBackend,
+) -> (Result<CliOutcome, NativeV2CliError>, Value) {
+    let mut output = Vec::new();
+    let mut signal = DetachNow;
+    let outcome = execute_native_v2_cli(command, backend, &mut signal, &mut output).await;
+    (outcome, serde_json::from_slice(&output).assert_value())
+}
+
 /// Every submission key a pass asked the target to admit, in submission order.
 fn submission_keys(backend: &FakeBackend) -> Vec<String> {
     backend
@@ -557,6 +576,90 @@ async fn eval_run_retries_a_retired_failure_only_with_retry_failed() {
     assert_eq!(
         recorded.status,
         crate::native_v2_eval::run::SampleStatus::Succeeded
+    );
+}
+
+#[tokio::test]
+async fn eval_run_resumes_a_retry_that_retired_evidence_before_claiming_its_replacement() {
+    let (workspace, _) = fixture_workspace();
+    let root = store(
+        workspace.path(),
+        &document("alpha", "candidate", Some("prod"), false),
+    );
+    let first = FakeBackend::default();
+    let (outcome, interrupted) = execute_until_detached(
+        run_command_with(&root, Some("prod"), StampFlags::default()),
+        &first,
+    )
+    .await;
+    assert_eq!(outcome.assert_value(), CliOutcome::Detached);
+    let stamp = interrupted["stamp"].as_str().assert_value().to_owned();
+    let failed_key = submission_keys(&first).pop().assert_value();
+
+    let (outcome, failed) = execute_summary(
+        run_command_with(&root, Some("prod"), StampFlags::default()),
+        &FakeBackend::with_missing_run(MissingRun::Remote),
+    )
+    .await;
+    assert_eq!(outcome.assert_value(), CliOutcome::Completed);
+    assert_eq!(failed["samples"][0]["status"], "failed");
+
+    // The retry pass retires the failed result, then detaches before claiming its replacement.
+    let interrupted_retry = FakeBackend::default();
+    let (outcome, _) = execute_until_detached_before_submitting(
+        run_command_with(
+            &root,
+            Some("prod"),
+            StampFlags {
+                stamp: Some(stamp.clone()),
+                retry_failed: true,
+                ..StampFlags::default()
+            },
+        ),
+        &interrupted_retry,
+    )
+    .await;
+    assert_eq!(outcome.assert_value(), CliOutcome::Detached);
+    assert_eq!(
+        submission_keys(&interrupted_retry).len(),
+        0,
+        "the retirement happened before the replacement was submitted"
+    );
+    let directory = root.join("runs/alpha").join(&stamp).join("arm-0");
+    assert!(
+        !directory.join("result.json").exists(),
+        "the failed canonical result was removed by the interrupted retry"
+    );
+    let journal: Value = serde_json::from_slice(
+        &std::fs::read(directory.parent().assert_value().join("resume.json")).assert_value(),
+    )
+    .assert_value();
+    assert_eq!(
+        journal["samples"][0]["retired"], "sample",
+        "the journal records the retirement before the replacement exists"
+    );
+
+    let retry = FakeBackend::with_run_outputs(vec![json!({"patch":"retried"})]);
+    let (outcome, summary) = execute_summary(
+        run_command_with(
+            &root,
+            Some("prod"),
+            StampFlags {
+                stamp: Some(stamp),
+                retry_failed: true,
+                ..StampFlags::default()
+            },
+        ),
+        &retry,
+    )
+    .await;
+    assert_eq!(outcome.assert_value(), CliOutcome::Completed);
+    assert_eq!(summary["samples"][0]["status"], "succeeded");
+    let retried_keys = submission_keys(&retry);
+    assert_eq!(retried_keys.len(), 1);
+    assert_ne!(
+        retried_keys[0], failed_key,
+        "the resumed retry is the next attempt, not a replay of the failed run's key"
     );
 }
 
