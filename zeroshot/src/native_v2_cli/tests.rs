@@ -675,7 +675,7 @@ async fn run_follows_by_default_and_forwards_per_run_intent_unchanged() {
             Call::Submit {
                 target: Some("prod".to_owned()),
                 title: RunTitle::new("Repair checkout").assert_value(),
-                runtime: runtime(),
+                runtime: Box::new(runtime()),
                 environment: None,
                 input: json!({"task":"ship it"}),
                 connections: BTreeMap::new(),

@@ -7,14 +7,15 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use openengine_cluster_protocol::{
-    HostedRunStatus, HostedRunStatusResult, RunId, RunStatus, RunStatusParams, RunTitle,
-    TerminalResult,
+    HostedRunStatus, HostedRunStatusResult, IdempotencyKey, RunId, RunStatus, RunStatusParams,
+    RunTitle, TerminalResult,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::submission::{RunSubmission, submit_run};
 use super::{CliExecutionContext, write_json};
@@ -26,7 +27,7 @@ use crate::native_v2_eval::config;
 use crate::native_v2_eval::run as artifacts;
 use crate::native_v2_eval::run::{
     INPUT_ARTIFACT, JUDGE_DIRECTORY, JUDGE_INPUT_ARTIFACT, JUDGE_RESULT_ARTIFACT, JudgeResult,
-    RESULT_ARTIFACT, SOURCE_ARTIFACT, SampleResult, SampleStatus, SampleSummary,
+    RESULT_ARTIFACT, ResumeJournal, RunStage, SOURCE_ARTIFACT, SampleResult, SampleStatus,
 };
 use crate::native_v2_eval::{EvalArm, EvalDocument, EvalStore};
 
@@ -200,13 +201,55 @@ where
             .map_err(cli_error)?;
         sources.insert(arm.id.clone(), source);
     }
-    let stamp = artifacts::create_stamp(&store.runs_root(&document.slug), SystemTime::now())
-        .map_err(cli_error)?;
+    // A pass continues the newest incomplete stamp unless the caller asked for a fresh one, so
+    // `eval run` after a crash picks up where the evidence stopped instead of starting over.
+    let resumed = select_stamp(&store, &command, &document)?;
+    if command.retry_failed && resumed.is_none() {
+        return Err(NativeV2CliError::Usage(
+            "--retry-failed only retries the failed stages of a resumed stamp; \
+             pass --stamp NAME or omit --restart"
+                .to_owned(),
+        ));
+    }
+    let stamp = match &resumed {
+        Some(stamp) => stamp.clone(),
+        None => artifacts::create_stamp(&store.runs_root(&document.slug), SystemTime::now())
+            .map_err(cli_error)?,
+    };
     let stamp_name = stamp
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default()
         .to_owned();
+    let pin = artifacts::stamp_pin(&document, &target, &sources).map_err(cli_error)?;
+    let journal = match ResumeJournal::load(&stamp).map_err(cli_error)? {
+        Some(journal) => {
+            if let Some(difference) = journal.pin.difference(&pin) {
+                return Err(NativeV2CliError::Usage(format!(
+                    "eval {:?} cannot continue stamp {stamp_name:?}: {difference}; \
+                     pass --restart to start a new stamp",
+                    document.slug
+                )));
+            }
+            journal
+        }
+        None => {
+            if resumed.is_some()
+                && artifacts::stamp_has_evidence(&stamp, &document).map_err(cli_error)?
+            {
+                return Err(NativeV2CliError::Usage(format!(
+                    "eval {:?} cannot continue stamp {stamp_name:?}: it holds evidence but no \
+                     resume record; pass --restart to start a new stamp",
+                    document.slug
+                )));
+            }
+            // The journal is the stamp's first artifact, so a pass that dies at any later step
+            // still leaves a record of what it was measuring and which run it started.
+            let journal = ResumeJournal::new(pin);
+            journal.save(&stamp).map_err(cli_error)?;
+            journal
+        }
+    };
 
     let mut runner = Runner {
         context,
@@ -215,18 +258,25 @@ where
         document: &document,
         target: &target,
         stamp: &stamp,
+        stamp_name: &stamp_name,
         judge,
         workspace: &workspace,
         input: document.input.clone(),
         sources,
+        journal,
+        retry_failed: command.retry_failed,
         interrupted: false,
     };
-    let (samples, interrupted) = runner.run().await?;
+    runner.run().await?;
     let Runner { output, .. } = runner;
 
+    // The aggregate is reduced from the stamp's evidence, never from what this pass happened to
+    // submit, so a resumed pass reports every sample an earlier pass already settled.
+    let (samples, complete) =
+        artifacts::summary_from_evidence(&document, &stamp).map_err(cli_error)?;
     let mut summary = artifacts::summarize(&document, &stamp_name, &target, samples);
-    summary.interrupted = interrupted;
-    artifacts::write_text(
+    summary.interrupted = !complete;
+    artifacts::replace_text(
         &stamp.join(artifacts::REPORT_ARTIFACT),
         &artifacts::report(&summary),
     )
@@ -239,10 +289,82 @@ where
     )
     .map_err(cli_error)?;
     write_json(output, &summary)?;
-    if interrupted {
+    if summary.interrupted {
         return Ok(CliOutcome::Detached);
     }
     Ok(CliOutcome::Completed)
+}
+
+/// Choose the stamp one pass writes into.
+///
+/// `--stamp NAME` continues exactly that stamp. Otherwise the newest stamp that still needs work
+/// and carries a resume record is continued, and only an eval with no such stamp starts a fresh
+/// one. `--restart` always starts a fresh stamp and never touches earlier evidence.
+///
+/// Only a stamp with a `resume.json` may be picked automatically: a stamp written before the
+/// journal existed holds evidence but no record of what it was measuring, so it is left exactly as
+/// it was found and a new stamp is started beside it.
+fn select_stamp(
+    store: &EvalStore,
+    command: &EvalRunCommand,
+    document: &EvalDocument,
+) -> Result<Option<PathBuf>, NativeV2CliError> {
+    let root = store.runs_root(&document.slug);
+    if let Some(name) = command.stamp.as_deref() {
+        let stamp = stamp_directory(&root, name)?;
+        if !stamp.is_dir() {
+            return Err(NativeV2CliError::Usage(format!(
+                "eval {:?} has no stamp {name:?} under {}; omit --stamp to continue the newest \
+                 incomplete stamp",
+                document.slug,
+                root.display()
+            )));
+        }
+        return Ok(Some(stamp));
+    }
+    if command.restart {
+        return Ok(None);
+    }
+    let mut names = match std::fs::read_dir(&root) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect::<Vec<_>>(),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(source) => {
+            return Err(NativeV2CliError::Read {
+                kind: "eval",
+                path: root,
+                source,
+            });
+        }
+    };
+    names.sort();
+    for name in names.iter().rev() {
+        let stamp = root.join(name);
+        if ResumeJournal::load(&stamp).map_err(cli_error)?.is_none() {
+            continue;
+        }
+        if artifacts::stamp_incomplete(&stamp, document).map_err(cli_error)? {
+            return Ok(Some(stamp));
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve `--stamp NAME` as one stamp directory name, refusing anything that could escape it.
+fn stamp_directory(root: &Path, name: &str) -> Result<PathBuf, NativeV2CliError> {
+    let trimmed = name.trim();
+    let mut components = Path::new(trimmed).components();
+    let one_name =
+        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+    if trimmed.is_empty() || !one_name {
+        return Err(NativeV2CliError::Usage(format!(
+            "--stamp must name one stamp directory, not {name:?}"
+        )));
+    }
+    Ok(root.join(trimmed))
 }
 
 /// One `eval run`, from the resolved document to the aggregate.
@@ -253,14 +375,36 @@ struct Runner<'a, 'c, B, S, W> {
     document: &'a EvalDocument,
     target: &'a str,
     stamp: &'a Path,
+    /// Name of `stamp`, which the aggregate and every submission key repeat.
+    stamp_name: &'a str,
     judge: Option<config::JudgePlan>,
     /// The checkout the eval document is stored in, which supplies the sample source.
     workspace: &'a Path,
     input: Value,
     /// Each arm's source revision, resolved once for this run.
     sources: BTreeMap<String, config::ArmSource>,
+    /// Which stage of each sample this stamp already submitted.
+    journal: ResumeJournal,
+    /// Whether a recorded failed result is retired and measured again.
+    retry_failed: bool,
     /// Set once the caller asked to detach, so no later sample starts a new run.
     interrupted: bool,
+}
+
+/// One sample of one arm, with the artifacts directory it owns.
+struct SampleTask<'a> {
+    directory: PathBuf,
+    arm: &'a EvalArm,
+    index: u32,
+    source: &'a config::ArmSource,
+}
+
+/// One stage's submission: what to submit, the title it is filed under, and whether the run the
+/// journal already recorded may be adopted instead of submitted again.
+struct StageSubmission<'a> {
+    plan: SampleRun<'a>,
+    title: RunTitle,
+    adopt: bool,
 }
 
 impl<'a, 'c, B, S, W> Runner<'a, 'c, B, S, W>
@@ -270,9 +414,8 @@ where
     W: Write,
 {
     /// Run every authored sample, stopping at the first detach request.
-    async fn run(&mut self) -> Result<(Vec<SampleSummary>, bool), NativeV2CliError> {
+    async fn run(&mut self) -> Result<(), NativeV2CliError> {
         let document = self.document;
-        let mut samples = Vec::new();
         for arm in &document.arms {
             let source = self.sources.get(&arm.id).cloned().ok_or_else(|| {
                 NativeV2CliError::Local(format!(
@@ -281,142 +424,262 @@ where
                 ))
             })?;
             for index in 0..document.runs_per_arm {
-                if let Some(summary) = self.sample(arm, index, &source).await? {
-                    samples.push(summary);
-                }
+                let task = SampleTask {
+                    directory: artifacts::sample_directory(self.stamp, &arm.id, index),
+                    arm,
+                    index,
+                    source: &source,
+                };
+                self.sample(&task).await?;
                 if self.interrupted {
-                    return Ok((samples, true));
+                    return Ok(());
                 }
             }
         }
-        Ok((samples, false))
+        Ok(())
     }
 
-    /// Run and, when an eval declares one, judge one sample.
-    async fn sample(
+    /// Settle one sample's own run, then judge it when it delivered output.
+    async fn sample(&mut self, task: &SampleTask<'_>) -> Result<(), NativeV2CliError> {
+        let Some(result) = self.sample_result(task).await? else {
+            return Ok(());
+        };
+        self.judge_sample(task, &result).await
+    }
+
+    /// Publish one sample's artifacts and settle its run.
+    ///
+    /// `None` means the pass stopped before the sample settled, so there is nothing to judge.
+    async fn sample_result(
         &mut self,
-        arm: &EvalArm,
-        index: u32,
-        source: &config::ArmSource,
-    ) -> Result<Option<SampleSummary>, NativeV2CliError> {
-        let directory = artifacts::sample_directory(self.stamp, &arm.id, index);
-        let input = directory.join(INPUT_ARTIFACT);
-        artifacts::write_json(&input, &self.input).map_err(cli_error)?;
-        artifacts::write_json(&directory.join(SOURCE_ARTIFACT), source).map_err(cli_error)?;
-        artifacts::write_json(&directory.join(GRAPH_ARTIFACT), &arm.graph).map_err(cli_error)?;
-        artifacts::write_json(&directory.join(RUNTIME_ARTIFACT), &arm.runtime)
+        task: &SampleTask<'_>,
+    ) -> Result<Option<SampleResult>, NativeV2CliError> {
+        let arm = task.arm;
+        let path = task.directory.join(RESULT_ARTIFACT);
+        let mut retry = false;
+        if let Some(recorded) = artifacts::read_result::<SampleResult>(&path).map_err(cli_error)? {
+            if recorded.status != SampleStatus::Failed || !self.retry_failed {
+                // Already measured: the recorded evidence is the answer, not a reason to resubmit.
+                return Ok(Some(recorded));
+            }
+            // Keep the failed evidence under its attempt, so a retry cannot destroy what it repeats.
+            artifacts::retire_result(
+                &path,
+                self.journal.attempt(&arm.id, task.index, RunStage::Sample),
+            )
             .map_err(cli_error)?;
-
-        let title = title(self.document, &arm.id, index)?;
-        let plan = SampleRun {
-            directory: &directory,
-            input: &input,
-            source,
+            retry = true;
+        }
+        self.publish_sample(task)?;
+        let input = task.directory.join(INPUT_ARTIFACT);
+        let identity = StageIdentity {
+            slug: &self.document.slug,
+            stamp: self.stamp_name,
+            arm: &arm.id,
+            sample: task.index,
+            stage: RunStage::Sample,
         };
-        let Some(settled) = self.submit(&plan, title).await? else {
-            return Ok(None);
-        };
-
-        let mut summary = SampleSummary {
-            arm: arm.id.clone(),
-            sample: index,
-            run_id: settled.run_id.clone(),
-            source: source.clone(),
-            status: settled.status,
-            reason: settled.reason.clone(),
-            verdicts: Vec::new(),
-        };
-        artifacts::write_json(
-            &directory.join(RESULT_ARTIFACT),
-            &SampleResult {
-                run_id: settled.run_id.clone(),
-                status: settled.status,
-                output: settled.output.clone(),
-                reason: settled.reason.clone(),
+        let submission = StageSubmission {
+            plan: SampleRun {
+                directory: &task.directory,
+                input: &input,
+                source: task.source,
             },
-        )
-        .map_err(cli_error)?;
-        let Some(output) = settled.output else {
-            return Ok(Some(summary));
+            title: title(self.document, &arm.id, task.index)?,
+            adopt: !retry,
+        };
+        let result = match self.dispatch(&identity, &submission).await? {
+            StageSettlement::Stopped => return Ok(None),
+            StageSettlement::Vanished { run_id } => SampleResult {
+                run_id,
+                status: SampleStatus::Failed,
+                output: None,
+                reason: Some(artifacts::VANISHED_REASON.to_owned()),
+            },
+            StageSettlement::Settled(settled) => SampleResult {
+                run_id: settled.run_id,
+                status: settled.status,
+                output: settled.output,
+                reason: settled.reason,
+            },
+        };
+        artifacts::write_json(&path, &result).map_err(cli_error)?;
+        Ok(Some(result))
+    }
+
+    /// Publish the artifacts that describe one sample's submission, once.
+    fn publish_sample(&self, task: &SampleTask<'_>) -> Result<(), NativeV2CliError> {
+        artifacts::write_json_checked(&task.directory.join(INPUT_ARTIFACT), &self.input)
+            .map_err(cli_error)?;
+        artifacts::write_json_checked(&task.directory.join(SOURCE_ARTIFACT), task.source)
+            .map_err(cli_error)?;
+        artifacts::write_json_checked(&task.directory.join(GRAPH_ARTIFACT), &task.arm.graph)
+            .map_err(cli_error)?;
+        artifacts::write_json_checked(&task.directory.join(RUNTIME_ARTIFACT), &task.arm.runtime)
+            .map_err(cli_error)
+    }
+
+    /// Judge one sample's delivered output, when the eval declares a judge.
+    async fn judge_sample(
+        &mut self,
+        task: &SampleTask<'_>,
+        result: &SampleResult,
+    ) -> Result<(), NativeV2CliError> {
+        let arm = task.arm;
+        let index = task.index;
+        let Some(output) = result.output.as_ref() else {
+            return Ok(());
         };
         let Some((judge_graph, judge_runtime)) = self
             .judge
             .as_ref()
             .map(|judge| (judge.graph.clone(), judge.runtime.clone()))
         else {
-            return Ok(Some(summary));
+            return Ok(());
         };
-
-        let judge_directory = directory.join(JUDGE_DIRECTORY);
+        let judge_directory = task.directory.join(JUDGE_DIRECTORY);
+        let path = judge_directory.join(JUDGE_RESULT_ARTIFACT);
+        let mut retry = false;
+        if let Some(recorded) = artifacts::read_result::<JudgeResult>(&path).map_err(cli_error)? {
+            if recorded.status != SampleStatus::Failed || !self.retry_failed {
+                return Ok(());
+            }
+            artifacts::retire_result(&path, self.journal.attempt(&arm.id, index, RunStage::Judge))
+                .map_err(cli_error)?;
+            retry = true;
+        }
         let judge_input = judge_directory.join(JUDGE_INPUT_ARTIFACT);
-        artifacts::write_json(
+        artifacts::write_json_checked(
             &judge_input,
-            &artifacts::judge_input(self.document, &artifacts::sample_patch(&output))
+            &artifacts::judge_input(self.document, &artifacts::sample_patch(output))
                 .map_err(cli_error)?,
         )
         .map_err(cli_error)?;
-        artifacts::write_json(&judge_directory.join(GRAPH_ARTIFACT), &judge_graph)
+        artifacts::write_json_checked(&judge_directory.join(GRAPH_ARTIFACT), &judge_graph)
             .map_err(cli_error)?;
-        artifacts::write_json(&judge_directory.join(RUNTIME_ARTIFACT), &judge_runtime)
+        artifacts::write_json_checked(&judge_directory.join(RUNTIME_ARTIFACT), &judge_runtime)
             .map_err(cli_error)?;
-        let plan = SampleRun {
-            directory: &judge_directory,
-            input: &judge_input,
-            source,
+        let identity = StageIdentity {
+            slug: &self.document.slug,
+            stamp: self.stamp_name,
+            arm: &arm.id,
+            sample: index,
+            stage: RunStage::Judge,
         };
-        let Some(settled) = self
-            .submit(&plan, judge_title(self.document, index)?)
-            .await?
-        else {
-            // The sample's own evidence is already published, so only the verdicts are lost.
-            summary.reason =
-                Some("the judge run did not finish before the eval stopped".to_owned());
-            return Ok(Some(summary));
+        let submission = StageSubmission {
+            plan: SampleRun {
+                directory: &judge_directory,
+                input: &judge_input,
+                source: task.source,
+            },
+            title: judge_title(self.document, index)?,
+            adopt: !retry,
         };
-        let mut judge_result = JudgeResult {
-            run_id: settled.run_id,
-            status: settled.status,
-            verdicts: Vec::new(),
-            reason: settled.reason,
-        };
-        if let Some(output) = settled.output {
-            judge_result.verdicts =
-                artifacts::verdicts(&output, &self.document.scoring.criteria).map_err(cli_error)?;
-        }
-        if judge_result.status == SampleStatus::Succeeded && judge_result.verdicts.is_empty() {
-            // A judge that reported no verdict at all measured nothing, so recording it as a
-            // successful judgement would report a sample the eval never actually scored.
-            judge_result.status = SampleStatus::Failed;
-            judge_result.reason = Some("it recorded no verdicts".to_owned());
-        }
-        artifacts::write_json(&judge_directory.join(JUDGE_RESULT_ARTIFACT), &judge_result)
-            .map_err(cli_error)?;
-        summary.verdicts = judge_result.verdicts;
-        if judge_result.status == SampleStatus::Failed {
-            // The judge is part of the measurement: when it fails, the sample is not a success
-            // that merely lacks verdicts, and the aggregate has to count it as failed.
-            summary.status = SampleStatus::Failed;
-            summary.reason = Some(format!(
-                "judge run {} failed: {}",
-                judge_result.run_id,
+        let mut judge_result = match self.dispatch(&identity, &submission).await? {
+            StageSettlement::Stopped => return Ok(()),
+            StageSettlement::Vanished { run_id } => JudgeResult {
+                run_id,
+                status: SampleStatus::Failed,
+                verdicts: Vec::new(),
+                reason: Some(artifacts::VANISHED_REASON.to_owned()),
+            },
+            StageSettlement::Settled(settled) => {
+                let mut judge_result = JudgeResult {
+                    run_id: settled.run_id,
+                    status: settled.status,
+                    verdicts: Vec::new(),
+                    reason: settled.reason,
+                };
+                if let Some(output) = settled.output {
+                    judge_result.verdicts =
+                        artifacts::verdicts(&output, &self.document.scoring.criteria)
+                            .map_err(cli_error)?;
+                }
                 judge_result
-                    .reason
-                    .as_deref()
-                    .unwrap_or("it recorded no verdicts")
-            ));
-        }
-        Ok(Some(summary))
+            }
+        };
+        artifacts::normalize_judge(&mut judge_result);
+        artifacts::write_json(&path, &judge_result).map_err(cli_error)
     }
 
-    /// Submit one run and wait for its terminal record.
+    /// Settle one stage: adopt the run the journal recorded, or submit a new one.
     ///
-    /// `None` means the caller asked to detach before the run settled; the sample's own artifacts
-    /// are then the evidence of what was started.
+    /// An adopted run is polled with the same settlement the submitting pass used, so a resumed
+    /// pass never starts a second run for work an earlier pass already admitted. `adopt` is false
+    /// when `--retry-failed` just retired the stage's recorded failure, which must be measured
+    /// again rather than polled to the same answer.
+    async fn dispatch(
+        &mut self,
+        identity: &StageIdentity<'_>,
+        submission: &StageSubmission<'_>,
+    ) -> Result<StageSettlement, NativeV2CliError> {
+        let recorded = self
+            .journal
+            .recorded(identity.arm, identity.sample)
+            .filter(|(stage, _)| submission.adopt && *stage == identity.stage)
+            .map(|(_, run_id)| run_id.to_owned());
+        let run_id = match recorded {
+            Some(run_id) => run_id,
+            None => match self.submit(identity, submission).await? {
+                SubmittedRun::Stopped => return Ok(StageSettlement::Stopped),
+                SubmittedRun::Submitted(run_id) => run_id,
+            },
+        };
+        match self.settle(&run_id, identity).await? {
+            Some(settled) => Ok(StageSettlement::Settled(settled)),
+            None if self.interrupted => Ok(StageSettlement::Stopped),
+            None => Ok(StageSettlement::Vanished { run_id }),
+        }
+    }
+
+    /// Journal one submitted run, durably, before it is polled.
+    fn claim(
+        &mut self,
+        identity: &StageIdentity<'_>,
+        run_id: &str,
+    ) -> Result<(), NativeV2CliError> {
+        self.journal.claim(
+            artifacts::StageId {
+                arm: identity.arm,
+                sample: identity.sample,
+                stage: identity.stage,
+            },
+            run_id,
+            SystemTime::now(),
+        );
+        self.journal.save(self.stamp).map_err(cli_error)
+    }
+
+    /// Journal one settled stage, so a resumed pass knows it owes no more work here.
+    fn settle_stage(&mut self, identity: &StageIdentity<'_>) -> Result<(), NativeV2CliError> {
+        self.journal
+            .settle(identity.arm, identity.sample, SystemTime::now());
+        self.journal.save(self.stamp).map_err(cli_error)
+    }
+
+    /// Journal one stage whose run vanished, so its failure is durable evidence.
+    fn fail_stage(&mut self, identity: &StageIdentity<'_>) -> Result<(), NativeV2CliError> {
+        self.journal
+            .fail(identity.arm, identity.sample, SystemTime::now());
+        self.journal.save(self.stamp).map_err(cli_error)
+    }
+
+    /// Submit one run, recording its receipt in the journal before it is polled.
+    ///
+    /// A receipt is journaled even when the caller detached while submitting, because the target
+    /// may already have admitted the run: a later pass then continues it instead of starting a
+    /// second, unreferenced run for the same sample.
     async fn submit(
         &mut self,
-        plan: &SampleRun<'_>,
-        title: RunTitle,
-    ) -> Result<Option<SettledRun>, NativeV2CliError> {
+        identity: &StageIdentity<'_>,
+        submission: &StageSubmission<'_>,
+    ) -> Result<SubmittedRun, NativeV2CliError> {
+        let plan = &submission.plan;
+        let title = submission.title.clone();
+        let attempt = self
+            .journal
+            .attempt(identity.arm, identity.sample, identity.stage)
+            .saturating_add(1);
         let command = RunCommand {
             controller: crate::native_v2_cli::local::LocalControllerMode::Detached,
             target: Some(self.target.to_owned()),
@@ -436,40 +699,29 @@ where
             revision: plan.source.revision.clone(),
             detach: true,
             validate_only: false,
-            submission_key: None,
+            submission_key: Some(submission_key(identity, attempt)),
             forward_github_token: false,
             workspace: None,
         };
-        let Self {
-            context,
-            signal,
-            interrupted: was_interrupted,
-            ..
-        } = self;
         let submission = {
-            let detach = signal.wait();
+            let detach = self.signal.wait();
             tokio::pin!(detach);
             // The submission's own record belongs to the sample's artifacts, so the run's stdout
             // stays the one aggregate a caller parses.
-            submit_run(&command, context, detach.as_mut(), &mut Vec::new()).await?
+            submit_run(&command, self.context, detach.as_mut(), &mut Vec::new()).await?
         };
-        let run_id = match submission {
+        let (run_id, interrupted) = match submission {
             RunSubmission::Submitted {
                 receipt,
                 interrupted,
             } => {
-                if interrupted {
-                    // The caller asked to stop while the run was being submitted. The submission's
-                    // detach signal already fired, so the eval ends here rather than polling a run
-                    // the caller no longer waits for.
-                    *was_interrupted = true;
-                    return Ok(None);
-                }
-                receipt.run_id.as_str().to_owned()
+                let run_id = receipt.run_id.as_str().to_owned();
+                self.claim(identity, &run_id)?;
+                (run_id, interrupted)
             }
             RunSubmission::Interrupted => {
-                *was_interrupted = true;
-                return Ok(None);
+                self.interrupted = true;
+                return Ok(SubmittedRun::Stopped);
             }
             RunSubmission::Validated => {
                 return Err(NativeV2CliError::Usage(
@@ -477,11 +729,24 @@ where
                 ));
             }
         };
-        self.settle(&run_id).await
+        if interrupted {
+            // The detach signal already fired; the journaled receipt is what lets the next pass
+            // continue this run.
+            self.interrupted = true;
+            return Ok(SubmittedRun::Stopped);
+        }
+        Ok(SubmittedRun::Submitted(run_id))
     }
 
     /// Poll one submitted run until it has a terminal record.
-    async fn settle(&mut self, run_id: &str) -> Result<Option<SettledRun>, NativeV2CliError> {
+    ///
+    /// `None` means the pass stopped or the target no longer has the run; both are journaled, so a
+    /// resumed pass never polls a run that can no longer settle.
+    async fn settle(
+        &mut self,
+        run_id: &str,
+        identity: &StageIdentity<'_>,
+    ) -> Result<Option<SettledRun>, NativeV2CliError> {
         let context = self.context;
         let target = self.target;
         let deadline = Instant::now() + SETTLEMENT_TIMEOUT;
@@ -496,15 +761,24 @@ where
                     biased;
                     () = detach.as_mut() => None,
                     status = context.backend.run_status(Some(target), params.clone()) => {
-                        Some(status?)
+                        Some(status)
                     }
                 }
             };
-            let Some(status) = reported else {
+            let Some(reported) = reported else {
                 self.interrupted = true;
                 return Ok(None);
             };
+            let status = match reported {
+                Ok(status) => status,
+                Err(error) if vanished(&error) => {
+                    self.fail_stage(identity)?;
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
             if let Some(settled) = settled_from(&status, run_id) {
+                self.settle_stage(identity)?;
                 return Ok(Some(settled));
             }
             if Instant::now() >= deadline {
@@ -528,6 +802,67 @@ where
             }
         }
     }
+}
+
+/// Which sample stage a run belongs to, and where its submission key comes from.
+struct StageIdentity<'a> {
+    slug: &'a str,
+    stamp: &'a str,
+    arm: &'a str,
+    sample: u32,
+    stage: RunStage,
+}
+
+/// What one stage dispatch concluded.
+enum StageSettlement {
+    /// The pass stopped before the stage settled.
+    Stopped,
+    /// The recorded run no longer exists on the target.
+    Vanished { run_id: String },
+    /// The run reached a terminal record.
+    Settled(SettledRun),
+}
+
+/// What one stage submission produced.
+enum SubmittedRun {
+    /// The pass stopped while submitting.
+    Stopped,
+    /// The target admitted this run.
+    Submitted(String),
+}
+
+/// Whether an error says the target no longer has a recorded run.
+///
+/// Only an explicit not-found answer counts: a transport failure is not evidence that a run is
+/// gone, so it keeps its own error handling instead of failing the sample.
+fn vanished(error: &NativeV2CliError) -> bool {
+    match error {
+        NativeV2CliError::RunNotFound { .. } => true,
+        NativeV2CliError::Remote { code, .. } => code == "run_not_found" || code == "not_found",
+        _ => false,
+    }
+}
+
+/// The deterministic resubmission key of one stage attempt.
+///
+/// Derived from the stamp, the sample and the attempt rather than minted once, so re-running the
+/// same pass replays the same admission instead of asking the target to admit a second, identical
+/// run. A deliberate retry after a durable receipt claims the next attempt, so its key differs and
+/// the target cannot replay the run the retry retired.
+fn submission_key(identity: &StageIdentity<'_>, attempt: u32) -> IdempotencyKey {
+    let stage = match identity.stage {
+        RunStage::Sample => "sample",
+        RunStage::Judge => "judge",
+    };
+    let digest = Sha256::digest(
+        format!(
+            "eval/{}/{}/{}/{}/{stage}/{attempt}",
+            identity.slug, identity.stamp, identity.arm, identity.sample
+        )
+        .as_bytes(),
+    );
+    IdempotencyKey::new(format!("eval-{digest:x}"))
+        .expect("a sha256 hex digest fits an idempotency key")
 }
 
 /// One already-published sample directory, ready to submit.

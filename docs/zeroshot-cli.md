@@ -1272,6 +1272,15 @@ Options:
       --target <NAME>
           Named target that receives the sample runs; overrides the eval's own target
 
+      --restart
+          Start a new stamp instead of continuing the newest incomplete stamp
+
+      --stamp <NAME>
+          Continue the stamp with this name instead of the newest incomplete stamp
+
+      --retry-failed
+          Re-run the failed stages of the resumed stamp
+
   -h, --help
           Print help
 ```

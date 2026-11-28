@@ -11,7 +11,9 @@
 //!
 //! `eval run` keeps its per-sample artifacts under `runs/<slug>/<stamp>/`, beside the documents and
 //! never among them: the loader only reads top-level `.json` files, so published runs cannot turn
-//! into eval definitions.
+//! into eval definitions. Inside a stamp, sample evidence is written once while `resume.json`, the
+//! journal that lets an interrupted pass continue without resubmitting its runs, is replaced
+//! atomically as each stage is submitted and settled.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};

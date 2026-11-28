@@ -93,7 +93,7 @@ pub(in crate::native_v2_cli) enum Call {
     Submit {
         target: Option<String>,
         title: RunTitle,
-        runtime: RuntimePlan,
+        runtime: Box<RuntimePlan>,
         environment: Option<openengine_cluster_protocol::RuntimeEnvironment>,
         input: Value,
         connections: RunConnectionValues,
@@ -250,6 +250,16 @@ pub(in crate::native_v2_cli) struct FakeBackend {
     review_file_change: Option<(std::path::PathBuf, String)>,
     workspace_export: Arc<Mutex<Option<WorkspaceExportStream>>>,
     run_outputs: Arc<Mutex<VecDeque<Value>>>,
+    missing_run: Option<MissingRun>,
+}
+
+/// How a fake target reports that a recorded run no longer exists.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::native_v2_cli) enum MissingRun {
+    /// The run-scoped answer a direct target gives.
+    Remote,
+    /// The client-side not-found error.
+    NotFound,
 }
 
 #[derive(Clone, Copy)]
@@ -342,6 +352,13 @@ impl FakeBackend {
     pub(super) fn with_run_outputs(outputs: Vec<Value>) -> Self {
         Self {
             run_outputs: Arc::new(Mutex::new(outputs.into())),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn with_missing_run(missing_run: MissingRun) -> Self {
+        Self {
+            missing_run: Some(missing_run),
             ..Self::default()
         }
     }
@@ -812,7 +829,7 @@ impl NativeV2CliBackend for FakeBackend {
         self.calls.lock().assert_value().push(Call::Submit {
             target: target.map(str::to_owned),
             title: intent.title,
-            runtime: intent.runtime,
+            runtime: Box::new(intent.runtime),
             environment: intent.environment,
             input: intent.initial_input,
             connections,
@@ -859,6 +876,18 @@ impl NativeV2CliBackend for FakeBackend {
             target: target.map(str::to_owned),
             run_id: params.run_id.as_str().to_owned(),
         });
+        if let Some(missing_run) = self.missing_run {
+            return Err(match missing_run {
+                MissingRun::Remote => NativeV2CliError::Remote {
+                    code: "run_not_found".to_owned(),
+                    message: "no such run".to_owned(),
+                    details: None,
+                },
+                MissingRun::NotFound => NativeV2CliError::RunNotFound {
+                    run_id: params.run_id.as_str().to_owned(),
+                },
+            });
+        }
         if let Some(started) = &self.unanswered_status {
             let _ = started.send(());
             return std::future::pending().await;
@@ -869,6 +898,8 @@ impl NativeV2CliBackend for FakeBackend {
         if let Some(output) = self.run_outputs.lock().assert_value().pop_front() {
             return serde_json::from_value(json!({
                 "runId":params.run_id,
+                "partId":params.run_id,
+                "currentPartId":params.run_id,
                 "title":"Repair checkout",
                 "source":source(),
                 "size":"medium",

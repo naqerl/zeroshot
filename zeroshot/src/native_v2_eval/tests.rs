@@ -268,6 +268,9 @@ fn parses_eval_commands_against_a_workspace() {
                 root: root.clone(),
                 slug: "alpha".to_owned(),
                 target: None,
+                restart: false,
+                stamp: None,
+                retry_failed: false,
             }
         ))
     );
@@ -286,6 +289,9 @@ fn parses_eval_commands_against_a_workspace() {
                 root,
                 slug: "alpha".to_owned(),
                 target: Some("prod".to_owned()),
+                restart: false,
+                stamp: None,
+                retry_failed: false,
             }
         ))
     );
@@ -501,5 +507,155 @@ async fn an_unresolvable_branch_is_refused_instead_of_sent_as_a_name() {
         matches!(&error, EvalError::Invalid(message)
             if message.contains("cannot resolve head branch \"no-such-branch\"")),
         "{error:?}"
+    );
+}
+
+fn stage<'a>(arm: &'a str, sample: u32, stage: super::run::RunStage) -> super::run::StageId<'a> {
+    super::run::StageId { arm, sample, stage }
+}
+
+fn pin(target: &str, revision: &str, runs_per_arm: u32) -> super::run::StampPin {
+    super::run::StampPin {
+        document_sha256: "sha".to_owned(),
+        target: target.to_owned(),
+        judge: None,
+        runs_per_arm,
+        arms: vec![super::run::StampArm {
+            id: "arm-0".to_owned(),
+            revision: revision.to_owned(),
+        }],
+    }
+}
+
+#[test]
+fn resume_journal_records_each_stage_attempt_and_its_outcome() {
+    let stamp = TempDir::new().unwrap();
+    let at = std::time::SystemTime::now();
+    let mut journal = super::run::ResumeJournal::new(pin("prod", "abc", 1));
+
+    assert_eq!(journal.recorded("arm-0", 0), None);
+    assert_eq!(journal.attempt("arm-0", 0, super::run::RunStage::Sample), 0);
+    assert_eq!(
+        journal.claim(stage("arm-0", 0, super::run::RunStage::Sample), "run-1", at),
+        1
+    );
+    journal.save(stamp.path()).unwrap();
+
+    let mut loaded = super::run::ResumeJournal::load(stamp.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded, journal);
+    assert_eq!(
+        loaded.recorded("arm-0", 0),
+        Some((super::run::RunStage::Sample, "run-1"))
+    );
+    loaded.settle("arm-0", 0, at);
+    assert!(!loaded.samples[0].failed);
+    assert_eq!(
+        loaded.claim(stage("arm-0", 0, super::run::RunStage::Judge), "run-2", at),
+        1,
+        "a sample's judge stage keeps its own attempt count"
+    );
+    assert_eq!(
+        loaded.claim(stage("arm-0", 0, super::run::RunStage::Judge), "run-3", at),
+        2,
+        "each retry of one stage is counted"
+    );
+    loaded.fail("arm-0", 0, at);
+    assert!(loaded.samples[0].failed);
+    assert_eq!(loaded.samples.len(), 1, "one sample has one journal entry");
+    loaded.save(stamp.path()).unwrap();
+    let reloaded = super::run::ResumeJournal::load(stamp.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(reloaded.samples[0].run_id, "run-3");
+    assert!(reloaded.samples[0].failed);
+}
+
+#[test]
+fn stamp_pin_names_the_first_fact_that_no_longer_matches() {
+    let pinned = pin("prod", "abc", 1);
+    assert_eq!(pinned.difference(&pin("prod", "abc", 1)), None);
+    assert_eq!(
+        pin("prod", "abc", 1).difference(&pin("prod", "def", 1)),
+        Some("arm \"arm-0\" moved from abc to def".to_owned())
+    );
+    let no_arms = super::run::StampPin {
+        arms: Vec::new(),
+        ..pin("prod", "abc", 1)
+    };
+    assert_eq!(
+        pinned.difference(&no_arms),
+        Some("arm \"arm-0\" was removed".to_owned())
+    );
+    assert_eq!(
+        no_arms.difference(&super::run::StampPin {
+            arms: vec![super::run::StampArm {
+                id: "arm-1".to_owned(),
+                revision: "abc".to_owned(),
+            }],
+            ..pin("prod", "abc", 1)
+        }),
+        Some("arm \"arm-1\" was added".to_owned())
+    );
+    assert_eq!(
+        pinned.difference(&pin("staging", "abc", 1)),
+        Some("target moved from \"prod\" to \"staging\"".to_owned())
+    );
+    assert_eq!(
+        pinned.difference(&pin("prod", "abc", 2)),
+        Some("runsPerArm moved from 1 to 2".to_owned())
+    );
+    assert_eq!(
+        pinned.difference(&super::run::StampPin {
+            judge: Some("eval-judge".to_owned()),
+            ..pin("prod", "abc", 1)
+        }),
+        Some("judge moved from None to Some(\"eval-judge\")".to_owned())
+    );
+    assert!(
+        pinned
+            .difference(&super::run::StampPin {
+                document_sha256: "sha2".to_owned(),
+                ..pin("prod", "abc", 1)
+            })
+            .is_some_and(|message| message.starts_with("the eval document changed from sha"))
+    );
+}
+
+#[test]
+fn write_json_checked_reuses_identical_bytes_and_refuses_changed_ones() {
+    let stamp = TempDir::new().unwrap();
+    let destination = stamp.path().join("input.json");
+    let value = json!({"task": "repair"});
+    super::run::write_json_checked(&destination, &value).unwrap();
+    let published = fs::read(&destination).unwrap();
+    super::run::write_json_checked(&destination, &value).unwrap();
+    assert_eq!(fs::read(&destination).unwrap(), published);
+
+    let error =
+        super::run::write_json_checked(&destination, &json!({"task": "other"})).unwrap_err();
+    assert!(
+        matches!(&error, EvalError::Invalid(message)
+            if message.contains("does not match the evidence this run would write")),
+        "{error:?}"
+    );
+    assert_eq!(
+        fs::read(&destination).unwrap(),
+        published,
+        "a refused rewrite never replaces the recorded evidence"
+    );
+}
+
+#[test]
+fn retire_result_keeps_the_failed_attempt_beside_the_canonical_result() {
+    let stamp = TempDir::new().unwrap();
+    let result = stamp.path().join("result.json");
+    fs::write(&result, b"{\"status\":\"failed\"}").unwrap();
+    super::run::retire_result(&result, 3).unwrap();
+    assert!(!result.exists());
+    assert_eq!(
+        fs::read(stamp.path().join("result.failed-3.json")).unwrap(),
+        b"{\"status\":\"failed\"}"
     );
 }

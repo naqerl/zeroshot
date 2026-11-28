@@ -39,4 +39,13 @@ pub(super) struct EvalRunArgs {
     /// Named target that receives the sample runs; overrides the eval's own target.
     #[arg(long, value_name = "NAME")]
     pub(super) target: Option<String>,
+    /// Start a new stamp instead of continuing the newest incomplete stamp.
+    #[arg(long, conflicts_with = "stamp")]
+    pub(super) restart: bool,
+    /// Continue the stamp with this name instead of the newest incomplete stamp.
+    #[arg(long, value_name = "NAME", conflicts_with = "restart")]
+    pub(super) stamp: Option<String>,
+    /// Re-run the failed stages of the resumed stamp.
+    #[arg(long)]
+    pub(super) retry_failed: bool,
 }

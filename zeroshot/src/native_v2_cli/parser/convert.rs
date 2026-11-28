@@ -477,6 +477,9 @@ impl EvalCommand {
                 root,
                 slug: args.slug,
                 target: args.target,
+                restart: args.restart,
+                stamp: args.stamp,
+                retry_failed: args.retry_failed,
             }),
         };
         Ok(NativeV2CliCommand::Eval(command))

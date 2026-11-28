@@ -439,6 +439,12 @@ pub struct EvalRunCommand {
     pub slug: String,
     /// Named target that receives the sample runs; overrides the eval's own target.
     pub target: Option<String>,
+    /// Start a new stamp instead of continuing the newest incomplete one.
+    pub restart: bool,
+    /// Continue the stamp with this name instead of the newest incomplete one.
+    pub stamp: Option<String>,
+    /// Re-run the stages of the resumed stamp whose recorded result failed.
+    pub retry_failed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
